@@ -1,4 +1,4 @@
-extern crate ffmpeg_next as ffmpeg;
+
 
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
@@ -6,7 +6,7 @@ use ffmpeg::software::scaling::{context::Context, flag::Flags};
 use ffmpeg::util::frame::video::Video;
 use std::env;
 use std::fs::File;
-use std::io::prelude::*;
+use std::io::Write;
 
 fn main() -> Result<(), ffmpeg::Error> {
     ffmpeg::init().unwrap();
