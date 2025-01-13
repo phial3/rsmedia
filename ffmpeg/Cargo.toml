@@ -14,7 +14,7 @@ categories    = ["multimedia"]
 
 [features]
 # Use FFmpeg 7 by default
-default = ["ffmpeg7", "link_system_ffmpeg"]
+default = ["ffmpeg6", "ffmpeg7", "link_system_ffmpeg"]
 
 # Note that ffmpeg{x}
 ffmpeg5 = ["rusty_ffmpeg/ffmpeg5"]

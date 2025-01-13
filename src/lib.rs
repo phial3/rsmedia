@@ -3,6 +3,7 @@ pub mod encode;
 pub mod error;
 pub mod extradata;
 pub mod frame;
+pub mod h264;
 pub mod hwaccel;
 pub mod init;
 pub mod io;
