@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     container: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu
     env:
-      RUSTFLAGS: "-C link-arg=-ldl -C link-arg=-lpthread -C link-args=-Wl,-Bdynamic"
+      RUSTFLAGS: ""
 
     strategy:
       matrix:
