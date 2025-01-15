@@ -19,16 +19,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - ffmpeg_version: "5.0"
-            feature: "ffmpeg5,ndarray"
           - ffmpeg_version: "5.1"
             feature: "ffmpeg5,ndarray"
-          - ffmpeg_version: "6.0"
-            feature: "ffmpeg6,ndarray"
           - ffmpeg_version: "6.1"
             feature: "ffmpeg6,ndarray"
-          - ffmpeg_version: "7.0"
-            feature: "ffmpeg7,ndarray"
           - ffmpeg_version: "7.1"
             feature: "ffmpeg7,ndarray"
       fail-fast: false
@@ -77,6 +71,7 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        run: echo "RUSTFLAGS=-C link-arg=-ldl" >> $GITHUB_ENV
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
