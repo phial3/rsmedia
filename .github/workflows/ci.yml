@@ -64,7 +64,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
     
       - name: Build
-        run: cargo build --no-default-features --features ffmpeg7 --verbose
+        run: cargo build --verbose
 
       - name: Run Test
         run: cargo test --verbose
@@ -98,7 +98,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --no-default-features --features ffmpeg7 --verbose
+        run: cargo build --verbose
+
+      - name: Run Test
+        run: cargo test --verbose
 
   test:
     runs-on: ubuntu-latest
