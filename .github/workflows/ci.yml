@@ -14,22 +14,16 @@ jobs:
   build-linux:
     name: build / linux / ffmpeg ${{ matrix.ffmpeg_version }}
     runs-on: ubuntu-latest
-    container: jrottenberg/ffmpeg:${{ matrix.container_tag }}
+    container: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu
 
     strategy:
       matrix:
         include:
-          # FFmpeg 5.x
-          - ffmpeg_version: "5.1"
-            container_tag: "5.1-ubuntu"
+          - ffmpeg_version: ["5.0", "5.1"]
             feature: "ffmpeg5,ndarray"
-          # FFmpeg 6.x
-          - ffmpeg_version: "6.1"
-            container_tag: "6.1-ubuntu-edge"
+          - ffmpeg_version: ["6.0", "6.1"]
             feature: "ffmpeg6,ndarray"
-          # FFmpeg 7.x
-          - ffmpeg_version: "7.1"
-            container_tag: "7.1-ubuntu-edge"
+          - ffmpeg_version: ["7.0", "7.1"]
             feature: "ffmpeg7,ndarray"
       fail-fast: false
 
@@ -40,7 +34,40 @@ jobs:
       - name: Install dependencies
         run: |
           DEBIAN_FRONTEND=noninteractive apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates clang curl pkg-config
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            autoconf \
+            automake \
+            pkg-config \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            cmake \
+            git-core \
+            libc6-dev \
+            libass-dev \
+            libfreetype6-dev \
+            libgnutls28-dev \
+            libsdl2-dev \
+            libtool \
+            libva-dev \
+            libvdpau-dev \
+            libvorbis-dev \
+            libxcb1-dev \
+            libxcb-shm0-dev \
+            libxcb-xfixes0-dev \
+            texinfo \
+            wget \
+            yasm \
+            nasm \
+            zlib1g-dev \
+            libx264-dev \
+            libx265-dev \
+            libnuma-dev \
+            libvpx-dev \
+            libfdk-aac-dev \
+            libmp3lame-dev \
+            libopus-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
