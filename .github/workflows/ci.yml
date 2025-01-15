@@ -15,6 +15,8 @@ jobs:
     name: build / linux / ffmpeg ${{ matrix.ffmpeg_version }}
     runs-on: ubuntu-latest
     container: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu
+    env:
+      RUSTFLAGS: "-C link-arg=-ldl"
 
     strategy:
       matrix:
@@ -71,7 +73,6 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        run: echo "RUSTFLAGS=-C link-arg=-ldl" >> $GITHUB_ENV
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
