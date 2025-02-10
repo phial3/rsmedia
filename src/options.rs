@@ -55,6 +55,11 @@ impl Options {
     pub fn preset_h264() -> Self {
         let mut opts = AvDictionary::new();
         // Set H264 encoder to the medium preset.
+        // 1. 基础编码参数
+        // preset: 预设编码配置,控制编码速度和质量的平衡
+        // - ultrafast,superfast,veryfast,faster,fast
+        // - medium (默认)
+        // - slow,slower,veryslow
         opts.set("preset", "medium");
 
         Self(opts)
@@ -65,26 +70,11 @@ impl Options {
     pub fn preset_h264_realtime() -> Self {
         let mut opts = AvDictionary::new();
         // Set H264 encoder to the medium preset.
-        opts.set("preset", "medium");
-        // Tune for low latency
-        opts.set("tune", "zerolatency");
-
-        Self(opts)
-    }
-
-    pub fn preset_h264_nvenc() -> Self {
-        let mut opts = AvDictionary::new();
         // preset: 预设编码配置,控制编码速度和质量的平衡
         // - slow: 更高质量,但编码速度较慢
         // - medium: 默认设置,平衡质量和速度
         // - fast: 更快编码速度,但质量可能略降
         opts.set("preset", "medium");
-
-        // profile: H.264编码配置文件
-        // - baseline: 基本画质,适用于低延迟视频通话
-        // - main: 主要画质,用于一般视频流
-        // - high: 高画质,用于高清视频,支持8位色深
-        opts.set("profile", "high");
 
         // quality: NVENC特定的质量控制模式
         // - high: 质量优先模式,产生最佳画质但占用更多GPU资源
