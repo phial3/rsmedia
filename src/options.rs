@@ -62,6 +62,16 @@ impl Options {
         // - slow,slower,veryslow
         opts.set("preset", "medium");
 
+        // profile: H.264编码配置文件
+        // - baseline: 基本画质,适用于低延迟视频通话
+        // - main: 主要画质,用于一般视频流
+        // - high: 高画质,用于高清视频,支持8位色深
+        opts.set("profile:v", "high");
+
+        // H.264编码级别
+        // - 常用级别: 3.0, 3.1, 4.0, 4.1, 4.2, 5.0, 5.1
+        opts.set("level", "4.1");
+
         Self(opts)
     }
 
@@ -84,6 +94,12 @@ impl Options {
 
         // Tune for low latency
         opts.set("tune", "zerolatency");
+
+        // profile: H.264编码配置文件
+        // - baseline: 基本画质,适用于低延迟视频通话
+        // - main: 主要画质,用于一般视频流
+        // - high: 高画质,用于高清视频,支持8位色深
+        opts.set("profile:v", "main");
 
         Self(opts)
     }
