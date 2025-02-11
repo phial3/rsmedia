@@ -372,6 +372,11 @@ impl DecoderSplit {
         ffi::set_decoder_context_time_base(&mut decoder, reader_stream.time_base());
         decoder.set_parameters(reader_stream.parameters()).unwrap();
 
+        tracing::info!("DecoderSplit new decoder context id: {:?}, medium:{:?}", decoder.id(), decoder.medium());
+        if let Some(codec) = decoder.codec() {
+            tracing::info!("DecoderSplit new decoder codec: {}, description:{}", codec.name(), codec.description());
+        }
+
         let hwaccel_context = match hw_device_type {
             Some(device_type) => Some(HWContext::new(&mut decoder, device_type)?),
             None => None,
