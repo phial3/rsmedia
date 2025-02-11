@@ -1,5 +1,6 @@
 use ffmpeg::codec::Parameters as AvCodecParameters;
-use ffmpeg::{Error as AvError, Rational as AvRational};
+use ffmpeg::Error as FfmpegError;
+use ffmpeg::Rational as AvRational;
 
 use crate::error::Error;
 use crate::io::Reader;
@@ -26,7 +27,7 @@ impl StreamInfo {
         let stream = reader
             .input
             .stream(stream_index)
-            .ok_or(AvError::StreamNotFound)?;
+            .ok_or(FfmpegError::StreamNotFound)?;
 
         Self::from_params(stream.parameters(), stream.time_base(), stream_index)
     }

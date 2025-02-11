@@ -1,7 +1,7 @@
 use ffmpeg::codec::packet::Packet as AvPacket;
 use ffmpeg::format::context::{Input as AvInput, Output as AvOutput};
 use ffmpeg::media::Type as AvMediaType;
-use ffmpeg::Error as AvError;
+use ffmpeg::Error as FfmpegError;
 
 use crate::error::Error;
 use crate::ffi;
@@ -163,7 +163,7 @@ impl Reader {
         unsafe {
             match ffmpeg::ffi::av_seek_frame(self.input.as_mut_ptr(), -1, frame_number, 0) {
                 0 => Ok(()),
-                e => Err(Error::BackendError(AvError::from(e))),
+                e => Err(Error::BackendError(FfmpegError::from(e))),
             }
         }
     }
@@ -180,7 +180,7 @@ impl Reader {
             .input
             .streams()
             .best(AvMediaType::Video)
-            .ok_or(AvError::StreamNotFound)?
+            .ok_or(FfmpegError::StreamNotFound)?
             .index())
     }
 }
