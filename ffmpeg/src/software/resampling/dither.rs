@@ -34,8 +34,7 @@ impl From<SwrDitherType> for Dither {
             SWR_DITHER_NS_HIGH_SHIBATA => Dither::NoiseShapingHighShibata,
             SWR_DITHER_NB => Dither::None,
             _ => {
-                eprintln!("Unknown SwrDitherType: {}", value);
-                Dither::None
+                unreachable!("Unknown SwrDitherType value: {}", value);
             }
         }
     }

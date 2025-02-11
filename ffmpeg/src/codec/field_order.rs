@@ -20,8 +20,7 @@ impl From<AVFieldOrder> for FieldOrder {
             AV_FIELD_TB => FieldOrder::TB,
             AV_FIELD_BT => FieldOrder::BT,
             _ => {
-                eprintln!("Unknown FieldOrder variant: {}", value);
-                FieldOrder::Unknown
+                unreachable!("Unknown AVFieldOrder value: {}", value);
             }
         }
     }

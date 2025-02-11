@@ -31,8 +31,7 @@ impl From<AVColorRange> for Range {
             AVCOL_RANGE_JPEG => Range::JPEG,
             AVCOL_RANGE_NB => Range::Unspecified,
             _ => {
-                eprintln!("Unknown value: {}", value);
-                Range::Unspecified
+                unreachable!("Unknown AVColorRange value: {}", value);
             }
         }
     }
