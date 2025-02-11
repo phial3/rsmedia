@@ -1,6 +1,6 @@
 use ffmpeg::codec::Id as AvCodecId;
-use ffmpeg::Rational as AvRational;
 use ffmpeg::Error as FfmpegError;
+use ffmpeg::Rational as AvRational;
 
 use crate::error::Error;
 use crate::extradata::{extract_parameter_sets_h264, Pps, Sps};
