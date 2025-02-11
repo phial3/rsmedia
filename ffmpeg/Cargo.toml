@@ -29,6 +29,5 @@ link_vcpkg_ffmpeg = ["rusty_ffmpeg/link_vcpkg_ffmpeg"]
 [dependencies]
 libc     = "0.2"
 bitflags = "2.8"
+rusty_ffmpeg = "0.16.1"
 image    = { version = "0.25", optional = true }
-rusty_ffmpeg = { version = "0.16.1", default-features = false }
-
