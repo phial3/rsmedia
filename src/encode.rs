@@ -11,7 +11,7 @@ use ffmpeg::util::error::EAGAIN;
 use ffmpeg::util::format::Pixel as AvPixel;
 use ffmpeg::util::mathematics::rescale::TIME_BASE;
 use ffmpeg::util::picture::Type as AvFrameType;
-use ffmpeg::Error as AvError;
+use ffmpeg::Error as FfmpegError;
 use ffmpeg::Rational as AvRational;
 
 use crate::error::Error;
@@ -169,7 +169,8 @@ impl Encoder {
             return Err(Error::InvalidFrameFormat);
         }
 
-        let mut frame = ffi::convert_ndarray_to_frame_rgb24(frame).map_err(Error::BackendError)?;
+        let mut frame = ffi::convert_ndarray_to_frame_rgb24(frame)
+            .map_err(Error::BackendError).unwrap();
 
         frame.set_pts(
             source_timestamp
@@ -208,7 +209,7 @@ impl Encoder {
 
         self.encoder
             .send_frame(&frame)
-            .map_err(Error::BackendError)?;
+            .map_err(Error::BackendError).unwrap();
         // Increment frame count regardless of whether or not frame is written, see
         // https://github.com/oddity-ai/video-rs/issues/46.
         self.frame_count += 1;
@@ -316,7 +317,7 @@ impl Encoder {
         let mut frame_scaled = RawFrame::empty();
         self.scaler
             .run(&frame, &mut frame_scaled)
-            .map_err(Error::BackendError)?;
+            .map_err(Error::BackendError).unwrap();
         // Copy over PTS from old frame.
         frame_scaled.set_pts(frame.pts());
 
@@ -330,7 +331,7 @@ impl Encoder {
         let encode_result = self.encoder.receive_packet(&mut packet);
         match encode_result {
             Ok(()) => Ok(Some(packet)),
-            Err(AvError::Other { errno }) if errno == EAGAIN => Ok(None),
+            Err(FfmpegError::Other { errno }) if errno == EAGAIN => Ok(None),
             Err(err) => Err(err.into()),
         }
     }

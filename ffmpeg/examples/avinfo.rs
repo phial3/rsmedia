@@ -226,7 +226,7 @@ fn main() -> Result<()> {
     let start_time = 0.0; // Start time in seconds
     let duration = 10.0; // Duration in seconds
 
-    trim_video(&input_path, &output_path1, start_time, duration)?;
+    trim_video(&input_path, output_path1, start_time, duration)?;
     let _ = codec_info(input_path.clone());
     let _ = copy_video(&input_path, output_path2);
 

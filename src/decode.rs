@@ -3,7 +3,8 @@ use ffmpeg::codec::Context as AvContext;
 use ffmpeg::format::pixel::Pixel as AvPixel;
 use ffmpeg::software::scaling::{context::Context as AvScaler, flag::Flags as AvScalerFlags};
 use ffmpeg::util::error::EAGAIN;
-use ffmpeg::{Error as AvError, Rational as AvRational};
+use ffmpeg::Rational as AvRational;
+use ffmpeg::Error as FfmpegError;
 
 use crate::error::Error;
 use crate::ffi;
@@ -76,7 +77,7 @@ impl<'a> DecoderBuilder<'a> {
             reader_builder = reader_builder.with_options(options);
         }
         let reader = reader_builder.build()?;
-        let reader_stream_index = reader.best_video_stream_index()?;
+        let reader_stream_index = reader.best_video_stream_index().unwrap();
         Ok(Decoder {
             decoder: DecoderSplit::new(
                 &reader,
@@ -134,7 +135,7 @@ impl Decoder {
             .reader
             .input
             .stream(self.reader_stream_index)
-            .ok_or(AvError::StreamNotFound)?;
+            .ok_or(FfmpegError::StreamNotFound)?;
         Ok(Time::new(
             Some(reader_stream.duration()),
             reader_stream.time_base(),
@@ -148,7 +149,7 @@ impl Decoder {
             .reader
             .input
             .stream(self.reader_stream_index)
-            .ok_or(AvError::StreamNotFound)?
+            .ok_or(FfmpegError::StreamNotFound)?
             .frames()
             .max(0) as u64)
     }
@@ -358,18 +359,18 @@ impl DecoderSplit {
         let reader_stream = reader
             .input
             .stream(reader_stream_index)
-            .ok_or(AvError::StreamNotFound)?;
+            .ok_or(FfmpegError::StreamNotFound).unwrap();
 
         let mut decoder = AvContext::new();
         ffi::set_decoder_context_time_base(&mut decoder, reader_stream.time_base());
-        decoder.set_parameters(reader_stream.parameters())?;
+        decoder.set_parameters(reader_stream.parameters()).unwrap();
 
         let hwaccel_context = match hw_device_type {
             Some(device_type) => Some(HWContext::new(&mut decoder, device_type)?),
             None => None,
         };
 
-        let decoder = decoder.decoder().video()?;
+        let decoder = decoder.decoder().video().unwrap();
         let decoder_time_base = decoder.time_base();
 
         if decoder.format() == AvPixel::None || decoder.width() == 0 || decoder.height() == 0 {
@@ -403,7 +404,7 @@ impl DecoderSplit {
                     resize_height,
                     AvScalerFlags::AREA,
                 )
-                .map_err(Error::BackendError)?,
+                .map_err(Error::BackendError).unwrap(),
             )
         } else {
             None
@@ -495,7 +496,7 @@ impl DecoderSplit {
     /// The decoded raw frame as [`RawFrame`] if the decoder has a frame available, [`None`] if not.
     pub fn drain_raw(&mut self) -> Result<Option<RawFrame>> {
         if !self.draining {
-            self.decoder.send_eof().map_err(Error::BackendError)?;
+            self.decoder.send_eof().map_err(Error::BackendError).unwrap();
             self.draining = true;
         }
         self.receive_frame_from_decoder()
@@ -527,7 +528,7 @@ impl DecoderSplit {
 
         self.decoder
             .send_packet(&packet)
-            .map_err(Error::BackendError)?;
+            .map_err(Error::BackendError).unwrap();
 
         Ok(())
     }
@@ -561,8 +562,8 @@ impl DecoderSplit {
         let decode_result = self.decoder.receive_frame(&mut frame);
         match decode_result {
             Ok(()) => Ok(Some(frame)),
-            Err(AvError::Eof) => Err(Error::ReadExhausted),
-            Err(AvError::Other { errno }) if errno == EAGAIN => Ok(None),
+            Err(FfmpegError::Eof) => Err(Error::ReadExhausted),
+            Err(FfmpegError::Other { errno }) if errno == EAGAIN => Ok(None),
             Err(err) => Err(err.into()),
         }
     }
@@ -581,7 +582,7 @@ impl DecoderSplit {
         let mut frame_scaled = RawFrame::empty();
         scaler
             .run(frame, &mut frame_scaled)
-            .map_err(Error::BackendError)?;
+            .map_err(Error::BackendError).unwrap();
         ffi::copy_frame_props(frame, &mut frame_scaled);
         Ok(frame_scaled)
     }
@@ -591,7 +592,8 @@ impl DecoderSplit {
         // We use the packet DTS here (which is `frame->pkt_dts`) because that is what the
         // encoder will use when encoding for the `PTS` field.
         let timestamp = Time::new(Some(frame.packet().dts), self.decoder_time_base);
-        let frame = ffi::convert_frame_to_ndarray_rgb24(frame).map_err(Error::BackendError)?;
+        let frame = ffi::convert_frame_to_ndarray_rgb24(frame)
+            .map_err(Error::BackendError).unwrap();
 
         Ok((timestamp, frame))
     }
