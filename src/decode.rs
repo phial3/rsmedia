@@ -78,6 +78,12 @@ impl<'a> DecoderBuilder<'a> {
         }
         let reader = reader_builder.build()?;
         let reader_stream_index = reader.best_video_stream_index().unwrap();
+        tracing::info!(
+            "DecoderBuilder using video source:{:?}, stream index: {}",
+            reader.source,
+            reader_stream_index
+        );
+
         Ok(Decoder {
             decoder: DecoderSplit::new(
                 &reader,
