@@ -1,6 +1,6 @@
 use ffmpeg::codec::Parameters as AvCodecParameters;
-use ffmpeg::Rational as AvRational;
 use ffmpeg::Error as FfmpegError;
+use ffmpeg::Rational as AvRational;
 
 use crate::error::Error;
 use crate::io::Reader;

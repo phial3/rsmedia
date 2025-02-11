@@ -170,7 +170,8 @@ impl Encoder {
         }
 
         let mut frame = ffi::convert_ndarray_to_frame_rgb24(frame)
-            .map_err(Error::BackendError).unwrap();
+            .map_err(Error::BackendError)
+            .unwrap();
 
         frame.set_pts(
             source_timestamp
@@ -209,7 +210,8 @@ impl Encoder {
 
         self.encoder
             .send_frame(&frame)
-            .map_err(Error::BackendError).unwrap();
+            .map_err(Error::BackendError)
+            .unwrap();
         // Increment frame count regardless of whether or not frame is written, see
         // https://github.com/oddity-ai/video-rs/issues/46.
         self.frame_count += 1;
@@ -317,7 +319,8 @@ impl Encoder {
         let mut frame_scaled = RawFrame::empty();
         self.scaler
             .run(&frame, &mut frame_scaled)
-            .map_err(Error::BackendError).unwrap();
+            .map_err(Error::BackendError)
+            .unwrap();
         // Copy over PTS from old frame.
         frame_scaled.set_pts(frame.pts());
 
