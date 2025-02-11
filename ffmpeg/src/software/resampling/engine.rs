@@ -13,8 +13,7 @@ impl From<SwrEngine> for Engine {
             SWR_ENGINE_SOXR => Engine::SoundExchange,
             SWR_ENGINE_NB => Engine::Software,
             _ => {
-                eprintln!("Unknown Engine variant: {}", value);
-                Engine::Software
+                unreachable!("Unknown SwrEngine value: {}", value);
             }
         }
     }

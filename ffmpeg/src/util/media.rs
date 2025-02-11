@@ -22,8 +22,7 @@ impl From<AVMediaType> for Type {
             AVMEDIA_TYPE_ATTACHMENT => Type::Attachment,
             AVMEDIA_TYPE_NB => Type::Unknown,
             _ => {
-                eprintln!("Unknown Type variant: {}", value);
-                Type::Unknown
+                unreachable!("Unknown AVMediaType value: {}", value);
             }
         }
     }

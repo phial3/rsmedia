@@ -21,8 +21,7 @@ impl From<AVRounding> for Rounding {
             AV_ROUND_NEAR_INF => Rounding::NearInfinity,
             AV_ROUND_PASS_MINMAX => Rounding::PassMinMax,
             _ => {
-                eprintln!("Unknown Rounding variant: {}", value);
-                Rounding::Zero
+                unreachable!("Unknown AVRounding value: {}", value);
             }
         }
     }

@@ -14,8 +14,7 @@ impl From<SwrFilterType> for Filter {
             SWR_FILTER_TYPE_BLACKMAN_NUTTALL => Filter::BlackmanNuttall,
             SWR_FILTER_TYPE_KAISER => Filter::Kaiser,
             _ => {
-                eprintln!("Unknown Filter variant: {}", value);
-                Filter::Cubic
+                unreachable!("Unknown SwrFilterType value: {}", value);
             }
         }
     }

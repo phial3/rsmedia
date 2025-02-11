@@ -27,8 +27,7 @@ impl From<AVAudioServiceType> for AudioService {
             AV_AUDIO_SERVICE_TYPE_KARAOKE => AudioService::Karaoke,
             AV_AUDIO_SERVICE_TYPE_NB => AudioService::Main,
             _ => {
-                eprintln!("Unknown audio service type: {}", value);
-                AudioService::Main
+                unreachable!("Unknown AVAudioServiceType value: {}", value);
             }
         }
     }
