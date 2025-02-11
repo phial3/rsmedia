@@ -25,8 +25,7 @@ impl From<AVPictureType> for Type {
             AV_PICTURE_TYPE_SP => Type::SP,
             AV_PICTURE_TYPE_BI => Type::BI,
             _ => {
-                eprintln!("Unknown Type variant: {}", value);
-                Type::None
+                unreachable!("Unknown AVPictureType value: {}", value);
             }
         }
     }

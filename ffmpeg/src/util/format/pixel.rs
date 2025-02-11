@@ -833,8 +833,7 @@ impl From<AVPixelFormat> for Pixel {
             // #[cfg(feature = "rpi")]
             // AV_PIX_FMT_RPI4_10 => Pixel::RPI4_10,
             _ => {
-                eprintln!("Unknown pixel format: {:?}", value);
-                Pixel::None
+                unreachable!("Unknown AVPixelFormat value: {:?}", value);
             }
         }
     }
@@ -1261,8 +1260,7 @@ impl From<Pixel> for AVPixelFormat {
             // #[cfg(feature = "rpi")]
             // Pixel::RPI4_10 => AV_PIX_FMT_RPI4_10,
             _ => {
-                eprintln!("Unknown pixel format: {:?}", value);
-                AV_PIX_FMT_NONE
+                unreachable!("Unknown AVPixelFormat value: {:?}", value);
             }
         }
     }

@@ -13,7 +13,7 @@ pub enum Id {
     MPEG1VIDEO,
     MPEG2VIDEO,
     // #[cfg(all(feature = "ff_api_xvmc", not(feature = "ffmpeg_5_0")))]
-    MPEG2VIDEO_XVMC,
+    // MPEG2VIDEO_XVMC,
     H261,
     H263,
     RV10,
@@ -360,7 +360,7 @@ pub enum Id {
     GSM_MS,
     ATRAC3,
     // #[cfg(feature = "ff_api_voxware")]
-    VOXWARE,
+    // VOXWARE,
     APE,
     NELLYMOSER,
     MUSEPACK8,
@@ -1348,8 +1348,7 @@ impl From<AVCodecID> for Id {
             AV_CODEC_ID_AYUV => Id::AYUV,
 
             _ => {
-                eprintln!("Unknown codec id: {}", value);
-                Id::None
+                unimplemented!("Unknown AVCodecID value: {}", value);
             }
         }
     }
@@ -1364,7 +1363,7 @@ impl From<Id> for AVCodecID {
             Id::MPEG1VIDEO => AV_CODEC_ID_MPEG1VIDEO,
             Id::MPEG2VIDEO => AV_CODEC_ID_MPEG2VIDEO,
             // #[cfg(all(feature = "ff_api_xvmc", not(feature = "ffmpeg_5_0")))]
-            Id::MPEG2VIDEO_XVMC => 0, //? AV_CODEC_ID_MPEG2VIDEO_XVMC,
+            // Id::MPEG2VIDEO_XVMC => AV_CODEC_ID_MPEG2VIDEO_XVMC,
             Id::H261 => AV_CODEC_ID_H261,
             Id::H263 => AV_CODEC_ID_H263,
             Id::RV10 => AV_CODEC_ID_RV10,
@@ -1711,7 +1710,7 @@ impl From<Id> for AVCodecID {
             Id::GSM_MS => AV_CODEC_ID_GSM_MS,
             Id::ATRAC3 => AV_CODEC_ID_ATRAC3,
             // #[cfg(feature = "ff_api_voxware")]
-            Id::VOXWARE => 0, //? AV_CODEC_ID_VOXWARE,
+            // Id::VOXWARE => AV_CODEC_ID_VOXWARE,
             Id::APE => AV_CODEC_ID_APE,
             Id::NELLYMOSER => AV_CODEC_ID_NELLYMOSER,
             Id::MUSEPACK8 => AV_CODEC_ID_MUSEPACK8,

@@ -23,8 +23,7 @@ impl From<AVChromaLocation> for Location {
             AVCHROMA_LOC_BOTTOM => Location::Bottom,
             AVCHROMA_LOC_NB => Location::Unspecified,
             _ => {
-                eprintln!("Unknown Location variant: {}", value);
-                Location::Unspecified
+                unreachable!("Unknown AVChromaLocation value: {}", value);
             }
         }
     }
