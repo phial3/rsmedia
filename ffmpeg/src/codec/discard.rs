@@ -22,8 +22,7 @@ impl From<ffi::AVDiscard> for Discard {
             ffi::AVDISCARD_NONKEY => Discard::NonKey,
             ffi::AVDISCARD_ALL => Discard::All,
             _ => {
-                eprintln!("Unknown Discard variant: {}", value);
-                Discard::None
+                unreachable!("Unknown AVDiscard value: {}", value);
             }
         }
     }

@@ -85,9 +85,9 @@ impl From<AVSampleFormat> for Sample {
             AV_SAMPLE_FMT_DBLP => Sample::F64(Type::Planar),
 
             AV_SAMPLE_FMT_NB => Sample::None,
+
             _ => {
-                eprintln!("Unknown value: {}", value);
-                Sample::None
+                unreachable!("Unknown AVSampleFormat value: {}", value);
             }
         }
     }

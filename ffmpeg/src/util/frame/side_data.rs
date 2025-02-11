@@ -28,9 +28,9 @@ pub enum Type {
     IccProfile,
 
     // #[cfg(all(feature = "ffmpeg_4_0", not(feature = "ffmpeg_5_0")))]
-    QPTableProperties,
+    // QPTableProperties,
     // #[cfg(all(feature = "ffmpeg_4_0", not(feature = "ffmpeg_5_0")))]
-    QPTableData,
+    // QPTableData,
 
     // #[cfg(feature = "ffmpeg_4_1")]
     S12M_TIMECODE,
@@ -142,8 +142,7 @@ impl From<AVFrameSideDataType> for Type {
             AV_FRAME_DATA_VIEW_ID => Type::VIEW_ID,
 
             _ => {
-                eprintln!("Unknown AVFrameSideDataType: {}", value);
-                Type::PanScan
+                unreachable!("Unknown AVFrameSideDataType value: {}", value);
             }
         }
     }
@@ -172,9 +171,9 @@ impl From<Type> for AVFrameSideDataType {
             Type::IccProfile => AV_FRAME_DATA_ICC_PROFILE,
 
             // #[cfg(all(feature = "ffmpeg_4_0", not(feature = "ffmpeg_5_0")))]
-            Type::QPTableProperties => 0, //? AV_FRAME_DATA_QP_TABLE_PROPERTIES,
+            // Type::QPTableProperties => AV_FRAME_DATA_QP_TABLE_PROPERTIES,
             // #[cfg(all(feature = "ffmpeg_4_0", not(feature = "ffmpeg_5_0")))]
-            Type::QPTableData => 0, //? AV_FRAME_DATA_QP_TABLE_DATA,
+            // Type::QPTableData => AV_FRAME_DATA_QP_TABLE_DATA,
             // #[cfg(feature = "ffmpeg_4_1")]
             Type::S12M_TIMECODE => AV_FRAME_DATA_S12M_TIMECODE,
 

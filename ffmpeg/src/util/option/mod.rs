@@ -66,8 +66,7 @@ impl From<AVOptionType> for Type {
             AV_OPT_TYPE_UINT => Type::UInt,
 
             _ => {
-                eprintln!("Unknown Type variant: {}", value);
-                Type::Flags
+                unreachable!("Unknown AVOptionType value: {}", value);
             }
         }
     }

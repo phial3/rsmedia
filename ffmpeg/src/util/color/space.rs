@@ -74,8 +74,7 @@ impl From<AVColorSpace> for Space {
             AVCOL_SPC_YCGCO_RO => Space::YCGCO_RO,
 
             _ => {
-                eprintln!("Unknown color space: {}", value);
-                Space::Unspecified
+                unreachable!("Unknown AVColorSpace value: {}", value);
             }
         }
     }

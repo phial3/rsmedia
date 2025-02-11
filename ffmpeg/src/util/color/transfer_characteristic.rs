@@ -63,8 +63,7 @@ impl From<AVColorTransferCharacteristic> for TransferCharacteristic {
             AVCOL_TRC_SMPTE428 => TransferCharacteristic::SMPTE428,
             AVCOL_TRC_ARIB_STD_B67 => TransferCharacteristic::ARIB_STD_B67,
             _ => {
-                eprintln!("Unknown value: {}", value);
-                TransferCharacteristic::Unspecified
+                unreachable!("Unknown TransferCharacteristic value: {}", value);
             }
         }
     }
