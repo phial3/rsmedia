@@ -180,7 +180,8 @@ impl Reader {
             .input
             .streams()
             .best(AvMediaType::Video)
-            .ok_or(FfmpegError::StreamNotFound)?
+            .ok_or(FfmpegError::StreamNotFound)
+            .unwrap()
             .index())
     }
 }
