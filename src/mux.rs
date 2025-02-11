@@ -1,5 +1,6 @@
 use ffmpeg::codec::Id as AvCodecId;
-use ffmpeg::{Error as AvError, Rational as AvRational};
+use ffmpeg::Rational as AvRational;
+use ffmpeg::Error as FfmpegError;
 
 use crate::error::Error;
 use crate::extradata::{extract_parameter_sets_h264, Pps, Sps};
@@ -138,13 +139,13 @@ impl<W: Write> Muxer<W> {
             let stream_description = self
                 .mapping
                 .get(&packet.stream())
-                .ok_or(AvError::StreamNotFound)?;
+                .ok_or(FfmpegError::StreamNotFound)?;
 
             let destination_stream = self
                 .writer
                 .output()
                 .stream(stream_description.index)
-                .ok_or(AvError::StreamNotFound)?;
+                .ok_or(FfmpegError::StreamNotFound)?;
 
             packet.set_stream(destination_stream.index());
             packet.set_position(-1);
