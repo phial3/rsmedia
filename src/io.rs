@@ -176,7 +176,7 @@ impl Reader {
 
     /// Find the best video stream and return the index.
     pub fn best_video_stream_index(&self) -> Result<usize> {
-        for (_index, stream) in self.input.streams().enumerate() {
+        for stream in self.input.streams() {
             tracing::info!("Stream: {:?}", stream);
         }
         Ok(self
