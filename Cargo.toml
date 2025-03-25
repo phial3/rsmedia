@@ -35,10 +35,19 @@ libc = "0.2"
 cstr = "0.2"
 camino = "1.1"
 chrono = "0.4"
-yuvutils-rs = "0.8"
-colorutils-rs = "0.7"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
+
+## image & video
+libblur = "0.17"
+pic-scale = "0.5"
+yuvutils-rs = "0.8"
+colorutils-rs = "0.7"
+histogram_equalization = "0.2"
+
+## audio & sound
+cpal = "0.15"
+rodio = { version = "0.20", features = ["symphonia-all", "tracing"] }
 
 [package.metadata.docs.rs]
 all-features = true

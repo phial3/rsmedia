@@ -12,6 +12,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
   RUST_LOG: "debug"
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
@@ -75,7 +76,8 @@ jobs:
             libmp3lame-dev \
             libopus-dev \
             libvorbis-dev \
-            libfdk-aac-dev
+            libfdk-aac-dev \
+            libasound2-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -273,7 +275,8 @@ jobs:
             libmp3lame-dev \
             libopus-dev \
             libvorbis-dev \
-            libfdk-aac-dev
+            libfdk-aac-dev \
+            libasound2-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -326,7 +329,8 @@ jobs:
             libmp3lame-dev \
             libopus-dev \
             libvorbis-dev \
-            libfdk-aac-dev
+            libfdk-aac-dev \
+            libasound2-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
