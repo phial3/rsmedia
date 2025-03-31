@@ -5,14 +5,32 @@
 
 version: 2
 updates:
-  - package-ecosystem: "cargo"
+  - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    target-branch: "rsmpeg"
-    versioning-strategy: "lockfile-only"
-    open-pull-requests-limit: 5
+    labels:
+      - "exclude"
+    commit-message:
+      prefix: "chore(github-actions)"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      #interval: "daily"
+      #interval: "monthly"
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore(cargo)"
     reviewers:
       - "phial3"
     assignees:
       - "phial3"
+    target-branch: "rsmpeg"
+    open-pull-requests-limit: 5
+    groups:
+      rust:
+        patterns:
+          - "*"
