@@ -101,8 +101,8 @@ impl<'a> StreamReaderBuilder<'a> {
     /// # Arguments
     ///
     /// * `options` - Options to pass on to input.
-    pub fn with_options(mut self, options: Options) -> Self {
-        self.options = Some(options);
+    pub fn with_options(mut self, options: Option<Options>) -> Self {
+        self.options = options;
         self
     }
 
@@ -289,8 +289,8 @@ impl<'a> StreamWriterBuilder<'a> {
     /// # Arguments
     ///
     /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: Options) -> Self {
-        self.options = Some(options);
+    pub fn with_options(mut self, options: Option<Options>) -> Self {
+        self.options = options;
         self
     }
 
@@ -379,8 +379,8 @@ impl<'a> BufferWriterBuilder<'a> {
     /// # Arguments
     ///
     /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: Options) -> Self {
-        self.options = Some(options);
+    pub fn with_options(mut self, options: Option<Options>) -> Self {
+        self.options = options;
         self
     }
 
@@ -462,8 +462,8 @@ impl<'a> PacketizedBufWriterBuilder<'a> {
     /// # Arguments
     ///
     /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: Options) -> Self {
-        self.options = Some(options);
+    pub fn with_options(mut self, options: Option<Options>) -> Self {
+        self.options = options;
         self
     }
 
@@ -983,16 +983,15 @@ unsafe extern "C" fn log_callback(
                     match level_no as u32 {
                         // These are all error states.
                         ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
-                            tracing::error!(target: "video", "{}", line)
+                            tracing::error!(target: "rsmedia", "{}", line)
                         }
-                        ffi::AV_LOG_WARNING => tracing::warn!(target: "video", "{}", line),
-                        ffi::AV_LOG_INFO => tracing::info!(target: "video", "{}", line),
-                        // There is no "verbose" in `log`, so we just put it in the "debug"
-                        // category.
+                        ffi::AV_LOG_WARNING => tracing::warn!(target: "rsmedia", "{}", line),
+                        ffi::AV_LOG_INFO => tracing::info!(target: "rsmedia", "{}", line),
+                        // There is no "verbose" in `log`, so we just put it in the "debug" category.
                         ffi::AV_LOG_VERBOSE | ffi::AV_LOG_DEBUG => {
-                            tracing::debug!(target: "video", "{}", line)
+                            tracing::debug!(target: "rsmedia", "{}", line)
                         }
-                        ffi::AV_LOG_TRACE => tracing::trace!(target: "video", "{}", line),
+                        ffi::AV_LOG_TRACE => tracing::trace!(target: "rsmedia", "{}", line),
                         _ => {}
                     };
                 }

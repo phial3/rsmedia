@@ -18,6 +18,15 @@ static SAVE_TASKS: Lazy<Mutex<Vec<task::JoinHandle<()>>>> = Lazy::new(|| Mutex::
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
+        .with_target(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .init();
+
     rsmedia::init().unwrap();
 
     // let source = std::path::Path::new("/tmp/bear.mp4");
@@ -28,8 +37,11 @@ async fn main() -> Result<()> {
         .unwrap();
 
     let mut stream_reader = StreamReader::new(source)?;
-    let mut decoder = DecoderBuilder::new()
+    let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
         .with_resize(Some(Resize::Fit(1280, 720)))
+        // decoder with CUDA acceleration
+        // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
+        // .with_codec_name(Some("h264_cuvid".to_string()))
         .build(&stream_reader)
         .context("failed to create decoder")?;
 

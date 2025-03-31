@@ -3,24 +3,32 @@ use rsmedia::{
     encode::EncodeResult,
     frame::FrameArray,
     io::private::{Output, Write},
+    stream::StreamInfo,
     time::Time,
     EncoderBuilder, StreamWriter,
 };
 
 use anyhow::Context;
-use rsmedia::stream::StreamInfo;
 use std::path::Path;
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
+        .with_target(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .init();
+
     rsmedia::init().unwrap();
 
-    let mut encoder = EncoderBuilder::new()
-        .with_video_size(1280, 720)
-        // use hwaccel cuda
-        // .with_hardware_device(HWDeviceType::CUDA)
-        // libx264, libx265, h264_nvenc, h264_vaapi etc.
-        // .with_codec_name("h264_nvenc".to_string())
-        // .with_codec_options(&Options::preset_h264_nvenc())
+    let mut encoder = EncoderBuilder::new_video(1280, 720)
+        // encoder with CUDA acceleration
+        // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
+        // libx264, libx265, h264_nvenc, h264_vaapi
+        // .with_codec_name(Some("h264_nvenc".to_string()))
+        // .with_options(Some(Options::preset_h264_nvenc()))
         .build()
         .expect("failed to create encoder");
 

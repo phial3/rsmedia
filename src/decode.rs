@@ -28,18 +28,30 @@ pub struct DecoderBuilder {
 }
 
 impl DecoderBuilder {
-    /// Create a decoder with the specified source.
+    /// create a new decoder builder with specified media type.
     ///
-    /// * `source` - Source to decode.
-    pub fn new() -> Self {
+    /// # Arguments
+    ///
+    /// `media_type` - The media type of the decoder.
+    pub fn new(media_type: MediaType) -> Self {
         Self {
-            flags: AvCodecFlags::LOW_DELAY,
+            media_type,
             resize: None,
-            media_type: MediaType::VIDEO,
             codec_name: None,
             codec_opts: None,
             hw_device_config: None,
+            flags: AvCodecFlags::LOW_DELAY,
         }
+    }
+
+    /// Create a video decoder
+    pub fn new_video() -> Self {
+        Self::new(MediaType::VIDEO)
+    }
+
+    /// create an audio decoder
+    pub fn new_audio() -> Self {
+        Self::new(MediaType::AUDIO)
     }
 
     /// Set decoding flags.
@@ -74,11 +86,6 @@ impl DecoderBuilder {
     /// * `device_config` - Device to use for hardware acceleration.
     pub fn with_hardware_device(mut self, device_config: Option<HWDeviceConfig>) -> Self {
         self.hw_device_config = device_config;
-        self
-    }
-
-    pub fn with_media_type(mut self, media_type: MediaType) -> Self {
-        self.media_type = media_type;
         self
     }
 
@@ -120,9 +127,11 @@ impl DecoderBuilder {
         let (width, height) = (decode_ctx.width, decode_ctx.height);
         let hw_context = self
             .hw_device_config
-            .filter(|cfg| {
+            .filter(|_cfg| {
                 // hardware acceleration enabled for video
-                let is_video = self.media_type == MediaType::VIDEO;
+                self.media_type == MediaType::VIDEO
+            })
+            .map(|cfg| {
                 // codec support or not for hardware acceleration
                 let hw_pixel = cfg
                     .device_type
@@ -130,12 +139,17 @@ impl DecoderBuilder {
                     .ok_or_else(|| {
                         let codec_name = utils::to_string(codec.name()).unwrap();
                         Error::msg(format!(
-                            "HW acceleration encoder not supported for codec: {codec_name}"
+                            "Decoder with HW acceleration is not supported for codec: {codec_name}"
                         ))
-                    });
-                is_video && hw_pixel.is_ok()
-            })
-            .map(|cfg| {
+                    })?;
+
+                log::info!(
+                    "Video decoder with HW acceleration codec: {:?}, hw_pixel: {:?}, config: {:#?}",
+                    codec.name(),
+                    PixelFormat::from(hw_pixel),
+                    cfg
+                );
+
                 // create hardware context
                 HWContext::new(cfg)
                     .and_then(|ctx| {
@@ -174,12 +188,6 @@ impl DecoderBuilder {
     }
 }
 
-impl Default for DecoderBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Decode video files and streams.
 ///
 /// # Example
@@ -208,10 +216,20 @@ impl Decoder {
     ///
     /// # Arguments
     ///
-    /// * `source` - Source to decode.
+    /// * `reader` - A [`Reader`] to read the source from.
     #[inline]
-    pub fn new<R: Reader>(reader: &R) -> Result<Decoder> {
-        DecoderBuilder::new().build(reader)
+    pub fn new_video<R: Reader>(reader: &R) -> Result<Decoder> {
+        DecoderBuilder::new_video().build(reader)
+    }
+
+    /// Create a decoder to decode the audio stream of the specified source.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - A [`Reader`] to read the source from.
+    #[inline]
+    pub fn new_audio<R: Reader>(reader: &R) -> Result<Decoder> {
+        DecoderBuilder::new_audio().build(reader)
     }
 
     /// Get the decoders input size (resolution dimensions): width * height.
@@ -535,7 +553,7 @@ impl Drop for Decoder {
                         continue;
                     }
                     DecodeRawResult::Drain => {
-                        // If need more, we continue to drain the queue.
+                        // If we need more, we continue to drain the queue.
                         log::debug!("Decoder drained. try send new packet again.");
                         continue;
                     }
@@ -615,9 +633,7 @@ mod tests {
         let path = std::path::Path::new("/tmp/bear.mp4");
 
         let mut stream_reader = StreamReader::new(path)?;
-        let mut decoder = DecoderBuilder::new()
-            .with_media_type(MediaType::VIDEO)
-            .build(&stream_reader)?;
+        let mut decoder = Decoder::new_video(&stream_reader).unwrap();
 
         loop {
             match stream_reader.read_packet() {
@@ -673,9 +689,7 @@ mod tests {
         let path = std::path::Path::new("/tmp/bear.mp4");
 
         let mut stream_reader = StreamReader::new(path)?;
-        let mut decoder = DecoderBuilder::new()
-            .with_media_type(MediaType::AUDIO)
-            .build(&stream_reader)?;
+        let mut decoder = Decoder::new_audio(&stream_reader).unwrap();
 
         loop {
             match stream_reader.read_packet() {

@@ -64,42 +64,52 @@ impl EncoderBuilder {
     const VIDEO_CODEC_NAME: &'static str = "libx264";
     const AUDIO_CODEC_NAME: &'static str = "aac";
 
-    /// Create an encoder with the specified destination and settings.
+    /// Create a video encoder with the specified destination
     ///
-    /// * `destination` - Where to encode to.
+    /// # Arguments
+    ///
     /// * `width` - The width of the video stream.
     /// * `height` - The height of the video stream.
     /// * `pixel_format` - The desired pixel format for the video stream.
-    /// * `options` - Custom H264 encoding options.
-    pub fn new() -> Self {
-        Self {
-            // video
-            width: 0,
-            height: 0,
-            pixel_format: PixelFormat::YUV420P,
-            time_base: time::TIME_BASE,
-            pkt_time_base: time::TIME_BASE,
-            bit_rate: Self::VIDEO_BIT_RATE,
-            frame_rate: avutil::ra(Self::FRAME_RATE, 1),
-            keyframe_interval: Self::KEY_FRAME_INTERVAL,
-            gop_size: 0,
-            max_b_frames: 0,
-            oformat_flags: AvFormatFlags::GLOBAL_HEADER as i32,
-            // audio
-            nb_channels: 2,
-            sample_rate: 44100,
-            sample_format: SampleFormat::FLTP,
-            // common
-            media_type: MediaType::VIDEO,
-            thread_count: 0,
-            codec_name: None,
-            codec_opts: None,
-            hw_device_config: None,
-        }
+    ///
+    /// note: default video codec is `libx264`
+    pub fn new_video(width: u32, height: u32) -> Self {
+        Self::default().with_width(width).with_height(height)
     }
 
-    pub fn with_video_size(mut self, width: u32, height: u32) -> Self {
+    /// Create an audio encoder with the specified parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `bit_rate` - The bit rate of the audio stream.
+    /// * `nb_channels` - The number of channels in the audio stream.
+    /// * `sample_rate` - The sample rate of the audio stream.
+    /// * `sample_format` - The sample format of the audio stream.
+    ///
+    /// note: default audio codec is `aac`
+    pub fn new_audio(
+        bit_rate: i64,
+        nb_channels: u32,
+        sample_rate: u32,
+        sample_format: SampleFormat,
+    ) -> Self {
+        Self::default()
+            .with_bit_rate(bit_rate)
+            .with_nb_channels(nb_channels)
+            .with_sample_rate(sample_rate)
+            .with_time_base(1, sample_rate as i32)
+            .with_sample_format(sample_format)
+            .with_media_type(MediaType::AUDIO)
+    }
+
+    /// Set the width of the video stream.
+    pub fn with_width(mut self, width: u32) -> Self {
         self.width = width as i32;
+        self
+    }
+
+    /// Set the height of the video stream.
+    pub fn with_height(mut self, height: u32) -> Self {
         self.height = height as i32;
         self
     }
@@ -296,9 +306,11 @@ impl EncoderBuilder {
 
         let hw_context = self
             .hw_device_config
-            .filter(|cfg| {
+            .filter(|_cfg| {
                 // hardware acceleration enabled for video
-                let is_video = self.media_type == MediaType::VIDEO;
+                self.media_type == MediaType::VIDEO
+            })
+            .map(|cfg| {
                 // codec support or not for hardware acceleration
                 let hw_pixel = cfg
                     .device_type
@@ -306,12 +318,17 @@ impl EncoderBuilder {
                     .ok_or_else(|| {
                         let codec_name = utils::to_string(codec.name()).unwrap();
                         Error::msg(format!(
-                            "HW acceleration encoder not supported for codec: {codec_name}"
+                            "Encoder with HW acceleration is not supported for codec: {codec_name}"
                         ))
-                    });
-                is_video && hw_pixel.is_ok()
-            })
-            .map(|cfg| {
+                    })?;
+
+                log::info!(
+                    "Video Encoder with HW acceleration codec: {:?}, hw_pixel: {:?}, config: {:#?}",
+                    codec.name(),
+                    PixelFormat::from(hw_pixel),
+                    cfg
+                );
+
                 // create hardware context
                 let (width, height) = (encode_ctx.width, encode_ctx.height);
                 HWContext::new(cfg)
@@ -340,7 +357,30 @@ impl EncoderBuilder {
 
 impl Default for EncoderBuilder {
     fn default() -> Self {
-        Self::new()
+        Self {
+            // video
+            width: 0,
+            height: 0,
+            pixel_format: PixelFormat::YUV420P,
+            time_base: time::TIME_BASE,
+            pkt_time_base: time::TIME_BASE,
+            bit_rate: Self::VIDEO_BIT_RATE,
+            frame_rate: avutil::ra(Self::FRAME_RATE, 1),
+            keyframe_interval: Self::KEY_FRAME_INTERVAL,
+            gop_size: 0,
+            max_b_frames: 0,
+            oformat_flags: AvFormatFlags::GLOBAL_HEADER as i32,
+            // audio
+            nb_channels: 2,
+            sample_rate: 44100,
+            sample_format: SampleFormat::FLTP,
+            // common
+            media_type: MediaType::VIDEO,
+            thread_count: 0,
+            codec_name: None,
+            codec_opts: None,
+            hw_device_config: None,
+        }
     }
 }
 
@@ -373,13 +413,34 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// Create an encoder with the specified destination and settings.
+    /// Create a video encoder with the specified destination
     ///
-    /// * `destination` - Where to encode to.
-    /// * `settings` - Encoding settings.
+    /// # Arguments
+    ///
+    /// * `width` - The width of the video stream.
+    /// * `height` - The height of the video stream.
+    ///
+    /// note: default video codec is `libx264`
     #[inline]
-    pub fn new() -> Result<Encoder> {
-        EncoderBuilder::new().build()
+    pub fn new_video(width: u32, height: u32) -> Result<Encoder> {
+        EncoderBuilder::new_video(width, height).build()
+    }
+
+    /// Create a audio encoder with the specified parameters.
+    ///
+    /// * `bit_rate` - Bit rate in bits per second. default is 128k.
+    /// * `nb_channels` - Number of channels.
+    /// * `sample_rate` - Sample rate in Hz.
+    /// * `sample_format` - Sample format.
+    ///
+    /// note: default audio codec is `aac`
+    #[inline]
+    pub fn new_audio(
+        nb_channels: u32,
+        sample_rate: u32,
+        sample_format: SampleFormat,
+    ) -> Result<Encoder> {
+        EncoderBuilder::new_audio(128_000, nb_channels, sample_rate, sample_format).build()
     }
 
     /// Encode a single `ndarray` frame.
@@ -653,34 +714,264 @@ pub type EncodeResult = EncodeRawResult;
 mod tests {
     use super::*;
     use crate::io::private::{Output, Write};
-    use crate::io::StreamWriter;
     use crate::stream::StreamInfo;
+    use crate::StreamWriterBuilder;
+    use std::collections::HashMap;
     use std::path::Path;
 
-    #[test]
+    /// 定义视频格式参数结构体
+    #[allow(dead_code)]
+    struct VideoFormatParams {
+        time_base: (i32, i32),
+        codec_name: String,
+        /// 支持的帧率列表（VIDEO）
+        supported_frame_rates: Option<Vec<ffi::AVRational>>,
+        /// 支持的像素格式列表（VIDEO）
+        supported_pix_fmts: Vec<ffi::AVPixelFormat>,
+        /// 特定编码器选项
+        codec_options: Option<HashMap<String, String>>,
+        /// 特定格式选项
+        format_options: Option<HashMap<String, String>>,
+    }
+
+    /// 动态码率/帧率调整、关键帧间隔控制
+    /// 完善主流编码格式支持（H.264/265, VP9/AV1, AAC/Opus）
+    ///
+    /// | 容器格式 | 标准时间基         | 说明                      |
+    /// | :------- | :-------------- | :------------------------|
+    /// | MP4      | 1/90_000        | 90kHz，源自MPEG-2标准      |
+    /// | MOV      | 1/10_000_000    | 10MHz，苹果QuickTime格式   |
+    /// | MKV      | 1/1_000_000_000 | 纳秒级精度                 |
+    /// | FLV      | 1/1_000         | 毫秒级，Flash视频标准       |
+    /// | TS       | 1/90_000        | 90kHz，MPEG传输流          |
+    /// | AVI      | 1/{帧率}         | 基于帧计数，或1/1000        |
+    /// | WebM     | 1/1_000_000_000 | 纳秒级，基于MKV            |
+    /// | 3GP      | 1/90_000        | 移动设备视频标准            |
+    /// | ASF/WMV  | 1/10_000_000    | 100纳秒单位，Windows Media |
+    /// | OGG/OGV  | 1/1_000_000     | 微秒级，开源标准            |
+    /// | MPEG     | 1/90_000        | 90kHz，MPEG标准           |
     #[cfg(feature = "ndarray")]
-    #[ignore = "ignore video output file"]
-    fn test_encode_video() -> Result<()> {
+    fn test_encode_video_for_container(container_type: &str, fps: f64) -> Result<()> {
         use crate::time::Time;
         use crate::FrameArray;
 
-        let output_path = Path::new("/tmp/h264_encode_video.mp4");
+        // 使用单一match获取基本参数
+        let (codec_name, time_base, codec_options, format_options) = match container_type {
+            // 常见流媒体/通用格式
+            "mp4" => (
+                None,
+                (1, 90_000), // 90kHz
+                None,
+                None,
+            ),
+            "mov" => {
+                let mut format_opts = HashMap::new();
+                format_opts.insert(
+                    "movflags".to_string(),
+                    "frag_keyframe+empty_moov".to_string(),
+                );
 
-        let mut encoder = EncoderBuilder::new()
-            .with_video_size(1280, 720)
-            .with_media_type(MediaType::VIDEO)
+                (
+                    None,
+                    (1, 90_000), // 90kHz
+                    None,
+                    Some(format_opts),
+                )
+            }
+            "mkv" => {
+                let mut format_opts = HashMap::new();
+                format_opts.insert("strict".to_string(), "experimental".to_string());
+
+                (
+                    None,
+                    (1, 1_000_000_000), // 纳秒级
+                    None,
+                    Some(format_opts),
+                )
+            }
+            "webm" => (
+                Some("libvpx-vp9".to_string()),
+                (1, 1_000_000_000), // 纳秒级
+                None,
+                None,
+            ),
+            "flv" => {
+                let mut format_opts = HashMap::new();
+                format_opts.insert("flvflags".to_string(), "no_duration_filesize".to_string());
+
+                (
+                    None,
+                    (1, 1_000), // 毫秒级
+                    None,
+                    Some(format_opts),
+                )
+            }
+            "ts" | "mts" | "m2ts" => (
+                None,
+                (1, 90_000), // 90kHz
+                None,
+                None,
+            ),
+            "avi" => {
+                // AVI通常使用帧率作为时间基
+                let fps_rounded = fps.round() as i32;
+
+                let mut codec_opts = HashMap::new();
+                codec_opts.insert("profile".to_string(), "baseline".to_string());
+                codec_opts.insert("level".to_string(), "3.0".to_string());
+
+                let mut format_opts = HashMap::new();
+                format_opts.insert("strict".to_string(), "normal".to_string());
+
+                (None, (1, fps_rounded), Some(codec_opts), Some(format_opts))
+            }
+            "3gp" => (
+                None,
+                (1, 90_000), // 通常为90kHz
+                None,
+                None,
+            ),
+            "wmv" | "asf" => {
+                let mut format_opts = HashMap::new();
+                format_opts.insert("strict".to_string(), "normal".to_string());
+
+                (
+                    None,
+                    (1, 10_000_000), // 100纳秒单位
+                    None,
+                    Some(format_opts),
+                )
+            }
+            "ogg" | "ogv" => (
+                Some("libtheora".to_string()),
+                (1, 1_000_000), // 微秒级
+                None,
+                None,
+            ),
+            "mpg" | "mpeg" => (
+                None,
+                (1, 90_000), // 90kHz
+                None,
+                None,
+            ),
+
+            // 专业广电格式
+            "mxf" => {
+                let mut format_opts = HashMap::new();
+                format_opts.insert("strict".to_string(), "experimental".to_string());
+                format_opts.insert("mxf_operational_pattern".to_string(), "1a".to_string());
+
+                let mut codec_opts = HashMap::new();
+                codec_opts.insert("profile".to_string(), "main".to_string());
+                codec_opts.insert("r".to_string(), "25".to_string());
+                codec_opts.insert("g".to_string(), "15".to_string());
+                codec_opts.insert("b".to_string(), "5M".to_string());
+
+                (
+                    Some("mpeg2video".to_string()),
+                    (1, 25),
+                    Some(codec_opts),
+                    Some(format_opts),
+                )
+            }
+            "gxf" | "ps" => (Some("mpeg2video".to_string()), (1, 90_000), None, None),
+            "xavc" => (None, (1, 90_000), None, None),
+
+            // 硬件设备格式
+            "vob" => (Some("mpeg2video".to_string()), (1, 90_000), None, None),
+            "rmvb" | "divx" => (None, (1, 90_000), None, None),
+
+            // 特殊格式
+            "heif" => {
+                let mut codec_opts = HashMap::new();
+                codec_opts.insert("x265-params".to_string(), "lossless=1".to_string());
+
+                let mut format_opts = HashMap::new();
+                format_opts.insert("brand".to_string(), "heic".to_string());
+                format_opts.insert("hvc1_flag".to_string(), "1".to_string());
+
+                (
+                    Some("libx265".to_string()),
+                    (1, 90_000),
+                    Some(codec_opts),
+                    Some(format_opts),
+                )
+            }
+            "f4v" | "dav" | "evo" | "h264" => (None, (1, 90_000), None, None),
+            "h265" => (Some("libx265".to_string()), (1, 90_000), None, None),
+            "cmaf" => {
+                let mut format_opts = HashMap::new();
+                format_opts.insert(
+                    "movflags".to_string(),
+                    "cmaf+dash+frag_keyframe+negative_cts_offsets".to_string(),
+                );
+                format_opts.insert("use_template".to_string(), "1".to_string());
+                format_opts.insert("use_timeline".to_string(), "1".to_string());
+
+                (None, (1, 90_000), None, Some(format_opts))
+            }
+
+            // 默认值（用于未明确定义的格式）
+            _ => (
+                None,
+                (1, 90_000), // 90kHz为最安全的默认值
+                None,
+                None,
+            ),
+        };
+
+        let codec_name = utils::from_str(&codec_name.unwrap_or_else(|| "libx264".to_string()));
+        let codec = AVCodec::find_encoder_by_name(&codec_name).expect("Failed to find encoder");
+
+        let supported_frame_rates = codec.supported_framerates().map(|rates| rates.to_vec());
+        let supported_pix_fmts = codec
+            .pix_fmts()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|&&fmt| fmt != ffi::AV_PIX_FMT_NONE)
+            .cloned()
+            .collect();
+
+        let config = VideoFormatParams {
+            time_base,
+            codec_name: codec.name().to_str().unwrap().to_string(),
+            supported_frame_rates,
+            supported_pix_fmts,
+            codec_options,
+            format_options,
+        };
+
+        // 创建编码器
+        let mut encoder = EncoderBuilder::new_video(1280, 720)
+            .with_time_base(time_base.0, time_base.1)
+            .with_codec_name(Some(config.codec_name))
+            .with_options(config.codec_options.map(|opts| opts.into()))
             .build()?;
 
-        // build writer
-        let mut stream_writer = StreamWriter::new(output_path)?;
+        // 确定输出路径和扩展名
+        let output_file = format!("/tmp/test_encode_video.{}", container_type);
+        let output_path = Path::new(output_file.as_str());
+
+        // 创建流写入器
+        let mut stream_writer = StreamWriterBuilder::new(output_path)
+            .with_options(config.format_options.map(|opts| opts.into()))
+            .build()?;
         let video_index = stream_writer.add_stream(encoder.codecpar(), encoder.time_base());
-        let stream_info = StreamInfo::from_writer(&stream_writer, video_index).unwrap();
+        let stream_info = StreamInfo::from_writer(&stream_writer, video_index)?;
+
+        // 输出实际使用的时间基（可能与请求的不同）
+        println!(
+            "Requested timebase: {}/{}, Actual encoder timebase: {}/{}, Stream timebase: {}/{}",
+            time_base.0,
+            time_base.1,
+            encoder.time_base().num,
+            encoder.time_base().den,
+            stream_info.time_base.num,
+            stream_info.time_base.den
+        );
 
         // write header
-        stream_writer.write_header().unwrap();
-
-        let duration: Time = Time::from_nth_of_a_second(24);
-        let mut position = Time::zero();
+        stream_writer.write_header()?;
 
         fn rainbow_frame(p: f32) -> FrameArray {
             use crate::colors;
@@ -688,17 +979,43 @@ mod tests {
             FrameArray::from_shape_fn((720, 1280, 3), |(_y, _x, c)| rgb[c])
         }
 
-        // frame encode and write to file
-        for i in 0..256 {
-            let frame = rainbow_frame(i as f32 / 256.0);
+        let actual_timebase = encoder.time_base();
+        let frame_duration_seconds = 1.0 / fps;
+
+        // 将秒转换为对应时间基单位
+        let duration_units = (frame_duration_seconds * actual_timebase.den as f64
+            / actual_timebase.num as f64)
+            .round() as i64;
+
+        let duration = Time::new(Some(duration_units), actual_timebase);
+
+        // 初始化position时使用正确的时间基
+        let mut position = Time::new(Some(0), avutil::ra(time_base.0, time_base.1));
+
+        println!(
+            "Encoding {} with actual timebase: {}/{}, duration units: {}, fps: {}",
+            container_type, actual_timebase.num, actual_timebase.den, duration_units, fps
+        );
+
+        // 帧编码并写入文件
+        for i in 0..10 {
+            let frame = rainbow_frame(i as f32 / 10.0);
 
             match encoder.encode(&frame, position) {
                 EncodeResult::Packet(mut packet) => {
                     packet.set_pos(-1);
                     packet.set_stream_index(video_index as i32);
+
                     // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
                     // encode_ctx_timebase => out_stream_time_base
+                    let orig_pts = packet.pts;
                     packet.rescale_ts(encoder.time_base(), stream_info.time_base);
+                    let new_pts = packet.pts;
+                    // 只打印少量帧以避免日志过多
+                    if i < 5 || i % 30 == 0 {
+                        println!("Frame {}: orig_pts={}, new_pts={}", i, orig_pts, new_pts);
+                    }
+
                     stream_writer.write_frame(&mut packet)?;
                 }
                 EncodeResult::Drain => {
@@ -715,234 +1032,96 @@ mod tests {
                 }
             }
 
-            println!("Encoded frame {} at position {:?}", i, position);
-
+            // 使用aligned_with确保时间基一致进行加法操作
             position = position.aligned_with(duration).add();
         }
 
-        // flush encoder and write trailer
-        encoder
-            .flush(
-                &mut stream_writer,
-                false,
-                video_index,
-                stream_info.time_base,
-            )
-            .unwrap();
+        // flush encoder
+        encoder.flush(
+            &mut stream_writer,
+            false,
+            video_index,
+            stream_info.time_base,
+        )?;
 
         // write trailer
-        stream_writer.write_trailer().unwrap();
+        stream_writer.write_trailer()?;
 
         Ok(())
     }
 
-    /// 音频采样率
-    const DEFAULT_SAMPLE_RATE: u32 = 44_100;
-    /// 比特率
-    const DEFAULT_BIT_RATE: i64 = 128_000;
-    /// 正弦波振幅
-    const SAFE_AMPLITUDE: f32 = 0.7;
-    /// 时长(秒)
-    const FADE_DURATION_MS: u32 = 10;
-    /// 生成带淡入淡出效果的浮点型正弦波音频帧
-    ///
-    /// # 参数说明
-    /// - `frequency`: 正弦波基础频率，单位赫兹(Hz)，有效范围 (0, sample_rate/2]
-    /// - `channels`: 音频声道数量，支持范围 [1, 8] 个声道
-    /// - `nb_samples`: 单个音频帧包含的样本数量，单位：采样点/帧
-    /// - `sample_rate`: 音频采样率，单位Hz，常见值：44100(CD)、48000(专业音频)
-    ///
-    /// # 返回值
-    /// 返回包装好的原始音频帧(RawFrame)，数据格式为平面浮点型(FLTP)
-    ///
-    /// # 数据格式说明
-    /// FLTP格式特点：
-    /// - 每个声道数据存储在独立的内存平面
-    /// - 采样值范围：[-1.0, 1.0]，超出会导致削波失真
-    /// - 内存布局示例（立体声）：
-    ///   data[0]: [L0, L1, L2,...] 左声道数据
-    ///   data[1]: [R0, R1, R2,...] 右声道数据
-    fn generate_sine_wave_frame(
-        frequency: f32,
-        channels: usize,
-        nb_samples: i32,
-        sample_rate: u32,
-    ) -> Result<RawFrame> {
-        // 奈奎斯特频率限制：频率不能超过采样率的一半
-        anyhow::ensure!(
-            frequency > 0.0 && frequency <= (sample_rate as f32 / 2.0),
-            "无效频率：{}Hz (采样率 {}Hz 下最高支持 {}Hz)",
-            frequency,
-            sample_rate,
-            sample_rate as f32 / 2.0
-        );
-
-        // 声道数限制：支持1到8声道
-        anyhow::ensure!(
-            channels > 0 && channels <= 8,
-            "不支持的声道数量：{} (支持1-8声道)",
-            channels
-        );
-
-        let mut frame = RawFrame::new();
-
-        // 设置帧参数
-        frame.set_nb_samples(nb_samples); // 每帧样本数
-        frame.set_format(SampleFormat::FLTP as i32); // 强制指定为平面浮点格式
-        frame.set_sample_rate(sample_rate as i32); // 设置采样率
-        frame.set_ch_layout(AVChannelLayout::from_nb_channels(channels as i32).into_inner());
-
-        // 分配音频数据缓冲区
-        frame
-            .alloc_buffer()
-            .context("Failed alloc audio frame buffer.")?;
-
-        // 计算音频生成参数
-        let sample_interval = 1.0 / sample_rate as f32; // 单个采样时间间隔（秒）
-        let two_pi_f = 2.0 * std::f32::consts::PI * frequency; // 角频率计算 2πf
-
-        // 淡入淡出参数
-        let fade_samples = (sample_rate as f32 * FADE_DURATION_MS as f32 / 1000.0).round() as usize;
-        let total_samples = nb_samples as usize; // 总采样点数
-
-        // 分声道生成数据
-        for ch in 0..channels {
-            // 获取当前声道的平面数据指针
-            // SAFETY: 帧缓冲区在frame生命周期内保持有效
-            let data_ptr = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (*frame.as_mut_ptr()).data[ch] as *mut f32,
-                    total_samples,
-                )
-            };
-
-            // 生成每个采样点的数据
-            for (i, sample) in data_ptr.iter_mut().enumerate() {
-                let t = i as f32 * sample_interval; // 当前采样时间点
-                let value = (two_pi_f * t).sin(); // 计算正弦波值
-
-                // 应用淡入淡出窗口函数
-                let window = match i {
-                    // 前 fade_samples 个采样：线性淡入
-                    i if i < fade_samples => i as f32 / fade_samples as f32,
-                    // 最后 fade_samples 个采样：线性淡出
-                    i if i >= total_samples - fade_samples => {
-                        (total_samples - i) as f32 / fade_samples as f32
-                    }
-                    // 中间部分：全振幅
-                    _ => 1.0,
-                };
-
-                // 设置采样值并限制振幅
-                *sample = value * SAFE_AMPLITUDE * window;
-            }
-        }
-
-        Ok(frame)
-    }
-
     #[test]
-    #[ignore = "ignore audio output file"]
-    fn test_encode_audio() -> Result<()> {
-        let output_path = Path::new("/tmp/aac_encode_audio.aac");
+    #[rustfmt::skip]
+    #[ignore = "ignore video output file"]
+    fn test_encode_video() -> Result<()> {
 
-        let mut encoder = EncoderBuilder::new()
-            .with_media_type(MediaType::AUDIO) // 指定音频编码
-            .with_nb_channels(2) // 立体声
-            .with_sample_rate(DEFAULT_SAMPLE_RATE) // 采样率
-            .with_bit_rate(DEFAULT_BIT_RATE) // 128kbps 比特率
-            .with_sample_format(SampleFormat::FLTP) // 平面浮点格式
-            .with_codec_name(Some("aac".to_string())) // 指定AAC编码
-            .build()
-            .unwrap();
+        let video_formats = [
+            // 通用/主流视频容器
+            "mp4",   // MPEG-4 Part 14，最通用的视频格式
+            "mkv",   // Matroska，开源高灵活性容器
+            "webm",  // Web优化的Matroska子集
+            "avi",   // Audio Video Interleave，传统通用格式
+            "mov",   // QuickTime格式，苹果生态常用
+            "wmv",   // Windows Media Video
+            "flv",   // Flash Video，流媒体
+            "mpg",   // MPEG-1/2 Program Stream
+            "mpeg",  // 同上
+            "asf",   // Advanced Systems Format
 
-        let mut stream_writer = StreamWriter::new(output_path)?;
-        let audio_index = stream_writer.add_stream(encoder.codecpar(), encoder.time_base());
-        let stream_info = StreamInfo::from_writer(&stream_writer, audio_index)?;
-        // 写入文件头
-        stream_writer.write_header().unwrap();
+            // 广播/专业视频容器
+            "mxf",   // Material eXchange Format，广电行业标准
+            "gxf",   // General eXchange Format，磁带元数据
+            "ts",    // MPEG Transport Stream，广播流
+            "m2ts",  // Blu-ray MPEG-2 Transport Stream
+            "mts",   // 同上
+            "xavc",  // Sony's 4K/8K专业格式
+            "ps",    // MPEG-2 Program Stream (专业用途)
 
-        // 音频生成参数
-        let duration_secs = 5; // 总时长5秒
-        let samples_per_second = DEFAULT_SAMPLE_RATE as i64; // 每秒采样数
-        let total_samples = duration_secs * samples_per_second; // 总采样数
-        let samples_per_frame = 1024; // 每帧采样数（AAC标准帧长）
-        let frequency = 440.0; // 正弦波基础频率
+            // 流媒体/网络视频容器
+            "f4v",   // Adobe Flash MP4衍生格式
+            "cmaf",  // Common Media Application Format (DASH/HLS)
+            "ismv",  // Microsoft Smooth Streaming
 
-        for frame_idx in 0..(total_samples / samples_per_frame as i64) {
-            let mut sine_frame = generate_sine_wave_frame(
-                frequency, // A4标准音高（国际标准音）
-                2,         // 立体声
-                samples_per_frame,
-                DEFAULT_SAMPLE_RATE,
-            )
-            .context("音频帧生成失败")?;
+            // 移动设备/特殊视频容器
+            "3gp",   // 3GPP移动多媒体格式
+            "3g2",   // 3GPP2多媒体格式
+            "ogv",   // Ogg Video
+            "rmvb",  // RealMedia Variable Bitrate
+            "rm",    // RealMedia
+            "vob",   // DVD Video Object
+            "divx",  // DivX Media Format
+            "amv",   // Anime Music Video
 
-            // 设置精确时间戳（单位：采样点数）
-            // 每个时间戳增量对应一帧的持续时间
-            // 例如：1024 samples/frame => 每帧时间戳增量为1024
-            sine_frame.set_pts(frame_idx * samples_per_frame as i64);
+            // 图像序列/原始视频格式
+            "heif",  // High Efficiency Image File Format
+            "heic",  // HEIF的iOS实现
+            "dav",   // 大华监控专用
+            "h264",  // 裸H.264比特流
+            "h265",  // 裸H.265/HEVC比特流
+            "y4m",   // YUV4MPEG2原始格式
 
-            match encoder.encode_raw(&sine_frame) {
-                EncodeRawResult::Packet(mut packet) => {
-                    packet.set_pos(-1);
-                    packet.set_stream_index(audio_index as i32);
-                    // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
-                    // encode_ctx_timebase => out_stream_time_base
-                    packet.rescale_ts(encoder.time_base(), stream_info.time_base);
-                    stream_writer.write_frame(&mut packet)?;
-                }
-                EncodeRawResult::Drain => {
-                    println!("Encoder drained, try send new frame again.");
-                    continue;
-                }
-                EncodeRawResult::Flushed => {
-                    println!("Encoder flushed, EOF reached.");
-                    break;
-                }
-                EncodeRawResult::Error(e) => {
-                    println!("Encode error: {}", e);
-                    break;
+            // 旧版/特殊格式
+            "swf",   // Shockwave Flash
+            "evo",   // HD-DVD格式
+            "ifo",   // DVD信息文件
+            "m4v",   // MPEG-4视频文件
+        ];
+
+        let mut err_encoder = Vec::new();
+        for format in video_formats {
+            println!("Testing format: {}...", format);
+            match test_encode_video_for_container(format, 24.0) {
+                Ok(_) => println!("Testing format: {} passed.", format),
+                Err(e) => {
+                    println!("Testing format: {} failed: {}", format, e);
+                    err_encoder.push(format.to_string());
                 }
             }
         }
 
-        // 处理剩余不足一帧的样本
-        let remaining = (total_samples % samples_per_frame as i64) as i32;
-        if remaining > 0 {
-            let mut last_frame = generate_sine_wave_frame(
-                frequency,
-                2,
-                remaining, // 最后剩余的样本数
-                DEFAULT_SAMPLE_RATE,
-            )?;
-
-            // 设置最后帧的时间戳（总样本数 - 剩余样本数）
-            last_frame.set_pts(total_samples - remaining as i64);
-
-            // write last frame
-            if let EncodeRawResult::Packet(mut packet) = encoder.encode_raw(&last_frame) {
-                packet.set_pos(-1);
-                packet.set_stream_index(audio_index as i32);
-                // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
-                // encode_ctx_timebase => out_stream_time_base
-                packet.rescale_ts(encoder.time_base(), stream_info.time_base);
-                stream_writer.write_frame(&mut packet)?;
-            }
+        if !err_encoder.is_empty() {
+            eprintln!("Failed encoders: {:#?}", err_encoder)
         }
-
-        // flush encoder and write trailer
-        encoder
-            .flush(
-                &mut stream_writer,
-                false,
-                audio_index,
-                stream_info.time_base,
-            )
-            .unwrap();
-
-        // write trailer
-        stream_writer.write_trailer().unwrap();
 
         Ok(())
     }

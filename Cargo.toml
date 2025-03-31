@@ -22,7 +22,11 @@ link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg"]
 
 [dependencies]
 url = "2.5"
+rayon = "1.10"
+palette = "0.7"
+ab_glyph = "0.2"
 image = "0.25"
+imageproc = "0.25"
 anyhow = "1.0"
 log = "0.4"
 tracing = "0.1"
@@ -35,18 +39,31 @@ libc = "0.2"
 cstr = "0.2"
 camino = "1.1"
 chrono = "0.4"
+ringbuf = "0.4"
+ctor = "0.4"
+rstest = "0.25"
+tracing-subscriber = {version = "0.3", features = ["fmt", "env-filter", "chrono"]}
+
+## parallel
+## security & async
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 
-## image & video
+## color
+colorous = "1.0"
 libblur = "0.17"
 pic-scale = "0.5"
 yuvutils-rs = "0.8"
 colorutils-rs = "0.7"
 histogram_equalization = "0.2"
 
-## audio & sound
+## image & video
+
+## sound & audio
 cpal = "0.15"
+wavers = "1.5"
+rubato = "0.16"
+dasp = {version = "0.11", features = ["all"]}
 rodio = { version = "0.20", features = ["symphonia-all", "tracing"] }
 
 [package.metadata.docs.rs]
