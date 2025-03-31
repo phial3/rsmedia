@@ -3,13 +3,15 @@ name = "rsmedia"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
 description = "High-level video toolkit based on ffmpeg."
 keywords = ["video", "ffmpeg", "encoding", "decoding", "muxing"]
 categories = ["multimedia", "multimedia::video", "multimedia::audio"]
 authors = ["Oddity.ai Developers <hello@oddity.ai>", "phial3 Developers"]
-repository = "https://github.com/phial3/rsmedia"
-readme = "README.md"
+repository = "https://github.com/phial3/rsmedia.git"
+include = ["src/**/*", "fonts/*", "Cargo.toml"]
+exclude = [".github/*", "assets/*", "data/*", "examples/*", "tests/*", "benches/*", "docs/*", ]
 
 [features]
 default = ["ndarray", "ffmpeg7", "link_system_ffmpeg"]
@@ -42,7 +44,7 @@ chrono = "0.4"
 ringbuf = "0.4"
 ctor = "0.4"
 rstest = "0.25"
-tracing-subscriber = {version = "0.3", features = ["fmt", "env-filter", "chrono"]}
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
 
 ## parallel
 ## security & async
@@ -63,7 +65,7 @@ histogram_equalization = "0.2"
 cpal = "0.15"
 wavers = "1.5"
 rubato = "0.16"
-dasp = {version = "0.11", features = ["all"]}
+dasp = { version = "0.11", features = ["all"] }
 rodio = { version = "0.20", features = ["symphonia-all", "tracing"] }
 
 [package.metadata.docs.rs]
