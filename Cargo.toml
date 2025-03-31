@@ -10,7 +10,6 @@ keywords = ["video", "ffmpeg", "encoding", "decoding", "muxing"]
 categories = ["multimedia", "multimedia::video", "multimedia::audio"]
 authors = ["Oddity.ai Developers <hello@oddity.ai>", "phial3 Developers"]
 repository = "https://github.com/phial3/rsmedia.git"
-include = ["src/**/*", "fonts/*", "Cargo.toml"]
 exclude = [".github/*", "assets/*", "data/*", "examples/*", "tests/*", "benches/*", "docs/*", ]
 
 [features]
