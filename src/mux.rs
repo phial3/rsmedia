@@ -1,5 +1,3 @@
-use crate::decode::DecodeRawResult;
-use crate::encode::EncodeRawResult;
 use crate::flags::MediaType;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{private::Output, Reader, Writer};
@@ -9,7 +7,9 @@ use crate::{utils, Decoder, DecoderBuilder, Encoder, Resize, StreamReader, Strea
 use rsmpeg::avutil::AVFrame;
 
 use anyhow::{Context, Error, Result};
+use dashmap::DashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Represents a muxer. A muxer allows muxing media packets into a new container format. Muxing does
 /// not require encoding and/or decoding.
@@ -116,8 +116,8 @@ impl<W: Writer> Muxer<W> {
         if self.have_written_header {
             let mux_stream = self.get_stream_mut(stream_idx)?;
 
-            match mux_stream.encoder.encode_raw(&frame) {
-                EncodeRawResult::Packet(mut packet) => {
+            match mux_stream.encoder.encode_raw(frame) {
+                Ok(Some(mut packet)) => {
                     packet.set_pos(-1);
                     packet.set_stream_index(mux_stream.stream_idx as i32);
                     // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
@@ -135,11 +135,11 @@ impl<W: Writer> Muxer<W> {
                         }
                     }))
                 }
-                EncodeRawResult::Drain | EncodeRawResult::Flushed => {
+                Ok(None) => {
                     log::debug!("Encoder Drain or Flushed.");
                     Ok(None)
                 }
-                EncodeRawResult::Error(e) => Err(e),
+                Err(e) => Err(e),
             }
         } else {
             self.have_written_header = true;
@@ -179,6 +179,7 @@ unsafe impl<W: Writer> Sync for Muxer<W> {}
 pub struct Demuxer<R: Reader> {
     pub reader: R,
     streams: Vec<DemuxerStream>,
+    states: Arc<DashMap<usize, i32>>,
 }
 
 /// stream definition for demuxer
@@ -202,19 +203,6 @@ impl DemuxerStream {
     }
 }
 
-/// Demux result
-#[derive(Debug)]
-pub enum DemuxResult {
-    /// decoded frame
-    Frame(usize, AVFrame),
-    /// need more data
-    Drain,
-    /// EOF of input
-    Flushed,
-    /// error
-    Error(Error),
-}
-
 impl<R: Reader> Demuxer<R> {
     pub fn from_reader(
         reader: R,
@@ -228,16 +216,29 @@ impl<R: Reader> Demuxer<R> {
             let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
             // auto detect hardware acceleration decoder codec
             let codec_name = stream_info.find_decoder_name(device_type);
-            let decoder = DecoderBuilder::new(stream_info.media_type)
-                .with_hardware_device(device_config.clone())
-                .with_codec_name(codec_name)
-                .with_resize(resize)
-                .build(&reader)
-                .context("Failed to build decoder")?;
+            let decoder = if stream_info.media_type == MediaType::VIDEO {
+                DecoderBuilder::new(stream_info.media_type)
+                    .with_hardware_device(device_config.clone())
+                    .with_codec_name(codec_name)
+                    .with_resize(resize)
+                    .build(&reader)
+                    .context("Failed to build decoder")?
+            } else {
+                DecoderBuilder::new(stream_info.media_type)
+                    .with_hardware_device(device_config.clone())
+                    .with_codec_name(codec_name)
+                    .build(&reader)
+                    .context("Failed to build decoder")?
+            };
+
             streams.push(DemuxerStream::new(decoder, stream_info));
         }
 
-        Ok(Self { reader, streams })
+        Ok(Self {
+            reader,
+            streams,
+            states: Arc::new(DashMap::new()),
+        })
     }
 
     pub fn streams(&self) -> &[DemuxerStream] {
@@ -258,36 +259,74 @@ impl<R: Reader> Demuxer<R> {
             .ok_or_else(|| Error::msg(format!("Stream index: {} not found", index)))
     }
 
-    pub fn demux(&mut self) -> DemuxResult {
-        match self.internal_demux() {
-            (index, DecodeRawResult::Frame(frame)) => DemuxResult::Frame(index, frame),
-            (_i, DecodeRawResult::Drain) => DemuxResult::Drain,
-            (_i, DecodeRawResult::Flushed) => DemuxResult::Flushed,
-            (_i, DecodeRawResult::Error(e)) => DemuxResult::Error(e),
-        }
+    fn set_flushed(&self, stream_index: usize) {
+        self.states.insert(stream_index, 1);
     }
 
-    /// handle demux internal logic
-    fn internal_demux(&mut self) -> (usize, DecodeRawResult) {
-        let (in_stream_index, in_stream_time_base, mut packet) = {
-            let (in_stream, pkt) = match self.reader.read_packet() {
-                Ok(Some((s, p))) => (s, p),
-                Ok(None) => return (0, DecodeRawResult::Flushed),
-                Err(e) => {
-                    log::error!("Error reading packet: {}", e);
-                    return (0, DecodeRawResult::Error(e));
-                }
-            };
-            (in_stream.index(), in_stream.time_base(), pkt)
-        };
+    fn is_flushed(&self, stream_index: usize) -> bool {
+        self.states
+            .get(&stream_index)
+            .map(|v| *v.value() == 1)
+            .unwrap_or(false)
+    }
 
-        let demux_stream = self.get_stream_mut(in_stream_index).unwrap();
-        // 解码前处理输入数据包, 将输入容器的时间基转换为解码器的时间基
-        // in_stream->time_base  =>  dec_ctx->time_base
-        packet.set_pos(-1);
-        packet.set_stream_index(in_stream_index as i32);
-        packet.rescale_ts(in_stream_time_base, demux_stream.decoder.time_base());
-        (in_stream_index, demux_stream.decoder.decode_raw(&packet))
+    pub fn demux(&mut self) -> Result<Option<(usize, AVFrame)>> {
+        let mut read_exhausted = false;
+        loop {
+            if !read_exhausted {
+                match self.reader.read_packet() {
+                    Ok(Some((stream, packet))) => {
+                        let stream_idx = stream.index();
+                        // get demuxer stream
+                        let demux_stream = self
+                            .streams
+                            .iter_mut()
+                            .find(|s| s.stream_idx == stream_idx)
+                            .unwrap();
+                        if let Some(frame) = demux_stream.decoder.decode_raw_packet(&packet)? {
+                            return Ok(Some((stream_idx, frame)));
+                        }
+                    }
+                    Ok(None) => {
+                        log::debug!("No more packets, Reader exhausted.");
+                        read_exhausted = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        log::error!("Error reading packet: {}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                for i in 0..self.streams.len() {
+                    // 先获取 stream_idx，避免后面重复借用
+                    let stream_idx = self.streams[i].stream_idx;
+
+                    // 使用实际的 stream_idx 检查状态
+                    if self.is_flushed(stream_idx) {
+                        continue;
+                    }
+
+                    // 然后获取stream的可变引用
+                    let demuxer_stream = &mut self.streams[i];
+                    match demuxer_stream.decoder.drain_raw() {
+                        Ok(Some(frame)) => {
+                            return Ok(Some((demuxer_stream.stream_idx, frame)));
+                        }
+                        Ok(None) => {
+                            log::debug!("Stream: [{}] Decoder flushed. EOF reached.", stream_idx);
+                            self.set_flushed(stream_idx);
+                            continue;
+                        }
+                        Err(e) => {
+                            log::error!("Stream: [{}] Decoder Drain Error: {}", stream_idx, e);
+                            return Err(e);
+                        }
+                    }
+                }
+                return Ok(None);
+            }
+        }
     }
 }
 
@@ -306,10 +345,9 @@ impl<R: Reader> Iterator for Demuxer<R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.demux() {
-            DemuxResult::Frame(stream_index, frame) => Some(Ok((stream_index, frame))),
-            DemuxResult::Drain => self.next(),
-            DemuxResult::Flushed => None,
-            DemuxResult::Error(e) => Some(Err(e)),
+            Ok(Some(item)) => Some(Ok(item)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
         }
     }
 }
@@ -385,7 +423,7 @@ mod tests {
     use std::path::Path;
 
     /// 生成YUV420P格式的视频帧,彩色渐变测试图
-    fn generate_video_frame(width: u32, height: u32, frame_index: i64) -> AVFrame {
+    fn generate_video_frame(width: usize, height: usize, frame_index: i64) -> AVFrame {
         let mut frame = AVFrame::new();
         frame.set_width(width as i32);
         frame.set_height(height as i32);
@@ -410,7 +448,7 @@ mod tests {
         // 填充Y平面 (亮度)
         for y in 0..height {
             for x in 0..width {
-                let index = (y * y_linesize as u32 + x) as usize;
+                let index = y * y_linesize as usize + x;
                 let gradient = (x as f32 / width as f32 * 255.0) as u8;
                 unsafe {
                     *y_plane.add(index) = gradient;
@@ -421,7 +459,7 @@ mod tests {
         // 填充U平面 (蓝色分量)
         for y in 0..(height / 2) {
             for x in 0..(width / 2) {
-                let index = (y * u_linesize as u32 + x) as usize;
+                let index = y * u_linesize as usize + x;
                 let u_value = ((time_factor * 128.0) as u8).wrapping_add(128);
                 unsafe {
                     *u_plane.add(index) = u_value;
@@ -432,7 +470,7 @@ mod tests {
         // 填充V平面 (红色分量)
         for y in 0..(height / 2) {
             for x in 0..(width / 2) {
-                let index = (y * v_linesize as u32 + x) as usize;
+                let index = (y * v_linesize as usize + x) as usize;
                 let v_value = (((1.0 - time_factor) * 128.0) as u8).wrapping_add(128);
                 unsafe {
                     *v_plane.add(index) = v_value;
@@ -542,7 +580,6 @@ mod tests {
     fn test_mux_demux_audio_aac() -> Result<()> {
         let output_path = Path::new("/tmp/test_mux_demux_audio_aac.aac");
         let sample_rate = 44_100;
-        // aac 要求输入的样本数必须是1024
         let nb_samples = 1024;
         let channels = 2;
 
@@ -616,8 +653,7 @@ mod tests {
         let output_path = Path::new("/tmp/test_mux_demux_audio_mp3.mp3");
         let sample_rate = 44_100;
         let bit_rate = 128_000;
-        // MP3通常使用1152个样本/帧
-        let nb_samples = 1152;
+        let nb_samples = 1152; // libmp3lame 要求的 frame_size 为 1152
         let channels = 2;
 
         // 修改音频编码器为MP3
@@ -669,9 +705,9 @@ mod tests {
     #[ignore = "demux test_multiple_streams"]
     fn test_multiple_streams() -> Result<()> {
         // 视频参数
-        pub const VIDEO_WIDTH: u32 = 1280;
-        pub const VIDEO_HEIGHT: u32 = 720;
-        pub const VIDEO_FPS: u32 = 30;
+        pub const VIDEO_WIDTH: usize = 1280;
+        pub const VIDEO_HEIGHT: usize = 720;
+        pub const VIDEO_FPS: i32 = 30;
         pub const VIDEO_DURATION_SEC: u32 = 10;
 
         // 音频参数
@@ -682,13 +718,13 @@ mod tests {
         let output_path = Path::new("/tmp/test_multiple_streams.mp4");
 
         let video_encoder = EncoderBuilder::new_video(VIDEO_WIDTH, VIDEO_HEIGHT)
-            .with_frame_rate(VIDEO_FPS as i32, 1)
+            .with_frame_rate(VIDEO_FPS, 1)
             // 使用标准的90kHz时间基
             .with_time_base(1, 90_000)
             .build()?;
 
         let audio_encoder =
-            Encoder::new_audio(AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, SampleFormat::FLTP).unwrap();
+            Encoder::new_audio(AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, SampleFormat::FLTP)?;
 
         let stream_writer = StreamWriter::new(output_path)?;
         let mut muxer = Muxer::from_writer(stream_writer);
@@ -701,7 +737,7 @@ mod tests {
         let audio_idx = muxer.add_stream(audio_encoder)?;
 
         // 计算总视频帧数
-        let total_video_frames = (VIDEO_FPS * VIDEO_DURATION_SEC) as i64;
+        let total_video_frames = (VIDEO_FPS as u32 * VIDEO_DURATION_SEC) as i64;
 
         // 计算每个视频帧对应的音频样本数，例如：48000Hz / 30fps = 1600个(样本/视频帧)
         let audio_samples_per_video_frame = (AUDIO_SAMPLE_RATE as f64 / VIDEO_FPS as f64) as usize;

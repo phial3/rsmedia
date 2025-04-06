@@ -100,7 +100,7 @@ impl Time {
         }
     }
 
-    /// Whether or not the [`Time`] has a time at all.
+    /// Whether the [`Time`] has a time at all.
     pub fn has_value(&self) -> bool {
         self.time.is_some()
     }
@@ -166,7 +166,7 @@ impl Time {
     /// # Arguments
     ///
     /// * `time_base` - Target time base.
-    pub(crate) fn aligned_with_rational(&self, time_base: AVRational) -> Time {
+    pub fn aligned_with_rational(&self, time_base: AVRational) -> Time {
         Time {
             time: self
                 .time

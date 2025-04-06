@@ -1,5 +1,5 @@
 use rsmedia::{
-    mux::{DemuxResult, Demuxer, Muxer},
+    mux::{Demuxer, Muxer},
     EncoderBuilder, MediaType, Options, PixelFormat, SampleFormat, StreamReader,
     StreamWriterBuilder,
 };
@@ -37,7 +37,7 @@ fn main() {
         let encoder = {
             if stream_info.media_type == MediaType::VIDEO {
                 // build video encoder
-                EncoderBuilder::new_video(stream_info.width as u32, stream_info.height as u32)
+                EncoderBuilder::new_video(stream_info.width as usize, stream_info.height as usize)
                     // cuda acceleration
                     // .with_hardware_device(Some(HWDeviceType::CUDA))
                     // .with_codec_name("h264_nvenc".to_string())
@@ -71,19 +71,15 @@ fn main() {
     // demux and mux all frames from input to output muxer
     loop {
         match demuxer.demux() {
-            DemuxResult::Frame(stream_index, frame) => {
+            Ok(Some((stream_index, frame))) => {
                 println!("stream index:{}, {:?}", stream_index, frame);
                 let _ = muxer.mux(frame, stream_index).unwrap();
             }
-            DemuxResult::Drain => {
-                println!("Need more data, continuing...");
-                continue;
-            }
-            DemuxResult::Flushed => {
-                println!("Input stream EOF reached");
+            Ok(None) => {
+                log::info!("End of input file");
                 break;
             }
-            DemuxResult::Error(e) => {
+            Err(e) => {
                 eprintln!("Demuxing error: {}", e);
                 break;
             }
