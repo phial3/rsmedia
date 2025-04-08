@@ -1,6 +1,6 @@
-use crate::PixelFormat;
+use crate::{time, PixelFormat};
 
-use rsmpeg::avutil::{self, AVFrame, AVSamples};
+use rsmpeg::avutil::{AVFrame, AVSamples};
 use rsmpeg::ffi;
 use rsmpeg::swresample::SwrContext;
 use rsmpeg::swscale::SwsContext;
@@ -240,8 +240,7 @@ pub fn convert(
         anyhow::bail!("Hardware frames are not supported in this software re-sampler");
     }
 
-    let sample_fmt = avutil::get_sample_fmt_name(src_frame.format);
-    if src_frame.sample_rate < 0 || sample_fmt.is_none() {
+    if src_frame.sample_rate < 1 || src_frame.nb_samples < 1 {
         return Err(Error::msg("Invalid input frame."));
     }
 
@@ -298,8 +297,7 @@ pub fn convert_frame(
         anyhow::bail!("Hardware frames are not supported in this software re-sampler");
     }
 
-    let sample_fmt = avutil::get_sample_fmt_name(src_frame.format);
-    if src_frame.sample_rate < 0 || sample_fmt.is_none() {
+    if src_frame.sample_rate < 1 || src_frame.nb_samples < 1 {
         return Err(Error::msg("Invalid input frame."));
     }
 
@@ -323,7 +321,7 @@ pub fn convert_frame(
     dst_frame.set_ch_layout(out_ch_layout);
     dst_frame.set_nb_samples(src_frame.nb_samples);
     dst_frame.set_sample_rate(out_sample_rate);
-    dst_frame.set_time_base(avutil::ra(1, out_sample_rate));
+    dst_frame.set_time_base(time::new_rational(1, out_sample_rate));
     dst_frame
         .alloc_buffer()
         .context("Failed to allocate destination frame buffer")?;
@@ -343,7 +341,7 @@ pub fn convert_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SampleFormat;
+    use crate::{time, SampleFormat};
     use anyhow::{Context, Result};
     use rsmpeg::avutil::AVChannelLayout;
     use rsmpeg::ffi;
@@ -495,7 +493,7 @@ mod tests {
         frame.set_ch_layout(AVChannelLayout::from_nb_channels(nb_channels).into_inner());
         frame.set_nb_samples(nb_samples);
         frame.set_sample_rate(sample_rate);
-        frame.set_time_base(avutil::ra(1, sample_rate));
+        frame.set_time_base(time::new_rational(1, sample_rate));
 
         frame
             .alloc_buffer()
@@ -509,7 +507,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "linux ffmpeg/7.1: AVFrame buffer allocating with incorrect parameters."]
     fn test_format_conversion() -> Result<()> {
         let sample_rate = 44100;
         let nb_samples = 1024;
@@ -555,7 +552,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "linux ffmpeg/7.1: AVFrame buffer allocating with incorrect parameters."]
     fn test_format_conversion_with_different_rates() -> Result<()> {
         let sample_rates = &[44100, 48000, 96000];
         let nb_samples = 1024;
@@ -594,7 +590,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "linux ffmpeg/7.1: AVFrame buffer allocating with incorrect parameters."]
     fn test_channel_conversion() -> Result<()> {
         let nb_samples = 1024;
         let channel_layouts = &[1, 2];

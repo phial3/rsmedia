@@ -1,14 +1,13 @@
 use crate::flags::MediaType;
 use crate::hwaccel::HWDeviceConfig;
-use crate::io::{private::Output, Reader, Writer};
+use crate::io::{Reader, Writer};
 use crate::stream::StreamInfo;
-use crate::{utils, Decoder, DecoderBuilder, Encoder, Resize, StreamReader, StreamWriter};
+use crate::{Decoder, DecoderBuilder, Encoder, Resize};
 
 use rsmpeg::avutil::AVFrame;
 
 use anyhow::{Context, Error, Result};
 use dashmap::DashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Represents a muxer. A muxer allows muxing media packets into a new container format. Muxing does
@@ -352,71 +351,11 @@ impl<R: Reader> Iterator for Demuxer<R> {
     }
 }
 
-/// transcode from one container format to another
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// transcode("input.mp4", "output.mov").unwrap();
-/// ```
-pub fn transcode(input_path: &str, output_path: &str) -> Result<()> {
-    let mut input_reader = StreamReader::new(Path::new(input_path))?;
-    let input = input_reader.input();
-
-    let mut output_writer = StreamWriter::new(Path::new(output_path))?;
-    let output = output_writer.output_mut();
-
-    let stream_mapping: Vec<_> = {
-        let mut stream_index = 0usize;
-        input
-            .streams()
-            .iter()
-            .map(|stream| {
-                let codec_type = stream.codecpar().codec_type();
-                if !codec_type.is_video() && !codec_type.is_audio() && !codec_type.is_subtitle() {
-                    None
-                } else {
-                    output.new_stream().set_codecpar(stream.codecpar().clone());
-                    stream_index += 1;
-                    Some(stream_index - 1)
-                }
-            })
-            .collect()
-    };
-
-    output
-        .dump(0, utils::from_str(output_path).as_c_str())
-        .context("Dump output format context failed.")?;
-
-    output
-        .write_header(&mut None)
-        .context("Writer header failed.")?;
-
-    while let Some((in_stream, mut packet)) =
-        input_reader.read_packet().context("Read packet failed.")?
-    {
-        let input_stream_index = in_stream.index();
-        let Some(output_stream_index) = stream_mapping[input_stream_index] else {
-            continue;
-        };
-        {
-            let output_stream = &output.streams()[output_stream_index];
-            packet.rescale_ts(in_stream.time_base(), output_stream.time_base);
-            packet.set_stream_index(output_stream_index as i32);
-            packet.set_pos(-1);
-        }
-        output
-            .interleaved_write_frame(&mut packet)
-            .context("Interleaved write frame failed.")?;
-    }
-
-    output.write_trailer().context("Write trailer failed.")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter};
+    use crate::io::private::Output;
+    use crate::{utils, EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter};
 
     use anyhow::{Context, Result};
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
@@ -523,7 +462,7 @@ mod tests {
         let output_path = Path::new("/tmp/test_mux_demux_video.mp4");
 
         let (width, height) = (1920, 1080);
-        let video_encoder = Encoder::new_video(width, height).unwrap();
+        let video_encoder = Encoder::new_video(width, height)?;
 
         let stream_writer = StreamWriter::new(output_path)?;
         let mut muxer = Muxer::from_writer(stream_writer);
@@ -576,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "test_mux_demux_audio_aac 需要写文件操作"]
+    #[ignore = "test_mux_demux_audio_aac is need write file"]
     fn test_mux_demux_audio_aac() -> Result<()> {
         let output_path = Path::new("/tmp/test_mux_demux_audio_aac.aac");
         let sample_rate = 44_100;
@@ -648,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "test_mux_demux_audio_mp3 需要写文件操作"]
+    #[ignore = "test_mux_demux_audio_mp3 is need write file"]
     fn test_mux_demux_audio_mp3() -> Result<()> {
         let output_path = Path::new("/tmp/test_mux_demux_audio_mp3.mp3");
         let sample_rate = 44_100;
@@ -702,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "demux test_multiple_streams"]
+    #[ignore = "demux test_multiple_streams need a file"]
     fn test_multiple_streams() -> Result<()> {
         // 视频参数
         pub const VIDEO_WIDTH: usize = 1280;
@@ -829,6 +768,68 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// transcode from one container format to another
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// transcode("input.mp4", "output.mov").unwrap();
+    /// ```
+    pub fn transcode(input_path: &str, output_path: &str) -> Result<()> {
+        let mut input_reader = StreamReader::new(Path::new(input_path))?;
+        let input = input_reader.input();
+
+        let mut output_writer = StreamWriter::new(Path::new(output_path))?;
+        let output = output_writer.output_mut();
+
+        let stream_mapping: Vec<_> = {
+            let mut stream_index = 0usize;
+            input
+                .streams()
+                .iter()
+                .map(|stream| {
+                    let codec_type = stream.codecpar().codec_type();
+                    if !codec_type.is_video() && !codec_type.is_audio() && !codec_type.is_subtitle()
+                    {
+                        None
+                    } else {
+                        output.new_stream().set_codecpar(stream.codecpar().clone());
+                        stream_index += 1;
+                        Some(stream_index - 1)
+                    }
+                })
+                .collect()
+        };
+
+        output
+            .dump(0, utils::from_str(output_path).as_c_str())
+            .context("Dump output format context failed.")?;
+
+        output
+            .write_header(&mut None)
+            .context("Writer header failed.")?;
+
+        while let Some((in_stream, mut packet)) =
+            input_reader.read_packet().context("Read packet failed.")?
+        {
+            let input_stream_index = in_stream.index();
+            let Some(output_stream_index) = stream_mapping[input_stream_index] else {
+                continue;
+            };
+            {
+                let output_stream = &output.streams()[output_stream_index];
+                packet.rescale_ts(in_stream.time_base(), output_stream.time_base);
+                packet.set_stream_index(output_stream_index as i32);
+                packet.set_pos(-1);
+            }
+            output
+                .interleaved_write_frame(&mut packet)
+                .context("Interleaved write frame failed.")?;
+        }
+
+        output.write_trailer().context("Write trailer failed.")
     }
 
     #[test]

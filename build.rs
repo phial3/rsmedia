@@ -6,24 +6,25 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
     match target_os.as_str() {
-        "macos" | "darwin" => configure_macos(),
+        "macos" => configure_macos(&target_arch),
         "linux" => configure_linux(&target_arch),
         "windows" => configure_windows(&target_arch),
         _ => panic!("Unsupported operating system"),
     }
 }
 
+#[allow(dead_code)]
 static FFMPEG_LIBS: [&str; 7] = [
     "avutil",
     "avcodec",
     "avdevice",
     "avfilter",
     "avformat",
-    "swresample",
     "swscale",
+    "swresample",
 ];
 
-fn configure_macos() {
+fn configure_macos(_target_arch: &str) {
     println!("cargo:rustc-link-lib=dylib=c");
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=pthread");
@@ -55,6 +56,42 @@ fn configure_linux(target_arch: &str) {
     };
     for path in arch_specific_paths {
         println!("cargo:rustc-link-search=native={}", path);
+    }
+
+    // 1. To link prebuilt libraries:
+    // Dynamic linking with pre-built dylib:
+    // Set `FFMPEG_DLL_PATH` to the path of dll or so files. (Windows: Put corresponding .lib file next to the .dll file.)
+    //
+    // Static linking with pre-built static lib:
+    // Set `FFMPEG_LIBS_DIR` to the path of FFmpeg pre-built libs directory.
+    //
+    // 2. To generate bindings:
+    // Compile-time binding generation(requires the Clang dylib):
+    // Set `FFMPEG_INCLUDE_DIR` to the path of the header files for binding generation.
+    //
+    // Use your prebuilt binding:
+    // Set `FFMPEG_BINDING_PATH` to the pre-built binding file.
+    // The pre-built binding is usually copied from the OUT_DIR of the compile-time binding generation,
+    // using it will prevent the need to regenerate the same binding file repeatedly.
+    //
+    // ffmpeg libs
+    #[cfg(target_os = "linux")]
+    for lib in FFMPEG_LIBS.iter() {
+        // println!("cargo:rustc-link-lib={}", lib);
+        match pkg_config::probe_library(format!("lib{}", lib).as_str()) {
+            Ok(lib_info) => {
+                println!("Found library: {}", lib);
+                for path in lib_info.include_paths.iter() {
+                    println!("Include path: {:?}", path);
+                }
+                for path in lib_info.link_paths.iter() {
+                    println!("Library path: {:?}", path);
+                }
+            }
+            Err(e) => {
+                panic!("Could not find {} via pkg-config: {:?}", lib, e);
+            }
+        }
     }
 
     // common
@@ -95,7 +132,6 @@ fn configure_windows(target_arch: &str) {
     }
 
     let (triplet, lib_path) = found_triplet.expect("No valid vcpkg triplets found!");
-    let is_static = triplet.contains("static");
 
     // 添加 vcpkg 库路径
     println!("cargo:rustc-link-search=native={}", lib_path.display());
@@ -109,12 +145,15 @@ fn configure_windows(target_arch: &str) {
         println!("cargo:rustc-link-arg=/DEFAULTLIB:msvcrt.lib");
     }
 
-    for lib in FFMPEG_LIBS.iter() {
-        if is_static {
-            println!("cargo:rustc-link-lib=static={}", lib);
-        } else {
+    println!("Using vcpkg on Windows.");
+    #[cfg(target_os = "windows")]
+    {
+        for lib in FFMPEG_LIBS.iter() {
             println!("cargo:rustc-link-lib={}", lib);
         }
+
+        vcpkg::find_package("ffmpeg")
+            .expect("Failed to find ffmpeg libs by vcpkg, please ensure vcpkg is installed.");
     }
 
     // Windows 系统库

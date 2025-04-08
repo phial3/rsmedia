@@ -4,6 +4,7 @@ pub mod encode;
 pub mod frame;
 #[cfg(feature = "ndarray")]
 pub use frame::MediaFrame;
+pub mod codec;
 pub mod colors;
 pub mod filter;
 pub mod flags;
@@ -31,8 +32,10 @@ pub use location::{Location, Url};
 pub use options::Options;
 pub use pixel::PixelFormat;
 pub use resize::Resize;
-pub use rsmpeg::ffi::AVRational;
 pub use time::Time;
+
+/// Re-export internal `AVRational` for caller to use.
+pub use rsmpeg::ffi::AVRational;
 
 /// Re-export internal `AvFrame` for caller to use.
 pub type RawFrame = rsmpeg::avutil::AVFrame;

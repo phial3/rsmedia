@@ -1,8 +1,8 @@
 use crate::pixel::PixelFormat;
-use crate::{MediaType, SampleFormat};
+use crate::{time, MediaType, SampleFormat};
 
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
-use rsmpeg::{avutil, ffi};
+use rsmpeg::ffi;
 
 use anyhow::{Context, Error, Result};
 use yuvutils_rs::{
@@ -256,7 +256,7 @@ where
             frame.set_format(self.format);
             frame.set_nb_samples(self.nb_samples as i32);
             frame.set_sample_rate(self.sample_rate as i32);
-            time_base = avutil::ra(1, self.sample_rate as i32);
+            time_base = time::new_rational(1, self.sample_rate as i32);
             frame.set_ch_layout(
                 AVChannelLayout::from_nb_channels(self.nb_channels as i32).into_inner(),
             );
@@ -274,11 +274,11 @@ where
 
     pub fn convert_rgb_to_yuv(&self) -> Result<Self> {
         if self.media_type != MediaType::VIDEO {
-            return Err(anyhow::anyhow!("只有视频帧可以进行颜色空间转换"));
+            return Err(Error::msg("Only video frames can be color space converted"));
         }
 
         if self.format != ffi::AV_PIX_FMT_RGB24 {
-            return Err(anyhow::anyhow!("仅支持RGB24格式的视频帧"));
+            return Err(Error::msg("Only RGB24 format video frames are supported"));
         }
 
         let height = self.height;
@@ -330,7 +330,7 @@ where
             matrix,
             YuvConversionMode::Professional,
         )
-        .map_err(|e| anyhow::anyhow!("YUV转换错误: {:?}", e))?;
+        .map_err(|e| Error::msg(format!("convert rgb24 to yuv420p error:{}", e)))?;
 
         // 6. 构建YUV数据
         let mut yuv_data = ndarray::Array3::<T>::zeros((height, width, 3));
@@ -373,11 +373,11 @@ where
 
     pub fn convert_yuv_to_rgb(&self) -> Result<Self> {
         if self.media_type != MediaType::VIDEO {
-            return Err(anyhow::anyhow!("只有视频帧可以进行颜色空间转换"));
+            return Err(Error::msg("Only video frames can be color space converted"));
         }
 
         if self.format != ffi::AV_PIX_FMT_YUV420P {
-            return Err(anyhow::anyhow!("仅支持YUV420P格式的视频帧"));
+            return Err(Error::msg("Only YUV420P format video frames are supported"));
         }
 
         let height = self.height;
@@ -437,7 +437,7 @@ where
             YuvRange::Full,
             matrix,
         )
-        .map_err(|e| anyhow::anyhow!("RGB转换错误: {:?}", e))?;
+        .map_err(|e| Error::msg(format!("convert yuv420p to rgb24 error:{}", e)))?;
 
         // 6. 构建RGB数据
         let mut rgb_data = ndarray::Array3::<T>::zeros((height, width, 3));
@@ -1339,7 +1339,6 @@ mod tests {
     /// frame_size = nb_samples * bytes_per_sample
     /// 每个通道分别: 1024 * 4 = 4096 bytes
     #[test]
-    #[ignore = "CI linux ffmpeg 7: AVFrame buffer allocating with incorrect parameters. (-22)"]
     fn test_audio_planar_frame_conversion() -> Result<()> {
         let nb_channels = 2;
         let nb_samples = 1024;
@@ -1426,7 +1425,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CI linux ffmpeg 7: AVFrame buffer allocating with incorrect parameters. (-22)"]
     fn test_audio_interleaved_frame_conversion() -> Result<()> {
         let nb_channels = 2;
         let nb_samples = 1024;
@@ -1498,7 +1496,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CI linux ffmpeg 7: AVFrame buffer allocating with incorrect parameters. (-22)"]
     fn test_get_audio_buffer() {
         let encoder = AVCodec::find_encoder(ffi::AV_CODEC_ID_AAC).unwrap();
         println!("aac sample_fmts:{:#?}", encoder.sample_fmts());

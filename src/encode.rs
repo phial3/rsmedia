@@ -1,3 +1,5 @@
+use crate::codec::CodecConfig;
+use crate::filter::FilterContext;
 use crate::flags::AvFormatFlags;
 #[cfg(feature = "ndarray")]
 use crate::frame::{MediaFrame, MediaFrameType};
@@ -8,7 +10,7 @@ use crate::{swctx, time};
 use crate::{utils, MediaType, RawFrame, SampleFormat, Writer};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket};
-use rsmpeg::avutil::{self, AVChannelLayout, AVChannelLayoutRef};
+use rsmpeg::avutil::{AVChannelLayout, AVChannelLayoutRef};
 use rsmpeg::ffi;
 
 use anyhow::{Context, Error, Result};
@@ -38,6 +40,7 @@ pub struct EncoderBuilder {
     media_type: MediaType,
     codec_name: Option<String>,
     codec_opts: Option<Options>,
+    filter: Option<FilterContext>,
     hw_device_config: Option<HWDeviceConfig>,
 }
 
@@ -146,7 +149,7 @@ impl EncoderBuilder {
     }
 
     pub fn with_frame_rate(mut self, num: i32, den: i32) -> Self {
-        self.frame_rate = avutil::ra(num, den);
+        self.frame_rate = time::new_rational(num, den);
         self
     }
 
@@ -157,7 +160,7 @@ impl EncoderBuilder {
     }
 
     pub fn with_time_base(mut self, num: i32, den: i32) -> Self {
-        self.time_base = avutil::ra(num, den);
+        self.time_base = time::new_rational(num, den);
         self
     }
 
@@ -168,7 +171,7 @@ impl EncoderBuilder {
     }
 
     pub fn with_pkt_time_base(mut self, num: i32, den: i32) -> Self {
-        self.pkt_time_base = avutil::ra(num, den);
+        self.pkt_time_base = time::new_rational(num, den);
         self
     }
 
@@ -193,6 +196,11 @@ impl EncoderBuilder {
     /// codec options used for encoder
     pub fn with_options(mut self, options: Option<Options>) -> Self {
         self.codec_opts = options;
+        self
+    }
+
+    pub fn with_filter(mut self, filter: Option<FilterContext>) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -244,7 +252,20 @@ impl EncoderBuilder {
     /// # Return value
     ///
     /// New encoder with settings applied.
-    fn setup_codec_context(&self, encoder: &mut AVCodecContext, media_type: MediaType) {
+    fn setup_codec_context(&self, encoder: &mut AVCodecContext) -> Result<()> {
+        let media_type = self.media_type;
+        if media_type as ffi::AVMediaType != encoder.codec_type {
+            return Err(Error::msg(format!(
+                "Encoder codec type not supported: {:?} vs. {:?}",
+                media_type, encoder.codec_type
+            )));
+        }
+
+        // Some formats want stream headers to be separate.
+        if self.oformat_flags & ffi::AVFMT_GLOBALHEADER as i32 != 0 {
+            encoder.set_flags(encoder.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
+        }
+
         if media_type == MediaType::VIDEO {
             encoder.set_width(self.width as i32);
             encoder.set_height(self.height as i32);
@@ -255,19 +276,25 @@ impl EncoderBuilder {
             encoder.set_time_base(self.time_base);
             encoder.set_pkt_timebase(self.pkt_time_base);
             encoder.set_pix_fmt(self.pixel_format.into());
-            encoder.set_sample_aspect_ratio(avutil::ra(1, 1));
+            encoder.set_sample_aspect_ratio(time::new_rational(1, 1));
         } else if media_type == MediaType::AUDIO {
             encoder.set_ch_layout(AVChannelLayout::from_nb_channels(self.nb_channels).into_inner());
             encoder.set_bit_rate(self.bit_rate);
             encoder.set_sample_rate(self.sample_rate);
-            encoder.set_time_base(avutil::ra(1, self.sample_rate));
+            encoder.set_time_base(time::new_rational(1, self.sample_rate));
             encoder.set_sample_fmt(self.sample_format as _);
         } else {
-            panic!("{}", format!("Unsupported media type:{:?}", media_type))
+            return Err(Error::msg(format!(
+                "Unsupported media type: {:?}",
+                media_type
+            )));
         }
+
         unsafe {
             (*encoder.as_mut_ptr()).thread_count = self.thread_count as i32;
         }
+
+        Ok(())
     }
 
     /// Build an [`Encoder`].
@@ -288,7 +315,12 @@ impl EncoderBuilder {
                 match media_type {
                     MediaType::VIDEO => Self::VIDEO_CODEC_NAME,
                     MediaType::AUDIO => Self::AUDIO_CODEC_NAME,
-                    _ => panic!("Unsupported media type, please specify codec name."),
+                    _ => {
+                        return Err(Error::msg(format!(
+                            "Unsupported media type:{:?}",
+                            media_type
+                        )))
+                    }
                 }
             };
             AVCodec::find_encoder_by_name(&utils::from_str(codec_name)).context(format!(
@@ -298,13 +330,8 @@ impl EncoderBuilder {
         };
 
         let mut encode_ctx = AVCodecContext::new(&codec);
-
-        // Some formats want stream headers to be separate.
-        if self.oformat_flags & ffi::AVFMT_GLOBALHEADER as i32 != 0 {
-            encode_ctx.set_flags(encode_ctx.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
-        }
-
-        self.setup_codec_context(&mut encode_ctx, media_type);
+        self.setup_codec_context(&mut encode_ctx)?;
+        let config = CodecConfig::new_with_ctx(&encode_ctx);
 
         let hw_context = self
             .hw_device_config
@@ -374,12 +401,13 @@ impl EncoderBuilder {
         };
 
         Ok(Encoder {
+            config,
             rescale,
             resample,
-            encode_ctx,
             hw_context,
             media_type,
-            frame_count: 0,
+            context: encode_ctx,
+            filter: self.filter,
             state: EncoderState::Normal,
             keyframe_interval: self.keyframe_interval,
         })
@@ -396,7 +424,7 @@ impl Default for EncoderBuilder {
             time_base: time::TIME_BASE,
             pkt_time_base: time::TIME_BASE,
             bit_rate: Self::VIDEO_BIT_RATE,
-            frame_rate: avutil::ra(Self::FRAME_RATE, 1),
+            frame_rate: time::new_rational(Self::FRAME_RATE, 1),
             keyframe_interval: Self::KEY_FRAME_INTERVAL,
             gop_size: 0,
             max_b_frames: 0,
@@ -410,13 +438,14 @@ impl Default for EncoderBuilder {
             thread_count: num_cpus::get(),
             codec_name: None,
             codec_opts: None,
+            filter: None,
             hw_device_config: None,
         }
     }
 }
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum EncoderState {
+enum EncoderState {
     Normal,
     Drained,
     Flushed,
@@ -443,14 +472,15 @@ pub enum EncoderState {
 ///     );
 /// ```
 pub struct Encoder {
-    encode_ctx: AVCodecContext,
+    config: CodecConfig,
+    context: AVCodecContext,
+    filter: Option<FilterContext>,
     hw_context: Option<Arc<HWContext>>,
     // video rescaling: (width, height, pixel_format)
     rescale: Option<(usize, usize, PixelFormat)>,
     // audio resampling: (nb_channels, sample_rate, sample_format)
     resample: Option<(usize, usize, SampleFormat)>,
     media_type: MediaType,
-    frame_count: u64,
     keyframe_interval: u64,
     state: EncoderState,
 }
@@ -521,12 +551,10 @@ impl Encoder {
     pub fn encode_raw(&mut self, raw_frame: RawFrame) -> Result<Option<AVPacket>> {
         log::info!("{:?}, time_base: {:?}", raw_frame, raw_frame.time_base);
 
-        // send frame to encoder
+        // send frame
         self.send_frame_to_encoder(Some(raw_frame))?;
 
-        // Increment frame count regardless of whether frame is written,
-        self.frame_count += 1;
-
+        // receive packet
         self.receive_packet()
     }
 
@@ -535,10 +563,19 @@ impl Encoder {
             (MediaType::VIDEO, Some(f)) => Some(self.process_video_frame(f)?),
             (MediaType::AUDIO, Some(f)) => Some(self.process_audio_frame(f)?),
             (_, None) => None,
-            _ => return Err(Error::msg("Invalid frame type")),
+            _ => return Err(Error::msg("Invalid media_type or frame.")),
         };
 
-        Ok(self.encode_ctx.send_frame(frame.as_ref())?)
+        //// filter
+        let filtered = if let Some(filter) = self.filter.as_mut() {
+            filter
+                .process_frame(frame)
+                .map_err(|e| Error::msg(format!("Filter failed: {}", e)))?
+        } else {
+            frame
+        };
+
+        Ok(self.context.send_frame(filtered.as_ref())?)
     }
 
     /// Internal: process a video frame (e.g., scale, convert, keyframe decision).
@@ -561,6 +598,25 @@ impl Encoder {
             frame
         };
 
+        // Check for encoding support for the given pixel format
+        self.config
+            .supported_pixel_formats()
+            .map_err(|_| Error::msg("Failed to get supported pixel formats"))?
+            .ok_or(Error::msg("No supported pixel formats found"))?
+            .contains(&scaled.format)
+            .then_some(())
+            .ok_or(Error::msg("Unsupported encode pixel format"))?;
+
+        // ensure frame rate matches encoder frame rate if supported rates are available
+        if let Some(rates) = self.config.supported_frame_rates()? {
+            assert!(
+                time::av_rational_contains(rates, &(self.context.framerate)),
+                "Unsupported frame rate - expected: {:?}, actual: {:?}",
+                rates,
+                self.context.framerate
+            );
+        }
+
         // ensure timebase matches encoder timebase
         // let dst_time_base = self.encode_ctx.time_base;
         // if scaled.pts != ffi::AV_NOPTS_VALUE {
@@ -570,7 +626,7 @@ impl Encoder {
         // }
 
         // Video Producer key frame every once in a while
-        if self.frame_count % self.keyframe_interval == 0 {
+        if self.context.frame_num % self.keyframe_interval as i64 == 0 {
             scaled.set_pict_type(ffi::AV_PICTURE_TYPE_I);
         }
 
@@ -579,7 +635,7 @@ impl Encoder {
             Some(hw_ctx) if hw_ctx.is_sw_frame(&scaled) => {
                 // sw_frame -> hw_frame
                 hw_ctx
-                    .hw_upload(&mut self.encode_ctx, &scaled)
+                    .hw_upload(&mut self.context, &scaled)
                     .map_err(|e| Error::msg(format!("HWContext failed to upload frame: {}", e)))?
             }
             _ => scaled.clone(),
@@ -593,7 +649,7 @@ impl Encoder {
     /// Ensures audio matches encoder sample rate, format, and channels.
     fn process_audio_frame(&mut self, frame: RawFrame) -> Result<RawFrame> {
         // resample frame if necessary
-        if let Some((nb_channels, sample_rate, dst_sample_fmt)) = self.resample {
+        let processed = if let Some((nb_channels, sample_rate, dst_sample_fmt)) = self.resample {
             let src_sample_rate = frame.sample_rate;
             let src_nb_channels = frame.ch_layout.nb_channels;
 
@@ -601,7 +657,7 @@ impl Encoder {
                 && src_sample_rate == sample_rate as i32
                 && frame.format == dst_sample_fmt as i32);
 
-            let out_frame = if is_resample_needed {
+            if is_resample_needed {
                 swctx::convert_frame(
                     &frame,
                     AVChannelLayout::from_nb_channels(nb_channels as i32).into_inner(),
@@ -610,50 +666,94 @@ impl Encoder {
                 )?
             } else {
                 frame
-            };
-
-            // ensure timebase matches encoder timebase
-            // let dst_time_base = self.encode_ctx.time_base;
-            // if src_pts != ffi::AV_NOPTS_VALUE {
-            //     let new_pts = avutil::av_rescale_q(src_pts, src_time_base, dst_time_base);
-            //     out_frame.set_pts(new_pts);
-            // }
-
-            Ok(out_frame)
+            }
         } else {
-            Ok(frame)
+            frame
+        };
+
+        // check supported channel layout
+        if let Some(channel_layouts) = self.config.supported_channel_layouts()? {
+            let ch = processed.ch_layout.nb_channels;
+            let channels = channel_layouts
+                .as_ref()
+                .iter()
+                .map(|l| l.nb_channels)
+                .collect::<Vec<_>>();
+            assert!(channels.contains(&ch), "Unsupported channel layout:{}", ch);
+        };
+
+        // check supported sample format
+        if let Some(sample_formats) = self.config.supported_sample_formats()? {
+            let fmt = processed.format;
+            assert!(
+                sample_formats.contains(&fmt),
+                "Unsupported sample format:{}",
+                fmt
+            );
+        };
+
+        // check supported sample rate
+        if let Some(sample_rates) = self.config.supported_sample_rates()? {
+            let rate = processed.sample_rate;
+            assert!(
+                sample_rates.contains(&rate),
+                "Unsupported sample rate:{}",
+                rate
+            );
+        };
+
+        // Number of samples per channel in an audio frame.
+        // encoding: set by libavcodec in avcodec_open2().
+        // Each submitted frame except the last must contain exactly frame_size samples per channel.
+        if !self.config.support_variable_frame_size() {
+            let expected = self.context.frame_size;
+            let actual = processed.nb_samples;
+            assert_eq!(
+                expected, actual,
+                "Unsupported variable frame size, expected: {}, actual: {}",
+                expected, actual
+            );
         }
+
+        // ensure timebase matches encoder timebase
+        // let dst_time_base = self.encode_ctx.time_base;
+        // if src_pts != ffi::AV_NOPTS_VALUE {
+        //     let new_pts = avutil::av_rescale_q(src_pts, src_time_base, dst_time_base);
+        //     out_frame.set_pts(new_pts);
+        // }
+
+        Ok(processed)
     }
 
     /// Get encoder time base.
     #[inline]
     pub fn time_base(&self) -> ffi::AVRational {
-        self.encode_ctx.time_base
+        self.context.time_base
     }
 
     #[inline]
     pub fn frame_rate(&self) -> ffi::AVRational {
-        self.encode_ctx.framerate
+        self.context.framerate
     }
 
     #[inline]
     pub fn sample_rate(&self) -> i32 {
-        self.encode_ctx.sample_rate
+        self.context.sample_rate
     }
 
     #[inline]
     pub fn width(&self) -> i32 {
-        self.encode_ctx.width
+        self.context.width
     }
 
     #[inline]
     pub fn height(&self) -> i32 {
-        self.encode_ctx.height
+        self.context.height
     }
 
     #[inline]
     pub fn pix_fmt(&self) -> PixelFormat {
-        self.encode_ctx.pix_fmt.into()
+        self.context.pix_fmt.into()
     }
 
     #[inline]
@@ -663,12 +763,12 @@ impl Encoder {
 
     #[inline]
     pub fn codecpar(&self) -> AVCodecParameters {
-        self.encode_ctx.extract_codecpar()
+        self.context.extract_codecpar()
     }
 
     #[inline]
     pub fn ch_layout(&self) -> AVChannelLayoutRef {
-        self.encode_ctx.ch_layout()
+        self.context.ch_layout()
     }
 
     /// Internal: Pull an encoded packet from the decoder.
@@ -679,7 +779,7 @@ impl Encoder {
     ///
     /// `Some(packet)` if a packet is returned, `None` if waiting or end.
     fn receive_packet(&mut self) -> Result<Option<AVPacket>> {
-        match self.encode_ctx.receive_packet() {
+        match self.context.receive_packet() {
             Ok(pkt) => Ok(Some(pkt)),
             Err(rsmpeg::error::RsmpegError::EncoderDrainError) => {
                 log::debug!("Encoder drained, try send new frame again.");
@@ -722,8 +822,15 @@ impl Encoder {
         // 如果编码器不支持延迟，那么就没有必要进行 flush 操作，因为在这种情况下，编码器不会保留任何未处理的数据。
         // 如果编码器支持延迟（delay），则在结束编码之前发送 EOS 包是有必要的，
         // 因为编码器可能还在缓冲一些数据，直到接收到 EOS 信号才会处理完这些数据并输出剩余的包。
-        if self.encode_ctx.codec().capabilities & ffi::AV_CODEC_CAP_DELAY as i32 == 0 {
+        if !self.config.support_delayed_frame() {
             return Ok(());
+        }
+
+        if let Some(filter) = self.filter.as_mut() {
+            let frames = filter.flush()?;
+            for frame in frames {
+                self.send_frame_to_encoder(Some(frame))?;
+            }
         }
 
         // EOF: Notify the encoder that the last frame has been sent.
@@ -789,9 +896,11 @@ unsafe impl Sync for Encoder {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::{self, FilterConfig, FilterParams, VideoParams};
     use crate::io::private::{Output, Write};
     use crate::stream::StreamInfo;
     use crate::StreamWriterBuilder;
+
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -996,33 +1105,55 @@ mod tests {
         };
 
         let codec_name = utils::from_str(&codec_name.unwrap_or_else(|| "libx264".to_string()));
-        let codec = AVCodec::find_encoder_by_name(&codec_name).expect("Failed to find encoder");
-
-        let supported_frame_rates = codec.supported_framerates().map(|rates| rates.to_vec());
-        let supported_pix_fmts = codec
-            .pix_fmts()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|&&fmt| fmt != ffi::AV_PIX_FMT_NONE)
-            .cloned()
-            .collect();
+        let codec_config = CodecConfig::new_with_name(&codec_name)?;
+        assert!(
+            codec_config.is_encoder(),
+            "Codec:'{:?}' is not an encoder.",
+            codec_name
+        );
 
         let config = VideoFormatParams {
             time_base,
-            codec_name: codec.name().to_str().unwrap().to_string(),
-            supported_frame_rates,
-            supported_pix_fmts,
+            codec_name: codec_name.to_str()?.to_string(),
+            supported_frame_rates: codec_config
+                .supported_frame_rates()?
+                .map(|fps| fps.to_vec()),
+            supported_pix_fmts: codec_config.supported_pixel_formats()?.unwrap().to_vec(),
             codec_options,
             format_options,
         };
 
+        // 视频编码参数
+        let width = 1280;
+        let height = 720;
+        let pix_fmt = PixelFormat::YUV420P;
+
+        let video_params = FilterParams::Video(VideoParams {
+            width,
+            height,
+            format: pix_fmt,
+            time_base: ffi::AVRational { num: 1, den: 25 },
+            frame_rate: ffi::AVRational { num: 25, den: 1 },
+            pixel_aspect: ffi::AVRational { num: 1, den: 1 },
+        });
+
+        let filters = vec![
+            filter::video::scale(1920, 1080, pix_fmt),
+            filter::video::drawtext("Watermark", 50, 50, 24, "white@0.5"),
+            filter::video::crop(0, 0, 640, 360),
+        ];
+
+        let video_filter_config = FilterConfig {
+            params: video_params,
+            filters,
+        };
+
         // 创建编码器
-        let width = 1280_usize;
-        let height = 720_usize;
-        let mut encoder = EncoderBuilder::new_video(width, height)
+        let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
             .with_time_base(time_base.0, time_base.1)
             .with_codec_name(Some(config.codec_name))
             .with_options(config.codec_options.map(|opts| opts.into()))
+            .with_filter(Some(FilterContext::new(video_filter_config)?))
             .build()?;
 
         // 确定输出路径和扩展名
@@ -1053,9 +1184,13 @@ mod tests {
         fn rainbow_frame(w: usize, h: usize, p: f32) -> MediaFrame<u8> {
             use crate::colors;
             let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
-            let mut frame =
-                MediaFrame::<u8>::new_video_frame(w, h, PixelFormat::RGB24, avutil::ra(1, 24))
-                    .unwrap();
+            let mut frame = MediaFrame::<u8>::new_video_frame(
+                w,
+                h,
+                PixelFormat::RGB24,
+                time::new_rational(1, 24),
+            )
+            .unwrap();
             for y in 0..h {
                 for x in 0..w {
                     frame.data[[y, x, 0]] = rgb[0];
@@ -1077,7 +1212,7 @@ mod tests {
         let duration = Time::new(Some(duration_units), actual_timebase);
 
         // 初始化position时使用正确的时间基
-        let mut position = Time::new(Some(0), avutil::ra(time_base.0, time_base.1));
+        let mut position = Time::new(Some(0), time::new_rational(time_base.0, time_base.1));
 
         println!(
             "Encoding {} with actual timebase: {}/{}, duration units: {}, fps: {}",
@@ -1086,7 +1221,7 @@ mod tests {
 
         // 帧编码并写入文件
         for i in 0..10 {
-            let mut frame = rainbow_frame(width, height, i as f32 / 10.0);
+            let mut frame = rainbow_frame(width as usize, height as usize, i as f32 / 10.0);
             frame.set_pts(
                 position
                     .aligned_with_rational(encoder.time_base())
