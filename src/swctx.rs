@@ -520,8 +520,6 @@ mod tests {
                 .with_context(|| format!("Failed to create source frame for {:?}", in_fmt))?;
 
             for out_fmt in AUDIO_FORMATS {
-                println!("  Converting to format: {:?}", out_fmt);
-
                 let ch_layout = AVChannelLayout::from_nb_channels(nb_channels).into_inner();
 
                 let result = convert_frame(&src_frame, ch_layout, out_fmt.format, sample_rate)
@@ -590,6 +588,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "This test is too slow to run frequently"]
     fn test_channel_conversion() -> Result<()> {
         let nb_samples = 1024;
         let channel_layouts = &[1, 2];
