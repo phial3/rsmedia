@@ -1,7 +1,6 @@
 use rsmedia::{
     mux::{Demuxer, Muxer},
-    EncoderBuilder, MediaType, Options, PixelFormat, SampleFormat, StreamReader,
-    StreamWriterBuilder,
+    EncoderBuilder, MediaType, Options, PixelFormat, SampleFormat, StreamWriterBuilder,
 };
 
 use std::path::Path;
@@ -19,8 +18,7 @@ fn main() {
     rsmedia::init().unwrap();
 
     let input_path = Path::new("/tmp/bear.mp4");
-    let stream_reader = StreamReader::new(input_path).unwrap();
-    let mut demuxer = Demuxer::from_reader(stream_reader, None, None).unwrap();
+    let mut demuxer = Demuxer::new(input_path).unwrap();
 
     let output_path = Path::new("/tmp/output.mov");
     let stream_writer = StreamWriterBuilder::new(output_path)
@@ -28,7 +26,7 @@ fn main() {
         .with_options(Some(Options::preset_avformat_fragmented_mov()))
         .build()
         .unwrap();
-    let mut muxer = Muxer::from_writer(stream_writer);
+    let mut muxer = Muxer::new_from_writer(stream_writer);
 
     // add all streams from input to output muxer
     for in_stream in demuxer.streams() {
@@ -54,8 +52,8 @@ fn main() {
                 // build audio encoder
                 EncoderBuilder::new_audio(
                     stream_info.bit_rate,
-                    stream_info.channel_layout.nb_channels as u32,
-                    stream_info.sample_rate as u32,
+                    stream_info.channel_layout.nb_channels,
+                    stream_info.sample_rate,
                     SampleFormat::from(stream_info.format),
                 )
                 .build()

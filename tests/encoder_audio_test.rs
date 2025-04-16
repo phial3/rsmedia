@@ -2,9 +2,7 @@
 mod tests {
     use anyhow::{Context, Result};
     use dasp::Signal;
-    use rsmedia::io::private::{Output, Write};
-    use rsmedia::stream::StreamInfo;
-    use rsmedia::{utils, EncoderBuilder, SampleFormat, StreamWriterBuilder};
+    use rsmedia::{filter, utils, EncoderBuilder, SampleFormat};
     use rsmpeg::avcodec::AVCodec;
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
     use rsmpeg::ffi;
@@ -485,29 +483,28 @@ mod tests {
         let sample_format = SampleFormat::from(audio_params.supported_sample_fmts[0]);
         let frame_size = audio_params.frame_size;
         let bitrate = audio_params.bitrate;
-        let channels = audio_params.channels as u32;
+        let channels = audio_params.channels;
 
         println!(
             "encode_audio type: {}, sample_rate: {}, sample_format: {:?}",
             container_type, sample_rate, sample_format
         );
 
+        let audio_filters = vec![
+            filter::audio::volume(1.2),                              // 音量提升
+            filter::audio::three_band_equalizer(3.0, 0.0, -2.0),     // 低音增强
+            filter::audio::compressor(3.0, Some(30.0), Some(200.0)), // 压缩器
+            filter::audio::highpass(80),                             // 切除80Hz以下低频噪声
+            filter::audio::atempo(1.25),                             // 加速25%
+        ];
+
         // 创建适合当前格式的编码器
         let mut encoder =
-            EncoderBuilder::new_audio(bitrate, channels, sample_rate as u32, sample_format)
+            EncoderBuilder::new_audio(bitrate, channels as i32, sample_rate, sample_format)
                 .with_codec_name(Some(audio_params.codec_name))
                 .with_options(audio_params.codec_options.map(|opts| opts.into()))
-                .build()?;
-
-        let mut stream_writer = StreamWriterBuilder::new(output_path)
-            .with_options(audio_params.format_options.map(|opts| opts.into()))
-            .build()?;
-        let audio_index = stream_writer.add_stream(encoder.codecpar(), encoder.time_base());
-        let stream_info = StreamInfo::from_writer(&stream_writer, audio_index)?;
-
-        // 写入文件头
-        stream_writer.write_header()?;
-
+                .with_filters(Some(audio_filters))
+                .build_wrapped(output_path)?;
         // 音频生成参数
         let duration_secs = 1.0; // 总时长5秒
         let total_samples = (duration_secs as i32 * sample_rate) as i64; // 总采样数
@@ -527,27 +524,7 @@ mod tests {
             // 设置精确时间戳
             frame.set_pts(frame_idx * frame_size as i64);
 
-            match encoder.encode_raw(frame.clone()) {
-                Ok(Some(mut packet)) => {
-                    packet.set_pos(-1);
-                    packet.set_stream_index(audio_index as i32);
-                    packet.rescale_ts(encoder.time_base(), stream_info.time_base);
-                    stream_writer.write_frame(&mut packet)?;
-                }
-                Ok(None) => {
-                    if encoder.is_drained() {
-                        println!("Encoder drained, try send new frame again.");
-                        continue;
-                    } else {
-                        println!("Encoder flushed, EOF reached.");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    println!("Encode error: {}", e);
-                    break;
-                }
-            }
+            encoder.encode_raw(frame.clone())?
         }
 
         // 处理剩余不足一帧的样本
@@ -558,27 +535,11 @@ mod tests {
             // 设置最后帧的时间戳
             frame.set_pts(total_samples - remaining as i64);
 
-            // write last frame
-            if let Some(mut packet) = encoder.encode_raw(frame)? {
-                packet.set_pos(-1);
-                packet.set_stream_index(audio_index as i32);
-                // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
-                // encode_ctx_timebase => out_stream_time_base
-                packet.rescale_ts(encoder.time_base(), stream_info.time_base);
-                stream_writer.write_frame(&mut packet)?;
-            }
+            encoder.encode_raw(frame)?
         }
 
         // flush encoder and write trailer
-        encoder.flush(
-            &mut stream_writer,
-            false,
-            audio_index,
-            stream_info.time_base,
-        )?;
-
-        // write trailer
-        stream_writer.write_trailer()?;
+        encoder.finish()?;
 
         Ok(())
     }

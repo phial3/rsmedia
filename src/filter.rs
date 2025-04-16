@@ -62,25 +62,67 @@ impl Filter {
     }
 }
 
+/// Escapes characters that are special within FFmpeg filtergraph descriptions.
+///
+/// This function prepends a backslash (`\`) to characters like `\`, `'`, `:`,
+/// `,`, `[`, `]`, and `=`. This is necessary when incorporating user-provided
+/// strings into filter parameters to prevent syntax errors or unexpected behavior.
+///
+/// Note: This implementation covers common cases. For extremely complex strings
+/// or direct use in `avfilter_graph_parse_ptr` with unquoted segments,
+/// FFmpeg's internal escaping might be more comprehensive (e.g., using
+/// `av_escape` or `av_bprint_escape`).
+fn escape_filter_str(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '\\' | '\'' | ':' | ',' | '[' | ']' | '=' => {
+                escaped.push('\\'); // Add the escape character
+                escaped.push(c); // Add the original character
+            }
+            _ => {
+                escaped.push(c); // Append regular characters directly
+            }
+        }
+    }
+    escaped
+}
+
 pub mod video {
     use super::*;
 
-    /// 缩放视频尺寸
-    pub fn scale(width: i32, height: i32, format: PixelFormat) -> Filter {
+    /// Scales video dimensions.
+    ///
+    /// `flags`: Optional SWS_FLAG string, Default is "fast_bilinear".
+    /// (e.g. "fast_bilinear", "bilinear", "bicubic", "experimental", "neighbor", "area",
+    /// "bicublin", "gauss", "sinc", "lanczos", "spline").
+    ///
+    /// See: <https://ffmpeg.org/ffmpeg-scaler.html#Scaler-Options>
+    pub fn scale(width: u32, height: u32, flags: Option<&str>) -> Filter {
+        let flags_str = flags.unwrap_or("fast_bilinear");
+
         Filter::new(
             "scale",
             MediaType::VIDEO,
-            format!(
-                "scale=w={}:h={},format={}",
-                width,
-                height,
-                format.get_pix_fmt_name()
-            ),
+            format!("scale=w={}:h={}:flags={}", width, height, flags_str),
         )
     }
 
-    /// 裁剪视频区域
-    pub fn crop(x: i32, y: i32, w: i32, h: i32) -> Filter {
+    /// Converts video pixel format.
+    /// `format`: <https://ffmpeg.org/ffmpeg-filters.html#format>
+    /// `aformat`: <https://ffmpeg.org/ffmpeg-filters.html#aformat-1.
+    pub fn format(format: PixelFormat) -> Filter {
+        Filter::new(
+            "format",
+            MediaType::VIDEO,
+            format!("format=pix_fmts={}", format.get_pix_fmt_name()),
+        )
+    }
+
+    /// Crops video to a specified rectangle.
+    /// `x` and `y` can be negative but runtime validation against input frame is better.
+    /// `w` and `h` must be positive.
+    pub fn crop(x: i32, y: i32, w: u32, h: u32) -> Filter {
         Filter::new(
             "crop",
             MediaType::VIDEO,
@@ -88,34 +130,63 @@ pub mod video {
         )
     }
 
-    /// 添加文字水印
-    pub fn drawtext(text: &str, x: i32, y: i32, fontsize: i32, fontcolor: &str) -> Filter {
+    /// Draws text on video. Requires `fontfile`.
+    pub fn drawtext(
+        text: &str,
+        x: i32,
+        y: i32,
+        fontfile: &str,
+        fontsize: u32,
+        fontcolor: &str,
+    ) -> Filter {
+        let escaped_text = escape_filter_str(text);
+        let escaped_font_file = escape_filter_str(fontfile);
         Filter::new(
             "drawtext",
             MediaType::VIDEO,
             format!(
-                "drawtext=text='{}':x={}:y={}:fontsize={}:fontcolor={}",
-                text, x, y, fontsize, fontcolor
+                "drawtext=text='{}':fontfile='{}':x={}:y={}:fontsize={}:fontcolor={}",
+                escaped_text, escaped_font_file, x, y, fontsize, fontcolor
             ),
         )
     }
 
     /// 画矩形框
-    pub fn drawbox(x: i32, y: i32, w: i32, h: i32, color: &str, thickness: i32) -> Filter {
+    pub fn drawbox(x: i32, y: i32, w: u32, h: u32, color: &str, thickness: i32) -> Filter {
+        if thickness < 0 {
+            // FFmpeg 't=fill' is also possible
+            log::warn!(
+                "Box thickness is negative ({}), using absolute value.",
+                thickness
+            );
+        }
         Filter::new(
             "drawbox",
             MediaType::VIDEO,
             format!(
                 "drawbox=x={}:y={}:w={}:h={}:color={}:t={}",
-                x, y, w, h, color, thickness
+                x,
+                y,
+                w,
+                h,
+                color,
+                thickness.abs()
             ),
         )
     }
 
-    /// <https://ffmpeg.org/ffmpeg-filters.html#transpose-1>
     /// transpose - 用于快速 90°/180°/270° 视频画面旋转、水平翻转或镜像翻转（无插值，高性能）
     /// mode: 0=逆时针90度/垂直翻转, 1=顺时针90度, 2=逆时针90度, 3=顺时针90度/垂直翻转
+    ///
+    /// Transposes video (rotates by multiples of 90 degrees and/or flips).
+    /// See `ffmpeg -filters` (search transpose) for valid modes.
+    ///
+    /// See: <https://ffmpeg.org/ffmpeg-filters.html#transpose-1>
     pub fn transpose(mode: i32) -> Filter {
+        // Common range is 0-3, but ffmpeg might support more
+        if !(0..=7).contains(&mode) {
+            log::warn!("Transpose mode {} might be invalid.", mode);
+        }
         Filter::new("transpose", MediaType::VIDEO, format!("transpose={}", mode))
     }
 
@@ -130,35 +201,49 @@ pub mod video {
         )
     }
 
-    /// 视频翻转
+    /// Flips video horizontally.
     pub fn hflip() -> Filter {
         Filter::new("hflip", MediaType::VIDEO, "hflip".to_string())
     }
+    /// Flips video vertically.
     pub fn vflip() -> Filter {
         Filter::new("vflip", MediaType::VIDEO, "vflip".to_string())
     }
 
     /// 视频淡入淡出
-    pub fn fade_in(frames: i32) -> Filter {
+    /// Fades video in from the start.
+    /// `duration_frames`: Fade duration in number of frames.
+    pub fn fade_in(duration_frames: u32) -> Filter {
         Filter::new(
             "fade",
             MediaType::VIDEO,
-            format!("fade=t=in:st=0:d={}", frames),
-        )
-    }
-    pub fn fade_out(start: i32, duration: i32) -> Filter {
-        Filter::new(
-            "fade",
-            MediaType::VIDEO,
-            format!("fade=t=out:st={}:d={}", start, duration),
+            format!("fade=t=in:st=0:d={}", duration_frames),
         )
     }
 
-    /// 视频锐化/模糊
+    /// Fades video out.
+    /// `start_frame`: Frame number to start the fade out.
+    /// `duration_frames`: Fade duration in number of frames.
+    pub fn fade_out(start_frame: u32, duration_frames: u32) -> Filter {
+        Filter::new(
+            "fade",
+            MediaType::VIDEO,
+            format!("fade=t=out:st={}:d={}", start_frame, duration_frames),
+        )
+    }
+
+    /// 视频锐化
+    /// Applies unsharp mask filter (default settings).
     pub fn unsharp() -> Filter {
+        // Add parameters if needed: lx, ly, la, cx, cy, ca
         Filter::new("unsharp", MediaType::VIDEO, "unsharp".to_string())
     }
+
+    /// 视频模糊
+    /// Applies box blur filter.
+    /// `luma_radius`: Radius of the luma blur.
     pub fn blur(radius: f32) -> Filter {
+        // Consider adding other boxblur params: luma_power, chroma_radius, chroma_power, alpha_radius, alpha_power
         Filter::new(
             "boxblur",
             MediaType::VIDEO,
@@ -176,14 +261,21 @@ pub mod video {
     }
 
     /// 帧率控制
-    pub fn fps(fps: i32) -> Filter {
+    pub fn fps(fps: f32) -> Filter {
         Filter::new("fps", MediaType::VIDEO, format!("fps={}", fps))
     }
 
     /// 修改时间戳表达式（加速、减速、对齐等）
     /// 典型值：`setpts=0.5*PTS`（2倍速），`1.5*PTS`（慢放）
+    /// Modifies presentation timestamp (PTS). Use with caution.
+    /// `expr`: FFmpeg expression (e.g., "0.5*PTS", "PTS-STARTPTS").
     pub fn setpts(expr: &str) -> Filter {
-        Filter::new("setpts", MediaType::VIDEO, format!("setpts={}", expr))
+        let escaped_expr = escape_filter_str(expr);
+        Filter::new(
+            "setpts",
+            MediaType::VIDEO,
+            format!("setpts={}", escaped_expr),
+        )
     }
 }
 
@@ -191,91 +283,113 @@ pub mod audio {
     use super::*;
 
     /// 创建音频重采样过滤器
-    pub fn resample(nb_channels: i32, sample_rate: i32, format: SampleFormat) -> Filter {
-        let channel_desc = AVChannelLayout::from_nb_channels(nb_channels)
+    pub fn resample(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
+        let channel_desc = AVChannelLayout::from_nb_channels(nb_channels as i32)
             .describe()
             .unwrap();
 
+        // async=1 might be better default for realtime to avoid buffer issues.
         let spec_str = format!(
-            "aresample=osr={}:async=0:ochl={}:osf={}",
+            "aresample=osr={}:osf={}:ochl={}:async=1",
             sample_rate,
+            format.get_sample_fmt_name(),
             channel_desc.to_string_lossy(),
-            format as i32,
         );
 
         Filter::new("resample", MediaType::AUDIO, spec_str)
     }
 
-    /// 音量调整
-    pub fn volume(val: f32) -> Filter {
-        Filter::new("volume", MediaType::AUDIO, format!("volume={}", val))
-    }
+    /// `aformat`: <https://ffmpeg.org/ffmpeg-filters.html#aformat-1.
+    pub fn format(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
+        let channel_desc = AVChannelLayout::from_nb_channels(nb_channels as i32)
+            .describe()
+            .unwrap();
 
-    /// 响度标准化
-    pub fn loudnorm(i: f32) -> Filter {
         Filter::new(
-            "loudnorm",
+            "aformat",
             MediaType::AUDIO,
-            format!("loudnorm=I={}:TP=-1.5:LRA=11", i),
+            format!(
+                "aformat=sample_fmts={}:sample_rates={}:channel_layouts={}",
+                format.get_sample_fmt_name(),
+                sample_rate,
+                channel_desc.to_string_lossy()
+            ),
         )
     }
 
+    /// 音量调整
+    /// Adjusts audio volume.
+    /// `volume`: Linear multiplier (1.0 is no change) or dB value (e.g., "-3dB").
+    pub fn volume(val: f32) -> Filter {
+        // FFmpeg volume filter can take linear scale or dB. Pass string directly.
+        // Validation could check if it's a number or ends with "dB".
+        Filter::new("volume", MediaType::AUDIO, format!("volume={}", val))
+    }
+
     /// 单频段均衡器
-    pub fn equalizer(frequency: i32, gain: f32, width: i32) -> Filter {
+    /// Applies a single-band peaking equalizer.
+    /// `frequency`: Center frequency in Hz.
+    /// `gain`: Gain in dB.
+    /// `width`: Bandwidth in Hz.
+    pub fn equalizer(frequency: i32, gain: f32, width: u32) -> Filter {
         Filter::new(
             "equalizer",
             MediaType::AUDIO,
             format!(
-                "equalizer=f={}:width_type=h:width={}:g={}",
+                "equalizer=f={}:width_type=h:width={}:g={}", // width_type=h (Hz)
                 frequency, width, gain
             ),
         )
     }
 
     /// 多频段均衡器 (bass, mid, treble)
+    /// Applies a simple 3-band equalizer using firequalizer.
+    /// See: <https://ffmpeg.org/ffmpeg-filters.html#firequalizer>
     pub fn three_band_equalizer(bass_gain: f32, mid_gain: f32, treble_gain: f32) -> Filter {
         Filter::new(
             "firequalizer",
             MediaType::AUDIO,
             format!(
-                "firequalizer=gain='if(lt(f,200),{},if(gt(f,5000),{},{}))':scale=log",
+                "firequalizer=gain='if(lt(f,200),{},if(gt(f,5000),{},{}))':scale=linlog",
                 bass_gain, treble_gain, mid_gain
             ),
         )
     }
 
-    /// 自定义多段均衡器
-    pub fn firequalizer(expr: &str) -> Filter {
-        Filter::new(
-            "firequalizer",
-            MediaType::AUDIO,
-            format!("firequalizer=gain='{}':scale=log", expr),
-        )
-    }
-
     /// 压缩器
-    pub fn compressor(threshold: f32, ratio: f32) -> Filter {
-        Filter::new(
-            "acompressor",
-            MediaType::AUDIO,
-            format!(
-                "acompressor=threshold={}:ratio={}:attack=200:release=1000",
-                threshold, ratio
-            ),
-        )
+    /// Applies dynamic range compression.
+    /// `ratio`: Compression ratio (1 - 20).
+    /// `attack`: Attack time in ms (optional, default 20).
+    /// `release`: Release time in ms (optional, default 250).
+    /// See: <https://ffmpeg.org/ffmpeg-filters.html#acompressor>
+    pub fn compressor(ratio: f32, attack: Option<f32>, release: Option<f32>) -> Filter {
+        if ratio < 1.0 {
+            panic!("{}", format!("Compressor ratio must be >= 1.0: {}", ratio));
+        }
+        let mut spec = format!("acompressor=ratio={}", ratio);
+        if let Some(a) = attack {
+            spec.push_str(&format!(":attack={}", a));
+        }
+        if let Some(r) = release {
+            spec.push_str(&format!(":release={}", r));
+        }
+        // Add other params: makeup, knee, link, detection, mix...
+        Filter::new("acompressor", MediaType::AUDIO, spec)
     }
 
     /// 高通滤波
-    pub fn highpass(freq: i32) -> Filter {
-        Filter::new("highpass", MediaType::AUDIO, format!("f={}", freq))
+    pub fn highpass(freq: u32) -> Filter {
+        Filter::new("highpass", MediaType::AUDIO, format!("highpass=f={}", freq))
     }
 
     /// 低通滤波
-    pub fn lowpass(freq: i32) -> Filter {
-        Filter::new("lowpass", MediaType::AUDIO, format!("f={}", freq))
+    pub fn lowpass(freq: u32) -> Filter {
+        Filter::new("lowpass", MediaType::AUDIO, format!("lowpass=f={}", freq))
     }
 
-    /// 音频变速（0.5~2.0）
+    /// 音频变速
+    /// Changes audio tempo without changing pitch.
+    /// * `rate`: Speed multiplier (0.5 to 100.0).
     pub fn atempo(rate: f32) -> Filter {
         Filter::new("atempo", MediaType::AUDIO, format!("atempo={}", rate))
     }
@@ -287,6 +401,9 @@ pub mod audio {
     }
 
     /// 创建FFT降噪过滤器
+    /// Applies FFT noise reduction (simple).
+    /// `noise_reduction`: Noise reduction factor in dB (e.g., 12).
+    /// `noise_floor`: Noise floor in dB (e.g., -50).
     pub fn fft_denoise(noise_reduction: i32, noise_floor: i32) -> Filter {
         Filter::new(
             "afftdn",
@@ -296,29 +413,55 @@ pub mod audio {
     }
 
     /// 创建高级FFT降噪过滤器
+    /// Applies FFT noise reduction (advanced).
+    /// `noise_reduction`: Noise reduction in dB.
+    /// `noise_floor`: Noise floor in dB.
+    /// `noise_type`: 'w', 'v', 'p', 'c', 's'. Default 'w'.
+    /// `time_smoothing`: Temporal smoothing factor. Default 0.
     pub fn advanced_fft_denoise(
         noise_reduction: i32,
         noise_floor: i32,
-        noise_type: &str,
-        time_smoothing: f32,
+        noise_type: Option<&str>,
+        time_smoothing: Option<f32>,
     ) -> Filter {
+        let nt = noise_type.unwrap_or("w");
+        let tr = time_smoothing.unwrap_or(0.0);
         Filter::new(
             "afftdn",
             MediaType::AUDIO,
             format!(
                 "afftdn=nr={}:nf={}:nt={}:tr={}",
-                noise_reduction, noise_floor, noise_type, time_smoothing
+                noise_reduction, noise_floor, nt, tr
             ),
         )
     }
 
     /// 创建自适应非局部均值降噪过滤器
-    pub fn anlm_denoise(strength: i32, patch_size: i32, search_range: i32) -> Filter {
-        Filter::new(
-            "anlmdn",
-            MediaType::AUDIO,
-            format!("anlmdn=s={}:p={}:r={}", strength, patch_size, search_range),
-        )
+    /// Applies Non-Local Means de-noising (anlmdn).
+    /// `strength`: Denoising strength (0 to inf, default 1e-05).
+    /// `patch_size`: Patch size (default 7).
+    /// `search_range`: Research range (default 15).
+    pub fn anlm_denoise(
+        strength: Option<f32>,
+        patch_size: Option<i32>,
+        search_range: Option<i32>,
+    ) -> Filter {
+        let mut params = Vec::new();
+        if let Some(s) = strength {
+            params.push(format!("s={}", s));
+        }
+        if let Some(p) = patch_size {
+            params.push(format!("p={}", p));
+        }
+        if let Some(r) = search_range {
+            params.push(format!("r={}", r));
+        }
+        let spec = if params.is_empty() {
+            "anlmdn".to_string()
+        } else {
+            format!("anlmdn={}", params.join(":"))
+        };
+        Filter::new("anlmdn", MediaType::AUDIO, spec)
     }
 }
 
@@ -326,17 +469,6 @@ pub mod audio {
 pub struct FilterFactory;
 
 impl FilterFactory {
-    /// format 转换
-    /// `format`: <https://ffmpeg.org/ffmpeg-filters.html#format>
-    /// `aformat`: <https://ffmpeg.org/ffmpeg-filters.html#aformat-1.
-    pub fn format(media_type: MediaType, fmt: &str) -> Filter {
-        if media_type == MediaType::AUDIO {
-            Filter::new("format", media_type, format!("aformat={}", fmt))
-        } else {
-            Filter::new("format", media_type, format!("format={}", fmt))
-        }
-    }
-
     /// 分支滤镜
     /// <https://ffmpeg.org/ffmpeg-filters.html#split_002c-asplit>
     pub fn split(media_type: MediaType, n: i32) -> Filter {
@@ -386,27 +518,48 @@ pub struct AudioParams {
 
 const DEFAULT_ORDERING: Ordering = Ordering::SeqCst;
 
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+enum FilterGraphState {
+    Normal,
+    Drained,
+    Flushed,
+}
+
 /// 过滤器图表 - 包含所有过滤器配置
 pub struct FilterGraph {
     graph: AVFilterGraph,
+    state: FilterGraphState,
     initialized: AtomicBool,
 }
 
 impl FilterGraph {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             graph: AVFilterGraph::new(),
+            state: FilterGraphState::Normal,
             initialized: AtomicBool::new(false),
         }
     }
 
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(DEFAULT_ORDERING)
+    }
+
+    pub fn is_drained(&self) -> bool {
+        self.state == FilterGraphState::Drained
+    }
+
+    pub fn is_flushed(&self) -> bool {
+        self.state == FilterGraphState::Flushed
+    }
+
     /// 初始化过滤器图表
     pub fn init(&mut self, params: &FilterParams, filters: &[Filter]) -> Result<()> {
-        if self.initialized.load(DEFAULT_ORDERING) {
+        if self.is_initialized() {
             return Err(Error::msg("Filter graph already initialized"));
         }
 
-        // 验证过滤器类型匹配
+        // check
         for filter in filters {
             if filter.media_type() != params.media_type() {
                 return Err(Error::msg(format!(
@@ -417,7 +570,7 @@ impl FilterGraph {
             }
         }
 
-        // 构建过滤器链
+        // build filters spec
         let filter_spec = filters
             .iter()
             .map(|f| f.spec())
@@ -542,7 +695,7 @@ impl FilterGraph {
 
     /// 处理单帧
     pub fn process_frame(&mut self, frame: Option<AVFrame>) -> Result<Option<AVFrame>> {
-        if !self.initialized.load(DEFAULT_ORDERING) {
+        if !self.is_initialized() {
             return Err(Error::msg("Filter graph not initialized"));
         }
 
@@ -551,21 +704,26 @@ impl FilterGraph {
             let mut src_ctx = self.get_src_context()?;
             src_ctx
                 .buffersrc_add_frame(frame, None)
-                .context("Error submitting the frame to the filter graph:")?;
+                .context("Error submitting the frame to the filter graph.")?;
         } // src_ctx is dropped here, releasing the mutable borrow
 
-        // safely get a new mutable borrow for sink_ctx
-        let mut sink_ctx = self.get_sink_context()?;
+        let filter_result = {
+            // safely get a new mutable borrow for sink_ctx
+            let mut sink_ctx = self.get_sink_context()?;
+            sink_ctx.buffersink_get_frame(None)
+        }; // sink_ctx is dropped here, releasing the mutable borrow
 
         // 获取处理后的帧
-        match sink_ctx.buffersink_get_frame(None) {
+        match filter_result {
             Ok(frame) => Ok(Some(frame)),
             Err(rsmpeg::error::RsmpegError::BufferSinkDrainError) => {
                 log::debug!("filter graph: buffer sink drain error");
+                self.state = FilterGraphState::Drained;
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::BufferSinkEofError) => {
-                log::debug!("filter graph: buffer sink eof error");
+                log::warn!("filter graph: buffer sink eof error");
+                self.state = FilterGraphState::Flushed;
                 Ok(None)
             }
             Err(e) => Err(Error::msg(format!(
@@ -577,8 +735,12 @@ impl FilterGraph {
 
     /// 刷新过滤器链
     pub fn flush(&mut self) -> Result<Vec<AVFrame>> {
-        if !self.initialized.load(DEFAULT_ORDERING) {
+        if !self.is_initialized() {
             return Err(Error::msg("Filter graph not initialized"));
+        }
+        if self.is_flushed() {
+            log::debug!("Filter graph already flushed.");
+            return Ok(Vec::new());
         }
 
         let mut frames = Vec::new();
@@ -586,8 +748,16 @@ impl FilterGraph {
         loop {
             match self.process_frame(None) {
                 Ok(Some(frame)) => frames.push(frame),
-                Ok(None) => break,
-                Err(e) => return Err(e),
+                Ok(None) => {
+                    if self.is_flushed() {
+                        break;
+                    }
+                    log::trace!("Filter graph draining during flush...");
+                }
+                Err(e) => {
+                    log::error!("Error encountered during filter graph flush: {}", e);
+                    return Err(e);
+                }
             }
         }
 
@@ -619,9 +789,10 @@ impl std::fmt::Debug for FilterGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "FilterGraph nb_filters:{}, initialized:{}",
+            "FilterGraph nb_filters:{}, initialized:{}, state:{:?}",
             self.graph.nb_filters,
-            self.initialized.load(DEFAULT_ORDERING)
+            self.is_initialized(),
+            self.state,
         )
     }
 }
@@ -635,20 +806,25 @@ pub struct FilterConfig {
 
 /// 流过滤器
 pub struct FilterContext {
-    config: FilterConfig,
-    graph: FilterGraph,
+    pub stream_index: usize,
+    pub config: FilterConfig,
+    pub graph: FilterGraph,
 }
 
 impl FilterContext {
     /// 为指定流添加过滤器
-    pub fn new(config: FilterConfig) -> Result<FilterContext> {
+    pub fn new(stream_index: usize, config: FilterConfig) -> Result<Self> {
         log::debug!("new filter context:{:?}", config);
 
         // 创建并初始化过滤器图表
         let mut graph = FilterGraph::new();
         graph.init(&config.params, &config.filters)?;
 
-        Ok(FilterContext { config, graph })
+        Ok(Self {
+            stream_index,
+            config,
+            graph,
+        })
     }
 
     /// 处理指定流的帧
@@ -665,6 +841,7 @@ impl FilterContext {
 impl std::fmt::Debug for FilterContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FilterContext")
+            .field("stream_index", &self.stream_index)
             .field("config", &self.config)
             .field("graph", &self.graph)
             .finish()

@@ -1,16 +1,13 @@
 use rsmedia::{
-    colors,
+    colors, filter,
     frame::MediaFrame,
-    io::private::{Output, Write},
-    stream::StreamInfo,
     time::{self, Time},
-    EncoderBuilder, PixelFormat, StreamWriter,
+    EncoderBuilder, PixelFormat,
 };
 
-use anyhow::Context;
 use std::path::Path;
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
@@ -22,61 +19,42 @@ fn main() {
 
     rsmedia::init().unwrap();
 
+    let filters = vec![
+        filter::video::scale(1920, 1080, Some("bicubic")),
+        filter::video::crop(100, 100, 1600, 900),
+        filter::video::drawtext("Watermark", 50, 50, "fonts/Arial.ttf", 24, "white@0.5"),
+        filter::video::hflip(),
+    ];
+
     let width = 1280;
     let height = 720;
-    let mut encoder = EncoderBuilder::new_video(width, height)
+    let output_path = Path::new("/tmp/rainbow.mp4");
+
+    let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
         // encoder with CUDA acceleration
         // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
         // libx264, libx265, h264_nvenc, h264_vaapi
         // .with_codec_name(Some("h264_nvenc".to_string()))
         // .with_options(Some(Options::preset_h264_nvenc()))
-        .build()
+        .with_filters(Some(filters))
+        .build_wrapped(output_path)
         .expect("failed to create encoder");
-
-    let output_path = Path::new("/tmp/rainbow.mp4");
-    let mut stream_writer = StreamWriter::new(output_path).unwrap();
-    let video_index = stream_writer.add_stream(encoder.codecpar(), encoder.time_base().into());
-    let stream_info = StreamInfo::from_writer(&stream_writer, video_index).unwrap();
-
-    // Write the header to the output file.
-    stream_writer.write_header().unwrap();
 
     let duration: Time = Time::from_nth_of_a_second(24);
     let mut position = Time::zero();
 
     for i in 0..256 {
         // This will create a smooth rainbow animation video!
-        let mut frame = rainbow_frame(width, height, i as f32 / 256.0);
+        let mut frame = rainbow_frame(width as usize, height as usize, i as f32 / 256.0);
+
         frame.set_pts(
             position
                 .aligned_with_rational(encoder.time_base())
                 .into_value()
                 .unwrap(),
         );
-        match encoder.encode(frame) {
-            Ok(Some(mut packet)) => {
-                packet.set_pos(-1);
-                packet.set_stream_index(video_index as i32);
-                packet.rescale_ts(encoder.time_base(), stream_info.time_base);
-                stream_writer
-                    .write_frame(&mut packet)
-                    .context("failed to write frame")
-                    .unwrap();
-            }
-            Ok(None) => {
-                if encoder.is_drained() {
-                    println!("Encoder drained, try send new frame again.");
-                    continue;
-                } else {
-                    println!("Encoder flushed, EOF reached.");
-                    break;
-                }
-            }
-            Err(e) => {
-                println!("Error encoding frame: {:?}", e);
-                break;
-            }
-        }
+
+        encoder.encode(frame)?;
 
         println!("Encoded frame {} at position {}", i, position);
 
@@ -84,16 +62,9 @@ fn main() {
         position = position.aligned_with(duration).add();
     }
 
-    encoder
-        .flush(
-            &mut stream_writer,
-            false,
-            video_index,
-            stream_info.time_base,
-        )
-        .expect("failed to finish encoder");
+    encoder.finish()?;
 
-    stream_writer.write_trailer().unwrap();
+    Ok(())
 }
 
 fn rainbow_frame(width: usize, height: usize, p: f32) -> MediaFrame<u8> {
