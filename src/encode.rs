@@ -344,10 +344,8 @@ impl EncoderBuilder {
                     }
                 }
             };
-            AVCodec::find_encoder_by_name(&utils::from_str(codec_name)).context(format!(
-                "Failed to find encoder for codec: '{}'",
-                codec_name
-            ))?
+            AVCodec::find_encoder_by_name(&utils::from_str(codec_name))
+                .context(format!("Failed to find encoder by name: '{}'", codec_name))?
         };
 
         let mut encode_ctx = AVCodecContext::new(&codec);
@@ -362,20 +360,9 @@ impl EncoderBuilder {
             })
             .map(|cfg| {
                 // codec support or not for hardware acceleration
-                let hw_pixel = cfg
-                    .device_type
-                    .find_hw_pixel_format_with_codec(&codec)
-                    .ok_or_else(|| {
-                        let codec_name = utils::to_string(codec.name()).unwrap();
-                        Error::msg(format!(
-                            "Encoder with HW acceleration is not supported for codec: {codec_name}"
-                        ))
-                    })?;
-
                 log::info!(
-                    "Video Encoder with HW acceleration codec: {:?}, hw_pixel: {:?}, config: {:#?}",
+                    "Video Encoder with HW acceleration codec: {:?}, config: {:#?}",
                     codec.name(),
-                    PixelFormat::from(hw_pixel),
                     cfg
                 );
 
@@ -402,20 +389,21 @@ impl EncoderBuilder {
             let filter_params = match media_type {
                 MediaType::VIDEO => {
                     FilterParams::Video(VideoParams {
-                        width: self.width as i32, // 使用 Builder 的 width/height/format
+                        width: self.width as i32,
                         height: self.height as i32,
                         format: self.pixel_format,
-                        time_base: self.time_base, // 使用 Builder 的 time_base
+                        time_base: self.time_base,
                         frame_rate: self.frame_rate,
-                        pixel_aspect: time::new_rational(1, 1), // 默认
+                        pixel_aspect: time::new_rational(1, 1), // 默认 1:1
                     })
                 }
                 MediaType::AUDIO => {
+                    // 音频参数
                     FilterParams::Audio(AudioParams {
                         nb_channels: self.nb_channels,
                         sample_rate: self.sample_rate,
-                        format: self.sample_format, // 使用 Builder 的 format/rate/channels
-                        time_base: time::new_rational(1, self.sample_rate), // 基于 Builder 的 rate
+                        format: self.sample_format,
+                        time_base: time::new_rational(1, self.sample_rate),
                     })
                 }
                 _ => {
@@ -423,7 +411,7 @@ impl EncoderBuilder {
                 }
             };
             let mut graph = FilterGraph::new();
-            // 验证 Filter 链的媒体类型
+            // check Filter media type
             if !filters.iter().all(|f| f.media_type() == media_type) {
                 return Err(Error::msg(format!(
                     "Filter media type mismatch for encoder type {:?}",
@@ -583,45 +571,8 @@ impl Encoder {
     pub fn encode_raw(&mut self, frame: AVFrame) -> Result<Option<AVPacket>> {
         log::info!("{:?}, time_base: {:?}", frame, frame.time_base);
 
-        // reformat
-        let raw_frame = match self.media_type {
-            MediaType::VIDEO => {
-                if frame.width != self.width()
-                    || frame.height != self.height()
-                    || frame.format != self.pix_fmt().into()
-                {
-                    swctx::scale(&frame, self.width(), self.height(), self.pix_fmt())?
-                } else {
-                    frame
-                }
-            }
-            MediaType::AUDIO => {
-                let ch_layout = self.context.ch_layout;
-                if frame.sample_rate != self.sample_rate()
-                    || frame.format != self.sample_fmt() as i32
-                    || frame.ch_layout.nb_channels != ch_layout.nb_channels
-                {
-                    swctx::convert_frame(
-                        &frame,
-                        ch_layout,
-                        self.sample_fmt() as _,
-                        self.sample_rate(),
-                    )?
-                } else {
-                    frame
-                }
-            }
-            _ => {
-                // do nothing
-                return Err(Error::msg(format!(
-                    "Unsupported encode frame media type: {:?}",
-                    self.media_type
-                )));
-            }
-        };
-
         // send frame
-        self.send_frame_to_encoder(Some(raw_frame))?;
+        self.send_frame_to_encoder(Some(frame))?;
 
         // receive packet
         self.receive_packet()
@@ -657,15 +608,18 @@ impl Encoder {
                 frame.set_pict_type(ffi::AV_PICTURE_TYPE_I);
             }
 
-            // HW 上传 (如果需要)
+            // 3. 确保帧的格式匹配编码器要求
+            let scaled_frame = self.rescale(frame)?;
+
+            // 转换硬件帧
             let hw_frame = match self.hw_context.as_ref() {
-                Some(hw_ctx) if hw_ctx.is_sw_frame(&frame) => {
+                Some(hw_ctx) if hw_ctx.is_sw_frame(&scaled_frame) => {
                     // sw_frame -> hw_frame
                     hw_ctx
-                        .hw_upload(&mut self.context, &frame)
+                        .hw_upload(&mut self.context, &scaled_frame)
                         .context("Failed to upload frame to HW")?
                 }
-                _ => frame, // 不需要上传或已经是 HW frame
+                _ => scaled_frame, // 不需要上传或已经是 HW frame
             };
 
             Some(hw_frame)
@@ -680,10 +634,55 @@ impl Encoder {
             self.time_base()
         );
 
-        // c. 发送最终帧给编码器上下文
+        // 发送最终帧给编码器上下文
         self.context.send_frame(final_frame.as_ref())?;
 
         Ok(())
+    }
+
+    fn rescale(&self, frame: AVFrame) -> Result<AVFrame> {
+        let scaled_frame = match self.media_type {
+            MediaType::VIDEO => {
+                let target_sw_pix_fmt = if let Some(hw_ctx) = self.hw_context.as_ref() {
+                    hw_ctx.get_format(false).into()
+                } else {
+                    self.pix_fmt()
+                };
+
+                if frame.width != self.width()
+                    || frame.height != self.height()
+                    || frame.format != target_sw_pix_fmt.into()
+                {
+                    swctx::scale(&frame, self.width(), self.height(), target_sw_pix_fmt)?
+                } else {
+                    frame
+                }
+            }
+            MediaType::AUDIO => {
+                let ch_layout = self.ch_layout();
+                if frame.sample_rate != self.sample_rate()
+                    || frame.format != self.sample_fmt() as i32
+                    || frame.ch_layout.nb_channels != ch_layout.nb_channels
+                {
+                    swctx::convert_frame(
+                        &frame,
+                        ch_layout.clone().into_inner(),
+                        self.sample_fmt() as _,
+                        self.sample_rate(),
+                    )?
+                } else {
+                    frame
+                }
+            }
+            _ => {
+                // do nothing
+                return Err(Error::msg(format!(
+                    "Unsupported encode frame media type: {:?}",
+                    self.media_type
+                )));
+            }
+        };
+        Ok(scaled_frame)
     }
 
     /// Get encoder time base.
