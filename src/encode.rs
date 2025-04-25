@@ -278,8 +278,8 @@ impl EncoderBuilder {
             encoder.set_ch_layout(AVChannelLayout::from_nb_channels(self.nb_channels).into_inner());
             encoder.set_bit_rate(self.bit_rate);
             encoder.set_sample_rate(self.sample_rate);
-            encoder.set_time_base(time::new_rational(1, self.sample_rate));
             encoder.set_sample_fmt(self.sample_format as _);
+            encoder.set_time_base(time::new_rational(1, self.sample_rate));
         } else {
             return Err(Error::msg(format!(
                 "Unsupported media type: {:?}",
@@ -434,7 +434,6 @@ impl EncoderBuilder {
             filter_graph,
             context: encode_ctx,
             state: EncoderState::Normal,
-            keyframe_interval: self.keyframe_interval,
         })
     }
 }
@@ -502,7 +501,6 @@ pub struct Encoder {
     filter_graph: Option<FilterGraph>,
     hw_context: Option<Arc<HWContext>>,
     media_type: MediaType,
-    keyframe_interval: u64,
     state: EncoderState,
 }
 
@@ -579,7 +577,7 @@ impl Encoder {
     }
 
     fn send_frame_to_encoder(&mut self, frame_opt: Option<AVFrame>) -> Result<()> {
-        // 1. 应用 Filter Graph (如果存在)
+        // 1. Filter Graph
         let filtered_frame = if let Some(graph) = self.filter_graph.as_mut() {
             // 即便输入是 None (EOF flush), 也要调用 process_frame(None) 来驱动 Filter flush
             match graph.process_frame(frame_opt)? {
@@ -601,12 +599,12 @@ impl Encoder {
             frame_opt
         };
 
-        let final_frame = if let Some(mut frame) = filtered_frame {
-            // 2. 处理需要发送给编码器的帧 (可能是过滤后的，也可能是原始的，或者是 None)
+        let final_frame = if let Some(frame) = filtered_frame {
+            // 2. 处理需要发送给编码器的帧
             // 确保关键帧标记正确, *注意*：frame_num 在 send_frame 后才更新
-            if (self.context.frame_num + 1) % self.keyframe_interval as i64 == 0 {
-                frame.set_pict_type(ffi::AV_PICTURE_TYPE_I);
-            }
+            // if (self.context.frame_num + 1) % self.keyframe_interval as i64 == 0 {
+            //     frame.set_pict_type(ffi::AV_PICTURE_TYPE_I);
+            // }
 
             // 3. 确保帧的格式匹配编码器要求
             let scaled_frame = self.rescale(frame)?;
@@ -628,13 +626,17 @@ impl Encoder {
             None
         };
 
+        // check frame valid
+        self.check_frame(final_frame.as_ref())?;
+
         log::debug!(
-            "Send frame to encoder: {:?}, time_base: {:?}",
+            "Send frame to encoder: {:?}, time_base: {:?}, media_type: {:?}",
             final_frame,
-            self.time_base()
+            self.time_base(),
+            self.media_type()
         );
 
-        // 发送最终帧给编码器上下文
+        // finally
         self.context.send_frame(final_frame.as_ref())?;
 
         Ok(())
@@ -685,6 +687,76 @@ impl Encoder {
         Ok(scaled_frame)
     }
 
+    /// Check if the frame is valid for encoding.
+    fn check_frame(&self, frame: Option<&AVFrame>) -> Result<()> {
+        if frame.is_none() {
+            return Ok(());
+        }
+        let frame = frame.unwrap();
+        match self.media_type {
+            MediaType::VIDEO => {
+                let pix_fmts_opt = self.config.supported_pixel_formats()?;
+                if let Some(pix_fmts) = pix_fmts_opt {
+                    if !pix_fmts.contains(&frame.format) {
+                        return Err(Error::msg(format!(
+                            "Unsupported encode frame pixel format: {:?}",
+                            frame.format
+                        )));
+                    }
+                }
+            }
+
+            MediaType::AUDIO => {
+                let ch_layouts_opt = self.config.supported_channel_layouts()?;
+                if let Some(ch_layouts) = ch_layouts_opt {
+                    ch_layouts
+                        .iter()
+                        .find(|ch_layout| ch_layout.nb_channels == frame.ch_layout.nb_channels)
+                        .ok_or_else(|| {
+                            Error::msg(format!(
+                                "Unsupported encode frame channel layout: {:?}",
+                                frame.ch_layout
+                            ))
+                        })?;
+                }
+
+                let sample_fmts_opt = self.config.supported_sample_formats()?;
+                if let Some(sample_fmts) = sample_fmts_opt {
+                    if !sample_fmts.contains(&frame.format) {
+                        return Err(Error::msg(format!(
+                            "Unsupported encode frame sample format: {:?}",
+                            frame.format
+                        )));
+                    }
+                }
+
+                let sample_rates_opt = self.config.supported_sample_rates()?;
+                if let Some(sample_rates) = sample_rates_opt {
+                    if !sample_rates.contains(&frame.sample_rate) {
+                        return Err(Error::msg(format!(
+                            "Unsupported encode frame sample rate: {:?}",
+                            frame.sample_rate
+                        )));
+                    }
+                }
+
+                // variable frame size, do nothing
+                // if fixed frame size, require frame size
+                if !self.config.support_variable_frame_size()
+                    && frame.nb_samples != self.frame_size()
+                {
+                    return Err(Error::msg(format!(
+                        "Unsupported encode frame sample size: {:?}, expect {:?}",
+                        frame.nb_samples,
+                        self.frame_size()
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Get encoder time base.
     #[inline]
     pub fn time_base(&self) -> ffi::AVRational {
@@ -694,16 +766,6 @@ impl Encoder {
     #[inline]
     pub fn frame_rate(&self) -> ffi::AVRational {
         self.context.framerate
-    }
-
-    #[inline]
-    pub fn sample_rate(&self) -> i32 {
-        self.context.sample_rate
-    }
-
-    #[inline]
-    pub fn sample_fmt(&self) -> SampleFormat {
-        SampleFormat::from(self.context.sample_fmt)
     }
 
     #[inline]
@@ -721,6 +783,30 @@ impl Encoder {
         self.context.pix_fmt.into()
     }
 
+    /// Each submitted frame except the last must contain exactly frame_size samples per channel.
+    /// May be 0 when the codec has AV_CODEC_CAP_VARIABLE_FRAME_SIZE set, then the frame size is not restricted.
+    #[inline]
+    pub fn frame_size(&self) -> i32 {
+        self.context.frame_size
+    }
+
+    /// audio samples per second
+    #[inline]
+    pub fn sample_rate(&self) -> i32 {
+        self.context.sample_rate
+    }
+
+    /// audio sample format
+    #[inline]
+    pub fn sample_fmt(&self) -> SampleFormat {
+        SampleFormat::from(self.context.sample_fmt)
+    }
+
+    #[inline]
+    pub fn ch_layout(&self) -> AVChannelLayoutRef {
+        self.context.ch_layout()
+    }
+
     #[inline]
     pub fn media_type(&self) -> MediaType {
         self.media_type
@@ -729,11 +815,6 @@ impl Encoder {
     #[inline]
     pub fn codecpar(&self) -> AVCodecParameters {
         self.context.extract_codecpar()
-    }
-
-    #[inline]
-    pub fn ch_layout(&self) -> AVChannelLayoutRef {
-        self.context.ch_layout()
     }
 
     /// Internal: Pull an encoded packet from the decoder.

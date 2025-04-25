@@ -92,6 +92,12 @@ impl<W: Writer> Muxer<W> {
         }
     }
 
+    pub fn dump(&self, index: usize) -> Result<()> {
+        let mux_stream = self.get_stream(index)?;
+        println!("{:?}", mux_stream.stream_info);
+        Ok(())
+    }
+
     pub fn add_stream(&mut self, encoder: Encoder) -> Result<usize> {
         let stream_idx = self
             .writer
@@ -127,7 +133,7 @@ impl<W: Writer> Muxer<W> {
             match mux_stream.encoder.encode_raw(frame) {
                 Ok(Some(mut packet)) => {
                     packet.set_pos(-1);
-                    packet.set_stream_index(mux_stream.stream_index as i32);
+                    packet.set_stream_index(stream_idx as i32);
                     // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
                     // encode_ctx_timebase => out_stream_time_base
                     packet.rescale_ts(
