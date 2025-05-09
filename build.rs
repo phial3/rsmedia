@@ -14,14 +14,15 @@ fn main() {
 }
 
 #[allow(dead_code)]
-static FFMPEG_LIBS: [&str; 7] = [
-    "avutil",
-    "avcodec",
-    "avdevice",
-    "avfilter",
-    "avformat",
-    "swscale",
-    "swresample",
+static FFMPEG_LIBS: [&str; 8] = [
+    "libavutil",
+    "libavcodec",
+    "libavformat",
+    "libavdevice",
+    "libavfilter",
+    "libswscale",
+    "libswresample",
+    "libpostproc",
 ];
 
 fn configure_macos(_target_arch: &str) {
@@ -78,14 +79,11 @@ fn configure_linux(target_arch: &str) {
     #[cfg(target_os = "linux")]
     for lib in FFMPEG_LIBS.iter() {
         // println!("cargo:rustc-link-lib={}", lib);
-        match pkg_config::probe_library(format!("lib{}", lib).as_str()) {
+        match pkg_config::probe_library(lib) {
             Ok(lib_info) => {
                 println!("Found library: {}", lib);
-                for path in lib_info.include_paths.iter() {
-                    println!("Include path: {:?}", path);
-                }
                 for path in lib_info.link_paths.iter() {
-                    println!("Library path: {:?}", path);
+                    println!("cargo:rustc-link-search=native={}", path.display());
                 }
             }
             Err(e) => {
@@ -145,15 +143,35 @@ fn configure_windows(target_arch: &str) {
         println!("cargo:rustc-link-arg=/DEFAULTLIB:msvcrt.lib");
     }
 
-    println!("Using vcpkg on Windows.");
     #[cfg(target_os = "windows")]
     {
-        for lib in FFMPEG_LIBS.iter() {
-            println!("cargo:rustc-link-lib={}", lib);
+        let ffmpeg = vcpkg::find_package("ffmpeg")
+            .expect("Failed to find ffmpeg libs by vcpkg, please ensure vcpkg is installed.");
+
+        // 定义一个函数来处理库名称提取和链接
+        let rustc_link_libs = |libs: &[PathBuf], lib_type: &str| {
+            for lib in libs {
+                // 库的基本名称，不包含路径、前缀（如 "lib"）或扩展名（如 ".dll"、".lib"）
+                let lib_name = lib.file_stem().unwrap_or_default().to_string_lossy();
+                // 如果名称包含连字符（如 "avcodec-61"），只保留连字符前的部分
+                let lib_base_name = if let Some(idx) = lib_name.find('-') {
+                    lib_name[..idx].to_string()
+                } else {
+                    lib_name.to_string()
+                };
+                println!("cargo:rustc-link-lib={}={}", lib_type, lib_base_name);
+            }
+        };
+
+        if ffmpeg.is_static {
+            rustc_link_libs(&ffmpeg.found_libs, "static");
+        } else {
+            rustc_link_libs(&ffmpeg.found_dlls, "dylib");
         }
 
-        vcpkg::find_package("ffmpeg")
-            .expect("Failed to find ffmpeg libs by vcpkg, please ensure vcpkg is installed.");
+        for path in ffmpeg.link_paths {
+            println!("cargo:rustc-link-search=native={}", path.display());
+        }
     }
 
     // Windows 系统库
