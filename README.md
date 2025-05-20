@@ -89,13 +89,15 @@ Hardware acceleration:
 >
 > <https://github.com/zmwangx/rust-ffmpeg>
 >
-> <https://github.com/larksuite/rsmpeg>
->
 > <https://github.com/oddity-ai/video-rs>
+>
+> <https://github.com/YeautyYE/ez-ffmpeg>
 > 
 > <https://github.com/gcanat/video_reader-rs>
 >
 > <https://github.com/angelcam/rust-ac-ffmpeg>
+>
+> <https://github.com/larksuite/rsmpeg>
 
 
 ##  📦 Advanced usage
