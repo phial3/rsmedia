@@ -94,6 +94,8 @@ Hardware acceleration:
 > <https://github.com/oddity-ai/video-rs>
 > 
 > <https://github.com/gcanat/video_reader-rs>
+>
+> <https://github.com/angelcam/rust-ac-ffmpeg>
 
 
 ##  📦 Advanced usage
