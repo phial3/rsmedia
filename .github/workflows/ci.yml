@@ -22,33 +22,34 @@ jobs:
   build-linux:
     name: build / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: ubuntu-latest
-    container:
-      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu
-
-    env:
-      DOCKER_DEFAULT_PLATFORM: ${{ matrix.platform }}
-      FFMPEG_INCLUDE_DIR: /usr/local/include
-      FFMPEG_PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
 
     strategy:
       fail-fast: false
       matrix:
-        platform: ["linux/amd64", "linux/arm64"]
-        ffmpeg_version: ["6.1", "7.1"]
+        platform: ["linux/amd64"]
+        ffmpeg_version: ["6.1", "7.1", "8.0"]
         include:
           - ffmpeg_version: "6.1"
+            lib_subdir: "amd64"
+            file: "ffmpeg-6.1-linux-clang-default.tar.xz"
             feature: "ndarray,ffmpeg6,link_system_ffmpeg"
           - ffmpeg_version: "7.1"
+            lib_subdir: "amd64"
+            file: "ffmpeg-7.1-linux-clang-default.tar.xz"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+          - ffmpeg_version: "8.0"
+            lib_subdir: "amd64"
+            file: "ffmpeg-8.0-linux-clang-default.tar.xz"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
-          DEBIAN_FRONTEND=noninteractive apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          DEBIAN_FRONTEND=noninteractive sudo apt-get update
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends \
           nasm \
           yasm \
           curl \
@@ -63,6 +64,12 @@ jobs:
           binutils \
           pkg-config \
           llvm-dev \
+          libc++1 \
+          libva2 \
+          libva-drm2 \
+          libva-x11-2 \
+          libvdpau1 \
+          libxv1 \
           libclang-dev \
           linux-libc-dev \
           build-essential \
@@ -74,7 +81,9 @@ jobs:
           libdrm-dev \
           libv4l-dev \
           libx264-dev \
+          libx264-164 \
           libx265-dev \
+          libx265-199 \
           libzimg-dev \
           libdav1d-dev \
           libwebp-dev \
@@ -95,6 +104,7 @@ jobs:
           libfdk-aac-dev \
           libasound2-dev \
           libmp3lame-dev \
+          libmp3lame0 \
           libtwolame-dev \
           libjack-jackd2-dev \
           libopencore-amrnb-dev \
@@ -125,6 +135,7 @@ jobs:
           libsdl2-dev \
           liblzma-dev \
           libzvbi-dev \
+          libpostproc-dev \
           librubberband-dev \
           libfrei0r-ocaml-dev
 ## ffmpeg
@@ -136,10 +147,21 @@ jobs:
 ## libswscale-dev \
 ## libswresample-dev \
 
+      - name: Download FFmpeg-${{ matrix.ffmpeg_version }}
+        shell: bash
+        run: |
+          mkdir ffmpeg_home
+          curl -L "https://sourceforge.net/projects/avbuild/files/linux/${{ matrix.file }}/download" \
+          | tar xJf - --strip 1 -C ffmpeg_home
+          
+          echo "FFMPEG_INCLUDE_DIR=$PWD/ffmpeg_home/include" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$PWD/ffmpeg_home/lib/${{ matrix.lib_subdir }}/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/ffmpeg_home/lib/${{ matrix.lib_subdir }}" >> "$GITHUB_ENV"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: nightly
           components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
 
       - name: Clippy check
@@ -152,17 +174,33 @@ jobs:
         run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
 
   build-macos:
-    name: build / macos / latest ffmpeg
+    name: build / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ["macos/amd64"]
+        ffmpeg_version: ["6", "7", "8"]
+        include:
+          - ffmpeg_version: "6"
+            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+          - ffmpeg_version: "7"
+            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+          - ffmpeg_version: "8"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+
+    env:
+      FFMPEG_PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@${{ matrix.ffmpeg_version }}/lib/pkgconfig
+      FFMPEG_INCLUDE_DIR: /opt/homebrew/opt/ffmpeg@${{ matrix.ffmpeg_version }}/include
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: nightly
           components: rustfmt, clippy
 
       - name: Cache Cargo
@@ -174,17 +212,16 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install dependencies
-        run: |
-          brew install ffmpeg pkg-config
+        run: brew install pkg-config ffmpeg@${{ matrix.ffmpeg_version }}
 
       - name: Clippy check
-        run: cargo clippy --all --all-features -- -D warnings
+        run: cargo clippy --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
       - name: Build
-        run: cargo build --all --all-features --verbose
+        run: cargo build --no-default-features --features ${{ matrix.feature }} --verbose
 
       - name: Run Test
-        run: cargo test --all --all-features --verbose -- --nocapture
+        run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
 
   build-windows:
     name: build / windows-${{ matrix.config.vcpkg_triplet }} / ffmpeg-7.1
@@ -209,7 +246,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -222,7 +259,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: nightly
           components: rustfmt, clippy
           targets: ${{ matrix.config.target }}
 
@@ -301,22 +338,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: ["linux/amd64", "linux/arm64"]
-        ffmpeg_version: ["6.1", "7.1"]
+        platform: ["linux/amd64"]
+        ffmpeg_version: ["6.1", "7.1", "8.0"]
         include:
           - ffmpeg_version: "6.1"
             feature: "ndarray,ffmpeg6,link_system_ffmpeg"
           - ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+          - ffmpeg_version: "8.0"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
           DEBIAN_FRONTEND=noninteractive apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
           nasm \
           yasm \
           curl \
@@ -393,6 +432,7 @@ jobs:
           libsdl2-dev \
           liblzma-dev \
           libzvbi-dev \
+          libpostproc-dev \
           librubberband-dev \
           libfrei0r-ocaml-dev
 ## ffmpeg
@@ -407,7 +447,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: nightly
           components: rustfmt, clippy
 
       - name: Clippy
@@ -427,12 +467,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: nightly
           components: rustfmt
 
       - name: Rust fmt
