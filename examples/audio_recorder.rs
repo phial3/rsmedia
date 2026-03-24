@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Local;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
-use rodio::{Decoder, Sink};
+use rodio::{Decoder, DeviceSinkBuilder};
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::Path;
@@ -30,11 +30,11 @@ impl AudioRecorder {
             .default_input_device()
             .ok_or_else(|| anyhow::anyhow!("未找到输入设备"))?;
 
-        println!("使用输入设备: {}", device.name()?);
+        println!("使用输入设备: {}", device.description()?);
 
         let config: StreamConfig = device.default_input_config()?.into();
 
-        println!("采样率: {} Hz", config.sample_rate.0);
+        println!("采样率: {} Hz", config.sample_rate);
         println!("通道数: {}", config.channels);
 
         Ok(Self {
@@ -124,7 +124,7 @@ impl AudioRecorder {
     /// 保存录音到WAV文件
     pub fn save_to_wav(&self, filename: &str) -> Result<()> {
         let samples = self.recording_buffer.lock().unwrap();
-        let sample_rate = self.config.sample_rate.0 as i32;
+        let sample_rate = self.config.sample_rate as i32;
         let n_channels = self.config.channels;
 
         // 使用 wavers 的 write 函数保存 WAV 文件
@@ -259,15 +259,15 @@ impl RecordingController {
         println!("时长: {:.2} 秒", wav.duration());
 
         // 使用 rodio 播放音频
-        let stream_handle = rodio::OutputStreamBuilder::open_default_stream().unwrap();
-        let sink = Sink::connect_new(&stream_handle.mixer());
+        let stream_handle = DeviceSinkBuilder::open_default_sink().unwrap();
+        let player = rodio::Player::connect_new(stream_handle.mixer());
 
         let file = File::open(filename)?;
         let source = Decoder::new(BufReader::new(file))?;
-        sink.append(source);
+        player.append(source);
 
         println!("播放中... (按 Ctrl+C 停止)");
-        sink.sleep_until_end();
+        player.sleep_until_end();
         Ok(())
     }
 }

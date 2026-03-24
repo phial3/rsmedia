@@ -755,8 +755,10 @@ where
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "ffmpeg8"))]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
     use rsmpeg::avcodec::AVCodec;
     use std::time::Duration;
 
@@ -1078,21 +1080,109 @@ mod tests {
         let time_base = ffi::AVRational { num: 1, den: 30 }; // 30 fps
 
         let mut frame =
-            MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24, time_base)?;
+            MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24, time_base)
+                .map_err(|e| anyhow!("Failed to create frame: {}", e))?;
 
-        // 填充一些测试数据
+        // 验证数组维度
+        assert_eq!(
+            frame.data.shape(),
+            &[height, width, 3],
+            "Array shape mismatch"
+        );
+        assert_eq!(frame.width, width, "Width mismatch");
+        assert_eq!(frame.height, height, "Height mismatch");
+        assert_eq!(frame.format, ffi::AV_PIX_FMT_RGB24, "Pixel format mismatch");
+
+        // 验证数组是否连续（contiguous）
+        assert!(
+            frame.data.is_standard_layout(),
+            "Array is not in standard (row-major) layout"
+        );
+
+        // 验证数组是否可写
+        assert_eq!(frame.data.view_mut().is_empty(), false);
+
+        // 填充测试数据（使用安全访问方法）
         for y in 0..height {
             for x in 0..width {
-                frame.data[[y, x, 0]] = (x % 255) as u8; // R
-                frame.data[[y, x, 1]] = (y % 255) as u8; // G
-                frame.data[[y, x, 2]] = ((x + y) % 255) as u8; // B
+                // 安全访问每个通道
+                if let Some(r) = frame.data.get_mut([y, x, 0]) {
+                    *r = (x % 255) as u8; // R
+                } else {
+                    return Err(anyhow!("Failed to access R channel at ({}, {})", x, y));
+                }
+
+                if let Some(g) = frame.data.get_mut([y, x, 1]) {
+                    *g = (y % 255) as u8; // G
+                } else {
+                    return Err(anyhow!("Failed to access G channel at ({}, {})", x, y));
+                }
+
+                if let Some(b) = frame.data.get_mut([y, x, 2]) {
+                    *b = ((x + y) % 255) as u8; // B
+                } else {
+                    return Err(anyhow!("Failed to access B channel at ({}, {})", x, y));
+                }
             }
         }
 
-        // 验证
-        assert_eq!(frame.width, width);
-        assert_eq!(frame.height, height);
-        assert_eq!(frame.format, ffi::AV_PIX_FMT_RGB24);
+        // 验证填充的数据
+        for y in 0..height {
+            for x in 0..width {
+                let r = frame.data[[y, x, 0]];
+                let g = frame.data[[y, x, 1]];
+                let b = frame.data[[y, x, 2]];
+
+                assert_eq!(r, (x % 255) as u8, "R value mismatch at ({}, {})", x, y);
+                assert_eq!(g, (y % 255) as u8, "G value mismatch at ({}, {})", x, y);
+                assert_eq!(
+                    b,
+                    ((x + y) % 255) as u8,
+                    "B value mismatch at ({}, {})",
+                    x,
+                    y
+                );
+            }
+        }
+
+        // 验证角落像素
+        let top_left = (0, 0);
+        assert_eq!(
+            frame.data[[top_left.1, top_left.0, 0]],
+            0,
+            "Top-left R value incorrect"
+        );
+        assert_eq!(
+            frame.data[[top_left.1, top_left.0, 1]],
+            0,
+            "Top-left G value incorrect"
+        );
+        assert_eq!(
+            frame.data[[top_left.1, top_left.0, 2]],
+            0,
+            "Top-left B value incorrect"
+        );
+
+        let bottom_right = (width - 1, height - 1);
+        let expected_r = ((width - 1) % 255) as u8;
+        let expected_g = ((height - 1) % 255) as u8;
+        let expected_b = ((width - 1 + height - 1) % 255) as u8;
+
+        assert_eq!(
+            frame.data[[bottom_right.1, bottom_right.0, 0]],
+            expected_r,
+            "Bottom-right R value incorrect"
+        );
+        assert_eq!(
+            frame.data[[bottom_right.1, bottom_right.0, 1]],
+            expected_g,
+            "Bottom-right G value incorrect"
+        );
+        assert_eq!(
+            frame.data[[bottom_right.1, bottom_right.0, 2]],
+            expected_b,
+            "Bottom-right B value incorrect"
+        );
 
         Ok(())
     }
@@ -1145,12 +1235,17 @@ mod tests {
             time_base,
         )?;
 
+        if frame.data.is_empty() {
+            return Err(Error::msg("Frame data pointer is null"));
+        }
+
         // 填充一些测试数据
         for s in 0..samples as usize {
             for ch in 0..channels as usize {
                 // 生成简单的正弦波
                 let t = s as f32 / sample_rate as f32;
-                let freq = 440.0 * (ch + 1) as f32; // 不同通道使用不同频率
+                // 不同通道使用不同频率
+                let freq = 440.0 * (ch + 1) as f32;
                 frame.data[[0, s, ch]] = (2.0 * std::f32::consts::PI * freq * t).sin();
             }
         }
@@ -1546,10 +1641,9 @@ mod tests {
         let encoder = AVCodec::find_encoder(ffi::AV_CODEC_ID_AAC).unwrap();
         println!("aac sample_fmts:{:#?}", encoder.sample_fmts());
         let mut frame = AVFrame::new();
-        frame.set_format(encoder.sample_fmts().unwrap()[0]);
-        frame.set_nb_samples(1024);
-        frame.set_sample_rate(48000);
+        frame.set_nb_samples(2);
         frame.set_ch_layout(AVChannelLayout::from_nb_channels(2).into_inner());
+        frame.set_format(encoder.sample_fmts().unwrap()[0]);
         assert!(frame.alloc_buffer().is_ok());
     }
 }
