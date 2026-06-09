@@ -1530,8 +1530,8 @@ mod tests {
         assert_eq!(converted_frame.format, ffi::AV_SAMPLE_FMT_FLTP);
         assert_eq!(converted_frame.nb_samples, nb_samples);
         assert_eq!(converted_frame.sample_rate, sample_rate);
-        // assert_eq!(converted_frame.linesize, frame.linesize);
-        // assert_eq!(converted_frame.data.len(), frame.data.len());
+        assert_eq!(converted_frame.linesize, frame.linesize);
+        assert_eq!(converted_frame.data.len(), frame.data.len());
 
         // 验证转换后的数据
         unsafe {
@@ -1612,8 +1612,8 @@ mod tests {
         assert_eq!(converted_frame.format, ffi::AV_SAMPLE_FMT_FLT);
         assert_eq!(converted_frame.nb_samples, nb_samples);
         assert_eq!(converted_frame.sample_rate, sample_rate);
-        // assert_eq!(converted_frame.linesize, frame.linesize);
-        // assert_eq!(converted_frame.data.len(), frame.data.len());
+        assert_eq!(converted_frame.linesize, frame.linesize);
+        assert_eq!(converted_frame.data.len(), frame.data.len());
 
         // 验证转换后的数据
         unsafe {
