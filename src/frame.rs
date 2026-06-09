@@ -591,8 +591,9 @@ where
                 // 平面布局：每个声道单独存储
                 for ch in 0..channels {
                     let dst = std::slice::from_raw_parts_mut(frame.data[ch] as *mut T, samples);
-                    let src = &buffer[ch * samples..(ch + 1) * samples];
-                    dst.copy_from_slice(src);
+                    for s in 0..samples {
+                        dst[s] = buffer[s * channels + ch];
+                    }
                 }
             } else {
                 // 交错布局：单块内存存储所有声道
@@ -1524,7 +1525,7 @@ mod tests {
         // 验证数据
         let first_sample = media_frame.data.slice(ndarray::s![0, 0, ..]);
         println!("{:#?}", first_sample);
-        assert_eq!(first_sample.to_vec(), vec![0.0, 1.0 / total_samples as f32]);
+        assert_eq!(first_sample.to_vec(), vec![0.0f32, 1.0f32 / total_samples as f32]);
 
         let converted_frame = media_frame.to_avframe().unwrap();
         assert_eq!(converted_frame.format, ffi::AV_SAMPLE_FMT_FLTP);
@@ -1549,7 +1550,7 @@ mod tests {
                     let conv = converted_data[i];
                     let diff = (orig - conv).abs();
                     assert!(
-                        diff < 1.0,
+                        diff < 1e-6,
                         "Mismatch at channel {} sample {}: expected {}, got {}, diff {}",
                         ch,
                         i,
@@ -1588,7 +1589,7 @@ mod tests {
             let data = std::slice::from_raw_parts_mut(frame.data[0] as *mut f32, total_samples);
             for i in 0..data.len() {
                 // 交错格式本身就是按照样本点交错排列的
-                data[i] = (i / total_samples) as f32;
+                data[i] = i as f32 / total_samples as f32;
             }
         }
 
@@ -1606,7 +1607,7 @@ mod tests {
         // 验证数据
         let first_sample = media_frame.data.slice(ndarray::s![0, 0, ..]);
         println!("{:#?}", first_sample);
-        assert_eq!(first_sample.to_vec(), vec![0.0, 0.0]);
+        assert_eq!(first_sample.to_vec(), vec![0.0f32, 1.0f32 / total_samples as f32]);
 
         let converted_frame = media_frame.to_avframe().unwrap();
         assert_eq!(converted_frame.format, ffi::AV_SAMPLE_FMT_FLT);
