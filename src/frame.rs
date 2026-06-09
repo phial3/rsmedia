@@ -1525,7 +1525,10 @@ mod tests {
         // 验证数据
         let first_sample = media_frame.data.slice(ndarray::s![0, 0, ..]);
         println!("{:#?}", first_sample);
-        assert_eq!(first_sample.to_vec(), vec![0.0f32, 1.0f32 / total_samples as f32]);
+        assert_eq!(
+            first_sample.to_vec(),
+            vec![0.0f32, 1.0f32 / total_samples as f32]
+        );
 
         let converted_frame = media_frame.to_avframe().unwrap();
         assert_eq!(converted_frame.format, ffi::AV_SAMPLE_FMT_FLTP);
@@ -1607,7 +1610,10 @@ mod tests {
         // 验证数据
         let first_sample = media_frame.data.slice(ndarray::s![0, 0, ..]);
         println!("{:#?}", first_sample);
-        assert_eq!(first_sample.to_vec(), vec![0.0f32, 1.0f32 / total_samples as f32]);
+        assert_eq!(
+            first_sample.to_vec(),
+            vec![0.0f32, 1.0f32 / total_samples as f32]
+        );
 
         let converted_frame = media_frame.to_avframe().unwrap();
         assert_eq!(converted_frame.format, ffi::AV_SAMPLE_FMT_FLT);
