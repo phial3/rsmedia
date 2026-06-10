@@ -23,7 +23,7 @@ jobs:
     name: build / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: ubuntu-latest
     container:
-      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu
+      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404
       options: --pull always
 
     env:
@@ -35,7 +35,7 @@ jobs:
       fail-fast: false
       matrix:
         platform: ["linux/amd64"]
-        ffmpeg_version: ["6.1", "7.1", "8.1"]
+        ffmpeg_version: ["6.1.3", "7.1.2", "8.1.1"]
         include:
           - ffmpeg_version: "6.1"
             feature: "ndarray,ffmpeg6,link_system_ffmpeg"
