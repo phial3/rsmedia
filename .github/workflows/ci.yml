@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu
+      options: --pull always
 
     env:
       DOCKER_DEFAULT_PLATFORM: ${{ matrix.platform }}
@@ -153,6 +154,9 @@ jobs:
         with:
           toolchain: nightly
           components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
+
+      - name: Verify FFmpeg version
+        run: ffmpeg -version
 
       - name: Clippy check
         run: cargo clippy --all --no-default-features --features ${{ matrix.feature }} -- -D warnings
