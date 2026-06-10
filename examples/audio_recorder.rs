@@ -90,7 +90,7 @@ impl AudioRecorder {
         let running = Arc::clone(running);
 
         let stream = self.device.build_input_stream(
-            &self.config,
+            self.config.clone(),
             move |data: &[T], _: &_| {
                 if running.load(Ordering::SeqCst) {
                     let mut buffer = recording_buffer.lock().unwrap();

@@ -351,18 +351,20 @@ pub fn color_distance(c1: &Color, c2: Color) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ctor::ctor;
+    use dtor::dtor;
     use palette::chromatic_adaptation::AdaptInto;
     use palette::convert::{FromColorUnclamped, IntoColorUnclamped};
     use palette::{Hsl, IntoColor, Lab, LinSrgb, Oklab, Oklch, Srgb, Xyz};
 
     const OUTPUT_DIR: &str = "output";
 
-    #[ctor::ctor]
+    #[ctor(unsafe)]
     fn before() {
         std::fs::create_dir_all(OUTPUT_DIR).unwrap();
     }
 
-    #[ctor::dtor]
+    #[dtor(unsafe)]
     fn after() {
         std::fs::remove_dir_all(OUTPUT_DIR).unwrap();
     }

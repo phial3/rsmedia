@@ -1534,10 +1534,11 @@ mod tests {
         assert_eq!(converted_frame.format, ffi::AV_SAMPLE_FMT_FLTP);
         assert_eq!(converted_frame.nb_samples, nb_samples);
         assert_eq!(converted_frame.sample_rate, sample_rate);
-        assert_eq!(converted_frame.linesize, frame.linesize);
-        assert_eq!(converted_frame.data.len(), frame.data.len());
 
         // 验证转换后的数据
+        // 注：不比较 linesize / data.len()，因为 FFmpeg 7+ on Linux 的
+        // av_frame_get_buffer 会因 SIMD 对齐而 padding 出不同的 linesize 值；
+        // data 是固定大小数组 [u8; 8] 没有意义。改用逐采样点比较确保数据完整性。
         unsafe {
             for ch in 0..nb_channels as usize {
                 let original_data =
@@ -1619,10 +1620,11 @@ mod tests {
         assert_eq!(converted_frame.format, ffi::AV_SAMPLE_FMT_FLT);
         assert_eq!(converted_frame.nb_samples, nb_samples);
         assert_eq!(converted_frame.sample_rate, sample_rate);
-        assert_eq!(converted_frame.linesize, frame.linesize);
-        assert_eq!(converted_frame.data.len(), frame.data.len());
 
         // 验证转换后的数据
+        // 注：不比较 linesize / data.len()，因为 FFmpeg 7+ on Linux 的
+        // av_frame_get_buffer 会因 SIMD 对齐而 padding 出不同的 linesize 值；
+        // data 是固定大小数组 [u8; 8] 没有意义。改用逐采样点比较确保数据完整性。
         unsafe {
             let original_data =
                 std::slice::from_raw_parts(frame.data[0] as *const f32, total_samples);

@@ -23,15 +23,15 @@ link_system_ffmpeg = ["rsmpeg/link_system_ffmpeg", "pkg-config"]
 link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg", "vcpkg"]
 
 [dependencies]
-pix = "0.14"
+pix = "1.0"
 rgb = "0.8"
 yuv = { version = "0.8", features = ["rayon", "professional_mode"] }
 color = "0.3"
 colorous = "1.0"
-colorutils-rs = "0.7"
+colorutils-rs = "0.8"
 palette = "0.7"
 image = "0.25"
-imageproc = "0.26"
+imageproc = "0.27"
 num-traits = "0.2"
 anyhow = "1.0"
 log = "0.4"
@@ -49,11 +49,12 @@ rsmpeg = { git = "https://github.com/larksuite/rsmpeg", default-features = false
 libc = "0.2"
 camino = "1.2"
 chrono = "0.4"
-ringbuf = "0.4"
-ctor = "0.6"
+ringbuf = "0.5"
+ctor = "1.0"
+dtor = "1.0"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
 ab_glyph = "0.2"
-libblur = "0.23"
+libblur = "0.24"
 pic-scale = "0.7"
 fast_image_resize = "6.0"
 histogram_equalization = "0.2"
@@ -61,9 +62,9 @@ histogram_equalization = "0.2"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 ## sound & audio
-cpal = "0.17"
+cpal = "0.18"
 wavers = "1.5"
-rubato = "1.0"
+rubato = "3.0"
 dasp = { version = "0.11", features = ["all"] }
 rodio = { version = "0.22", features = ["symphonia-all", "tracing"] }
 
