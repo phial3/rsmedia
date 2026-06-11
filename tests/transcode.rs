@@ -483,8 +483,7 @@ pub fn transcode(
             *stream_index,
         )
         .context("Flushing filter failed")?;
-        flush_encoder(enc_ctx, &mut ofmt_ctx, *stream_index)
-            .context("Flushing encoder failed")?;
+        flush_encoder(enc_ctx, &mut ofmt_ctx, *stream_index).context("Flushing encoder failed")?;
     }
     ofmt_ctx.write_trailer()?;
     Ok(())

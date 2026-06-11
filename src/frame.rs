@@ -1100,7 +1100,10 @@ mod tests {
         );
 
         // 验证数组是否可写
-        assert!(!frame.data.view_mut().is_empty(), "Array should be writable");
+        assert!(
+            !frame.data.view_mut().is_empty(),
+            "Array should be writable"
+        );
 
         // 填充测试数据（使用安全访问方法）
         for y in 0..height {
@@ -1503,8 +1506,10 @@ mod tests {
         let total_samples = (nb_samples * nb_channels) as usize;
         unsafe {
             for ch in 0..nb_channels as usize {
-                let data =
-                    std::slice::from_raw_parts_mut(frame.data[ch].cast::<f32>(), nb_samples as usize);
+                let data = std::slice::from_raw_parts_mut(
+                    frame.data[ch].cast::<f32>(),
+                    nb_samples as usize,
+                );
                 for (i, sample) in data.iter_mut().enumerate() {
                     *sample = (i * nb_channels as usize + ch) as f32 / total_samples as f32;
                 }

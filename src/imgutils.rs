@@ -1145,11 +1145,7 @@ mod tests {
                 let row_ptr = y_ptr.add(y * y_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, width as usize);
                 for (x, &val) in row.iter().enumerate() {
-                    assert_eq!(
-                        val, 100,
-                        "YUV444P Y plane data mismatch at ({}, {})",
-                        x, y
-                    );
+                    assert_eq!(val, 100, "YUV444P Y plane data mismatch at ({}, {})", x, y);
                 }
             }
 
@@ -1160,11 +1156,7 @@ mod tests {
                 let row_ptr = u_ptr.add(y * u_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, width as usize);
                 for (x, &val) in row.iter().enumerate() {
-                    assert_eq!(
-                        val, 150,
-                        "YUV444P U plane data mismatch at ({}, {})",
-                        x, y
-                    );
+                    assert_eq!(val, 150, "YUV444P U plane data mismatch at ({}, {})", x, y);
                 }
             }
 
@@ -1175,11 +1167,7 @@ mod tests {
                 let row_ptr = v_ptr.add(y * v_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, width as usize);
                 for (x, &val) in row.iter().enumerate() {
-                    assert_eq!(
-                        val, 200,
-                        "YUV444P V plane data mismatch at ({}, {})",
-                        x, y
-                    );
+                    assert_eq!(val, 200, "YUV444P V plane data mismatch at ({}, {})", x, y);
                 }
             }
         }

@@ -83,7 +83,8 @@ fn hw_encode(config: &HwEncodeConfig<'_>) -> Result<()> {
     let hw_device_ctx = AVHWDeviceContext::create(config.device_type, None, None, 0)
         .context("Failed to create a VAAPI device")?;
 
-    let codec = AVCodec::find_encoder_by_name(config.encode_codec).context("Could not find encoder.")?;
+    let codec =
+        AVCodec::find_encoder_by_name(config.encode_codec).context("Could not find encoder.")?;
 
     let mut avctx = AVCodecContext::new(&codec);
 
