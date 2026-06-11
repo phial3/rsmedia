@@ -39,7 +39,7 @@ jobs:
     name: clippy / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: ${{ matrix.runner }}
     container:
-      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404
+      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404   # rottenberg/ffmpeg 8.1 开始有多平台镜像包，8.1 之前只有 amd64
       options: --pull always
 
     env:
@@ -60,18 +60,6 @@ jobs:
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
           - arch: linux/amd64
             runner: ubuntu-latest
-            ffmpeg_version: "8.1"
-            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
-          - arch: linux/arm64
-            runner: ubuntu-24.04-arm
-            ffmpeg_version: "6.1"
-            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
-          - arch: linux/arm64
-            runner: ubuntu-24.04-arm
-            ffmpeg_version: "7.1"
-            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-          - arch: linux/arm64
-            runner: ubuntu-24.04-arm
             ffmpeg_version: "8.1"
             feature: "ndarray,ffmpeg8,link_system_ffmpeg"
 
@@ -95,6 +83,7 @@ jobs:
           autoconf \
           automake \
           binutils \
+          xz-utils \
           pkg-config \
           llvm-dev \
           libc++1 \
@@ -234,16 +223,95 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libclang-dev \
-            clang \
-            cmake \
-            build-essential \
-            ca-certificates \
-            wget \
-            xz-utils
+          DEBIAN_FRONTEND=noninteractive apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          nasm \
+          yasm \
+          curl \
+          wget \
+          unzip \
+          gnupg \
+          clang \
+          cmake \
+          libtool \
+          autoconf \
+          automake \
+          binutils \
+          xz-utils \
+          pkg-config \
+          llvm-dev \
+          libc++1 \
+          libva2 \
+          libva-drm2 \
+          libva-x11-2 \
+          libvdpau1 \
+          libxv1 \
+          libclang-dev \
+          linux-libc-dev \
+          build-essential \
+          ca-certificates \
+          libva-dev \
+          libvpx-dev \
+          libaom-dev \
+          libass-dev \
+          libdrm-dev \
+          libv4l-dev \
+          libx264-dev \
+          libx264-164 \
+          libx265-dev \
+          libx265-199 \
+          libzimg-dev \
+          libdav1d-dev \
+          libwebp-dev \
+          libbluray-dev \
+          libtheora-dev \
+          libvidstab-dev \
+          libsvtav1-dev \
+          libxvidcore-dev \
+          libopenjp2-7-dev \
+          libgsm1-dev \
+          libsoxr-dev \
+          libopus-dev \
+          libpulse-dev \
+          libshine-dev \
+          libspeex-dev \
+          libbs2b-dev \
+          libvorbis-dev \
+          libfdk-aac-dev \
+          libasound2-dev \
+          libmp3lame-dev \
+          libmp3lame0 \
+          libtwolame-dev \
+          libjack-jackd2-dev \
+          libopencore-amrnb-dev \
+          libopencore-amrwb-dev \
+          libva-dev \
+          libdrm-dev \
+          libnuma-dev \
+          libvdpau-dev \
+          ocl-icd-opencl-dev \
+          libass-dev \
+          libxml2-dev \
+          libfribidi-dev \
+          libfreetype6-dev \
+          libfontconfig1-dev \
+          libssh-dev \
+          libzmq5-dev \
+          libssl-dev \
+          librtmp-dev \
+          libiec61883-dev \
+          libgnutls28-dev \
+          libsmbclient-dev \
+          libtiff-dev \
+          libpng-dev \
+          libraw-dev \
+          libjpeg-dev \
+          zlib1g-dev \
+          libsdl2-dev \
+          liblzma-dev \
+          libzvbi-dev \
+          libpostproc-dev \
+          librubberband-dev
 
       - name: Download FFmpeg
         run: |
