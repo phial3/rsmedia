@@ -640,7 +640,7 @@ mod tests {
                         in_fmt, in_rate, in_channels
                     );
 
-                    let src_frame = create_test_frame(&in_fmt, in_rate, in_channels, nb_samples)?;
+                    let src_frame = create_test_frame(in_fmt, in_rate, in_channels, nb_samples)?;
 
                     assert_eq!(src_frame.ch_layout.nb_channels, in_channels);
 

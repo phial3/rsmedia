@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tokio::task;
 
-const OUTPUT_DIR: &'static str = "output";
+const OUTPUT_DIR: &str = "output";
 static FRAME_COUNT: Lazy<Mutex<u32>> = Lazy::new(|| Mutex::new(0));
 static SAVE_TASKS: Lazy<Mutex<Vec<task::JoinHandle<()>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 

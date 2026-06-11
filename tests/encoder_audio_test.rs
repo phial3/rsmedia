@@ -37,7 +37,7 @@ mod tests {
     /// 获取特定音频格式的详细参数
     fn get_format_parameters(container_type: &str, requested_channels: usize) -> AudioFormatParams {
         // 限制在1-8通道范围内
-        let channels = requested_channels.max(1).min(8);
+        let channels = requested_channels.clamp(1, 8);
 
         // 1、通过 container_type 获取特定的编码器和默认比特率
         let (encoder_name, default_bitrate, codec_options, format_options) =
@@ -138,7 +138,7 @@ mod tests {
 
         // 2、通过编码器获取支持的参数
         let codec = AVCodec::find_encoder_by_name(&utils::from_str(encoder_name))
-            .expect(&format!("Failed to find encoder: {}", encoder_name));
+            .unwrap_or_else(|| panic!("Failed to find encoder: {}", encoder_name));
 
         // 获取视频相关参数
         let supported_frame_rates = codec.supported_framerates().map(|rates| rates.to_vec());
@@ -263,16 +263,14 @@ mod tests {
         if is_planar {
             // 平面格式处理
             let mut planar = Vec::with_capacity(channels * total_samples);
-            for ch in 0..channels {
-                planar.extend(convert_samples::<T>(&buffers[ch], sample_format));
+            for buf in &buffers {
+                planar.extend(convert_samples::<T>(buf, sample_format));
             }
             planar
         } else {
             let mut interleaved = Vec::with_capacity(total_samples * channels);
-            for i in 0..total_samples {
-                for ch in 0..channels {
-                    interleaved.push(buffers[ch][i]);
-                }
+            for samples in (0..total_samples).flat_map(|i| buffers.iter().map(move |b| b[i])) {
+                interleaved.push(samples);
             }
             convert_samples::<T>(&interleaved, sample_format)
         }

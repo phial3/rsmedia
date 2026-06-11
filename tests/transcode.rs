@@ -39,7 +39,7 @@ fn open_input_file(filename: &CStr) -> Result<(Vec<Option<AVCodecContext>>, AVFo
     let mut ifmt_ctx = AVFormatContextInput::open(filename)?;
     let mut stream_ctx = Vec::with_capacity(ifmt_ctx.nb_streams as usize);
 
-    for (i, input_stream) in ifmt_ctx.streams().into_iter().enumerate() {
+    for (i, input_stream) in ifmt_ctx.streams().iter().enumerate() {
         let codecpar = input_stream.codecpar();
         let codec_type = codecpar.codec_type();
         let dec_ctx = if codec_type.is_video() || codec_type.is_audio() {
@@ -466,29 +466,25 @@ pub fn transcode(
 
     // Flush the filter graph by pushing EOF packet to buffer_src_context.
     // Flush the encoder by pushing EOF frame to encode_context.
-    for filter_ctx in filter_ctx.iter_mut() {
-        match filter_ctx {
-            Some(FilteringContext {
-                dec_ctx: _,
-                enc_ctx,
-                stream_index,
-                buffersrc_ctx,
-                buffersink_ctx,
-            }) => {
-                filter_encode_write_frame(
-                    None,
-                    buffersrc_ctx,
-                    buffersink_ctx,
-                    enc_ctx,
-                    &mut ofmt_ctx,
-                    *stream_index,
-                )
-                .context("Flushing filter failed")?;
-                flush_encoder(enc_ctx, &mut ofmt_ctx, *stream_index)
-                    .context("Flushing encoder failed")?;
-            }
-            None => (),
-        }
+    for FilteringContext {
+        dec_ctx: _,
+        enc_ctx,
+        stream_index,
+        buffersrc_ctx,
+        buffersink_ctx,
+    } in filter_ctx.iter_mut().flatten()
+    {
+        filter_encode_write_frame(
+            None,
+            buffersrc_ctx,
+            buffersink_ctx,
+            enc_ctx,
+            &mut ofmt_ctx,
+            *stream_index,
+        )
+        .context("Flushing filter failed")?;
+        flush_encoder(enc_ctx, &mut ofmt_ctx, *stream_index)
+            .context("Flushing encoder failed")?;
     }
     ofmt_ctx.write_trailer()?;
     Ok(())

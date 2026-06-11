@@ -22,7 +22,7 @@ fn dump_frame(file: &CStr, out_dir: &str) -> Result<()> {
 
     let video_stream_index = input_format_context
         .streams()
-        .into_iter()
+        .iter()
         .position(|stream| stream.codecpar().codec_type().is_video())
         .context("No video stream")?;
 

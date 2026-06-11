@@ -158,8 +158,11 @@ jobs:
       - name: Verify FFmpeg version
         run: ffmpeg -version
 
-      - name: Clippy check
-        run: cargo clippy --all --no-default-features --features ${{ matrix.feature }} -- -D warnings
+      - name: Check
+        run: cargo check --all --all-targets --no-default-features --features ${{ matrix.feature }}
+
+      - name: Clippy
+        run: cargo clippy --all --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
       - name: Run Test
         run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
@@ -207,8 +210,11 @@ jobs:
       - name: Install dependencies
         run: brew install pkg-config ffmpeg@${{ matrix.ffmpeg_version }}
 
-      - name: Clippy check
-        run: cargo clippy --no-default-features --features ${{ matrix.feature }} -- -D warnings
+      - name: Check
+        run: cargo check --all --all-targets --no-default-features --features ${{ matrix.feature }}
+
+      - name: Clippy
+        run: cargo clippy --all --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
       - name: Run Test
         run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
@@ -258,11 +264,14 @@ jobs:
       - name: Verify FFmpeg version
         run: ffmpeg -version
 
-      - name: Clippy check
-        run: cargo clippy --no-default-features --features ${{ matrix.feature }} -- -D warnings
+      - name: Check
+        run: cargo check --all --all-targets --no-default-features --features ${{ matrix.feature }}
+
+      - name: Clippy
+        run: cargo clippy --all --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
       - name: Run Test
-        run: cargo test --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
+        run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
 
   lints:
     name: Rust fmt / ${{ matrix.os }}

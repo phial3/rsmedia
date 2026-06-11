@@ -1100,7 +1100,7 @@ mod tests {
         );
 
         // 验证数组是否可写
-        assert_eq!(frame.data.view_mut().is_empty(), false);
+        assert!(!frame.data.view_mut().is_empty(), "Array should be writable");
 
         // 填充测试数据（使用安全访问方法）
         for y in 0..height {
@@ -1271,7 +1271,7 @@ mod tests {
         // 填充测试数据
         unsafe {
             let data = std::slice::from_raw_parts_mut(
-                frame.data[0] as *mut u8,
+                frame.data[0].cast::<u8>(),
                 frame.height as usize * frame.width as usize * 3,
             );
             for (i, byte) in data.iter_mut().enumerate() {
@@ -1312,7 +1312,7 @@ mod tests {
         unsafe {
             // Y 平面 (全分辨率)
             let y_data = std::slice::from_raw_parts_mut(
-                frame.data[0] as *mut u8,
+                frame.data[0].cast::<u8>(),
                 height as usize * width as usize,
             );
             for (i, byte) in y_data.iter_mut().enumerate() {
@@ -1321,7 +1321,7 @@ mod tests {
 
             // U 平面 (1/4分辨率)
             let u_data = std::slice::from_raw_parts_mut(
-                frame.data[1] as *mut u8,
+                frame.data[1].cast::<u8>(),
                 (height as usize / 2) * (width as usize / 2),
             );
             for (i, byte) in u_data.iter_mut().enumerate() {
@@ -1330,7 +1330,7 @@ mod tests {
 
             // V 平面 (1/4分辨率)
             let v_data = std::slice::from_raw_parts_mut(
-                frame.data[2] as *mut u8,
+                frame.data[2].cast::<u8>(),
                 (height as usize / 2) * (width as usize / 2),
             );
             for (i, byte) in v_data.iter_mut().enumerate() {
@@ -1349,18 +1349,18 @@ mod tests {
         // 验证数据
         unsafe {
             // 验证 Y 分量
-            let y_val = *frame.data[0] as u8;
+            let y_val = *frame.data[0];
             assert_eq!(media_frame.data[[0, 0, 0]], y_val);
 
             // 验证 U 分量 (2x2块使用相同的值)
-            let u_val = *frame.data[1] as u8;
+            let u_val = *frame.data[1];
             assert_eq!(media_frame.data[[0, 0, 1]], u_val);
             assert_eq!(media_frame.data[[0, 1, 1]], u_val);
             assert_eq!(media_frame.data[[1, 0, 1]], u_val);
             assert_eq!(media_frame.data[[1, 1, 1]], u_val);
 
             // 验证 V 分量 (2x2块使用相同的值)
-            let v_val = *frame.data[2] as u8;
+            let v_val = *frame.data[2];
             assert_eq!(media_frame.data[[0, 0, 2]], v_val);
             assert_eq!(media_frame.data[[0, 1, 2]], v_val);
             assert_eq!(media_frame.data[[1, 0, 2]], v_val);
@@ -1504,9 +1504,9 @@ mod tests {
         unsafe {
             for ch in 0..nb_channels as usize {
                 let data =
-                    std::slice::from_raw_parts_mut(frame.data[ch] as *mut f32, nb_samples as usize);
-                for i in 0..data.len() {
-                    data[i] = (i * nb_channels as usize + ch) as f32 / total_samples as f32;
+                    std::slice::from_raw_parts_mut(frame.data[ch].cast::<f32>(), nb_samples as usize);
+                for (i, sample) in data.iter_mut().enumerate() {
+                    *sample = (i * nb_channels as usize + ch) as f32 / total_samples as f32;
                 }
             }
         }
@@ -1590,10 +1590,10 @@ mod tests {
         // data[0]: [L1 R1 L2 R2 L3 R3 ...] (左右声道交错)
         let total_samples = (nb_samples * nb_channels) as usize;
         unsafe {
-            let data = std::slice::from_raw_parts_mut(frame.data[0] as *mut f32, total_samples);
-            for i in 0..data.len() {
+            let data = std::slice::from_raw_parts_mut(frame.data[0].cast::<f32>(), total_samples);
+            for (i, sample) in data.iter_mut().enumerate() {
                 // 交错格式本身就是按照样本点交错排列的
-                data[i] = i as f32 / total_samples as f32;
+                *sample = i as f32 / total_samples as f32;
             }
         }
 

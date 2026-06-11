@@ -458,7 +458,7 @@ mod tests {
         // 中灰
         let [h, s, v] = rgb_to_hsv(128, 128, 128);
         assert_approx_eq!(s, 0.0);
-        assert_approx_eq!(v, 50.196078, 0.1); // 128/255 ≈ 50.196%
+        assert_approx_eq!(v, 50.2, 0.1); // 128/255 ≈ 50.2%
         assert_eq!(hsv_to_rgb(h, s, v), [128, 128, 128]);
     }
 

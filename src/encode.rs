@@ -1039,10 +1039,8 @@ impl<W: Writer> EncoderWrapper<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter;
 
     use std::collections::HashMap;
-    use std::path::Path;
 
     /// 定义视频格式参数结构体
     #[allow(dead_code)]
@@ -1077,7 +1075,9 @@ mod tests {
     /// | MPEG     | 1/90_000        | 90kHz，MPEG标准           |
     #[cfg(feature = "ndarray")]
     fn test_encode_video_for_container(container_type: &str, fps: f64) -> Result<()> {
+        use crate::filter;
         use crate::time::Time;
+        use std::path::Path;
 
         // 使用单一match获取基本参数
         let (codec_name, time_base, codec_options, format_options) = match container_type {
@@ -1344,6 +1344,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "ndarray")]
     #[test]
     #[rustfmt::skip]
     #[ignore = "ignore video output file"]
