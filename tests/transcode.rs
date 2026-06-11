@@ -105,7 +105,7 @@ fn open_output_file(
                 dec_ctx
                     .get_supported_pix_fmts(None)
                     .ok()
-                    .and_then(|x| x.get(0).copied())
+                    .and_then(|x| x.first().copied())
                     .unwrap_or(dec_ctx.pix_fmt),
             );
             enc_ctx.set_time_base(av_inv_q(dec_ctx.framerate));
@@ -119,7 +119,7 @@ fn open_output_file(
                 dec_ctx
                     .get_supported_sample_fmts(None)
                     .ok()
-                    .and_then(|x| x.get(0).copied())
+                    .and_then(|x| x.first().copied())
                     .unwrap_or(dec_ctx.sample_fmt),
             );
             enc_ctx.set_time_base(ra(1, dec_ctx.sample_rate));
@@ -290,7 +290,7 @@ fn init_filters(
 ) -> Result<Vec<Option<FilteringContext<'_>>>> {
     let mut filter_ctx = Vec::with_capacity(stream_contexts.len());
 
-    for (filter_graph, stream_context) in filter_graphs.iter_mut().zip(stream_contexts.into_iter())
+    for (filter_graph, stream_context) in filter_graphs.iter_mut().zip(stream_contexts)
     {
         let Some(stream_context) = stream_context else {
             filter_ctx.push(None);
