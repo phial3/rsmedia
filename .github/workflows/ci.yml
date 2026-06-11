@@ -214,6 +214,7 @@ jobs:
       FFMPEG_INCLUDE_DIR: /opt/ffmpeg/include
       FFMPEG_LIBS_DIR: /opt/ffmpeg/lib
       PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
+      LD_LIBRARY_PATH: /opt/ffmpeg/lib
 
     steps:
       - name: Checkout
