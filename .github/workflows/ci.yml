@@ -143,7 +143,6 @@ jobs:
           libopencore-amrnb-dev \
           libopencore-amrwb-dev \
           libva-dev \
-          libmfx-dev \
           libdrm-dev \
           libnuma-dev \
           libvdpau-dev \
@@ -154,7 +153,7 @@ jobs:
           libfreetype6-dev \
           libfontconfig1-dev \
           libssh-dev \
-          libzmq3-dev \
+          libzmq5-dev \
           libssl-dev \
           librtmp-dev \
           libiec61883-dev \
@@ -169,8 +168,7 @@ jobs:
           liblzma-dev \
           libzvbi-dev \
           libpostproc-dev \
-          librubberband-dev \
-          libfrei0r-ocaml-dev
+          librubberband-dev
 ## ffmpeg
 ## libavutil-dev \
 ## libavcodec-dev \
