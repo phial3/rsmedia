@@ -16,7 +16,6 @@ env:
   RUST_LOG: "debug"
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
-  BtBN_FFMPEG_BASE_URL: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
 
 jobs:
   lints:
@@ -193,22 +192,22 @@ jobs:
             runner: ubuntu-latest
             ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n7.1-latest-linux64-gpl-shared-7.1.tar.xz"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-shared-7.1.tar.xz"
           - arch: linux/amd64
             runner: ubuntu-latest
             ffmpeg_version: "8.1"
             feature: "ndarray,ffmpeg8,link_system_ffmpeg"
-            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
           - arch: linux/arm64
             runner: ubuntu-24.04-arm
             ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n7.1-latest-linuxarm64-gpl-shared-7.1.tar.xz"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linuxarm64-gpl-shared-7.1.tar.xz"
           - arch: linux/arm64
             runner: ubuntu-24.04-arm
             ffmpeg_version: "8.1"
             feature: "ndarray,ffmpeg8,link_system_ffmpeg"
-            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n8.1-latest-linuxarm64-gpl-shared-8.1.tar.xz"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linuxarm64-gpl-shared-8.1.tar.xz"
 
     env:
       FFMPEG_DIR: /opt/ffmpeg
@@ -266,22 +265,22 @@ jobs:
             runner: windows-latest
             ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
           - arch: windows/amd64
             runner: windows-latest
             ffmpeg_version: "8.1"
             feature: "ndarray,ffmpeg8,link_system_ffmpeg"
-            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
           - arch: windows/arm64
             runner: windows-11-arm
             ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n7.1-latest-winarm64-gpl-shared-7.1.zip"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-winarm64-gpl-shared-7.1.zip"
           - arch: windows/arm64
             runner: windows-11-arm
             ffmpeg_version: "8.1"
             feature: "ndarray,ffmpeg8,link_system_ffmpeg"
-            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n8.1-latest-winarm64-gpl-shared-8.1.zip"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-winarm64-gpl-shared-8.1.zip"
 
     steps:
       - name: Checkout
