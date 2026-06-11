@@ -2,7 +2,6 @@
 name = "rsmedia"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 description = "High-level video toolkit based on ffmpeg."
@@ -18,9 +17,9 @@ ffmpeg6 = ["rsmpeg/ffmpeg6"]
 ffmpeg7 = ["rsmpeg/ffmpeg7_1"]
 ffmpeg8 = ["rsmpeg/ffmpeg8"]
 ## unxi linking ffmpeg with pkg-config.
-link_system_ffmpeg = ["rsmpeg/link_system_ffmpeg", "pkg-config"]
+link_system_ffmpeg = ["rsmpeg/link_system_ffmpeg"]
 ## windows linking ffmpeg with vcpkg.
-link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg", "vcpkg"]
+link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg"]
 
 [dependencies]
 pix = "1.0"
@@ -67,10 +66,6 @@ wavers = "1.5"
 rubato = "3.0"
 dasp = { version = "0.11", features = ["all"] }
 rodio = { version = "0.22", features = ["symphonia-all", "tracing"] }
-
-[build-dependencies]
-vcpkg = { version = "0.2", optional = true }
-pkg-config = { version = "0.3", optional = true }
 
 [package.metadata.docs.rs]
 all-features = true
