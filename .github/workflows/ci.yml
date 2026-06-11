@@ -36,28 +36,43 @@ jobs:
         run: cargo fmt --all -- --check
 
   clippy:
-    name: clippy / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
-    runs-on: ubuntu-latest
+    name: clippy / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
+    runs-on: ${{ matrix.runner }}
     container:
       image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404
       options: --pull always
 
     env:
-      DOCKER_DEFAULT_PLATFORM: ${{ matrix.platform }}
       FFMPEG_INCLUDE_DIR: /usr/local/include
       FFMPEG_PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
 
     strategy:
       fail-fast: false
       matrix:
-        platform: ["linux/amd64"]
-        ffmpeg_version: ["6.1", "7.1", "8.1"]
         include:
-          - ffmpeg_version: "6.1"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "6.1"
             feature: "ndarray,ffmpeg6,link_system_ffmpeg"
-          - ffmpeg_version: "7.1"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-          - ffmpeg_version: "8.1"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            ffmpeg_version: "6.1"
+            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            ffmpeg_version: "8.1"
             feature: "ndarray,ffmpeg8,link_system_ffmpeg"
 
     steps:
@@ -213,7 +228,6 @@ jobs:
       FFMPEG_DIR: /opt/ffmpeg
       FFMPEG_INCLUDE_DIR: /opt/ffmpeg/include
       FFMPEG_LIBS_DIR: /opt/ffmpeg/lib
-      PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
       LD_LIBRARY_PATH: /opt/ffmpeg/lib
 
     steps:
