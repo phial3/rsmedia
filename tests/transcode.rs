@@ -290,8 +290,7 @@ fn init_filters(
 ) -> Result<Vec<Option<FilteringContext<'_>>>> {
     let mut filter_ctx = Vec::with_capacity(stream_contexts.len());
 
-    for (filter_graph, stream_context) in filter_graphs.iter_mut().zip(stream_contexts)
-    {
+    for (filter_graph, stream_context) in filter_graphs.iter_mut().zip(stream_contexts) {
         let Some(stream_context) = stream_context else {
             filter_ctx.push(None);
             continue;
