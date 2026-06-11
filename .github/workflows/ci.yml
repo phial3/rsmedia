@@ -16,11 +16,28 @@ env:
   RUST_LOG: "debug"
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
+  BtBN_FFMPEG_BASE_URL: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
 
 jobs:
+  lints:
+    name: Rust fmt
+    runs-on: ubuntu-latest
 
-  build-linux:
-    name: build / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          components: rustfmt
+
+      - name: Rust fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: ubuntu-latest
     container:
       image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404
@@ -164,6 +181,139 @@ jobs:
       - name: Clippy
         run: cargo clippy --all --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
+  test-linux:
+    name: test / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n7.1-latest-linux64-gpl-shared-7.1.tar.xz"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n7.1-latest-linuxarm64-gpl-shared-7.1.tar.xz"
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n8.1-latest-linuxarm64-gpl-shared-8.1.tar.xz"
+
+    env:
+      FFMPEG_DIR: /opt/ffmpeg
+      FFMPEG_INCLUDE_DIR: /opt/ffmpeg/include
+      FFMPEG_LIBS_DIR: /opt/ffmpeg/lib
+      PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libclang-dev \
+            clang \
+            cmake \
+            build-essential \
+            ca-certificates \
+            wget \
+            xz-utils
+
+      - name: Download FFmpeg
+        run: |
+          sudo mkdir -p /opt/ffmpeg
+          wget -O ffmpeg.tar.xz "${{ matrix.download_url }}"
+          sudo tar -xJf ffmpeg.tar.xz -C /opt/ffmpeg --strip-components=1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify FFmpeg version
+        run: /opt/ffmpeg/bin/ffmpeg -version
+
+      - name: Run Test
+        run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
+
+  test-windows:
+    name: test / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: windows/amd64
+            runner: windows-latest
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
+          - arch: windows/amd64
+            runner: windows-latest
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+          - arch: windows/arm64
+            runner: windows-11-arm
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n7.1-latest-winarm64-gpl-shared-7.1.zip"
+          - arch: windows/arm64
+            runner: windows-11-arm
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            download_url: "${{ env.BtBN_FFMPEG_BASE_URL }}/ffmpeg-n8.1-latest-winarm64-gpl-shared-8.1.zip"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          $VCINSTALLDIR = $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
+          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\x64\bin"
+
+      - name: Download FFmpeg
+        run: |
+          Invoke-WebRequest "${{ matrix.download_url }}" -OutFile ffmpeg-build.zip
+          Expand-Archive ffmpeg-build.zip -DestinationPath ffmpeg
+          $ffmpegDir = (Get-Item ffmpeg\ffmpeg-n*-*).FullName
+          Add-Content $env:GITHUB_PATH "$ffmpegDir\bin"
+          Add-Content $env:GITHUB_ENV "FFMPEG_DIR=$ffmpegDir"
+          Add-Content $env:GITHUB_ENV "FFMPEG_LIBS_DIR=$ffmpegDir\lib"
+          Add-Content $env:GITHUB_ENV "FFMPEG_INCLUDE_DIR=$ffmpegDir\include"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify FFmpeg version
+        run: ffmpeg -version
+
       - name: Run Test
         run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
 
@@ -273,24 +423,3 @@ jobs:
       - name: Run Test
         run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
 
-  lints:
-    name: Rust fmt / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: nightly
-          components: rustfmt
-
-      - name: Rust fmt
-        run: cargo fmt --all -- --check
