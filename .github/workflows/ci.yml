@@ -318,6 +318,7 @@ jobs:
           sudo mkdir -p /opt/ffmpeg
           wget -O ffmpeg.tar.xz "${{ matrix.download_url }}"
           sudo tar -xJf ffmpeg.tar.xz -C /opt/ffmpeg --strip-components=1
+          echo "PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
