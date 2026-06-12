@@ -1493,8 +1493,9 @@ mod tests {
         frame.set_format(ffi::AV_SAMPLE_FMT_FLTP);
         frame.set_nb_samples(nb_samples);
         frame.set_sample_rate(sample_rate);
-        // frame.set_time_base(avutil::ra(1, sample_rate));
-        frame.set_ch_layout(AVChannelLayout::from_nb_channels(nb_channels).into_inner());
+        // 对于双声道
+        let stereo_layout = AVChannelLayout::from_string(c"stereo").unwrap();
+        frame.set_ch_layout(stereo_layout.into_inner());
         frame
             .alloc_buffer()
             .context("Failed to allocate buffer for AVFrame")?;
@@ -1585,7 +1586,8 @@ mod tests {
         frame.set_nb_samples(nb_samples);
         frame.set_sample_rate(sample_rate);
         // 对于双声道
-        frame.set_ch_layout(AVChannelLayout::from_nb_channels(nb_channels).into_inner());
+        let stereo_layout = AVChannelLayout::from_string(c"stereo").unwrap();
+        frame.set_ch_layout(stereo_layout.into_inner());
         frame
             .alloc_buffer()
             .context("Failed to allocate buffer for AVFrame")?;
@@ -1655,8 +1657,9 @@ mod tests {
         println!("aac sample_fmts:{:#?}", encoder.sample_fmts());
         let mut frame = AVFrame::new();
         frame.set_nb_samples(2);
-        frame.set_ch_layout(AVChannelLayout::from_nb_channels(2).into_inner());
         frame.set_format(encoder.sample_fmts().unwrap()[0]);
+        let stereo_layout = AVChannelLayout::from_string(c"stereo").unwrap();
+        frame.set_ch_layout(stereo_layout.into_inner());
         assert!(frame.alloc_buffer().is_ok());
     }
 }

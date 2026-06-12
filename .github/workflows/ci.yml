@@ -44,7 +44,7 @@ jobs:
     name: clippy / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: ${{ matrix.runner }}
     container:
-      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404   # rottenberg/ffmpeg 8.1 开始有多平台镜像包，8.1 之前只有 amd64
+      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404   # jrottenberg/ffmpeg 8.1 开始有多平台镜像包，8.1 之前只有 amd64
       options: --pull always
 
     env:
