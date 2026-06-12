@@ -19,8 +19,13 @@ env:
 
 jobs:
   lints:
-    name: Rust fmt
-    runs-on: ubuntu-latest
+    name: Rust fmt / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+      fail-fast: false
 
     steps:
       - name: Checkout
