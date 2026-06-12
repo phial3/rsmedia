@@ -371,12 +371,11 @@ jobs:
       - name: Install dependencies
         run: |
           $arch = "${{ matrix.arch }}"
+          $vswhere = vswhere -latest -property installationPath
           if ($arch -eq "windows/arm64") {
-            $VCINSTALLDIR = $(& "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
-            Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\arm64\bin"
+            Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${vswhere}\VC\Tools\LLVM\arm64\bin"
           } else {
-            $VCINSTALLDIR = $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
-            Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\x64\bin"
+            Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${vswhere}\VC\Tools\LLVM\x64\bin"
           }
 
       - name: Download FFmpeg
