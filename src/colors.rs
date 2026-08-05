@@ -353,7 +353,7 @@ mod tests {
     use super::*;
     use ctor::ctor;
     use dtor::dtor;
-    use palette::chromatic_adaptation::AdaptInto;
+    use palette::chromatic_adaptation::AdaptIntoUnclamped;
     use palette::convert::{FromColorUnclamped, IntoColorUnclamped};
     use palette::{Hsl, IntoColor, Lab, LinSrgb, Oklab, Oklch, Srgb, Xyz};
 
@@ -607,7 +607,7 @@ mod tests {
         let xyz_d65: Xyz<D65, f32> = srgb_color.into_color_unclamped();
         println!("SRGB (D65): {:?} -> Lab (D50): {:?}", srgb_color, xyz_d65);
         //  Step 2: Xyz (D65) -> Xyz (D50)
-        let xyz_d50: Xyz<D50, f32> = xyz_d65.adapt_into();
+        let xyz_d50: Xyz<D50, f32> = xyz_d65.adapt_into_unclamped();
         println!("Xyz (D65): {:?} -> Lab (D50): {:?}", xyz_d65, xyz_d50);
         // Step 3: Xyz (D50) -> Lab (D50)
         let lab_d50: Lab<D50, f32> = xyz_d50.into_color_unclamped();
@@ -621,7 +621,7 @@ mod tests {
             lab_d50, xyz_d50_from_lab
         );
         // 2. Xyz(D50) -> Xyz(D65) (Adapt back)
-        let xyz_d65_from_d50: Xyz<D65, f32> = xyz_d50_from_lab.adapt_into();
+        let xyz_d65_from_d50: Xyz<D65, f32> = xyz_d50_from_lab.adapt_into_unclamped();
         println!(
             "Xyz (D50): {:?} -> Xyz (D65): {:?}",
             xyz_d50_from_lab, xyz_d65_from_d50
