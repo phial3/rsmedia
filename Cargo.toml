@@ -42,7 +42,8 @@ dashmap = "6.1"
 once_cell = "1.21"
 num_cpus = "1.17"
 ndarray = { version = "0.17", optional = true }
-rsmpeg = { git = "https://github.com/larksuite/rsmpeg", default-features = false }
+# use custom rsmpeg
+rsmpeg = { git = "https://gitee.com/phial3/rsmpeg", branch = "dev", default-features = false }
 
 [dev-dependencies]
 libc = "0.2"
