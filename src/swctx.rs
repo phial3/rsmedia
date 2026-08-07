@@ -87,6 +87,10 @@ fn setup_scaler(
         ffi::SWS_BICUBIC | ffi::SWS_FULL_CHR_H_INT | ffi::SWS_ACCURATE_RND | ffi::SWS_BITEXACT;
 
     // 创建转换上下文
+    // 不同 FFmpeg 版本/平台下 `ffi::SWS_*` 常量类型不同（ffmpeg6/7 与 macOS 为 `u32`，
+    // Windows ffmpeg8 为 `i32`），而 `get_context` 统一要求 `u32`。
+    // 该转换在 `u32` 平台上看似冗余，但对 `i32` 平台是必要的，故显式允许此 lint。
+    #[allow(clippy::unnecessary_cast)]
     let sws_ctx = SwsContext::get_context(
         src_width,
         src_height,
@@ -94,7 +98,7 @@ fn setup_scaler(
         dst_width,
         dst_height,
         dst_pix_fmt,
-        flags.try_into().unwrap(),
+        flags as u32,
         None,
         None,
         None,
