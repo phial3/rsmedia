@@ -94,7 +94,7 @@ fn setup_scaler(
         dst_width,
         dst_height,
         dst_pix_fmt,
-        flags,
+        flags.try_into().unwrap(),
         None,
         None,
         None,
