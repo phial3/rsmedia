@@ -24,8 +24,8 @@ link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg"]
 [dependencies]
 pix = "1.0"
 rgb = "0.8"
-yuv = { version = "0.8", features = ["rayon", "professional_mode"] }
 color = "0.3"
+yuv = { version = "0.8", features = ["rayon", "professional_mode"] }
 colorous = "1.0"
 colorutils-rs = "0.8"
 palette = "0.7"
@@ -103,4 +103,9 @@ required-features = ["ndarray"]
 [[example]]
 name = "filter_demo"
 path = "examples/filter_demo.rs"
+required-features = ["ndarray"]
+
+[[example]]
+name = "color_professional"
+path = "examples/color_professional.rs"
 required-features = ["ndarray"]

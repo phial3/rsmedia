@@ -291,7 +291,8 @@ where
     ///////////////////////////// convert //////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////
 
-    pub fn convert_rgb_to_yuv(&self) -> Result<Self> {
+    /// 校验当前帧是否为可转换的 RGB24 视频帧。
+    fn check_rgb24_supported(&self) -> Result<()> {
         if self.media_type != MediaType::VIDEO {
             return Err(Error::msg("Only video frames can be color space converted"));
         }
@@ -299,6 +300,41 @@ where
         if self.format != ffi::AV_PIX_FMT_RGB24 {
             return Err(Error::msg("Only RGB24 format video frames are supported"));
         }
+        Ok(())
+    }
+
+    pub fn convert_rgb_to_yuv(&self) -> Result<Self> {
+        self.check_rgb24_supported()?;
+
+        // 根据分辨率自动选择色彩矩阵：SD -> BT.601 / HD -> BT.709 / UHD -> BT.2020
+        let colorspace = if self.height < 720 {
+            YuvStandardMatrix::Bt601
+        } else if self.height < 1080 {
+            YuvStandardMatrix::Bt709
+        } else {
+            YuvStandardMatrix::Bt2020
+        };
+
+        self.convert_rgb_to_yuv_with_matrix(colorspace)
+    }
+
+    /// 用**指定**的色彩矩阵将 RGB24 帧转换为 YUV420P。
+    ///
+    /// 相比自动按分辨率判断的 [`convert_rgb_to_yuv`](Self::convert_rgb_to_yuv)，
+    /// 此方法允许用户显式选择 BT.601 / BT.709 / BT.2020，用于需要精确控制
+    /// 色彩矩阵的专业场景（例如与源视频的色彩标准保持一致）。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rsmedia::MediaFrame;
+    /// # fn d(mut f: MediaFrame<u8>) -> anyhow::Result<()> {
+    /// let yuv = f.convert_rgb_to_yuv_with_matrix(yuv::YuvStandardMatrix::Bt709)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn convert_rgb_to_yuv_with_matrix(&self, colorspace: YuvStandardMatrix) -> Result<Self> {
+        self.check_rgb24_supported()?;
 
         let height = self.height;
         let width = self.width;
@@ -342,21 +378,7 @@ where
             height: height as u32,
         };
 
-        // 4. 选择转换参数
-        let colorspace = {
-            if height < 720 {
-                // SD color space
-                YuvStandardMatrix::Bt601
-            } else if height < 1080 {
-                // HD color space
-                YuvStandardMatrix::Bt709
-            } else {
-                // UHD color space
-                YuvStandardMatrix::Bt2020
-            }
-        };
-
-        // 5. 使用Full Range进行转换
+        // 4. 使用指定的色彩矩阵进行转换（Full Range）
         yuv::rgb_to_yuv420(
             &mut planar_image,
             &rgb_bytes,
@@ -941,6 +963,37 @@ mod tests {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rgb_yuv_conversion_with_matrix() -> Result<()> {
+        let mut rgb_frame = MediaFrame::<u8>::new_video_frame(
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            PixelFormat::RGB24,
+            TIME_BASE,
+        )?;
+        let (r, g, b) = create_test_pattern(TEST_WIDTH, TEST_HEIGHT);
+        for y in 0..TEST_HEIGHT {
+            for x in 0..TEST_WIDTH {
+                let idx = y * TEST_WIDTH + x;
+                rgb_frame.data[[y, x, 0]] = r[idx];
+                rgb_frame.data[[y, x, 1]] = g[idx];
+                rgb_frame.data[[y, x, 2]] = b[idx];
+            }
+        }
+
+        // 显式指定不同色彩矩阵，均应输出 YUV420P
+        let yuv709 = rgb_frame.convert_rgb_to_yuv_with_matrix(YuvStandardMatrix::Bt709)?;
+        assert_eq!(yuv709.format, ffi::AV_PIX_FMT_YUV420P);
+
+        let yuv2020 = rgb_frame.convert_rgb_to_yuv_with_matrix(YuvStandardMatrix::Bt2020)?;
+        assert_eq!(yuv2020.format, ffi::AV_PIX_FMT_YUV420P);
+
+        // 不同色彩矩阵导致不同的 YUV 转换结果
+        assert_ne!(yuv709.data, yuv2020.data);
 
         Ok(())
     }

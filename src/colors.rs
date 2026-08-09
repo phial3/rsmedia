@@ -348,6 +348,76 @@ pub fn color_distance(c1: &Color, c2: Color) -> f32 {
     (dr + dg + db).sqrt()
 }
 
+/// Calculate the perceptual color difference (CIEDE2000) in CIE Lab space.
+///
+/// Unlike the plain RGB [`color_distance`], CIEDE2000 is aligned with human
+/// color perception, making it suitable for quantitative video-quality
+/// assessment, watermark-removal evaluation, and palette discrimination.
+///
+/// Reference thresholds: `<1` imperceptible, `1~2` subtle, `2~10` noticeable,
+/// `>10` very different.
+pub fn color_delta_e(c1: &Color, c2: Color) -> f32 {
+    use palette::color_difference::Ciede2000;
+    use palette::{IntoColor, Lab, Srgb};
+
+    let lab1: Lab = Srgb::new(
+        c1.r() as f32 / 255.0,
+        c1.g() as f32 / 255.0,
+        c1.b() as f32 / 255.0,
+    )
+    .into_color();
+    let lab2: Lab = Srgb::new(
+        c2.r() as f32 / 255.0,
+        c2.g() as f32 / 255.0,
+        c2.b() as f32 / 255.0,
+    )
+    .into_color();
+    lab1.difference(lab2)
+}
+
+/// Map a scalar in `[min, max]` to an RGB color from the given colormap.
+///
+/// Useful for rendering grayscale / depth / heatmap data as pseudo-color
+/// visualizations. Values outside `[min, max]` are clamped to the range.
+pub fn colormap_lookup(
+    gradient: &colorous::Gradient,
+    value: f64,
+    min: f64,
+    max: f64,
+) -> (u8, u8, u8) {
+    let span = max - min;
+    let t = if span <= f64::EPSILON || !span.is_finite() {
+        0.0
+    } else {
+        ((value - min) / span).clamp(0.0, 1.0)
+    };
+    let steps = 255usize;
+    let c = gradient.eval_rational((t * steps as f64).round() as usize, steps);
+    (c.r, c.g, c.b)
+}
+
+/// Render an entire grayscale frame (`Array2`) to an RGB frame using a colormap.
+///
+/// `gray` values in `[min, max]` are mapped to colors; the result is an
+/// `Array3` of shape `(height, width, 3)` suitable for constructing a
+/// `MediaFrame` (RGB24) or saving as an image.
+pub fn grayscale_to_colormap<T>(
+    gradient: &colorous::Gradient,
+    gray: &ndarray::Array2<T>,
+    min: f64,
+    max: f64,
+) -> ndarray::Array3<u8>
+where
+    T: num_traits::NumCast + Copy,
+{
+    let (h, w) = gray.dim();
+    ndarray::Array3::from_shape_fn((h, w, 3), |(y, x, c)| {
+        let v = num_traits::cast::<T, f64>(gray[[y, x]]).unwrap_or(0.0);
+        let (r, g, b) = colormap_lookup(gradient, v, min, max);
+        [r, g, b][c]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,5 +722,39 @@ mod tests {
             "Xyz (D65): {:?} -> SRGB (D65): {:?}",
             xyz_d65_from_d50, srgb_from_lab_d50
         );
+    }
+
+    #[test]
+    fn test_color_delta_e() {
+        // 相同颜色 CIEDE2000 色差近似为 0
+        let a = Color::from_rgb(120, 80, 200);
+        assert!(color_delta_e(&a, a) < 0.01);
+
+        // 明显不同的颜色（黑 vs 白）色差应非常大
+        let black = Color::from_rgb(0, 0, 0);
+        let white = Color::from_rgb(255, 255, 255);
+        let de = color_delta_e(&black, white);
+        assert!(de > 50.0, "black vs white deltaE should be large, got {de}");
+    }
+
+    #[test]
+    fn test_colormap_lookup() {
+        let g = colorous::VIRIDIS;
+        let lo = colormap_lookup(&g, 0.0, 0.0, 1.0);
+        let hi = colormap_lookup(&g, 1.0, 0.0, 1.0);
+        assert_ne!(lo, hi);
+        // 越界值被钳制到端点
+        assert_eq!(colormap_lookup(&g, -10.0, 0.0, 1.0), lo);
+        assert_eq!(colormap_lookup(&g, 99.0, 0.0, 1.0), hi);
+    }
+
+    #[test]
+    fn test_grayscale_to_colormap() {
+        let g = colorous::MAGMA;
+        let gray = ndarray::Array2::from_shape_fn((4, 5), |(y, x)| (y * 5 + x) as u8);
+        let rgb = grayscale_to_colormap(&g, &gray, 0.0, 19.0);
+        assert_eq!(rgb.dim(), (4, 5, 3));
+        // 最暗处与最亮处的映射颜色不同
+        assert_ne!(rgb[[0, 0, 0]], rgb[[3, 4, 0]]);
     }
 }
