@@ -692,7 +692,7 @@ impl Encoder {
                 if let Some(pix_fmts) = pix_fmts_opt {
                     if !pix_fmts.contains(&frame.format) {
                         return Err(Error::msg(format!(
-                            "Unsupported encode frame pixel format: {:?}",
+                            "Unsupported video encoder frame pixel format: {:?}",
                             frame.format
                         )));
                     }
@@ -707,8 +707,8 @@ impl Encoder {
                         .find(|ch_layout| ch_layout.nb_channels == frame.ch_layout.nb_channels)
                         .ok_or_else(|| {
                             Error::msg(format!(
-                                "Unsupported encode frame channel layout: {:?}",
-                                frame.ch_layout
+                                "Unsupported audio encoder frame channel layout: {:?}",
+                                frame.ch_layout.nb_channels
                             ))
                         })?;
                 }
