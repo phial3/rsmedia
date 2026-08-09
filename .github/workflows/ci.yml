@@ -370,12 +370,12 @@ jobs:
             feature: "ndarray,ffmpeg8,link_system_ffmpeg"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
           - arch: windows/arm64
-            runner: windows-11-arm64
+            runner: windows-11-arm
             ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-winarm64-gpl-shared-7.1.zip"
           - arch: windows/arm64
-            runner: windows-11-arm64
+            runner: windows-11-arm
             ffmpeg_version: "8.1"
             feature: "ndarray,ffmpeg8,link_system_ffmpeg"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-winarm64-gpl-shared-8.1.zip"
