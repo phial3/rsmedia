@@ -109,13 +109,22 @@ impl DecoderBuilder {
         Ok(())
     }
 
-    /// Build [`Decoder`].
+    /// 构建一个**裸** [`Decoder`]（不持有 reader）。
+    ///
+    /// 适合需要精细控制 reader 生命周期的高级场景：解码时需每帧传入 reader
+    /// （`decoder.decode(&mut reader)`），且**不支持 seek**（seek 需要 reader，
+    /// 请改用 [`build_wrapped`](DecoderBuilder::build_wrapped)）。
     pub fn build(self, source: impl Into<Location>) -> Result<Decoder> {
         let reader = StreamReader::new(source)?;
         self.build_from_reader(&reader)
     }
 
-    /// 创建一个包装的解码器
+    /// 构建一个持有 reader 的 [`DecoderWrapper`]（**推荐入口**）。
+    ///
+    /// 返回的 [`DecoderWrapper`] 封装了 reader，解码无需每帧传参
+    /// （`decoder.decode()` / `decoder.decode_frame()`），并支持直接
+    /// [`seek_to_frame`](DecoderWrapper::seek_to_frame) /
+    /// [`seek_to_timestamp`](DecoderWrapper::seek_to_timestamp)。
     pub fn build_wrapped(
         self,
         source: impl Into<Location>,
@@ -124,13 +133,19 @@ impl DecoderBuilder {
         self.build_wrapped_with_reader(reader)
     }
 
-    /// a reader be required to get input stream, and build a decoder.
+    /// 用自定义 reader 构建持有 reader 的 [`DecoderWrapper`]。
+    ///
+    /// 当需要从自定义 [`Reader`]（如网络流、内存缓冲）解码时使用，行为与
+    /// [`build_wrapped`](DecoderBuilder::build_wrapped) 一致。
     pub fn build_wrapped_with_reader<R: Reader>(self, reader: R) -> Result<DecoderWrapper<R>> {
         let decoder = self.build_from_reader(&reader)?;
         Ok(DecoderWrapper::new(decoder, reader))
     }
 
-    /// a reader be required to get input stream, and build a decoder.
+    /// 用给定的 reader 构建**裸** [`Decoder`]（不持有 reader）。
+    ///
+    /// 高级/内部场景使用（如 mux 多流共享同一 reader）。解码时需每帧传入
+    /// reader，且不支持 seek。日常使用请优先 [`build_wrapped`](DecoderBuilder::build_wrapped)。
     pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
@@ -463,6 +478,18 @@ impl Decoder {
         })
     }
 
+    /// Decode a single frame as a `MediaFrame<u8>` (video) or `MediaFrame<f32>` (audio).
+    ///
+    /// Convenience for `decode::<u8>()` which is the common video path.
+    ///
+    /// # Return value
+    ///
+    /// The decoded frame, or [`None`] at end of stream.
+    #[cfg(feature = "ndarray")]
+    pub fn decode_frame(&mut self, reader: &mut impl Reader) -> Result<Option<MediaFrame<u8>>> {
+        self.decode::<u8>(reader)
+    }
+
     /// Decode a single frame and return the raw ffmpeg `AvFrame`.
     ///
     /// # Arguments
@@ -661,6 +688,9 @@ impl Decoder {
         // 例如：
         // 无硬件加速，默认解码格式 YUV420P
         // 存在硬件加速帧，则转换 NV12 -> YUV420P
+        // 注意：这里无论是否有 Filter，都会统一转成 YUV420P（因为
+        // `MediaFrame` 视频目前主要支持 YUV420P/RGB24）。因此即使源是
+        // yuv444p / nv12 / 10-bit，解码输出也会被转成 YUV420P，不会颜色错乱。
         let raw_frame = match self.media_type {
             MediaType::VIDEO => {
                 let target_sw_pix_fmt = PixelFormat::YUV420P;
@@ -827,6 +857,12 @@ impl<R: Reader> DecoderWrapper<R> {
     /// 解码下一帧（媒体帧）
     #[cfg(feature = "ndarray")]
     pub fn decode<T: MediaFrameType>(&mut self) -> Result<Option<MediaFrame<T>>> {
+        self.decoder.decode(&mut self.reader)
+    }
+
+    /// 解码下一帧（`MediaFrame<u8>` 便捷方法，等价于 `decode::<u8>()`）
+    #[cfg(feature = "ndarray")]
+    pub fn decode_frame(&mut self) -> Result<Option<MediaFrame<u8>>> {
         self.decoder.decode(&mut self.reader)
     }
 

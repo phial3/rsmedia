@@ -44,7 +44,7 @@ where
     R: Reader,
 {
     for _ in 0..100 {
-        if let Some(frame) = decoder.decode::<u8>()? {
+        if let Some(frame) = decoder.decode_frame()? {
             return Ok(frame.pts);
         }
     }

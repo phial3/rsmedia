@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     decoder.seek_to_frame(20).unwrap();
 
     loop {
-        match decoder.decode::<u8>() {
+        match decoder.decode_frame() {
             Ok(Some(yuv_frame)) => {
                 println!(
                     "decoded frame pts: {}, type: {:?}, format:{:?}",

@@ -67,7 +67,7 @@ fn main() -> Result<()> {
     let mut decoded = 0usize;
     let mut saved = 0usize;
     loop {
-        match decoder.decode::<u8>() {
+        match decoder.decode_frame() {
             Ok(Some(frame)) => {
                 let fmt = frame
                     .video_format()
