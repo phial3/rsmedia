@@ -56,7 +56,7 @@ pub struct MediaFrame<T> {
     pub duration: i64,
     /// Video: [`PixelFormat`]
     /// Audio: [`SampleFormat`]
-    pub format: i32,
+    format: i32,
     /// Video: `[height, width, channels]`
     /// Audio: `[frames, nb_samples, nb_channels]`
     pub data: ndarray::Array3<T>,
@@ -180,6 +180,18 @@ where
 
     pub fn set_pts(&mut self, pts: i64) {
         self.pts = pts;
+    }
+
+    /// Returns the pixel format if this is a video frame, otherwise `None`.
+    #[inline]
+    pub fn video_format(&self) -> Option<PixelFormat> {
+        (self.media_type == MediaType::VIDEO).then(|| PixelFormat::from(self.format))
+    }
+
+    /// Returns the sample format if this is an audio frame, otherwise `None`.
+    #[inline]
+    pub fn audio_format(&self) -> Option<SampleFormat> {
+        (self.media_type == MediaType::AUDIO).then(|| SampleFormat::from(self.format))
     }
 
     pub fn set_dts(&mut self, dts: i64) {

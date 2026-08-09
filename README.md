@@ -211,7 +211,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
       Ok(Some(yuv_frame)) => {
         println!(
           "decoded frame pts: {}, type: {:?}, format:{:?}",
-          yuv_frame.pts, yuv_frame.media_type, yuv_frame.format
+          yuv_frame.pts,
+          yuv_frame.media_type,
+          yuv_frame
+            .video_format()
+            .map(|f| f.get_pix_fmt_name())
+            .unwrap_or_else(|| "n/a".to_string())
         );
         
         // processing frame here...
