@@ -99,3 +99,8 @@ required-features = ["ndarray"]
 name = "metadata"
 path = "examples/metadata.rs"
 required-features = ["ndarray"]
+
+[[example]]
+name = "filter_demo"
+path = "examples/filter_demo.rs"
+required-features = ["ndarray"]

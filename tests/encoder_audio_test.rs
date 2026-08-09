@@ -489,11 +489,11 @@ mod tests {
         );
 
         let audio_filters = vec![
-            filter::audio::volume(1.2),                              // 音量提升
-            filter::audio::three_band_equalizer(3.0, 0.0, -2.0),     // 低音增强
-            filter::audio::compressor(3.0, Some(30.0), Some(200.0)), // 压缩器
-            filter::audio::highpass(80),                             // 切除80Hz以下低频噪声
-            filter::audio::atempo(1.25),                             // 加速25%
+            filter::audio::volume(1.2),                               // 音量提升
+            filter::audio::three_band_equalizer(3.0, 0.0, -2.0),      // 低音增强
+            filter::audio::compressor(3.0, Some(30.0), Some(200.0))?, // 压缩器
+            filter::audio::highpass(80),                              // 切除80Hz以下低频噪声
+            filter::audio::atempo(1.25),                              // 加速25%
         ];
 
         // 创建适合当前格式的编码器

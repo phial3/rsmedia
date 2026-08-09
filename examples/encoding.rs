@@ -25,7 +25,10 @@ fn main() -> anyhow::Result<()> {
     let filters = vec![
         filter::video::scale(1280, 720, Some("bicubic")),
         filter::video::crop(20, 20, width, height),
-        filter::video::drawtext("Watermark", 50, 50, "fonts/Arial.ttf", 18, "white@0.5"),
+        filter::video::hqdn3d(3.0, 2.0), // 视频降噪
+        filter::video::DrawText::new("", 50, 50, 18, "white@0.5")
+            .time_text("%{localtime}") // 当前时间水印
+            .build(),
     ];
 
     let output_path = Path::new("/tmp/rainbow.mp4");

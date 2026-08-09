@@ -917,7 +917,7 @@ mod tests {
 
         let filters = vec![
             filter::video::scale(1280, 720, None),
-            filter::video::drawtext("Hello", 10, 10, "", 24, "white"),
+            filter::video::DrawText::new("Hello", 10, 10, 24, "white").build(),
         ];
 
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
