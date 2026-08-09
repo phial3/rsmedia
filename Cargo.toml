@@ -80,3 +80,22 @@ required-features = ["ndarray"]
 name = "encoding"
 path = "examples/encoding.rs"
 required-features = ["ndarray"]
+
+[[example]]
+name = "decode_raw"
+path = "examples/decode_raw.rs"
+
+[[example]]
+name = "audio"
+path = "examples/audio.rs"
+required-features = ["ndarray"]
+
+[[example]]
+name = "seek"
+path = "examples/seek.rs"
+required-features = ["ndarray"]
+
+[[example]]
+name = "metadata"
+path = "examples/metadata.rs"
+required-features = ["ndarray"]

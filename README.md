@@ -166,7 +166,7 @@ export FFMPEG_DLL_PATH=$FFMPEG_DIR/lib/libffmpeg.dll
 fn main() {
   rsmedia::init().unwrap();
 
-  let input_path = Path::new("/tmp/bear.mp4");
+  let input_path = Path::new("/tmp/test.mp4");
   let mut demuxer = Demuxer::new(input_path).unwrap();
 
   // demux and mux all streams frame

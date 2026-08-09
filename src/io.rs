@@ -130,7 +130,7 @@ impl<'a> StreamReaderBuilder<'a> {
         let mut dict = self.options.map(|opts| opts.into_dict());
         let mut ctx_input = AVFormatContextInput::builder()
             .url(&filename)
-            .format(fmt_opt.unwrap().deref())
+            .maybe_format(fmt_opt.as_deref())
             .options(&mut dict)
             .open()
             .context("Create input format context failed.")?;
@@ -327,7 +327,7 @@ impl<'a> StreamWriterBuilder<'a> {
         let mut dict = self.options.map(|opts| opts.into_dict());
         let output_ctx = AVFormatContextOutput::builder()
             .filename(&filename)
-            .format_name(format.unwrap().as_ref())
+            .maybe_format_name(format.as_deref())
             .options(&mut dict)
             .build()
             .context("Create output format context failed.")?;

@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
 
     rsmedia::init().unwrap();
 
-    let source = std::path::Path::new("/tmp/bear.mp4");
+    let source = std::path::Path::new("/tmp/test.mp4");
 
     // 640x360 mp4
     // let source = "https://img.qunliao.info/4oEGX68t_9505974551.mp4"

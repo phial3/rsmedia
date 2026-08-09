@@ -913,7 +913,7 @@ mod tests {
     #[test]
     #[ignore = "need a video file"]
     fn test_decode_video() -> Result<()> {
-        let video_path = std::path::Path::new("/tmp/bear.mp4");
+        let video_path = std::path::Path::new("/tmp/test.mp4");
 
         let filters = vec![
             filter::video::scale(1280, 720, None),
@@ -946,7 +946,7 @@ mod tests {
     #[test]
     #[ignore = "need a audio file"]
     fn test_decode_audio() -> Result<()> {
-        let audio_path = std::path::Path::new("/tmp/bear.mp4");
+        let audio_path = std::path::Path::new("/tmp/test.mp4");
 
         let filters = vec![
             filter::audio::resample(2, 48000, SampleFormat::FLTP),
