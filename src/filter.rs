@@ -354,6 +354,78 @@ pub mod video {
         )
     }
 
+    /// 去除水印（delogo）的 Builder：支持**多个区域**串联及可选参数。
+    ///
+    /// FFmpeg 的 `delogo` 通过周围像素插值填补指定矩形区域，适合去除固定位置的
+    /// 简单文字/logo 水印。对半透明、异形或复杂背景的水印效果有限。
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rsmedia::filter::video::Delogo;
+    /// // 去除两处水印并开启调试可视化
+    /// let filters = Delogo::new()
+    ///     .add_region(10, 10, 120, 30)
+    ///     .add_region(640, 10, 120, 30)
+    ///     .band(2)
+    ///     .show()
+    ///     .build();
+    /// ```
+    pub struct Delogo {
+        regions: Vec<(i32, i32, u32, u32)>,
+        band: i32,
+        show: bool,
+    }
+
+    impl Default for Delogo {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Delogo {
+        /// 创建一个空的水印去除器（需通过 [`add_region`](Delogo::add_region) 添加区域）。
+        pub fn new() -> Self {
+            Self {
+                regions: Vec::new(),
+                band: 1,
+                show: false,
+            }
+        }
+
+        /// 添加一个待去除的水印区域（左上角坐标 + 宽高）。
+        pub fn add_region(mut self, x: i32, y: i32, w: u32, h: u32) -> Self {
+            self.regions.push((x, y, w, h));
+            self
+        }
+
+        /// 扫描带宽度（插值取样宽度，默认 1）。
+        pub fn band(mut self, band: i32) -> Self {
+            self.band = band;
+            self
+        }
+
+        /// 显示去除区域（调试用），将待去除区域标记出来再输出。
+        pub fn show(mut self) -> Self {
+            self.show = true;
+            self
+        }
+
+        /// 生成滤镜列表，每个水印区域对应一个 `delogo` 滤镜（按顺序串联）。
+        pub fn build(self) -> Vec<Filter> {
+            self.regions
+                .into_iter()
+                .map(|(x, y, w, h)| {
+                    let mut params = format!("delogo=x={x}:y={y}:w={w}:h={h}:band={}", self.band);
+                    if self.show {
+                        params.push_str(":show=1");
+                    }
+                    Filter::new("delogo", MediaType::VIDEO, params)
+                })
+                .collect()
+        }
+    }
+
     /// zoompan - 平移和缩放效果
     pub fn zoompan(zoom: &str, x: &str, y: &str, duration: Option<i32>) -> Filter {
         let mut params = format!("zoompan=z={zoom}:x={x}:y={y}");
@@ -1488,6 +1560,40 @@ mod tests {
         assert_eq!(comp.spec(), "acompressor=ratio=3:attack=30:release=200");
         // 非法 ratio 返回错误而非 panic
         assert!(audio::compressor(0.5, None, None).is_err());
+    }
+
+    #[test]
+    fn test_delogo_builder() {
+        use MediaType::*;
+
+        // 单区域便捷方法
+        let simple = video::delogo(0, 0, 100, 50);
+        assert_eq!(simple.name(), "delogo");
+        assert_eq!(simple.media_type(), VIDEO);
+        assert_eq!(simple.spec(), "delogo=x=0:y=0:w=100:h=50");
+
+        // Builder：多区域 + band + show
+        let filters = video::Delogo::new()
+            .add_region(10, 10, 120, 30)
+            .add_region(640, 10, 120, 30)
+            .band(2)
+            .show()
+            .build();
+        assert_eq!(filters.len(), 2, "one delogo per region");
+        assert_eq!(
+            filters[0].spec(),
+            "delogo=x=10:y=10:w=120:h=30:band=2:show=1"
+        );
+        assert_eq!(
+            filters[1].spec(),
+            "delogo=x=640:y=10:w=120:h=30:band=2:show=1"
+        );
+        for f in &filters {
+            assert_eq!(f.media_type(), VIDEO);
+        }
+
+        // 空 Builder 生成空列表
+        assert!(video::Delogo::new().build().is_empty());
     }
 
     #[test]

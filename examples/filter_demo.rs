@@ -1,21 +1,23 @@
 //! 滤镜（Filter）使用示例
 //!
 //! 演示两件事：
-//! 1. 在编码器中构建一条滤镜链（缩放 + 裁剪 + 降噪 + 画质增强 + 时间水印）。
-//! 2. 打印出 `filter::video` / `filter::audio` 提供的常用滤镜 API 目录，方便查阅用法。
+//! 1. **真正解码视频并通过滤镜链后处理**：读取输入视频，应用
+//!    `缩放 + 去水印 + 降噪 + 饱和度增强` 滤镜链，逐帧验证处理后的
+//!    尺寸/格式变化，并把前几帧保存为图片。
+//! 2. 打印 `filter::video` / `filter::audio` 提供的常用滤镜 API 目录。
 //!
-//! 运行：`cargo run --example filter_demo`
+//! 运行：`cargo run --example filter_demo -- /tmp/test.mp4`
 
-use rsmedia::{
-    colors, filter,
-    frame::MediaFrame,
-    time::{self, Time},
-    EncoderBuilder, PixelFormat,
-};
+use image::{ImageBuffer, Rgb};
 
-use std::path::Path;
+use rsmedia::{filter, DecoderBuilder, MediaFrame, MediaType};
 
-fn main() -> anyhow::Result<()> {
+use anyhow::{Context, Result};
+
+const OUTPUT_DIR: &str = "output_filter_demo";
+const SAVE_FRAMES: usize = 3;
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
@@ -26,47 +28,100 @@ fn main() -> anyhow::Result<()> {
 
     rsmedia::init().unwrap();
 
-    // ---- 1) 构建一条视频滤镜链并编码成文件 ----
-    let width = 640;
-    let height = 640;
+    let source = std::env::args()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/test.mp4"));
+    if !source.exists() {
+        anyhow::bail!(
+            "input video not found: {}, pass a video path as the first argument",
+            source.display()
+        );
+    }
 
-    // 典型滤镜链：缩放 -> 裁剪 -> 视频降噪 -> 饱和度增强
-    // 注意：`drawtext`（文字/时间水印）需要 FFmpeg 编译时开启 libfreetype，
-    // 本地精简版可能缺失，故此处仅用于打印目录，未放入实际编码链。
+    // ---- 1) 真实处理视频：解码 + 滤镜链 ----
+    // 缩放 -> 裁剪 -> 去水印 -> 视频降噪 -> 饱和度增强
+    // 注意：delogo 区域必须离帧边界至少 band(默认1) 像素，故 x/y 从 10 开始。
     let filters = vec![
-        filter::video::scale(1280, 720, Some("bicubic")),
-        filter::video::crop(20, 20, width, height),
-        filter::video::hqdn3d(3.0, 2.0), // 视频降噪
-        filter::video::saturation(1.3),  // 画质增强：饱和度
+        filter::video::scale(426, 240, None),  // 缩放到 426x240
+        filter::video::crop(0, 0, 400, 200),   // 裁剪出 400x200 区域
+        filter::video::delogo(10, 10, 60, 20), // 去除左上角水印
+        filter::video::hqdn3d(3.0, 2.0),       // 视频降噪
+        filter::video::saturation(1.3),        // 画质增强：饱和度
     ];
 
-    let output_path = Path::new("/tmp/filter_rainbow.mp4");
-
-    let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
+    let filter_count = filters.len();
+    let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
         .with_filters(filters)
-        .build_wrapped(output_path)
-        .expect("failed to create encoder");
+        .build_wrapped(source.as_path())
+        .context("failed to create decoder")?;
 
-    let duration: Time = Time::from_nth_of_a_second(24);
-    let mut position = Time::zero();
+    std::fs::create_dir_all(OUTPUT_DIR).context("failed to create output directory")?;
 
-    for i in 0..128 {
-        let mut frame = rainbow_frame(width as usize, height as usize, i as f32 / 128.0);
-        frame.set_pts(
-            position
-                .aligned_with_rational(encoder.time_base())
-                .into_value()
-                .unwrap(),
-        );
-        encoder.encode(frame)?;
-        position = position.aligned_with(duration).add();
+    println!(
+        "processing '{}' with {} filters...",
+        source.display(),
+        filter_count
+    );
+
+    let mut decoded = 0usize;
+    let mut saved = 0usize;
+    loop {
+        match decoder.decode::<u8>() {
+            Ok(Some(frame)) => {
+                let fmt = frame
+                    .video_format()
+                    .map(|f| f.get_pix_fmt_name().to_string())
+                    .unwrap_or_else(|| "n/a".to_string());
+                println!(
+                    "frame[{decoded}] pts={} size={}x{} fmt={}",
+                    frame.pts, frame.width, frame.height, fmt
+                );
+
+                if saved < SAVE_FRAMES {
+                    save_frame(&frame, saved)?;
+                    saved += 1;
+                }
+                decoded += 1;
+                if decoded >= 30 {
+                    println!("stopped after {decoded} frames (demo)");
+                    break;
+                }
+            }
+            Ok(None) => {
+                println!("decoder reached end of stream");
+                break;
+            }
+            Err(e) => {
+                println!("decode error: {e}");
+                break;
+            }
+        }
     }
-    encoder.finish()?;
-    println!("encoded -> {}", output_path.display());
+
+    println!(
+        "decoded {decoded} frames, saved {saved} to '{}' (note: size={}x{} is the filtered result)",
+        OUTPUT_DIR, 400, 200
+    );
 
     // ---- 2) 打印滤镜 API 目录（仅展示 spec，不实际运行）----
     print_filter_catalog();
 
+    Ok(())
+}
+
+/// 把处理后的帧另存为 PNG（RGB 转换后再写）。
+fn save_frame(frame: &MediaFrame<u8>, index: usize) -> Result<()> {
+    let rgb = frame.convert_yuv_to_rgb()?;
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(
+        frame.width as u32,
+        frame.height as u32,
+        rgb.data.as_slice().unwrap().to_vec(),
+    )
+    .context("failed to build image buffer")?;
+    let path = format!("{OUTPUT_DIR}/filtered_{:03}.png", index);
+    img.save(&path).context("failed to save frame")?;
+    println!("  saved {path}");
     Ok(())
 }
 
@@ -121,6 +176,18 @@ fn print_filter_catalog() {
             "delogo(0,0,100,50)",
             filter::video::delogo(0, 0, 100, 50).spec(),
         ),
+        (
+            "Delogo::new().add_region(x2).band(2)",
+            filter::video::Delogo::new()
+                .add_region(0, 0, 100, 50)
+                .add_region(640, 0, 100, 50)
+                .band(2)
+                .build()
+                .into_iter()
+                .map(|f| f.spec())
+                .collect::<Vec<_>>()
+                .join(" , "),
+        ),
     ];
     for (name, spec) in v {
         println!("  {name}\n    -> {spec}");
@@ -147,23 +214,4 @@ fn print_filter_catalog() {
     for (name, spec) in a {
         println!("  {name}\n    -> {spec}");
     }
-}
-
-fn rainbow_frame(width: usize, height: usize, p: f32) -> MediaFrame<u8> {
-    let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
-    let mut frame = MediaFrame::<u8>::new_video_frame(
-        width,
-        height,
-        PixelFormat::RGB24,
-        time::new_rational(1, 24),
-    )
-    .unwrap();
-    for y in 0..height {
-        for x in 0..width {
-            frame.data[[y, x, 0]] = rgb[0];
-            frame.data[[y, x, 1]] = rgb[1];
-            frame.data[[y, x, 2]] = rgb[2];
-        }
-    }
-    frame
 }
