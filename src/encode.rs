@@ -121,8 +121,8 @@ impl EncoderBuilder {
     /// Set the codec name.
     /// video codec default is `libx264`
     /// audio codec default is `aac`
-    pub fn with_codec_name(mut self, codec_name: Option<String>) -> Self {
-        self.codec_name = codec_name;
+    pub fn with_codec_name(mut self, codec_name: impl Into<Option<String>>) -> Self {
+        self.codec_name = codec_name.into();
         self
     }
 
@@ -196,14 +196,14 @@ impl EncoderBuilder {
     }
 
     /// codec options used for encoder
-    pub fn with_options(mut self, options: Option<Options>) -> Self {
-        self.codec_opts = options;
+    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.codec_opts = options.into();
         self
     }
 
     /// filters used for encoder
-    pub fn with_filters(mut self, filters: Option<Vec<Filter>>) -> Self {
-        self.filters = filters;
+    pub fn with_filters(mut self, filters: impl Into<Option<Vec<Filter>>>) -> Self {
+        self.filters = filters.into();
         self
     }
 
@@ -1279,9 +1279,9 @@ mod tests {
         // 创建编码器
         let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
             .with_time_base(time_base.0, time_base.1)
-            .with_codec_name(Some(config.codec_name))
+            .with_codec_name(config.codec_name)
             .with_options(config.codec_options.map(|opts| opts.into()))
-            .with_filters(Some(filters))
+            .with_filters(filters)
             .build_wrapped(output_path)?;
 
         fn rainbow_frame(w: usize, h: usize, p: f32) -> MediaFrame<u8> {

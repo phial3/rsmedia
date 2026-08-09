@@ -34,9 +34,9 @@ fn main() -> anyhow::Result<()> {
         // encoder with CUDA acceleration
         // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
         // libx264, libx265, h264_nvenc, h264_vaapi
-        // .with_codec_name(Some("h264_nvenc".to_string()))
-        // .with_options(Some(Options::preset_h264_nvenc()))
-        .with_filters(Some(filters))
+        // .with_codec_name("h264_nvenc".to_string())
+        // .with_options(Options::preset_h264_nvenc())
+        .with_filters(filters)
         .build_wrapped(output_path)
         .expect("failed to create encoder");
 

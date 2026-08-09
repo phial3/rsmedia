@@ -41,8 +41,8 @@ async fn main() -> Result<()> {
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
         // decoder with CUDA acceleration
         // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
-        // .with_codec_name(Some("h264_cuvid".to_string()))
-        .with_filters(Some(filters))
+        // .with_codec_name("h264_cuvid".to_string())
+        .with_filters(filters)
         .build_wrapped(source)
         .context("failed to create decoder")?;
 

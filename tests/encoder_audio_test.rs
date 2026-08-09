@@ -499,9 +499,9 @@ mod tests {
         // 创建适合当前格式的编码器
         let mut encoder =
             EncoderBuilder::new_audio(bitrate, channels as i32, sample_rate, sample_format)
-                .with_codec_name(Some(audio_params.codec_name))
+                .with_codec_name(audio_params.codec_name)
                 .with_options(audio_params.codec_options.map(|opts| opts.into()))
-                .with_filters(Some(audio_filters))
+                .with_filters(audio_filters)
                 .build_wrapped(output_path)?;
         // 音频生成参数
         let duration_secs = 1.0; // 总时长5秒

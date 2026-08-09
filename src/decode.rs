@@ -54,14 +54,14 @@ impl DecoderBuilder {
 
     /// Set the codec name to use for decoding.
     /// If not set, the decoder will try to guess the codec based on the input.
-    pub fn with_codec_name(mut self, codec_name: Option<String>) -> Self {
-        self.codec_name = codec_name;
+    pub fn with_codec_name(mut self, codec_name: impl Into<Option<String>>) -> Self {
+        self.codec_name = codec_name.into();
         self
     }
 
     /// codec options to use for decoding.
-    pub fn with_options(mut self, options: Option<Options>) -> Self {
-        self.codec_opts = options;
+    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.codec_opts = options.into();
         self
     }
 
@@ -72,8 +72,8 @@ impl DecoderBuilder {
     }
 
     /// set the filters to apply to decoded frames.
-    pub fn with_filters(mut self, filters: Option<Vec<Filter>>) -> Self {
-        self.filters = filters;
+    pub fn with_filters(mut self, filters: impl Into<Option<Vec<Filter>>>) -> Self {
+        self.filters = filters.into();
         self
     }
 
@@ -921,7 +921,7 @@ mod tests {
         ];
 
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(Some(filters))
+            .with_filters(filters)
             .build_wrapped(video_path)?;
 
         loop {
@@ -954,7 +954,7 @@ mod tests {
         ];
 
         let mut decoder = DecoderBuilder::new(MediaType::AUDIO)
-            .with_filters(Some(filters))
+            .with_filters(filters)
             .build_wrapped(audio_path)?;
 
         loop {

@@ -619,7 +619,7 @@ mod tests {
         let audio_encoder =
             EncoderBuilder::new_audio(bit_rate, channels, sample_rate, SampleFormat::FLTP)
                 // 使用LAME MP3编码器
-                .with_codec_name(Some("libmp3lame".to_string()))
+                .with_codec_name("libmp3lame".to_string())
                 .build()?;
 
         let mut muxer = Muxer::new(output_path)?;
