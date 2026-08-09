@@ -513,10 +513,30 @@ mod tests {
 
         for (r, g, b) in test_cases.iter() {
             let hsv_f32 = rgb_to_hsv(*r, *g, *b);
-            println!("RGB({}, {}, {})", r, g, b);
-            println!(
-                "HSV f32: [{:.6}, {:.6}, {:.6}]",
-                hsv_f32[0], hsv_f32[1], hsv_f32[2]
+            // HSV 输出必须落在合法范围内
+            assert!(
+                (0.0..360.0).contains(&hsv_f32[0]),
+                "Hue out of range for RGB({}, {}, {}): {}",
+                r,
+                g,
+                b,
+                hsv_f32[0]
+            );
+            assert!(
+                (0.0..=100.0).contains(&hsv_f32[1]),
+                "Saturation out of range for RGB({}, {}, {}): {}",
+                r,
+                g,
+                b,
+                hsv_f32[1]
+            );
+            assert!(
+                (0.0..=100.0).contains(&hsv_f32[2]),
+                "Value out of range for RGB({}, {}, {}): {}",
+                r,
+                g,
+                b,
+                hsv_f32[2]
             );
         }
     }

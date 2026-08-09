@@ -1530,7 +1530,6 @@ mod tests {
 
         // 验证数据
         let first_sample = media_frame.data.slice(ndarray::s![0, 0, ..]);
-        println!("{:#?}", first_sample);
         assert_eq!(
             first_sample.to_vec(),
             vec![0.0f32, 1.0f32 / total_samples as f32]
@@ -1617,7 +1616,6 @@ mod tests {
 
         // 验证数据
         let first_sample = media_frame.data.slice(ndarray::s![0, 0, ..]);
-        println!("{:#?}", first_sample);
         assert_eq!(
             first_sample.to_vec(),
             vec![0.0f32, 1.0f32 / total_samples as f32]
@@ -1654,7 +1652,11 @@ mod tests {
     #[test]
     fn test_get_buffer() {
         let encoder = AVCodec::find_encoder(ffi::AV_CODEC_ID_AAC).unwrap();
-        println!("aac sample_fmts:{:#?}", encoder.sample_fmts());
+        // 校验编码器至少声明了一种采样格式
+        assert!(
+            encoder.sample_fmts().is_some_and(|fmts| !fmts.is_empty()),
+            "AAC encoder should expose at least one supported sample format"
+        );
         let mut frame = AVFrame::new();
         frame.set_nb_samples(2);
         frame.set_format(encoder.sample_fmts().unwrap()[0]);
