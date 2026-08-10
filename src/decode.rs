@@ -419,7 +419,7 @@ impl Decoder {
     ///
     /// ```ignore
     /// loop {
-    ///     let (ts, frame) = decoder.decode()?;
+    ///     let (ts, frame) = decoder.decode::<u8>()?;
     ///     // Do something with frame...
     /// }
     /// ```

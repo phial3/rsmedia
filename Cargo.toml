@@ -109,3 +109,8 @@ required-features = ["ndarray"]
 name = "color_professional"
 path = "examples/color_professional.rs"
 required-features = ["ndarray"]
+
+[[example]]
+name = "quick_write"
+path = "examples/quick_write.rs"
+required-features = ["ndarray"]
