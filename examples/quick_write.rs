@@ -24,15 +24,22 @@ fn main() -> anyhow::Result<()> {
     }
 
     encoder.finish()?;
-    println!("Wrote /tmp/quick_write.mp4 ({}x{} @ {}fps)", width, height, fps);
+    println!(
+        "Wrote /tmp/quick_write.mp4 ({}x{} @ {}fps)",
+        width, height, fps
+    );
     Ok(())
 }
 
 fn rainbow_frame(width: usize, height: usize, p: f32) -> MediaFrame<u8> {
     let rgb = rsmedia::colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
-    let mut frame =
-        MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24, time::new_rational(1, 30))
-            .unwrap();
+    let mut frame = MediaFrame::<u8>::new_video_frame(
+        width,
+        height,
+        PixelFormat::RGB24,
+        time::new_rational(1, 30),
+    )
+    .unwrap();
     for y in 0..height {
         for x in 0..width {
             frame.data[[y, x, 0]] = rgb[0];
