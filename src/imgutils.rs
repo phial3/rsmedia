@@ -94,7 +94,7 @@ pub fn fill_plane_sizes<I: IntoIterator<Item = u32>>(
         .collect())
 }
 
-/// frame data => Vec<u8>
+/// frame data => `Vec<u8>`
 pub fn copy_frame_to_buffer(frame: &AVFrame) -> Result<Vec<u8>> {
     let frame_width: i32 = frame.width;
     let frame_height: i32 = frame.height;

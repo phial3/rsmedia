@@ -192,8 +192,8 @@ pub mod video {
     }
 
     /// Converts video pixel format.
-    /// `format`: <https://ffmpeg.org/ffmpeg-filters.html#format>
-    /// `aformat`: <https://ffmpeg.org/ffmpeg-filters.html#aformat-1.
+    /// `format`: https://ffmpeg.org/ffmpeg-filters.html#format
+    /// `aformat`: https://ffmpeg.org/ffmpeg-filters.html#aformat-1
     pub fn format(format: PixelFormat) -> Filter {
         Filter::new(
             "format",

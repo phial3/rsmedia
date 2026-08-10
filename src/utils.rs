@@ -19,7 +19,7 @@ pub fn from_path<P: AsRef<Path> + ?Sized>(path: &P) -> CString {
     }
 }
 
-/// Option<&Path> -> Option<CString>
+/// Option<&Path> -> `Option<CString>`
 pub fn from_path_opt<P: AsRef<Path> + ?Sized>(path: Option<&P>) -> Option<CString> {
     path.map(from_path)
 }
@@ -53,7 +53,7 @@ pub fn from_str<S: AsRef<str> + ?Sized>(s: &S) -> CString {
     CString::new(s.as_ref()).unwrap()
 }
 
-/// Option<&str> -> Option<CString>
+/// Option<&str> -> `Option<CString>`
 pub fn from_str_opt<S: AsRef<str> + ?Sized>(s: Option<&S>) -> Option<CString> {
     s.map(from_str)
 }
