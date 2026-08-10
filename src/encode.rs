@@ -957,12 +957,27 @@ pub struct EncoderWrapper<W: Writer> {
     have_written_trailer: bool,
     /// 自动时间戳的当前位置，由 [`write_frame`](Self::write_frame) 维护。
     position: time::Time,
+    frame_duration: time::Time,
 }
 
 impl<W: Writer> EncoderWrapper<W> {
     /// 创建一个新的编码器包装器
     pub fn new(encoder: Encoder, writer: W, stream_index: usize, interleaved: bool) -> Self {
         let stream_info = StreamInfo::from_writer(&writer, stream_index).unwrap();
+        // 当前帧时长：视频按帧率，音频按采样数/采样率
+        let duration = match encoder.media_type {
+            // 帧时长 = 1 / frame_rate，即取帧率(fr.num / fr.den)的倒数 (fr.den / fr.num)
+            MediaType::VIDEO => {
+                let fr = encoder.frame_rate();
+                time::Time::new(Some(1), time::new_rational(fr.den, fr.num.max(1)))
+            }
+            // 帧时长 = nb_samples / sample_rate
+            MediaType::AUDIO => time::Time::new(
+                Some(encoder.context.frame_size as i64),
+                time::new_rational(1, encoder.context.sample_rate.max(1)),
+            ),
+            _ => panic!("No supported encoder for media_type."),
+        };
         Self {
             writer,
             encoder,
@@ -972,6 +987,7 @@ impl<W: Writer> EncoderWrapper<W> {
             have_written_header: false,
             have_written_trailer: false,
             position: time::Time::zero(),
+            frame_duration: duration,
         }
     }
 
@@ -1012,28 +1028,14 @@ impl<W: Writer> EncoderWrapper<W> {
     /// 若需要完全控制时间戳，请使用 [`encode`](Self::encode)。
     #[cfg(feature = "ndarray")]
     pub fn write_frame<T: MediaFrameType>(&mut self, mut frame: MediaFrame<T>) -> Result<()> {
-        // 当前帧时长：视频按帧率，音频按采样数/采样率
-        let duration = match frame.media_type {
-            // 帧时长 = 1 / frame_rate，即取帧率(fr.num / fr.den)的倒数 (fr.den / fr.num)
-            MediaType::VIDEO => {
-                let fr = self.encoder.frame_rate();
-                time::Time::new(Some(1), time::new_rational(fr.den, fr.num.max(1)))
-            }
-            // 帧时长 = nb_samples / sample_rate
-            MediaType::AUDIO => time::Time::new(
-                Some(frame.nb_samples as i64),
-                time::new_rational(1, frame.sample_rate.max(1) as i32),
-            ),
-            _ => return Err(Error::msg("Only VIDEO/AUDIO frames can be written")),
-        };
-
         let pts = self
             .position
             .aligned_with_rational(self.encoder.time_base())
             .into_value()
             .unwrap_or(0);
         frame.set_pts(pts);
-        self.position = self.position.aligned_with(duration).add();
+
+        self.position = self.position.aligned_with(self.frame_duration).add();
 
         self.encode(frame)
     }
