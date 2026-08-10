@@ -11,6 +11,60 @@ use anyhow::{Context, Error, Result};
 ////////////////////////////// Video Scaler SwsContext ////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// 缩放算法选择。对应 FFmpeg 的 `sws_flags` 缩放算法位，多个质量相关 flag
+/// （`SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND | SWS_BITEXACT`）恒被附加。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ScaleAlgorithm {
+    /// 快速双线性插值（性能优先，质量略逊）
+    FastBilinear,
+    /// 双线性插值，与 FFmpeg 命令行默认一致
+    Bilinear,
+    /// 双三次插值（默认，质量/性能均衡）
+    #[default]
+    Bicubic,
+    /// 实验性算法（`SWS_X`）
+    Experimental,
+    /// 最近邻（阶跃边缘，无平滑）
+    Point,
+    /// 面积平均（适合缩小）
+    Area,
+    /// 双三次亮度 + 双线性色度（`SWS_BICUBLIN`）
+    BicubicLinear,
+    /// 高斯插值
+    Gaussian,
+    /// sinc 插值
+    Sinc,
+    /// Lanczos 插值（高质量）
+    Lanczos,
+    /// 三次 Keys 样条
+    Spline,
+}
+
+impl ScaleAlgorithm {
+    /// 返回该算法对应的完整 swscale flags（算法位 + 质量 flag）。
+    // 不同 FFmpeg 版本/平台下 `ffi::SWS_*` 常量类型不同（u32 / i32），统一转 u32
+    #[allow(clippy::unnecessary_cast)]
+    pub fn flags(self) -> u32 {
+        let mut flags = match self {
+            Self::FastBilinear => ffi::SWS_FAST_BILINEAR,
+            Self::Bilinear => ffi::SWS_BILINEAR,
+            Self::Bicubic => ffi::SWS_BICUBIC,
+            Self::Experimental => ffi::SWS_X,
+            Self::Point => ffi::SWS_POINT,
+            Self::Area => ffi::SWS_AREA,
+            Self::BicubicLinear => ffi::SWS_BICUBLIN,
+            Self::Gaussian => ffi::SWS_GAUSS,
+            Self::Sinc => ffi::SWS_SINC,
+            Self::Lanczos => ffi::SWS_LANCZOS,
+            Self::Spline => ffi::SWS_SPLINE,
+        } as u32;
+        flags |= ffi::SWS_FULL_CHR_H_INT as u32;
+        flags |= ffi::SWS_ACCURATE_RND as u32;
+        flags |= ffi::SWS_BITEXACT as u32;
+        flags
+    }
+}
+
 fn setup_scaler(
     src_width: i32,
     src_height: i32,
@@ -18,6 +72,7 @@ fn setup_scaler(
     dst_width: i32,
     dst_height: i32,
     dst_pix_fmt: ffi::AVPixelFormat,
+    flags: u32,
 ) -> Result<SwsContext> {
     /*
      * Scaler selection options. Only one may be active at a time.
@@ -82,15 +137,7 @@ fn setup_scaler(
     // SWS_ACCURATE_RND   = 1 << 18,
     // SWS_BITEXACT       = 1 << 19,
 
-    // 考虑性能和质量平衡
-    let flags =
-        ffi::SWS_BICUBIC | ffi::SWS_FULL_CHR_H_INT | ffi::SWS_ACCURATE_RND | ffi::SWS_BITEXACT;
-
-    // 创建转换上下文
-    // 不同 FFmpeg 版本/平台下 `ffi::SWS_*` 常量类型不同（ffmpeg6/7 与 macOS 为 `u32`，
-    // Windows ffmpeg8 为 `i32`），而 `get_context` 统一要求 `u32`。
-    // 该转换在 `u32` 平台上看似冗余，但对 `i32` 平台是必要的，故显式允许此 lint。
-    #[allow(clippy::unnecessary_cast)]
+    // new sws_ctx
     let sws_ctx = SwsContext::get_context(
         src_width,
         src_height,
@@ -98,7 +145,7 @@ fn setup_scaler(
         dst_width,
         dst_height,
         dst_pix_fmt,
-        flags as u32,
+        flags,
         None,
         None,
         None,
@@ -116,6 +163,27 @@ pub fn scale(
     dst_width: i32,
     dst_height: i32,
     dst_pix_fmt: PixelFormat,
+) -> Result<AVFrame> {
+    scale_with_flags(
+        src_frame,
+        dst_width,
+        dst_height,
+        dst_pix_fmt,
+        ScaleAlgorithm::default(),
+    )
+}
+
+/// 与 [`scale`] 相同，但可指定缩放算法 [`ScaleAlgorithm`]。
+///
+/// # Safety
+///
+/// ffi::sws_scale_frame
+pub fn scale_with_flags(
+    src_frame: &AVFrame,
+    dst_width: i32,
+    dst_height: i32,
+    dst_pix_fmt: PixelFormat,
+    scaler_algo: ScaleAlgorithm,
 ) -> Result<AVFrame> {
     if !src_frame.hw_frames_ctx.is_null() {
         anyhow::bail!("Hardware frames are not supported in this software scalar");
@@ -136,6 +204,7 @@ pub fn scale(
         dst_width,
         dst_height,
         dst_pix_fmt.into(),
+        scaler_algo.flags(),
     )
     .context("Failed to create swscale context.")?;
 
@@ -201,6 +270,7 @@ pub fn scale_frame(
         dst_width,
         dst_height,
         dst_pix_fmt.into(),
+        ScaleAlgorithm::default().flags(),
     )
     .context("Failed to create swscale context.")?;
 

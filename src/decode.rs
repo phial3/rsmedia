@@ -6,6 +6,7 @@ use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Reader;
 use crate::options::Options;
 use crate::stream::StreamInfo;
+use crate::swctx::ScaleAlgorithm;
 use crate::{swctx, utils, Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
@@ -26,6 +27,7 @@ pub struct DecoderBuilder {
     codec_opts: Option<Options>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
+    scale_algorithm: ScaleAlgorithm,
 }
 
 impl DecoderBuilder {
@@ -43,6 +45,7 @@ impl DecoderBuilder {
             hw_device_config: None,
             thread_count: num_cpus::get(),
             flags: AvCodecFlags::LOW_DELAY,
+            scale_algorithm: ScaleAlgorithm::default(),
         }
     }
 
@@ -82,6 +85,17 @@ impl DecoderBuilder {
     /// * `device_config` - Device to use for hardware acceleration.
     pub fn with_hardware_device(mut self, device_config: Option<HWDeviceConfig>) -> Self {
         self.hw_device_config = device_config;
+        self
+    }
+
+    /// Set the scaling algorithm used when converting decoded frames to a
+    /// canonical pixel format (e.g. YUV420P).
+    ///
+    /// Defaults to [`ScaleAlgorithm::Bicubic`]. Use
+    /// [`ScaleAlgorithm::Bilinear`] for output consistent with FFmpeg's command
+    /// line default, or [`ScaleAlgorithm::Area`] when downscaling.
+    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
+        self.scale_algorithm = algorithm;
         self
     }
 
@@ -270,6 +284,7 @@ impl DecoderBuilder {
             filter_graph,
             context: decode_ctx,
             state: DecoderState::Normal,
+            scale_algorithm: self.scale_algorithm,
         })
     }
 }
@@ -304,6 +319,7 @@ pub struct Decoder {
     stream_index: usize,
     media_type: MediaType,
     state: DecoderState,
+    scale_algorithm: ScaleAlgorithm,
 }
 
 impl Decoder {
@@ -695,11 +711,12 @@ impl Decoder {
             MediaType::VIDEO => {
                 let target_sw_pix_fmt = PixelFormat::YUV420P;
                 if sw_frame.format != target_sw_pix_fmt.into() {
-                    swctx::scale(
+                    swctx::scale_with_flags(
                         &sw_frame,
                         sw_frame.width,
                         sw_frame.height,
                         target_sw_pix_fmt,
+                        self.scale_algorithm,
                     )?
                 } else {
                     sw_frame
