@@ -973,8 +973,8 @@ impl<W: Writer> EncoderWrapper<W> {
             }
             // 帧时长 = nb_samples / sample_rate
             MediaType::AUDIO => time::Time::new(
-                Some(encoder.context.frame_size as i64),
-                time::new_rational(1, encoder.context.sample_rate.max(1)),
+                Some(encoder.frame_size() as i64),
+                time::new_rational(1, encoder.sample_rate().max(1)),
             ),
             _ => panic!("No supported encoder for media_type."),
         };
