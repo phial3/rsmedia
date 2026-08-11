@@ -40,87 +40,28 @@ pub enum ScaleAlgorithm {
     Spline,
 }
 
-/// SwsFlags define:
-/// https://ffmpeg.org/doxygen/trunk/swscale_8h_source.html
-///
-///  typedef enum SwsFlags {
-///      /**
-///       * Return an error on underspecified conversions. Without this flag,
-///       * unspecified fields are defaulted to sensible values.
-///       */
-///      SWS_STRICT        = 1 << 11,
-///
-///      /**
-///       * Emit verbose log of scaling parameters.
-///       */
-///      SWS_PRINT_INFO    = 1 << 12,
-///
-///      /**
-///       * Perform full chroma upsampling when upscaling to RGB.
-///       *
-///       * For example, when converting 50x50 yuv420p to 100x100 rgba, setting this flag
-///       * will scale the chroma plane from 25x25 to 100x100 (4:4:4), and then convert
-///       * the 100x100 yuv444p image to rgba in the final output step.
-///       *
-///       * Without this flag, the chroma plane is instead scaled to 50x100 (4:2:2),
-///       * with a single chroma sample being reused for both of the horizontally
-///       * adjacent RGBA output pixels.
-///       */
-///      SWS_FULL_CHR_H_INT = 1 << 13,
-///
-///      /**
-///       * Perform full chroma interpolation when downscaling RGB sources.
-///       *
-///       * For example, when converting a 100x100 rgba source to 50x50 yuv444p, setting
-///       * this flag will generate a 100x100 (4:4:4) chroma plane, which is then
-///       * downscaled to the required 50x50.
-///       *
-///       * Without this flag, the chroma plane is instead generated at 50x100 (dropping
-///       * every other pixel), before then being downscaled to the required 50x50
-///       * resolution.
-///       */
-///      SWS_FULL_CHR_H_INP = 1 << 14,
-///
-///      /**
-///       * Force bit-exact output. This will prevent the use of platform-specific
-///       * optimizations that may lead to slight difference in rounding, in favor
-///       * of always maintaining exact bit output compatibility with the reference
-///       * C code.
-///       *
-///       * Note: It is recommended to set both of these flags simultaneously.
-///       */
-///      SWS_ACCURATE_RND   = 1 << 18,
-///      SWS_BITEXACT       = 1 << 19,
-///
-///      /**
-///       * Allow/prefer using experimental new code paths. This may be faster,
-///       * slower, or produce different output, with semantics subject to change
-///       * at any point in time. For testing and debugging purposes only.
-///       */
-///      SWS_UNSTABLE = 1 << 20,
-///
-///      /**
-///       * Deprecated flags.
-///       */
-///      SWS_DIRECT_BGR      = 1 << 15, ///< This flag has no effect
-///      SWS_ERROR_DIFFUSION = 1 << 23, ///< Set `SwsContext.dither` instead
-///
-///      /**
-///       * Scaler selection options. Only one may be active at a time.
-///       * Deprecated in favor of `SwsContext.scaler`.
-///       */
-///      SWS_FAST_BILINEAR = 1 <<  0, ///< fast bilinear filtering
-///      SWS_BILINEAR      = 1 <<  1, ///< bilinear filtering
-///      SWS_BICUBIC       = 1 <<  2, ///< 2-tap cubic B-spline
-///      SWS_X             = 1 <<  3, ///< experimental
-///      SWS_POINT         = 1 <<  4, ///< nearest neighbor
-///      SWS_AREA          = 1 <<  5, ///< area averaging
-///      SWS_BICUBLIN      = 1 <<  6, ///< bicubic luma, bilinear chroma
-///      SWS_GAUSS         = 1 <<  7, ///< gaussian approximation
-///      SWS_SINC          = 1 <<  8, ///< unwindowed sinc
-///      SWS_LANCZOS       = 1 <<  9, ///< 3-tap sinc/sinc
-///      SWS_SPLINE        = 1 << 10, ///< unwindowed natural cubic spline
-///  } SwsFlags;
+// FFmpeg `SwsFlags` 定义参考（对应 swscale 头的开关位，见
+// https://ffmpeg.org/doxygen/trunk/swscale_8h_source.html ）：
+//   SWS_STRICT         1 << 11   Return an error on underspecified conversions.
+//   SWS_PRINT_INFO     1 << 12   Emit verbose log of scaling parameters.
+//   SWS_FULL_CHR_H_INT 1 << 13   Perform full chroma upsampling when upscaling to RGB.
+//   SWS_FULL_CHR_H_INP 1 << 14   Perform full chroma interpolation when downscaling RGB.
+//   SWS_ACCURATE_RND   1 << 18   Force bit-exact output rounding.
+//   SWS_BITEXACT       1 << 19   Disable platform-specific optimizations for bit-exactness.
+//   SWS_UNSTABLE       1 << 20   Prefer experimental code paths.
+//   SWS_DIRECT_BGR     1 << 15   Deprecated: no effect.
+//   SWS_ERROR_DIFFUSION 1 << 23   Deprecated: set `SwsContext.dither` instead.
+//   SWS_FAST_BILINEAR  1 <<  0   fast bilinear filtering
+//   SWS_BILINEAR       1 <<  1   bilinear filtering
+//   SWS_BICUBIC        1 <<  2   2-tap cubic B-spline
+//   SWS_X              1 <<  3   experimental
+//   SWS_POINT          1 <<  4   nearest neighbor
+//   SWS_AREA           1 <<  5   area averaging
+//   SWS_BICUBLIN       1 <<  6   bicubic luma, bilinear chroma
+//   SWS_GAUSS          1 <<  7   gaussian approximation
+//   SWS_SINC           1 <<  8   unwindowed sinc
+//   SWS_LANCZOS        1 <<  9   3-tap sinc/sinc
+//   SWS_SPLINE         1 << 10   unwindowed natural cubic spline
 impl ScaleAlgorithm {
     /// 返回该算法对应的完整 swscale flags（算法位 + 质量 flag）。
     // 不同 FFmpeg 版本/平台下 `ffi::SWS_*` 常量类型不同（u32 / i32），统一转 u32
