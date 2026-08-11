@@ -44,8 +44,6 @@ fn main() {
                     .with_options(Options::preset_h264_nvenc())
                     .with_bit_rate(stream_info.bit_rate)
                     // video
-                    .with_time_base_ra(stream_info.time_base)
-                    .with_frame_rate_ra(stream_info.frame_rate)
                     .with_pixel_format(PixelFormat::from(stream_info.format))
                     .build()
                     .unwrap()

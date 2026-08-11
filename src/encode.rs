@@ -8,6 +8,7 @@ use crate::io::Writer;
 use crate::options::Options;
 use crate::pixel::PixelFormat;
 use crate::stream::StreamInfo;
+use crate::swctx::ScaleAlgorithm;
 use crate::{swctx, time, utils, Location, MediaType, SampleFormat, StreamWriter};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket};
@@ -21,6 +22,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct EncoderBuilder {
     /// Video
+    fps: f32,
     width: usize,
     height: usize,
     pixel_format: PixelFormat,
@@ -44,6 +46,7 @@ pub struct EncoderBuilder {
     codec_opts: Option<Options>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
+    scale_algorithm: ScaleAlgorithm,
 }
 
 impl EncoderBuilder {
@@ -103,7 +106,6 @@ impl EncoderBuilder {
             .with_bit_rate(bit_rate)
             .with_nb_channels(nb_channels)
             .with_sample_rate(sample_rate)
-            .with_time_base(1, sample_rate)
             .with_sample_format(sample_format)
             .with_media_type(MediaType::AUDIO)
     }
@@ -146,16 +148,16 @@ impl EncoderBuilder {
         self
     }
 
-    /// Set the frame rate.
-    pub fn with_frame_rate_ra(mut self, frame_rare: ffi::AVRational) -> Self {
-        self.frame_rate = frame_rare;
-        self
-    }
-
-    pub fn with_frame_rate(mut self, num: i32, den: i32) -> Self {
-        self.frame_rate = time::new_rational(num, den);
-        self
-    }
+    // /// Set the frame rate.
+    // pub fn with_frame_rate_ra(mut self, frame_rare: ffi::AVRational) -> Self {
+    //     self.frame_rate = frame_rare;
+    //     self
+    // }
+    //
+    // pub fn with_frame_rate(mut self, num: i32, den: i32) -> Self {
+    //     self.frame_rate = time::new_rational(num, den);
+    //     self
+    // }
 
     /// Set the video frame rate from a floating-point number of frames per second.
     ///
@@ -164,32 +166,33 @@ impl EncoderBuilder {
     /// reduced rational via FFmpeg's `av_d2q` and used as the encoder frame rate.
     pub fn with_fps(mut self, fps: f32) -> Self {
         if fps > 0.0 && fps.is_finite() {
+            self.fps = fps;
             self.frame_rate = avutil::av_d2q(fps as f64, Self::FPS_MAX);
         }
         self
     }
 
-    /// Set the time base.
-    pub fn with_time_base_ra(mut self, time_base: ffi::AVRational) -> Self {
-        self.time_base = time_base;
-        self
-    }
-
-    pub fn with_time_base(mut self, num: i32, den: i32) -> Self {
-        self.time_base = time::new_rational(num, den);
-        self
-    }
-
-    /// Set the packet time base.
-    pub fn with_pkt_time_base_ra(mut self, pkt_time_base: ffi::AVRational) -> Self {
-        self.pkt_time_base = pkt_time_base;
-        self
-    }
-
-    pub fn with_pkt_time_base(mut self, num: i32, den: i32) -> Self {
-        self.pkt_time_base = time::new_rational(num, den);
-        self
-    }
+    // /// Set the time base.
+    // pub fn with_time_base_ra(mut self, time_base: ffi::AVRational) -> Self {
+    //     self.time_base = time_base;
+    //     self
+    // }
+    //
+    // pub fn with_time_base(mut self, num: i32, den: i32) -> Self {
+    //     self.time_base = time::new_rational(num, den);
+    //     self
+    // }
+    //
+    // /// Set the packet time base.
+    // pub fn with_pkt_time_base_ra(mut self, pkt_time_base: ffi::AVRational) -> Self {
+    //     self.pkt_time_base = pkt_time_base;
+    //     self
+    // }
+    //
+    // pub fn with_pkt_time_base(mut self, num: i32, den: i32) -> Self {
+    //     self.pkt_time_base = time::new_rational(num, den);
+    //     self
+    // }
 
     /// Set the GOP size.
     pub fn with_gop_size(mut self, gop_size: i32) -> Self {
@@ -229,6 +232,15 @@ impl EncoderBuilder {
         self
     }
 
+    /// Set the scaling algorithm used when converting input frames to the
+    /// encoder's target pixel format (e.g. RGB24 -> YUV420P).
+    ///
+    /// Defaults to [`ScaleAlgorithm::Bicubic`].
+    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
+        self.scale_algorithm = algorithm;
+        self
+    }
+
     /// explicit media type, default is `MediaType::VIDEO`
     pub fn with_media_type(mut self, media_type: MediaType) -> Self {
         self.media_type = media_type;
@@ -260,6 +272,19 @@ impl EncoderBuilder {
         self
     }
 
+    /// 编码器使用的 time_base。
+    ///
+    /// 视频由用户 fps 推导为 `1/fps`（libx264 等编码器在这种 time_base 下才
+    /// 能正确输出 packet duration，避免 MP4 muxer 丢弃末帧）；音频按
+    /// `1/sample_rate` 推导，对所有音频编码器一致。
+    fn effective_time_base(&self) -> ffi::AVRational {
+        match self.media_type {
+            MediaType::VIDEO => avutil::av_inv_q(self.frame_rate),
+            MediaType::AUDIO => time::new_rational(1, self.sample_rate),
+            _ => self.time_base,
+        }
+    }
+
     /// Apply the settings to an encoder.
     ///
     /// # Arguments
@@ -285,7 +310,7 @@ impl EncoderBuilder {
             encoder.set_gop_size(self.gop_size);
             encoder.set_max_b_frames(self.max_b_frames);
             encoder.set_framerate(self.frame_rate);
-            encoder.set_time_base(self.time_base);
+            encoder.set_time_base(self.effective_time_base());
             encoder.set_pkt_timebase(self.pkt_time_base);
             encoder.set_pix_fmt(self.pixel_format.into());
             encoder.set_sample_aspect_ratio(time::new_rational(1, 1));
@@ -294,7 +319,7 @@ impl EncoderBuilder {
             encoder.set_bit_rate(self.bit_rate);
             encoder.set_sample_rate(self.sample_rate);
             encoder.set_sample_fmt(self.sample_format as _);
-            encoder.set_time_base(time::new_rational(1, self.sample_rate));
+            encoder.set_time_base(self.effective_time_base());
         } else {
             return Err(Error::msg(format!(
                 "Unsupported media type: {media_type:?}"
@@ -365,6 +390,48 @@ impl EncoderBuilder {
         self.setup_codec_context(&mut encode_ctx)?;
         let config = CodecConfig::new_with_ctx(&encode_ctx);
 
+        // 在 hw_device_config / codec_opts 被 move 之前构造 filter graph：
+        // 此位置 self 尚未被部分 move，可直接借用 self 计算 time_base。
+        let filter_graph = if let Some(filters) = self.filters.as_ref() {
+            let filter_params = match media_type {
+                MediaType::VIDEO => {
+                    FilterParams::Video(VideoParams {
+                        width: self.width as i32,
+                        height: self.height as i32,
+                        format: self.pixel_format,
+                        time_base: self.effective_time_base(),
+                        frame_rate: self.frame_rate,
+                        pixel_aspect: encode_ctx.sample_aspect_ratio, // sample aspect ratio (0 if unknown)
+                    })
+                }
+                MediaType::AUDIO => {
+                    FilterParams::Audio(AudioParams {
+                        nb_channels: self.nb_channels,
+                        sample_rate: self.sample_rate,
+                        format: self.sample_format,
+                        time_base: self.effective_time_base(), // time_base = 1 / sample_rate
+                    })
+                }
+                _ => {
+                    panic!("Unsupported filter for media type: {media_type:?}");
+                }
+            };
+            let mut graph = FilterGraph::new();
+            // check Filter media type
+            if !filters.iter().all(|f| f.media_type() == media_type) {
+                return Err(Error::msg(format!(
+                    "Filter media type mismatch for encoder type {media_type:?}"
+                )));
+            }
+            graph
+                .init(&filter_params, filters.as_slice())
+                .context("Failed to initialize filter graph")?;
+
+            Some(graph)
+        } else {
+            None
+        };
+
         let hw_context = self
             .hw_device_config
             .filter(|_cfg| {
@@ -398,46 +465,6 @@ impl EncoderBuilder {
             .open(dict)
             .context("Failed to open encode context")?;
 
-        let filter_graph = if let Some(filters) = self.filters {
-            let filter_params = match media_type {
-                MediaType::VIDEO => {
-                    FilterParams::Video(VideoParams {
-                        width: self.width as i32,
-                        height: self.height as i32,
-                        format: self.pixel_format,
-                        time_base: self.time_base,
-                        frame_rate: self.frame_rate,
-                        pixel_aspect: encode_ctx.sample_aspect_ratio, // sample aspect ratio (0 if unknown)
-                    })
-                }
-                MediaType::AUDIO => {
-                    FilterParams::Audio(AudioParams {
-                        nb_channels: self.nb_channels,
-                        sample_rate: self.sample_rate,
-                        format: self.sample_format,
-                        time_base: time::new_rational(1, self.sample_rate), // time_base = 1 / sample_rate
-                    })
-                }
-                _ => {
-                    panic!("Unsupported filter for media type: {media_type:?}");
-                }
-            };
-            let mut graph = FilterGraph::new();
-            // check Filter media type
-            if !filters.iter().all(|f| f.media_type() == media_type) {
-                return Err(Error::msg(format!(
-                    "Filter media type mismatch for encoder type {media_type:?}"
-                )));
-            }
-            graph
-                .init(&filter_params, filters.as_slice())
-                .context("Failed to initialize filter graph")?;
-
-            Some(graph)
-        } else {
-            None
-        };
-
         Ok(Encoder {
             config,
             hw_context,
@@ -445,6 +472,7 @@ impl EncoderBuilder {
             filter_graph,
             context: encode_ctx,
             state: EncoderState::Normal,
+            scale_algorithm: self.scale_algorithm,
         })
     }
 }
@@ -460,6 +488,7 @@ impl Default for EncoderBuilder {
             pkt_time_base: time::TIME_BASE,
             bit_rate: Self::VIDEO_BIT_RATE,
             frame_rate: time::new_rational(Self::FRAME_RATE, 1),
+            fps: Self::FRAME_RATE as f32,
             keyframe_interval: Self::KEY_FRAME_INTERVAL,
             gop_size: 0,
             max_b_frames: 0,
@@ -475,6 +504,7 @@ impl Default for EncoderBuilder {
             codec_opts: None,
             filters: None,
             hw_device_config: None,
+            scale_algorithm: ScaleAlgorithm::default(),
         }
     }
 }
@@ -507,6 +537,7 @@ pub struct Encoder {
     hw_context: Option<Arc<HWContext>>,
     media_type: MediaType,
     state: EncoderState,
+    scale_algorithm: ScaleAlgorithm,
 }
 
 impl Encoder {
@@ -656,7 +687,13 @@ impl Encoder {
                     self.pix_fmt()
                 };
                 if frame.format != target_sw_pix_fmt.into() {
-                    swctx::scale(&frame, frame.width, frame.height, target_sw_pix_fmt)?
+                    swctx::scale_with_flags(
+                        &frame,
+                        frame.width,
+                        frame.height,
+                        target_sw_pix_fmt,
+                        self.scale_algorithm,
+                    )?
                 } else {
                     frame
                 }
@@ -696,6 +733,11 @@ impl Encoder {
         let frame = frame.unwrap();
         match self.media_type {
             MediaType::VIDEO => {
+                // 硬件帧的像素格式（如 NV12/HW 私有格式）不在软件编码器的
+                // `supported_pixel_formats()` 列表中，跳过该检查以免误报。
+                if !frame.hw_frames_ctx.is_null() {
+                    return Ok(());
+                }
                 let pix_fmts_opt = self.config.supported_pixel_formats()?;
                 if let Some(pix_fmts) = pix_fmts_opt {
                     if !pix_fmts.contains(&frame.format) {
@@ -818,6 +860,28 @@ impl Encoder {
         self.context.extract_codecpar()
     }
 
+    /// 单帧时长（编码器 time_base 单位），用于补全缺失的 packet duration。
+    ///
+    /// 先求单帧时长（秒），再换算到编码器 time_base 的整数 tick：
+    /// `ticks = av_rescale_q(1, frame_dur_sec, time_base)`。
+    fn packet_duration(&self) -> i64 {
+        let tb = self.time_base();
+        let frame_dur_sec = match self.media_type {
+            // 视频：1 / frame_rate
+            MediaType::VIDEO => avutil::av_inv_q(self.frame_rate()),
+            // 音频：frame_size / sample_rate
+            MediaType::AUDIO => {
+                let fs = self.frame_size();
+                if fs <= 0 {
+                    return 0;
+                }
+                time::new_rational(fs, self.sample_rate())
+            }
+            _ => return 0,
+        };
+        avutil::av_rescale_q(1, frame_dur_sec, tb).max(1)
+    }
+
     /// Internal: Pull an encoded packet from the decoder.
     ///
     /// Handles `EAGAIN`, drained, and flushed states.
@@ -884,11 +948,21 @@ impl Encoder {
         self.send_frame_to_encoder(None)?;
 
         // drain the items still on the queue before giving up.
+        // EOF 已发送，理论上编码器最终会返回 EOF；但为防御个别编码器在 EOS 后
+        // 持续返回 EAGAIN（Drained）而不返回 EOF，增加迭代上限，避免死循环。
+        let mut drained_iterations = 0u32;
         loop {
             match self.receive_packet() {
                 Ok(Some(mut packet)) => {
+                    drained_iterations = 0;
                     packet.set_pos(-1);
                     packet.set_stream_index(index as i32);
+                    // 编码器输出的 packet 常不带 duration（libx264 等），若缺失则按
+                    // 帧率/采样率补上，否则 MP4 等容器无法推导**最后一帧**的时长，
+                    // 导致末帧被 muxer 丢弃。
+                    if packet.duration <= 0 {
+                        packet.set_duration(self.packet_duration());
+                    }
                     // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
                     // encode_ctx_timebase => out_stream_time_base
                     packet.rescale_ts(self.time_base(), out_stream_time_base);
@@ -901,6 +975,13 @@ impl Encoder {
                 Ok(None) => {
                     if self.is_drained() {
                         log::debug!("Encoder drained, try send new frame again.");
+                        drained_iterations += 1;
+                        if drained_iterations > 1_000 {
+                            log::error!(
+                                "Encoder keeps returning EAGAIN after EOF, aborting flush."
+                            );
+                            break;
+                        }
                         continue;
                     } else {
                         log::debug!("Encoder flushed, EOF reached.");
@@ -1001,7 +1082,14 @@ impl<W: Writer> EncoderWrapper<W> {
         if let Some(mut packet) = self.encoder.encode_raw(frame)? {
             packet.set_pos(-1);
             packet.set_stream_index(self.stream_index as i32);
-            packet.rescale_ts(self.time_base(), self.stream_info.time_base);
+            if packet.duration <= 0 {
+                packet.set_duration(self.encoder.packet_duration());
+            }
+            // 实时获取输出流时间基（write_header 后 muxer 可能调整 timescale）。
+            packet.rescale_ts(
+                self.time_base(),
+                self.writer.stream_time_base(self.stream_index),
+            );
 
             if self.interleaved {
                 self.writer.write_interleaved(&mut packet)?;
@@ -1052,11 +1140,13 @@ impl<W: Writer> EncoderWrapper<W> {
 
     /// 刷新编码器并写入剩余数据
     fn flush(&mut self) -> Result<()> {
+        // 实时获取（write_header 后 muxer 可能已调整 timescale）
+        let out_stream_time_base = self.writer.stream_time_base(self.stream_index);
         self.encoder.flush(
             &mut self.writer,
             self.interleaved,
             self.stream_index,
-            self.stream_info.time_base,
+            out_stream_time_base,
         )
     }
 
@@ -1090,7 +1180,25 @@ mod tests {
 
     use std::collections::HashMap;
 
-    /// 定义视频格式参数结构体
+    /// 生成一帧纯色（RGB24）测试帧，颜色随相位 `p` 在彩虹色相上变化。
+    #[cfg(feature = "ndarray")]
+    fn rainbow_frame(w: usize, h: usize, p: f32) -> MediaFrame<u8> {
+        use crate::colors;
+        let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
+        let mut frame =
+            MediaFrame::<u8>::new_video_frame(w, h, PixelFormat::RGB24, time::new_rational(1, 24))
+                .unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                frame.data[[y, x, 0]] = rgb[0];
+                frame.data[[y, x, 1]] = rgb[1];
+                frame.data[[y, x, 2]] = rgb[2];
+            }
+        }
+        frame
+    }
+
+    /// 视频/容器格式参数（内部测试辅助）
     #[allow(dead_code)]
     struct VideoFormatParams {
         time_base: (i32, i32),
@@ -1326,31 +1434,10 @@ mod tests {
 
         // 创建编码器
         let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
-            .with_time_base(time_base.0, time_base.1)
             .with_codec_name(config.codec_name)
             .with_options(config.codec_options.map(|opts| opts.into()))
             .with_filters(filters)
             .build_wrapped(output_path)?;
-
-        fn rainbow_frame(w: usize, h: usize, p: f32) -> MediaFrame<u8> {
-            use crate::colors;
-            let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
-            let mut frame = MediaFrame::<u8>::new_video_frame(
-                w,
-                h,
-                PixelFormat::RGB24,
-                time::new_rational(1, 24),
-            )
-            .unwrap();
-            for y in 0..h {
-                for x in 0..w {
-                    frame.data[[y, x, 0]] = rgb[0];
-                    frame.data[[y, x, 1]] = rgb[1];
-                    frame.data[[y, x, 2]] = rgb[2];
-                }
-            }
-            frame
-        }
 
         let actual_timebase = encoder.time_base();
         let frame_duration_seconds = 1.0 / fps;
@@ -1466,6 +1553,224 @@ mod tests {
             eprintln!("Failed encoders: {:#?}", err_encoder)
         }
 
+        Ok(())
+    }
+
+    /// 自包含的编解码往返测试：编码若干帧到临时文件，再解码回，验证帧数与尺寸一致。
+    /// 不依赖任何外部媒体文件，可自动运行。
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_encode_decode_roundtrip() -> Result<()> {
+        use crate::{DecoderBuilder, MediaType};
+
+        let width = 64usize;
+        let height = 64usize;
+        let n_frames = 10;
+        let fps = 25.0;
+
+        let path = std::env::temp_dir().join("rsmedia_roundtrip.mp4");
+        let _ = std::fs::remove_file(&path);
+
+        // 1) 编码：用 write_frame 自动维护 pts
+        let mut encoder = EncoderBuilder::new_video(width, height)
+            .with_fps(fps)
+            .build_wrapped(path.as_path())?;
+        for i in 0..n_frames {
+            let frame = rainbow_frame(width, height, i as f32 / n_frames as f32);
+            encoder.write_frame(frame)?;
+        }
+        encoder.finish()?;
+
+        // 2) 解码回：验证帧数与解码尺寸
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+        let mut decoded = 0usize;
+        while let Some(frame) = decoder.decode_frame()? {
+            assert_eq!(frame.width, width);
+            assert_eq!(frame.height, height);
+            decoded += 1;
+        }
+        assert_eq!(
+            decoded, n_frames,
+            "decoded frame count mismatch: got {decoded}, expected {n_frames}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// 验证 `write_frame` 自动维护的 pts 单调递增且与帧率一致（不含 B 帧时每帧
+    /// 时长为 1/fps，按编码器时间基换算）。
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_write_frame_auto_pts() -> Result<()> {
+        use crate::{DecoderBuilder, MediaType};
+
+        let width = 64usize;
+        let height = 64usize;
+        let n_frames = 8;
+        let fps: f64 = 30.0;
+
+        let path = std::env::temp_dir().join("rsmedia_auto_pts.mp4");
+        let _ = std::fs::remove_file(&path);
+
+        let mut encoder = EncoderBuilder::new_video(width, height)
+            .with_fps(fps as f32)
+            .build_wrapped(path.as_path())?;
+
+        // 帧时长 = 1/fps（秒）。解码输出的 pts 位于输出流 time_base（movenc
+        // 可能调整，如 MP4 用 1/15360），故在解码后按实际帧 time_base 计算期望增量。
+        for i in 0..n_frames {
+            let frame = rainbow_frame(width, height, i as f32 / n_frames as f32);
+            encoder.write_frame(frame)?;
+        }
+        encoder.finish()?;
+
+        // 解码回，收集真实 pts，验证相邻帧 pts 差恒定
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+        let mut pts_list: Vec<i64> = Vec::new();
+        while let Some(frame) = decoder.decode_frame()? {
+            pts_list.push(frame.pts);
+        }
+        assert_eq!(pts_list.len(), n_frames);
+
+        // 解码 pts 位于输出流 time_base（movenc 可能调整，如 MP4 用 1/15360）
+        let tb = decoder.decoder_mut().time_base();
+        let expected_delta = (tb.den as f64 / tb.num as f64 / fps).round() as i64;
+
+        // 排除 B 帧重排的影响：仅断言存在一致的正增量（B 帧可能为 0/负，取出现最多的增量）
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for d in pts_list.windows(2).map(|w| w[1] - w[0]) {
+            if d > 0 {
+                *counts.entry(d).or_default() += 1;
+            }
+        }
+        let delta = counts
+            .into_iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(d, _)| d)
+            .unwrap_or(expected_delta);
+        assert_eq!(delta, expected_delta, "pts delta mismatch vs 1/fps");
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// 验证不同帧率下：编码器 time_base 恒为 `1/fps`，且编码→解码往返帧数一致。
+    ///
+    /// 这是对 fps → time_base 推导（`av_inv_q`）与末帧 duration 修复的回归测试。
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_encode_video_multiple_fps() -> Result<()> {
+        use crate::{DecoderBuilder, MediaType};
+
+        for fps in [24.0f32, 25.0, 30.0, 60.0, 29.97] {
+            let path = std::env::temp_dir().join(format!("rsmedia_fps_{fps}.mp4"));
+            let _ = std::fs::remove_file(&path);
+
+            let n_frames = 12;
+            let mut encoder = EncoderBuilder::new_video(64, 64)
+                .with_fps(fps)
+                .build_wrapped(path.as_path())?;
+
+            // 1) 编码器 time_base 必须等于 1/fps
+            let tb = encoder.time_base();
+            let expected_tb = avutil::av_inv_q(avutil::av_d2q(fps as f64, EncoderBuilder::FPS_MAX));
+            assert_eq!(
+                (tb.num, tb.den),
+                (expected_tb.num, expected_tb.den),
+                "fps={fps}: time_base {}/{} != 1/fps",
+                tb.num,
+                tb.den
+            );
+
+            for i in 0..n_frames {
+                let frame = rainbow_frame(64, 64, i as f32 / n_frames as f32);
+                encoder.write_frame(frame)?;
+            }
+            encoder.finish()?;
+
+            // 2) 解码回，帧数必须与编码一致（验证末帧未被 muxer 丢弃）
+            let mut decoder =
+                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let mut decoded = 0usize;
+            while let Some(frame) = decoder.decode_frame()? {
+                assert_eq!(frame.width, 64);
+                assert_eq!(frame.height, 64);
+                decoded += 1;
+            }
+            assert_eq!(
+                decoded, n_frames,
+                "fps={fps}: decoded {decoded} frames, expected {n_frames}"
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(())
+    }
+
+    /// 音频编解码往返测试：编码若干 AAC 音频帧，解码回验证采样率/通道数/总采样数。
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_encode_decode_audio_roundtrip() -> Result<()> {
+        use crate::frame::MediaFrame;
+        use crate::{DecoderBuilder, MediaType};
+
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
+        let format = SampleFormat::FLTP;
+        // AAC 默认 frame_size = 1024 采样/帧
+        let samples_per_frame = 1024u32;
+        let frames_to_write = 10u32;
+
+        let path = std::env::temp_dir().join("rsmedia_audio_roundtrip.m4a");
+        let _ = std::fs::remove_file(&path);
+
+        let mut encoder =
+            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
+                .build_wrapped(path.as_path())?;
+
+        // 1) 音频 time_base 应为 1/sample_rate
+        let tb = encoder.time_base();
+        let expected_tb = time::new_rational(1, sample_rate as i32);
+        assert_eq!(
+            (tb.num, tb.den),
+            (expected_tb.num, expected_tb.den),
+            "audio time_base {}/{} != 1/sample_rate",
+            tb.num,
+            tb.den
+        );
+
+        for _ in 0..frames_to_write {
+            let frame = MediaFrame::<f32>::new_audio_frame(
+                format,
+                channels,
+                samples_per_frame,
+                sample_rate,
+                time::new_rational(1, sample_rate as i32),
+            )?;
+            encoder.write_frame(frame)?;
+        }
+        encoder.finish()?;
+
+        // 2) 解码验证：采样率、通道数、采样量（AAC 有编码延迟/padding，总采样数应覆盖输入）
+        // 音频 FLTP 用 f32 解码（decode_frame 固定返回 u8，仅适用于视频）。
+        let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+        let mut total_samples = 0u64;
+        let mut decoded_frames = 0usize;
+        while let Some(frame) = decoder.decode::<f32>()? {
+            assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
+            assert_eq!(frame.nb_channels, channels, "channel count mismatch");
+            total_samples += frame.nb_samples as u64;
+            decoded_frames += 1;
+        }
+        let expected = frames_to_write as u64 * samples_per_frame as u64;
+        assert!(
+            total_samples >= expected,
+            "decoded {total_samples} samples, expected >= {expected}"
+        );
+        assert!(decoded_frames > 0, "no audio frames decoded");
+
+        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 }

@@ -480,6 +480,13 @@ impl Decoder {
                         break Some(frame);
                     }
                     Ok(None) => {
+                        // None 可能来自 Drained（EAGAIN，解码器仍有缓冲帧待产出）或
+                        // Flushed（EOF）。若是 Drained 需继续 drain，否则会丢失尾部帧
+                        // （多见于含 B 帧的码流）。
+                        if self.is_drained() {
+                            log::debug!("Decoder drained, keep draining.");
+                            continue;
+                        }
                         log::debug!("Decoder flushed. EOF reached.");
                         // self.reset();
                         // read_exhausted = false;
@@ -555,6 +562,10 @@ impl Decoder {
                         break Some(frame);
                     }
                     Ok(None) => {
+                        if self.is_drained() {
+                            log::debug!("Decoder drained, keep draining.");
+                            continue;
+                        }
                         log::debug!("Decoder flushed. EOF reached.");
                         // self.reset();
                         // read_exhausted = false;
@@ -649,9 +660,16 @@ impl Decoder {
     /// # Return value
     ///
     /// The decoded raw frame as [`AVFrame`] if the decoder has a frame available, [`None`] if not.
+    ///
+    /// 作为低层手动解码 API 的一部分公开：配合 [`into_parts`](Self::into_parts) 与
+    /// [`decode_raw_packet`](Self::decode_raw_packet) 使用，可逐 packet 送入解码器并排空
+    /// 缓冲帧。需要 [`MediaFrame`] 的高级调用请使用 [`drain`](Self::drain)。
     pub fn drain_raw(&mut self) -> Result<Option<AVFrame>> {
         if !self.is_drained() {
             self.send_packet_to_decoder(None)?;
+            // 已发送 EOS，进入 draining 模式。此后 EAGAIN 表示"仍在 drain"，
+            // 而非 read 阶段缺包，因此在此处显式置位。
+            self.state = DecoderState::Drained;
         }
         self.receive_frame_from_decoder()
     }
@@ -682,7 +700,28 @@ impl Decoder {
         // 1. 从解码器获取原始帧
         let decoded_frame = match self.decoder_receive_frame() {
             Ok(Some(f)) => f,
-            Ok(None) => return Ok(None), // Decoder drained or flushed
+            Ok(None) => {
+                // 解码器无更多帧。
+                // - Drained：仍需更多输入，暂不刷新 filter，返回 None 让外层继续喂包。
+                // - Flushed：到达 EOF，此时驱动 filter graph 冲刷内部缓冲帧（如
+                //   fps/setpts 等带延迟滤镜）。逐帧调用 `process_frame(None)`，
+                //   每帧返回一帧，直到 graph 进入 Flushed 状态，无需额外队列字段。
+                if self.is_drained() {
+                    return Ok(None);
+                }
+                if let Some(graph) = self.filter_graph.as_mut() {
+                    if !graph.is_flushed() {
+                        match graph.process_frame(None)? {
+                            Some(frame) => return Ok(Some(frame)),
+                            None => {
+                                // 已无更多缓冲帧（graph 此时已 Flushed）
+                                debug_assert!(graph.is_flushed());
+                            }
+                        }
+                    }
+                }
+                return Ok(None);
+            }
             Err(e) => return Err(e),
         };
 
@@ -759,8 +798,12 @@ impl Decoder {
         match self.context.receive_frame() {
             Ok(frame) => Ok(Some(frame)),
             Err(rsmpeg::error::RsmpegError::DecoderDrainError) => {
+                // EAGAIN：此刻无帧可出。
+                // - read 阶段：表示"该包暂未解出帧，需继续喂包"，此时不应置 Drained，
+                //   否则会使后续 drain_raw 误判已进入 draining 而跳过 EOS 发送（见 drain_raw）。
+                // - drain 阶段：Drained 已在 drain_raw 中置位，这里保持即可。
                 log::debug!("Decoder drained. try send new packet again.");
-                self.state = DecoderState::Drained;
+                // self.state = DecoderState::Drained;
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::DecoderFlushedError) => {

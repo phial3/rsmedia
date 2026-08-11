@@ -262,7 +262,20 @@ unsafe impl Send for StreamReader {}
 unsafe impl Sync for StreamReader {}
 
 /// Any type that implements this can write video packets.
-pub trait Writer: private::Write + private::Output {}
+pub trait Writer: private::Write + private::Output {
+    /// 获取输出流当前的时间基。
+    ///
+    /// 注意：`write_header` 之后 muxer 可能调整 stream 的时间基（例如 MP4 的
+    /// movenc 会重设 timescale）。因此写包时应**实时获取**，不要缓存 write 前
+    /// 的值，否则 packet 的 pts/duration 会按错误的 time_base 解析。
+    fn stream_time_base(&self, stream_index: usize) -> ffi::AVRational {
+        self.output()
+            .streams()
+            .get(stream_index)
+            .map(|s| s.time_base)
+            .unwrap_or(crate::time::TIME_BASE)
+    }
+}
 
 /// Build a [`StreamWriter`].
 pub struct StreamWriterBuilder<'a> {

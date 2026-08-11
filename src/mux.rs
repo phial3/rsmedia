@@ -665,7 +665,7 @@ mod tests {
         // 视频参数
         pub const VIDEO_WIDTH: usize = 1280;
         pub const VIDEO_HEIGHT: usize = 720;
-        pub const VIDEO_FPS: i32 = 30;
+        pub const VIDEO_FPS: f32 = 30f32;
         pub const VIDEO_DURATION_SEC: u32 = 10;
 
         // 音频参数
@@ -676,9 +676,7 @@ mod tests {
         let output_path = Path::new("/tmp/test_multiple_streams.mp4");
 
         let video_encoder = EncoderBuilder::new_video(VIDEO_WIDTH, VIDEO_HEIGHT)
-            .with_frame_rate(VIDEO_FPS, 1)
-            // 使用标准的90kHz时间基
-            .with_time_base(1, 90_000)
+            .with_fps(VIDEO_FPS)
             .build()?;
 
         let audio_encoder =
