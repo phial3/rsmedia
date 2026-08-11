@@ -91,6 +91,11 @@ path = "examples/audio_encoding.rs"
 required-features = ["ndarray"]
 
 [[example]]
+name = "decode_streams"
+path = "examples/decode_streams.rs"
+required-features = ["ndarray"]
+
+[[example]]
 name = "seek"
 path = "examples/seek.rs"
 required-features = ["ndarray"]

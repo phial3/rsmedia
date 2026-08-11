@@ -216,9 +216,26 @@ where
         let dts = frame.pkt_dts;
         let format = frame.format;
         let duration = frame.duration;
-        let time_base = frame.time_base;
+        // AVFrame 的 time_base 常未被解码器填充（默认 0/0）。无效时：
+        // - 音频可由采样率推断为 1/sample_rate
+        // - 视频无法从帧内推断帧率，告警并提示调用方设置
+        let time_base = if frame.time_base.num == 0 || frame.time_base.den == 0 {
+            if frame.nb_samples > 0 && frame.sample_rate > 0 {
+                time::new_rational(1, frame.sample_rate)
+            } else {
+                log::warn!(
+                    "AVFrame has no valid time_base ({:?}); call MediaFrame::set_time_base",
+                    frame.time_base
+                );
+                frame.time_base
+            }
+        } else {
+            frame.time_base
+        };
 
-        if width == 0 && height == 0 && frame.nb_samples > 0 {
+        // 判断依据：nb_samples 是音频帧专属字段（视频帧恒为 0），
+        // 是最可靠的音频信号；width/height 是视频帧的固有属性。
+        if frame.nb_samples > 0 {
             // Audio frame
             Ok(Self {
                 pts,
@@ -524,6 +541,54 @@ where
     }
 }
 
+impl MediaFrame<u8> {
+    /// 将 RGB24 视频帧转换为 `image::DynamicImage`。
+    ///
+    /// 仅支持 [`PixelFormat::RGB24`] 视频帧；其他格式或媒体类型返回错误。
+    pub fn to_dynamic_image(&self) -> Result<image::DynamicImage> {
+        self.check_rgb24_supported()?;
+        let (height, width, _) = self.data.dim();
+        let mut rgb = Vec::with_capacity(width * height * 3);
+        if let Some(slice) = self.data.as_standard_layout().as_slice() {
+            rgb.extend_from_slice(slice);
+        } else {
+            for y in 0..height {
+                for x in 0..width {
+                    rgb.extend_from_slice(&[
+                        self.data[[y, x, 0]],
+                        self.data[[y, x, 1]],
+                        self.data[[y, x, 2]],
+                    ]);
+                }
+            }
+        }
+        image::RgbImage::from_raw(width as u32, height as u32, rgb)
+            .map(image::DynamicImage::ImageRgb8)
+            .ok_or_else(|| Error::msg("Failed to build image from RGB24 data"))
+    }
+
+    /// 从 `image::DynamicImage` 创建 RGB24 视频帧。
+    ///
+    /// 任意色彩模式（RGB / RGBA / 灰度等）都会统一转为 RGB8。
+    pub fn from_dynamic_image(
+        img: &image::DynamicImage,
+        time_base: ffi::AVRational,
+    ) -> Result<Self> {
+        let rgb = img.to_rgb8();
+        let (width, height) = rgb.dimensions();
+        let data =
+            ndarray::Array3::from_shape_vec((height as usize, width as usize, 3), rgb.into_raw())
+                .map_err(|e| Error::msg(format!("Failed to build ndarray from image: {e}")))?;
+        Self::new_video(
+            width as usize,
+            height as usize,
+            PixelFormat::RGB24,
+            time_base,
+            data,
+        )
+    }
+}
+
 /// 验证帧格式和类型大小的匹配关系
 fn validate_format_type_size<T>(format: i32, expected_size: usize) -> Result<()> {
     let type_size = std::mem::size_of::<T>();
@@ -556,18 +621,42 @@ where
 
     match frame.format {
         ffi::AV_PIX_FMT_RGB24 => {
-            // 对于RGB格式，尝试直接使用连续内存
-            if let Some(buffer) = data.as_standard_layout().as_slice() {
-                unsafe {
-                    let dst_ptr = frame.data[0] as *mut T;
-                    std::ptr::copy_nonoverlapping(buffer.as_ptr(), dst_ptr, buffer.len());
-                }
-                Ok(())
-            } else {
-                Err(Error::msg("Non-contiguous video data"))
+            let line_size = frame.linesize[0] as usize;
+            let width_bytes = width * 3;
+            if line_size < width_bytes {
+                return Err(Error::msg(format!(
+                    "Insufficient linesize for RGB24: {line_size} < {width_bytes}"
+                )));
             }
+            unsafe {
+                let dst_ptr = frame.data[0];
+                if let Some(buffer) = data.as_standard_layout().as_slice() {
+                    // 按行拷贝，ceil 到 linesize（可能有对齐 padding）
+                    for y in 0..height {
+                        let src = buffer.as_ptr().cast::<u8>().add(y * width_bytes);
+                        std::ptr::copy_nonoverlapping(src, dst_ptr.add(y * line_size), width_bytes);
+                    }
+                } else {
+                    // 非连续数据：逐元素放置到每行 linesize 布局
+                    for y in 0..height {
+                        let row = dst_ptr.add(y * line_size);
+                        for x in 0..width {
+                            let o = x * 3;
+                            *row.add(o) = data[[y, x, 0]].to_u8().unwrap();
+                            *row.add(o + 1) = data[[y, x, 1]].to_u8().unwrap();
+                            *row.add(o + 2) = data[[y, x, 2]].to_u8().unwrap();
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
         ffi::AV_PIX_FMT_YUV420P => {
+            if width % 2 != 0 || height % 2 != 0 {
+                return Err(Error::msg(format!(
+                    "YUV420P requires even dimensions, got {width}x{height}"
+                )));
+            }
             // 提取 Y 平面数据
             let mut y_data = Vec::with_capacity(width * height);
             for y in 0..height {
@@ -679,6 +768,12 @@ where
 
         ffi::AV_PIX_FMT_YUV420P => {
             validate_format_type_size::<T>(frame.format, 1)?;
+            // YUV420P 的色度是亮度采样的 1/4，宽高必须为偶数，否则 UV 平面无法完整上采样
+            if width % 2 != 0 || height % 2 != 0 {
+                return Err(Error::msg(format!(
+                    "YUV420P requires even dimensions, got {width}x{height}"
+                )));
+            }
 
             let y_line_size = frame.linesize[0] as usize;
             let uv_line_size = frame.linesize[1] as usize;
@@ -792,11 +887,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::colors::Color;
     use anyhow::anyhow;
     use rsmpeg::avcodec::AVCodec;
     use std::time::Duration;
 
-    fn create_test_pattern(width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    /// 用 `Color::from_rgb` 生成渐变测试图案并填充 RGB24 帧。
+    /// 返回 r/g/b 三个平面，方便调用方做断言。
+    fn fill_rgb_data(
+        frame: &mut MediaFrame<u8>,
+        width: usize,
+        height: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut r = vec![0u8; width * height];
         let mut g = vec![0u8; width * height];
         let mut b = vec![0u8; width * height];
@@ -804,9 +906,17 @@ mod tests {
         for y in 0..height {
             for x in 0..width {
                 let idx = y * width + x;
-                r[idx] = ((x as f32 / width as f32) * 255.0) as u8;
-                g[idx] = ((y as f32 / height as f32) * 255.0) as u8;
-                b[idx] = (((x + y) as f32 / (width + height) as f32) * 255.0) as u8;
+                let c = Color::from_rgb(
+                    ((x as f32 / width as f32) * 255.0) as u8,
+                    ((y as f32 / height as f32) * 255.0) as u8,
+                    (((x + y) as f32 / (width + height) as f32) * 255.0) as u8,
+                );
+                r[idx] = c.r();
+                g[idx] = c.g();
+                b[idx] = c.b();
+                frame.data[[y, x, 0]] = c.r();
+                frame.data[[y, x, 1]] = c.g();
+                frame.data[[y, x, 2]] = c.b();
             }
         }
         (r, g, b)
@@ -891,16 +1001,7 @@ mod tests {
         )?;
 
         // 测试数据访问和修改
-        let (r, g, b) = create_test_pattern(TEST_WIDTH, TEST_HEIGHT);
-
-        for y in 0..TEST_HEIGHT {
-            for x in 0..TEST_WIDTH {
-                let idx = y * TEST_WIDTH + x;
-                frame.data[[y, x, 0]] = r[idx];
-                frame.data[[y, x, 1]] = g[idx];
-                frame.data[[y, x, 2]] = b[idx];
-            }
-        }
+        let (r, g, b) = fill_rgb_data(&mut frame, TEST_WIDTH, TEST_HEIGHT);
 
         // 验证数据正确性
         for y in 0..TEST_HEIGHT {
@@ -925,15 +1026,7 @@ mod tests {
             TIME_BASE,
         )?;
 
-        let (r, g, b) = create_test_pattern(TEST_WIDTH, TEST_HEIGHT);
-        for y in 0..TEST_HEIGHT {
-            for x in 0..TEST_WIDTH {
-                let idx = y * TEST_WIDTH + x;
-                rgb_frame.data[[y, x, 0]] = r[idx];
-                rgb_frame.data[[y, x, 1]] = g[idx];
-                rgb_frame.data[[y, x, 2]] = b[idx];
-            }
-        }
+        let _ = fill_rgb_data(&mut rgb_frame, TEST_WIDTH, TEST_HEIGHT);
 
         // RGB -> YUV 转换
         let yuv_frame = rgb_frame.convert_rgb_to_yuv()?;
@@ -975,15 +1068,7 @@ mod tests {
             PixelFormat::RGB24,
             TIME_BASE,
         )?;
-        let (r, g, b) = create_test_pattern(TEST_WIDTH, TEST_HEIGHT);
-        for y in 0..TEST_HEIGHT {
-            for x in 0..TEST_WIDTH {
-                let idx = y * TEST_WIDTH + x;
-                rgb_frame.data[[y, x, 0]] = r[idx];
-                rgb_frame.data[[y, x, 1]] = g[idx];
-                rgb_frame.data[[y, x, 2]] = b[idx];
-            }
-        }
+        let _ = fill_rgb_data(&mut rgb_frame, TEST_WIDTH, TEST_HEIGHT);
 
         // 显式指定不同色彩矩阵，均应输出 YUV420P
         let yuv709 = rgb_frame.convert_rgb_to_yuv_with_matrix(YuvStandardMatrix::Bt709)?;
@@ -1039,15 +1124,7 @@ mod tests {
         )?;
 
         // 填充测试数据
-        let (r, g, b) = create_test_pattern(TEST_WIDTH, TEST_HEIGHT);
-        for y in 0..TEST_HEIGHT {
-            for x in 0..TEST_WIDTH {
-                let idx = y * TEST_WIDTH + x;
-                original.data[[y, x, 0]] = r[idx];
-                original.data[[y, x, 1]] = g[idx];
-                original.data[[y, x, 2]] = b[idx];
-            }
-        }
+        let _ = fill_rgb_data(&mut original, TEST_WIDTH, TEST_HEIGHT);
 
         // RGB -> YUV -> RGB -> YUV -> RGB
         let converted = original
@@ -1728,5 +1805,135 @@ mod tests {
         let stereo_layout = AVChannelLayout::from_string(c"stereo").unwrap();
         frame.set_ch_layout(stereo_layout.into_inner());
         assert!(frame.alloc_buffer().is_ok());
+    }
+
+    #[test]
+    fn test_dynamic_image_conversion() -> Result<()> {
+        let mut frame = MediaFrame::<u8>::new_video_frame(
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            PixelFormat::RGB24,
+            TIME_BASE,
+        )?;
+        let (r, g, b) = fill_rgb_data(&mut frame, TEST_WIDTH, TEST_HEIGHT);
+
+        // MediaFrame -> DynamicImage
+        let img = frame.to_dynamic_image()?;
+        let rgb = img.to_rgb8();
+        assert_eq!(rgb.dimensions(), (TEST_WIDTH as u32, TEST_HEIGHT as u32));
+        for y in 0..TEST_HEIGHT {
+            for x in 0..TEST_WIDTH {
+                let idx = y * TEST_WIDTH + x;
+                let px = rgb.get_pixel(x as u32, y as u32);
+                assert_eq!(px.0, [r[idx], g[idx], b[idx]]);
+            }
+        }
+
+        // DynamicImage -> MediaFrame
+        let back = MediaFrame::<u8>::from_dynamic_image(&img, TIME_BASE)?;
+        assert_eq!(back.format, ffi::AV_PIX_FMT_RGB24);
+        assert_eq!(back.data.dim(), (TEST_HEIGHT, TEST_WIDTH, 3));
+        assert_eq!(back.data, frame.data);
+
+        // RGBA 输入也应能正确转回 RGB24
+        let rgba = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            TEST_WIDTH as u32,
+            TEST_HEIGHT as u32,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let from_rgba = MediaFrame::<u8>::from_dynamic_image(&rgba, TIME_BASE)?;
+        assert_eq!(from_rgba.data[[0, 0, 0]], 10);
+        assert_eq!(from_rgba.data[[0, 0, 1]], 20);
+        assert_eq!(from_rgba.data[[0, 0, 2]], 30);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rgb24_to_avframe_respects_linesize() -> Result<()> {
+        // 使用不满足 32 字节对齐的宽高，强制 av_frame_get_buffer 填充 linesize，
+        // 验证 to_avframe 按行拷贝而非错误的连续内存拷贝。
+        let width = 63usize;
+        let height = 47usize;
+        let mut frame =
+            MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24, TIME_BASE)?;
+        for y in 0..height {
+            for x in 0..width {
+                frame.data[[y, x, 0]] = (x % 256) as u8;
+                frame.data[[y, x, 1]] = (y % 256) as u8;
+                frame.data[[y, x, 2]] = ((x + y) % 256) as u8;
+            }
+        }
+
+        let av = frame.to_avframe()?;
+        assert!(
+            av.linesize[0] as usize >= width * 3,
+            "linesize should absorb padding"
+        );
+
+        // 往返回来应逐像素一致
+        let back = MediaFrame::<u8>::from_avframe(&av)?;
+        assert_eq!(back.data, frame.data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_avframe_invalid_time_base() -> Result<()> {
+        // 音频帧未设置 time_base，应推断为 1/sample_rate
+        let mut aframe = AVFrame::new();
+        aframe.set_format(ffi::AV_SAMPLE_FMT_FLTP);
+        aframe.set_nb_samples(480);
+        aframe.set_sample_rate(48000);
+        let stereo = AVChannelLayout::from_string(c"stereo").unwrap();
+        aframe.set_ch_layout(stereo.into_inner());
+        aframe.alloc_buffer()?;
+        let media = MediaFrame::<f32>::from_avframe(&aframe)?;
+        assert_eq!(media.media_type, MediaType::AUDIO);
+        assert_eq!(media.time_base.num, 1);
+        assert_eq!(media.time_base.den, 48000);
+
+        // 视频帧未设置 time_base，无法从帧内推断，保留原值（den==0）
+        let mut vframe = AVFrame::new();
+        vframe.set_format(ffi::AV_PIX_FMT_RGB24);
+        vframe.set_width(320);
+        vframe.set_height(240);
+        vframe.alloc_buffer()?;
+        let vmedia = MediaFrame::<u8>::from_avframe(&vframe)?;
+        assert_eq!(vmedia.media_type, MediaType::VIDEO);
+        assert_eq!(vmedia.time_base.num, 0); // 无效，保留原值
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_yuv420p_odd_dimensions_rejected() -> Result<()> {
+        // 奇数尺寸 YUV420P：from_avframe 应报错
+        let mut frame = AVFrame::new();
+        frame.set_format(ffi::AV_PIX_FMT_YUV420P);
+        frame.set_width(63);
+        frame.set_height(47);
+        frame.alloc_buffer()?;
+        unsafe {
+            std::ptr::write_bytes(
+                frame.data[0],
+                0,
+                frame.linesize[0] as usize * frame.height as usize,
+            );
+            for p in 1..3 {
+                std::ptr::write_bytes(
+                    frame.data[p],
+                    128,
+                    frame.linesize[p] as usize * (frame.height as usize / 2),
+                );
+            }
+        }
+        assert!(MediaFrame::<u8>::from_avframe(&frame).is_err());
+
+        // 奇数尺寸 YUV420P MediaFrame：to_avframe 应报错
+        let media = MediaFrame::<u8>::new_video_frame(63, 47, PixelFormat::YUV420P, TIME_BASE)?;
+        assert!(media.to_avframe().is_err());
+
+        Ok(())
     }
 }
