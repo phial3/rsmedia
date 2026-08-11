@@ -40,7 +40,6 @@ pub struct EncoderBuilder {
     /// config
     oformat_flags: i32,
     thread_count: usize,
-    keyframe_interval: u64,
     media_type: MediaType,
     codec_name: Option<String>,
     codec_opts: Option<Options>,
@@ -50,9 +49,6 @@ pub struct EncoderBuilder {
 }
 
 impl EncoderBuilder {
-    /// Default keyframe interval.
-    const KEY_FRAME_INTERVAL: u64 = 12;
-
     /// This is the assumed FPS for the encoder to use.
     /// Note that this does not need to be correct exactly.
     const FRAME_RATE: i32 = 30;
@@ -130,13 +126,7 @@ impl EncoderBuilder {
         self
     }
 
-    /// Set the keyframe interval.
-    pub fn with_keyframe_interval(mut self, keyframe_interval: u64) -> Self {
-        self.keyframe_interval = keyframe_interval;
-        self
-    }
-
-    /// set the thread count.
+    /// Set the thread count.
     pub fn with_thread_count(mut self, thread_count: usize) -> Self {
         self.thread_count = thread_count;
         self
@@ -489,7 +479,6 @@ impl Default for EncoderBuilder {
             bit_rate: Self::VIDEO_BIT_RATE,
             frame_rate: time::new_rational(Self::FRAME_RATE, 1),
             fps: Self::FRAME_RATE as f32,
-            keyframe_interval: Self::KEY_FRAME_INTERVAL,
             gop_size: 0,
             max_b_frames: 0,
             oformat_flags: AvFormatFlags::GLOBAL_HEADER as i32,

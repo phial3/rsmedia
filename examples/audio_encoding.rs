@@ -1,22 +1,24 @@
-//! 演示音频的解码与编码。
+//! 演示音频的编码与解码。
 //!
 //! 覆盖的 API：
-//! - `DecoderBuilder::new(MediaType::AUDIO)` + `build_wrapped` —— 音频解码器
-//! - `DecoderWrapper::decode::<f32>` —— 解码为音频 [`MediaFrame`]
-//! - `MediaFrame::audio_format` —— 读取音频帧的采样格式（类型安全访问器）
 //! - `EncoderBuilder::new_audio` —— 音频编码器
 //! - `MediaFrame::new_audio_frame` —— 创建音频帧（数据布局 `(1, nb_samples, nb_channels)`）
 //! - `EncoderWrapper::encode` / `EncoderWrapper::finish`
+//! - `DecoderBuilder::new(MediaType::AUDIO)` + `build_wrapped` —— 音频解码器
+//! - `DecoderWrapper::decode::<f32>` —— 解码为音频 [`MediaFrame`]
+//! - `MediaFrame::audio_format` —— 读取音频帧的采样格式（类型安全访问器）
 
 use rsmedia::{DecoderBuilder, EncoderBuilder, MediaFrame, MediaType, SampleFormat};
 
 use anyhow::Result;
-use rsmedia::time::{self, Time};
+use rsmedia::time;
 use std::path::Path;
 
 const SAMPLE_RATE: u32 = 44_100;
 const CHANNELS: u32 = 2;
 const NB_SAMPLES: u32 = 1024;
+/// 编码时长（秒），>10s 便于用播放器/ffprobe 验证。
+const DURATION_SEC: u32 = 12;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -24,39 +26,19 @@ fn main() -> Result<()> {
         .init();
     rsmedia::init()?;
 
-    // 1. 演示音频解码
-    decode_audio(Path::new("/tmp/test.mp4"))?;
+    // 1. 演示音频编码（生成 12 秒正弦波写入 m4a，aac 编码器的标准容器）
+    encode_audio(Path::new("/tmp/sine_12s.m4a"))?;
 
-    // 2. 演示音频编码（生成 1 秒正弦波写入 wav）
-    encode_audio(Path::new("/tmp/sine.wav"))?;
+    // 2. 演示音频解码
+    decode_audio(Path::new("/tmp/sine_12s.m4a"))?;
 
     Ok(())
 }
 
-/// 解码音频流，打印每帧的采样格式信息。
-fn decode_audio(source: &Path) -> Result<()> {
-    let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(source)?;
-
-    let mut frames = 0;
-    while let Some(frame) = decoder.decode::<f32>()? {
-        let fmt = frame
-            .audio_format()
-            .map(|f| f.get_sample_fmt_name())
-            .unwrap_or_else(|| "n/a".to_string());
-        println!(
-            "[decode] pts={}, sample_rate={}, channels={}, samples={}, format={fmt}",
-            frame.pts, frame.sample_rate, frame.nb_channels, frame.nb_samples
-        );
-        frames += 1;
-        if frames >= 10 {
-            break;
-        }
-    }
-    println!("decoded {frames} audio frames");
-    Ok(())
-}
-
-/// 编码 1 秒正弦波音频。
+/// 编码 `DURATION_SEC` 秒正弦波音频。
+///
+/// 使用 `write_frame` 自动维护 pts（音频按 `frame_size/sample_rate` 递增），
+/// 无需手动计算 position / set_pts。
 fn encode_audio(output: &Path) -> Result<()> {
     let mut encoder = EncoderBuilder::new_audio(
         128_000,
@@ -66,28 +48,45 @@ fn encode_audio(output: &Path) -> Result<()> {
     )
     .build_wrapped(output)?;
 
-    let frame_duration = Time::new(
-        Some(NB_SAMPLES as i64),
-        time::new_rational(1, SAMPLE_RATE as i32),
-    );
-    let mut position = Time::zero();
-
-    let total_frames = SAMPLE_RATE / NB_SAMPLES;
+    let total_frames = SAMPLE_RATE * DURATION_SEC / NB_SAMPLES;
     for i in 0..total_frames {
-        let mut frame = sine_frame(i as f32 * NB_SAMPLES as f32 / SAMPLE_RATE as f32)?;
-        frame.set_pts(
-            position
-                .aligned_with_rational(encoder.time_base())
-                .into_value()
-                .unwrap(),
-        );
-
-        encoder.encode(frame)?;
-        position = position.aligned_with(frame_duration).add();
+        let frame = sine_frame(i as f32 * NB_SAMPLES as f32 / SAMPLE_RATE as f32)?;
+        encoder.write_frame(frame)?;
     }
 
     encoder.finish()?;
-    println!("encoded audio to {:?}", output);
+    println!(
+        "encoded {total_frames} frames ({DURATION_SEC}s) audio to {:?}",
+        output
+    );
+    Ok(())
+}
+
+/// 解码音频流，打印每帧的采样格式信息。
+fn decode_audio(source: &Path) -> Result<()> {
+    let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(source)?;
+
+    let mut frames = 0;
+    let mut total_samples = 0i64;
+    while let Some(frame) = decoder.decode::<f32>()? {
+        let fmt = frame
+            .audio_format()
+            .map(|f| f.get_sample_fmt_name())
+            .unwrap_or_else(|| "n/a".to_string());
+        println!(
+            "[decode] pts={}, sample_rate={}, channels={}, samples={}, format={fmt}",
+            frame.pts, frame.sample_rate, frame.nb_channels, frame.nb_samples
+        );
+        total_samples += frame.nb_samples as i64;
+        frames += 1;
+        if frames >= 10 {
+            break;
+        }
+    }
+    println!(
+        "decoded {frames} audio frames (first 10), ~{:.2}s",
+        total_samples as f64 / SAMPLE_RATE as f64
+    );
     Ok(())
 }
 

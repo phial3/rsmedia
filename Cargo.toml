@@ -86,8 +86,8 @@ name = "decode_raw"
 path = "examples/decode_raw.rs"
 
 [[example]]
-name = "audio"
-path = "examples/audio.rs"
+name = "audio_encoding"
+path = "examples/audio_encoding.rs"
 required-features = ["ndarray"]
 
 [[example]]
