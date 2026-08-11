@@ -613,68 +613,58 @@ impl Encoder {
     }
 
     fn send_frame_to_encoder(&mut self, frame_opt: Option<AVFrame>) -> Result<()> {
-        // 1. Filter Graph
-        let filtered_frame = if let Some(graph) = self.filter_graph.as_mut() {
-            // 即便输入是 None (EOF flush), 也要调用 process_frame(None) 来驱动 Filter flush
-            match graph.process_frame(frame_opt)? {
-                Some(filtered) => Some(filtered),
-                None => {
-                    if graph.is_drained() {
-                        log::debug!("Filter graph drained, try send new frame again.");
-                        return Ok(());
-                    } else if graph.is_flushed() {
-                        log::warn!("Filter graph EOF reached.");
-                    } else {
-                        log::error!("Filter graph returned None, should not happen.");
+        if let Some(frame) = frame_opt {
+            // 正常编码帧：经过 filter（如有）
+            if let Some(graph) = self.filter_graph.as_mut() {
+                match graph.process_frame(Some(frame))? {
+                    Some(filtered) => self.send_frame_post_filter(filtered)?,
+                    None => {
+                        // filter 暂未输出（内部缓冲中），等待后续帧驱动
+                        log::debug!("Filter graph drained, waiting for more input.");
                     }
-                    None
                 }
+            } else {
+                self.send_frame_post_filter(frame)?;
             }
+            Ok(())
         } else {
-            // 没有Filter，直接发送到 Encoder 或者是 EOF
-            frame_opt
-        };
+            // EOF：向编码器发送 EOS。filter 的缓冲帧已由 `flush()` 单独冲刷送走，
+            // 这里不应再调用 `process_frame(None)`，否则对已 flushed 的 graph 会报错。
+            self.context.send_frame(None)?;
+            Ok(())
+        }
+    }
 
-        let final_frame = if let Some(frame) = filtered_frame {
-            // 2. 处理需要发送给编码器的帧
-            // 确保关键帧标记正确, *注意*：frame_num 在 send_frame 后才更新
-            // if (self.context.frame_num + 1) % self.keyframe_interval as i64 == 0 {
-            //     frame.set_pict_type(ffi::AV_PICTURE_TYPE_I);
-            // }
+    /// 将已通过 filter（或无 filter）的帧做 rescale/hw 上传后发送给编码器。
+    ///
+    /// 注意：`flush()` 阶段 filter 已进入 Flushed 状态，不能再把缓冲帧送回
+    /// `process_frame`（会因 EAGAIN 被丢弃），因此缓冲帧必须直接走本方法。
+    fn send_frame_post_filter(&mut self, frame: AVFrame) -> Result<()> {
+        // 确保帧的格式匹配编码器要求
+        let scaled_frame = self.rescale(frame)?;
 
-            // 3. 确保帧的格式匹配编码器要求
-            let scaled_frame = self.rescale(frame)?;
-
-            // 转换硬件帧
-            let hw_frame = match self.hw_context.as_ref() {
-                Some(hw_ctx) if hw_ctx.is_sw_frame(&scaled_frame) => {
-                    // sw_frame -> hw_frame
-                    hw_ctx
-                        .hw_upload(&mut self.context, &scaled_frame)
-                        .context("Failed to upload frame to HW")?
-                }
-                _ => scaled_frame, // 不需要上传或已经是 HW frame
-            };
-
-            Some(hw_frame)
-        } else {
-            // EOF
-            None
+        // 转换硬件帧
+        let hw_frame = match self.hw_context.as_ref() {
+            Some(hw_ctx) if hw_ctx.is_sw_frame(&scaled_frame) => {
+                // sw_frame -> hw_frame
+                hw_ctx
+                    .hw_upload(&mut self.context, &scaled_frame)
+                    .context("Failed to upload frame to HW")?
+            }
+            _ => scaled_frame, // 不需要上传或已经是 HW frame
         };
 
         // check frame valid
-        self.check_frame(final_frame.as_ref())?;
+        self.check_frame(Some(&hw_frame))?;
 
         log::debug!(
             "Send frame to encoder: {:?}, time_base: {:?}, media_type: {:?}",
-            final_frame,
+            hw_frame,
             self.time_base(),
             self.media_type()
         );
 
-        // finally
-        self.context.send_frame(final_frame.as_ref())?;
-
+        self.context.send_frame(Some(&hw_frame))?;
         Ok(())
     }
 
@@ -940,7 +930,8 @@ impl Encoder {
         if let Some(filter) = self.filter_graph.as_mut() {
             let frames = filter.flush()?;
             for frame in frames {
-                self.send_frame_to_encoder(Some(frame))?;
+                // filter 已 Flushed，缓冲帧直接走 post-filter 路径，不可再进 process_frame
+                self.send_frame_post_filter(frame)?;
             }
         }
 
@@ -1592,6 +1583,52 @@ mod tests {
         assert_eq!(
             decoded, n_frames,
             "decoded frame count mismatch: got {decoded}, expected {n_frames}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// 回归测试：带延迟滤镜（framerate，内部缓冲运动插值帧、flush 时才输出剩余帧）
+    /// 编码时，flush() 阶段取出的缓冲帧必须全部写盘，不能因再次送入已 flushed 的
+    /// filter 而被丢弃。
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_encode_delayed_filter_roundtrip() -> Result<()> {
+        use crate::{filter::Filter, DecoderBuilder, MediaType};
+
+        let width = 64usize;
+        let height = 64usize;
+        let n_frames = 30;
+        let fps = 30.0;
+
+        let path = std::env::temp_dir().join("rsmedia_delayed_filter.mp4");
+        let _ = std::fs::remove_file(&path);
+
+        // framerate 滤镜内部缓冲运动插值帧，输入 30 帧@30fps=1s，输出仍约 30 帧，
+        // 其中尾部的插值帧要等 flush(EOF) 才输出。若 flush 缓冲帧被丢弃会偏少。
+        let mut encoder = EncoderBuilder::new_video(width, height)
+            .with_fps(fps as f32)
+            .with_filters(vec![Filter::new(
+                "framerate",
+                MediaType::VIDEO,
+                "framerate=fps=30".to_string(),
+            )])
+            .build_wrapped(path.as_path())?;
+        for i in 0..n_frames {
+            let frame = rainbow_frame(width, height, i as f32 / n_frames as f32);
+            encoder.write_frame(frame)?;
+        }
+        encoder.finish()?;
+
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+        let mut decoded = 0usize;
+        while let Some(_frame) = decoder.decode_frame()? {
+            decoded += 1;
+        }
+        assert!(
+            decoded >= n_frames,
+            "delayed filter roundtrip lost frames: got {decoded}, expected >= {n_frames}"
         );
 
         let _ = std::fs::remove_file(&path);

@@ -114,3 +114,8 @@ required-features = ["ndarray"]
 name = "quick_write"
 path = "examples/quick_write.rs"
 required-features = ["ndarray"]
+
+[[example]]
+name = "hw_vt_check"
+path = "examples/hw_vt_check.rs"
+required-features = ["ndarray"]
