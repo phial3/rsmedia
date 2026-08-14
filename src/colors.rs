@@ -488,65 +488,27 @@ mod tests {
     }
 
     #[test]
-    fn test_pure_colors() {
-        // 红色
-        let [h, s, v] = rgb_to_hsv(255, 0, 0);
-        assert_approx_eq!(h, 0.0);
-        assert_approx_eq!(s, 100.0);
-        assert_approx_eq!(v, 100.0);
-        assert_eq!(hsv_to_rgb(h, s, v), [255, 0, 0]);
+    fn test_rgb_hsv_known_values() {
+        // (r, g, b, 期望 h/s/v)；灰色/黑色时饱和度需单独容差
+        let cases: &[(u8, u8, u8, f32, f32, f32, f32)] = &[
+            (255, 0, 0, 0.0, 100.0, 100.0, f32::EPSILON),     // 纯红
+            (0, 255, 0, 120.0, 100.0, 100.0, f32::EPSILON),   // 纯绿
+            (0, 0, 255, 240.0, 100.0, 100.0, f32::EPSILON),   // 纯蓝
+            (255, 255, 0, 60.0, 100.0, 100.0, f32::EPSILON),  // 黄
+            (255, 0, 255, 300.0, 100.0, 100.0, f32::EPSILON), // 品红
+            (0, 255, 255, 180.0, 100.0, 100.0, f32::EPSILON), // 青
+            (0, 0, 0, 0.0, 0.0, 0.0, f32::EPSILON),           // 纯黑
+            (255, 255, 255, 0.0, 0.0, 100.0, f32::EPSILON),   // 纯白
+            (128, 128, 128, 0.0, 0.0, 50.2, 0.1),             // 中灰
+        ];
 
-        // 绿色
-        let [h, s, v] = rgb_to_hsv(0, 255, 0);
-        assert_approx_eq!(h, 120.0);
-        assert_approx_eq!(s, 100.0);
-        assert_approx_eq!(v, 100.0);
-        assert_eq!(hsv_to_rgb(h, s, v), [0, 255, 0]);
-
-        // 蓝色
-        let [h, s, v] = rgb_to_hsv(0, 0, 255);
-        assert_approx_eq!(h, 240.0);
-        assert_approx_eq!(s, 100.0);
-        assert_approx_eq!(v, 100.0);
-        assert_eq!(hsv_to_rgb(h, s, v), [0, 0, 255]);
-    }
-
-    #[test]
-    fn test_grayscale() {
-        // 纯黑
-        let [h, s, v] = rgb_to_hsv(0, 0, 0);
-        assert_approx_eq!(s, 0.0);
-        assert_approx_eq!(v, 0.0);
-        assert_eq!(hsv_to_rgb(h, s, v), [0, 0, 0]);
-
-        // 纯白
-        let [h, s, v] = rgb_to_hsv(255, 255, 255);
-        assert_approx_eq!(s, 0.0);
-        assert_approx_eq!(v, 100.0);
-        assert_eq!(hsv_to_rgb(h, s, v), [255, 255, 255]);
-
-        // 中灰
-        let [h, s, v] = rgb_to_hsv(128, 128, 128);
-        assert_approx_eq!(s, 0.0);
-        assert_approx_eq!(v, 50.2, 0.1); // 128/255 ≈ 50.2%
-        assert_eq!(hsv_to_rgb(h, s, v), [128, 128, 128]);
-    }
-
-    #[test]
-    fn test_special_colors() {
-        // 黄色 (R+G)
-        let [h, s, v] = rgb_to_hsv(255, 255, 0);
-        assert_approx_eq!(h, 60.0);
-        assert_approx_eq!(s, 100.0);
-        assert_approx_eq!(v, 100.0);
-        assert_eq!(hsv_to_rgb(h, s, v), [255, 255, 0]);
-
-        // 品红色 (R+B)
-        let [h, s, v] = rgb_to_hsv(255, 0, 255);
-        assert_approx_eq!(h, 300.0);
-        assert_approx_eq!(s, 100.0);
-        assert_approx_eq!(v, 100.0);
-        assert_eq!(hsv_to_rgb(h, s, v), [255, 0, 255]);
+        for &(r, g, b, eh, es, ev, eps) in cases {
+            let [h, s, v] = rgb_to_hsv(r, g, b);
+            assert_approx_eq!(h, eh);
+            assert_approx_eq!(s, es, eps);
+            assert_approx_eq!(v, ev, eps);
+            assert_eq!(hsv_to_rgb(h, s, v), [r, g, b]);
+        }
     }
 
     #[test]

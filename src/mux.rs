@@ -128,33 +128,28 @@ impl<W: Writer> Muxer<W> {
     /// * `packet` - [`Packet`] to mux.
     pub fn mux(&mut self, frame: AVFrame, stream_idx: usize) -> Result<Option<W::Out>> {
         if self.have_written_header {
+            let interleaved = self.interleaved;
             let mux_stream = self.get_stream_mut(stream_idx)?;
+            let enc_time_base = mux_stream.encoder.time_base();
+            let out_time_base = mux_stream.stream_info.time_base;
+            let packets = mux_stream.encoder.encode_raw(frame)?;
+            // mux_stream 对 self.streams 的借用至此结束，之后可独占使用 self.writer
 
-            match mux_stream.encoder.encode_raw(frame) {
-                Ok(Some(mut packet)) => {
-                    packet.set_pos(-1);
-                    packet.set_stream_index(stream_idx as i32);
-                    // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
-                    // encode_ctx_timebase => out_stream_time_base
-                    packet.rescale_ts(
-                        mux_stream.encoder.time_base(),
-                        mux_stream.stream_info.time_base,
-                    );
+            let mut last_out = None;
+            for mut packet in packets {
+                packet.set_pos(-1);
+                packet.set_stream_index(stream_idx as i32);
+                // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
+                // encode_ctx_timebase => out_stream_time_base
+                packet.rescale_ts(enc_time_base, out_time_base);
 
-                    Ok(Some({
-                        if self.interleaved {
-                            self.writer.write_interleaved(&mut packet)?
-                        } else {
-                            self.writer.write_frame(&mut packet)?
-                        }
-                    }))
-                }
-                Ok(None) => {
-                    log::debug!("Encoder Drain or Flushed.");
-                    Ok(None)
-                }
-                Err(e) => Err(e),
+                last_out = if interleaved {
+                    Some(self.writer.write_interleaved(&mut packet)?)
+                } else {
+                    Some(self.writer.write_frame(&mut packet)?)
+                };
             }
+            Ok(last_out)
         } else {
             self.have_written_header = true;
             self.writer.write_header()?;

@@ -6,21 +6,12 @@
 //!
 //!```rust,ignore
 //! /// 水印 + 缩放 + 淡入淡出组合
-//! /// [buffer] -> scale -> fifo -> drawtext -> [buffersink]
+//! /// [buffer] -> scale -> drawtext -> [buffersink]
 //! let video_watermark_preset_filters = vec![
 //!     scale(1280, 720, None),
-//!     fifo(MediaType::VIDEO), // 避免 drawtext 卡住
 //!     DrawText::new("Hello Text", 20, 20, 24, "white").build(),
 //!     fade_in(30),
 //!     fade_out(270, 30),
-//! ];
-//!
-//! /// 音频过滤器链中
-//! /// [abuffer] -> volume -> fifo -> loudnorm -> [abuffersink]
-//! let filters = vec![
-//!     volume(1.5),
-//!     fifo(MediaType::AUDIO),
-//!     loudnorm(-16.0),
 //! ];
 //! ```
 use crate::{MediaType, PixelFormat, SampleFormat};
@@ -473,7 +464,7 @@ pub mod video {
         Filter::new(
             "fade",
             MediaType::VIDEO,
-            format!("fade=t=in:st=0:d={duration_frames}:units=frames"),
+            format!("fade=t=in:start_frame=0:nb_frames={duration_frames}"),
         )
     }
 
@@ -484,7 +475,7 @@ pub mod video {
         Filter::new(
             "fade",
             MediaType::VIDEO,
-            format!("fade=t=out:st={start_frame}:d={duration_frames}:units=frames"),
+            format!("fade=t=out:start_frame={start_frame}:nb_frames={duration_frames}"),
         )
     }
 
@@ -614,12 +605,12 @@ pub mod video {
     }
 
     /// 鲜艳度调节（画质增强）。
-    /// `vibrance` 为鲜艳度（-1.0 ~ 1.0，0 表示不变）。
+    /// `vibrance` 为鲜艳度（-1.0 ~ 1.0，0 表示不变），对应 FFmpeg `vibrance=intensity`。
     pub fn vibrance(vibrance: f32) -> Filter {
         Filter::new(
             "vibrance",
             MediaType::VIDEO,
-            format!("vibrance=vibrance={vibrance}"),
+            format!("vibrance=intensity={vibrance}"),
         )
     }
 
@@ -831,21 +822,6 @@ pub mod audio {
             format!("afftdn=nr={strength}:nt=w"),
         )
     }
-}
-
-/// 创建 FIFO 过滤器，避免后面的滤镜因缓冲不足而阻塞。
-pub fn fifo(media_type: MediaType) -> Filter {
-    #[rustfmt::skip]
-    let name = if media_type == MediaType::AUDIO { "afifo" } else { "fifo" };
-    Filter::new(name, media_type, name.to_string())
-}
-
-/// 分支滤镜，将一个输入流分成多个相同的输出流。
-/// See: <https://ffmpeg.org/ffmpeg-filters.html#split_002c-asplit>
-pub fn split(media_type: MediaType, n: i32) -> Filter {
-    #[rustfmt::skip]
-    let name = if media_type == MediaType::AUDIO { "asplit" } else { "split" };
-    Filter::new(name, media_type, format!("{name}={n}"))
 }
 
 /// 修改时间戳表达式（加速、减速、对齐等）。
@@ -1167,6 +1143,24 @@ impl FilterGraph {
             .get_filter(c"out")
             .context("Sink filter context not found")
     }
+
+    /// 滤镜输出链路的帧率（`av_buffersink_get_frame_rate`），无滤镜或不可用时返回 `None`。
+    pub fn output_frame_rate(&mut self) -> Option<ffi::AVRational> {
+        let sink = self.get_sink_context().ok()?;
+        Some(sink.get_frame_rate())
+    }
+
+    /// 滤镜输出链路的时间基（`av_buffersink_get_time_base`），无滤镜或不可用时返回 `None`。
+    pub fn output_time_base(&mut self) -> Option<ffi::AVRational> {
+        let sink = self.get_sink_context().ok()?;
+        Some(sink.get_time_base())
+    }
+
+    /// 滤镜输出链路的尺寸 `(width, height)`（`av_buffersink_get_w/h`），无滤镜或不可用时返回 `None`。
+    pub fn output_size(&mut self) -> Option<(i32, i32)> {
+        let sink = self.get_sink_context().ok()?;
+        Some((sink.get_w(), sink.get_h()))
+    }
 }
 
 impl Default for FilterGraph {
@@ -1455,12 +1449,12 @@ mod tests {
                 VIDEO,
             ),
             (
-                "fade=t=in:st=0:d=30:units=frames".into(),
+                "fade=t=in:start_frame=0:nb_frames=30".into(),
                 video::fade_in(30).spec(),
                 VIDEO,
             ),
             (
-                "fade=t=out:st=30:d=30:units=frames".into(),
+                "fade=t=out:start_frame=30:nb_frames=30".into(),
                 video::fade_out(30, 30).spec(),
                 VIDEO,
             ),
@@ -1509,7 +1503,7 @@ mod tests {
                 VIDEO,
             ),
             (
-                "vibrance=vibrance=0.4".into(),
+                "vibrance=intensity=0.4".into(),
                 video::vibrance(0.4).spec(),
                 VIDEO,
             ),

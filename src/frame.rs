@@ -888,7 +888,6 @@ where
 mod tests {
     use super::*;
     use crate::colors::Color;
-    use anyhow::anyhow;
     use rsmpeg::avcodec::AVCodec;
     use std::time::Duration;
 
@@ -920,6 +919,21 @@ mod tests {
             }
         }
         (r, g, b)
+    }
+
+    /// 断言 `b` 与 `a` 逐像素差值不超过 `max_diff`（用于有损的颜色空间转换）。
+    fn assert_pixel_close(b: &MediaFrame<u8>, a: &MediaFrame<u8>, max_diff: i16) {
+        for y in 0..a.height {
+            for x in 0..a.width {
+                for c in 0..3 {
+                    let diff = (b.data[[y, x, c]] as i16 - a.data[[y, x, c]] as i16).abs();
+                    assert!(
+                        diff <= max_diff,
+                        "Color difference too large: {diff} at [{y}, {x}, {c}]"
+                    );
+                }
+            }
+        }
     }
 
     /// 创建测试用的 RGB AVFrame
@@ -1017,45 +1031,29 @@ mod tests {
     }
 
     #[test]
-    fn test_rgb_yuv_conversion() -> Result<()> {
-        // 创建带测试图案的 RGB 帧
-        let mut rgb_frame = MediaFrame::<u8>::new_video_frame(
+    fn test_rgb_yuv_roundtrip() -> Result<()> {
+        let mut rgb = MediaFrame::<u8>::new_video_frame(
             TEST_WIDTH,
             TEST_HEIGHT,
             PixelFormat::RGB24,
             TIME_BASE,
         )?;
+        fill_rgb_data(&mut rgb, TEST_WIDTH, TEST_HEIGHT);
 
-        let _ = fill_rgb_data(&mut rgb_frame, TEST_WIDTH, TEST_HEIGHT);
+        // 单次往返：RGB -> YUV -> RGB
+        let yuv = rgb.convert_rgb_to_yuv()?;
+        assert_eq!(yuv.format, ffi::AV_PIX_FMT_YUV420P);
+        let back = yuv.convert_yuv_to_rgb()?;
+        assert_eq!(back.format, ffi::AV_PIX_FMT_RGB24);
+        assert_pixel_close(&back, &rgb, 3);
 
-        // RGB -> YUV 转换
-        let yuv_frame = rgb_frame.convert_rgb_to_yuv()?;
-        assert_eq!(yuv_frame.format, ffi::AV_PIX_FMT_YUV420P);
-
-        // YUV -> RGB 转换回来
-        let converted_rgb = yuv_frame.convert_yuv_to_rgb()?;
-        assert_eq!(converted_rgb.format, ffi::AV_PIX_FMT_RGB24);
-
-        // 验证转换后的颜色值（允许有小的误差）
-        for h in 0..TEST_HEIGHT {
-            for w in 0..TEST_WIDTH {
-                for c in 0..3 {
-                    let diff = (converted_rgb.data[[h, w, c]] as i16
-                        - rgb_frame.data[[h, w, c]] as i16)
-                        .abs();
-                    assert!(
-                        diff <= 3,
-                        "Color difference too large: {} at [{}, {}, {}]: original={}, converted={}",
-                        diff,
-                        h,
-                        w,
-                        c,
-                        rgb_frame.data[[h, w, c]],
-                        converted_rgb.data[[h, w, c]]
-                    );
-                }
-            }
-        }
+        // 多次链式转换（容差放宽）
+        let chained = rgb
+            .convert_rgb_to_yuv()?
+            .convert_yuv_to_rgb()?
+            .convert_rgb_to_yuv()?
+            .convert_yuv_to_rgb()?;
+        assert_pixel_close(&chained, &rgb, 5);
 
         Ok(())
     }
@@ -1109,47 +1107,6 @@ mod tests {
             TIME_BASE,
         )?;
         assert_eq!(std::mem::size_of_val(&frame_f32.data[[0, 0, 0]]), 4);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_format_conversion_chain() -> Result<()> {
-        // 测试多次转换
-        let mut original = MediaFrame::<u8>::new_video_frame(
-            TEST_WIDTH,
-            TEST_HEIGHT,
-            PixelFormat::RGB24,
-            TIME_BASE,
-        )?;
-
-        // 填充测试数据
-        let _ = fill_rgb_data(&mut original, TEST_WIDTH, TEST_HEIGHT);
-
-        // RGB -> YUV -> RGB -> YUV -> RGB
-        let converted = original
-            .convert_rgb_to_yuv()?
-            .convert_yuv_to_rgb()?
-            .convert_rgb_to_yuv()?
-            .convert_yuv_to_rgb()?;
-
-        // 验证多次转换后的数据 , 允许稍大的误差（因为多次转换）
-        for y in 0..TEST_HEIGHT {
-            for x in 0..TEST_WIDTH {
-                for c in 0..3 {
-                    let diff =
-                        (converted.data[[y, x, c]] as i16 - original.data[[y, x, c]] as i16).abs();
-                    assert!(
-                        diff <= 5,
-                        "Color difference too large: {} at [{}, {}, {}]",
-                        diff,
-                        y,
-                        x,
-                        c
-                    );
-                }
-            }
-        }
 
         Ok(())
     }
@@ -1222,112 +1179,30 @@ mod tests {
         let time_base = ffi::AVRational { num: 1, den: 30 }; // 30 fps
 
         let mut frame =
-            MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24, time_base)
-                .map_err(|e| anyhow!("Failed to create frame: {}", e))?;
+            MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24, time_base)?;
 
-        // 验证数组维度
-        assert_eq!(
-            frame.data.shape(),
-            &[height, width, 3],
-            "Array shape mismatch"
-        );
-        assert_eq!(frame.width, width, "Width mismatch");
-        assert_eq!(frame.height, height, "Height mismatch");
-        assert_eq!(frame.format, ffi::AV_PIX_FMT_RGB24, "Pixel format mismatch");
+        // 验证元数据与数组布局
+        assert_eq!(frame.data.shape(), &[height, width, 3]);
+        assert_eq!(frame.width, width);
+        assert_eq!(frame.height, height);
+        assert_eq!(frame.format, ffi::AV_PIX_FMT_RGB24);
+        assert!(frame.data.is_standard_layout(), "RGB24 应为行主序连续布局");
 
-        // 验证数组是否连续（contiguous）
-        assert!(
-            frame.data.is_standard_layout(),
-            "Array is not in standard (row-major) layout"
-        );
-
-        // 验证数组是否可写
-        assert!(
-            !frame.data.view_mut().is_empty(),
-            "Array should be writable"
-        );
-
-        // 填充测试数据（使用安全访问方法）
+        // 填充并读回验证
         for y in 0..height {
             for x in 0..width {
-                // 安全访问每个通道
-                if let Some(r) = frame.data.get_mut([y, x, 0]) {
-                    *r = (x % 255) as u8; // R
-                } else {
-                    return Err(anyhow!("Failed to access R channel at ({}, {})", x, y));
-                }
-
-                if let Some(g) = frame.data.get_mut([y, x, 1]) {
-                    *g = (y % 255) as u8; // G
-                } else {
-                    return Err(anyhow!("Failed to access G channel at ({}, {})", x, y));
-                }
-
-                if let Some(b) = frame.data.get_mut([y, x, 2]) {
-                    *b = ((x + y) % 255) as u8; // B
-                } else {
-                    return Err(anyhow!("Failed to access B channel at ({}, {})", x, y));
-                }
+                frame.data[[y, x, 0]] = (x % 255) as u8;
+                frame.data[[y, x, 1]] = (y % 255) as u8;
+                frame.data[[y, x, 2]] = ((x + y) % 255) as u8;
             }
         }
-
-        // 验证填充的数据
         for y in 0..height {
             for x in 0..width {
-                let r = frame.data[[y, x, 0]];
-                let g = frame.data[[y, x, 1]];
-                let b = frame.data[[y, x, 2]];
-
-                assert_eq!(r, (x % 255) as u8, "R value mismatch at ({}, {})", x, y);
-                assert_eq!(g, (y % 255) as u8, "G value mismatch at ({}, {})", x, y);
-                assert_eq!(
-                    b,
-                    ((x + y) % 255) as u8,
-                    "B value mismatch at ({}, {})",
-                    x,
-                    y
-                );
+                assert_eq!(frame.data[[y, x, 0]], (x % 255) as u8);
+                assert_eq!(frame.data[[y, x, 1]], (y % 255) as u8);
+                assert_eq!(frame.data[[y, x, 2]], ((x + y) % 255) as u8);
             }
         }
-
-        // 验证角落像素
-        let top_left = (0, 0);
-        assert_eq!(
-            frame.data[[top_left.1, top_left.0, 0]],
-            0,
-            "Top-left R value incorrect"
-        );
-        assert_eq!(
-            frame.data[[top_left.1, top_left.0, 1]],
-            0,
-            "Top-left G value incorrect"
-        );
-        assert_eq!(
-            frame.data[[top_left.1, top_left.0, 2]],
-            0,
-            "Top-left B value incorrect"
-        );
-
-        let bottom_right = (width - 1, height - 1);
-        let expected_r = ((width - 1) % 255) as u8;
-        let expected_g = ((height - 1) % 255) as u8;
-        let expected_b = ((width - 1 + height - 1) % 255) as u8;
-
-        assert_eq!(
-            frame.data[[bottom_right.1, bottom_right.0, 0]],
-            expected_r,
-            "Bottom-right R value incorrect"
-        );
-        assert_eq!(
-            frame.data[[bottom_right.1, bottom_right.0, 1]],
-            expected_g,
-            "Bottom-right G value incorrect"
-        );
-        assert_eq!(
-            frame.data[[bottom_right.1, bottom_right.0, 2]],
-            expected_b,
-            "Bottom-right B value incorrect"
-        );
 
         Ok(())
     }
