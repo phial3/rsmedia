@@ -13,7 +13,7 @@ use crate::time::Rescale;
 use crate::{swctx, time, utils, Location, MediaType, SampleFormat, StreamWriter};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket};
-use rsmpeg::avutil::{self, AVChannelLayout, AVChannelLayoutRef, AVFrame};
+use rsmpeg::avutil::{self, AVAudioFifo, AVChannelLayout, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
 
 use anyhow::{Context, Error, Result};
@@ -508,6 +508,8 @@ impl EncoderBuilder {
             state: EncoderState::Normal,
             scale_algorithm: self.scale_algorithm,
             pending_packets: VecDeque::new(),
+            audio_fifo: None,
+            audio_pts: 0,
         })
     }
 }
@@ -575,6 +577,14 @@ pub struct Encoder {
     /// 编码器缓冲满（send_frame 返回 EAGAIN）时，先行排空的已就绪包暂存于此， 由 `receive_packet` 优先取出，
     /// 避免丢包。按 FIFO 出队（`pop_front`）， 保证与编码器输出顺序一致（否则 dts 会乱序、mux 报错）。
     pending_packets: VecDeque<AVPacket>,
+    /// 音频样本缓冲：固定帧长编码器（如 aac，frame_size=1024）要求每次 `send_frame`
+    /// 恰好给出 `frame_size` 个样本，而待编码音频帧大小可能可变（滤镜输出、或用户
+    /// 输入不足一帧），需先累积补齐到帧长再送编码器。
+    audio_fifo: Option<AVAudioFifo>,
+    /// 音频缓冲下一帧的 pts（编码器时间基 `1/sample_rate` 下的样本位置计数）。
+    /// 取首帧 pts 作为起点，此后每切出一帧按 `frame_size` 递增；对音频而言样本
+    /// 位置即正确时间轴，比直接沿用滤镜 pts 更可靠。
+    audio_pts: i64,
 }
 
 impl Encoder {
@@ -659,14 +669,18 @@ impl Encoder {
     fn send_frame_to_encoder(&mut self, frame_opt: Option<AVFrame>) -> Result<()> {
         if let Some(frame) = frame_opt {
             // 正常编码帧：经过 filter（如有）
-            // 滤镜 buffer 源按 `self.pixel_format` 配置；输入帧若携带其它像素格式
+            // 视频：滤镜 buffer 源按 `self.pixel_format` 配置；输入帧若携带其它像素格式
             // （如测试用的 RGB24），需先转成该格式再进图，否则 FFmpeg 自动格式转换
             // 路径会越界读写（SIGSEGV）。此转换与无滤镜时 `send_frame_post_filter`
             // 里的 `rescale` 行为一致。
+            // 音频：滤镜 buffer 源按 `self.sample_format` 配置；与视频不同，音频帧无需
+            // 像素格式转换，直接进图即可（格式统一由滤镜后的 `rescale` 处理）。
+            let need_format_convert =
+                self.media_type == MediaType::VIDEO && frame.format != self.pix_fmt().into();
             let enc_fmt = self.pix_fmt();
             let scale_algorithm = self.scale_algorithm;
             if let Some(graph) = self.filter_graph.as_mut() {
-                let frame = if frame.format != enc_fmt.into() {
+                let frame = if need_format_convert {
                     swctx::scale_with_flags(
                         &frame,
                         frame.width,
@@ -741,19 +755,115 @@ impl Encoder {
             _ => scaled_frame, // 不需要上传或已经是 HW frame
         };
 
-        // check frame valid
-        self.check_frame(Some(&hw_frame))?;
+        // 固定帧长音频编码器（如 aac，frame_size=1024）要求每次 `send_frame` 恰好给出
+        // frame_size 个样本，而待编码帧大小可能可变（滤镜输出、或用户输入不足一帧），
+        // 需先进 `audio_fifo` 累积补齐后再送编码器；无固定帧长（frame_size=0）的
+        // 编码器（如部分无损格式）直接发送。
+        if self.media_type == MediaType::AUDIO && self.frame_size() > 0 {
+            self.buffer_audio_frame(hw_frame)
+        } else {
+            self.check_frame(Some(&hw_frame))?;
 
-        log::debug!(
-            "Send frame to encoder: {:?}, time_base: {:?}, media_type: {:?}",
-            hw_frame,
-            self.time_base(),
-            self.media_type()
-        );
+            log::debug!(
+                "Send frame to encoder: {:?}, time_base: {:?}, media_type: {:?}",
+                hw_frame,
+                self.time_base(),
+                self.media_type()
+            );
 
-        // 发送到编码器；若缓冲已满（EAGAIN），先排空已就绪包到暂存区，再重试发送。
+            self.send_ready_frame(hw_frame)
+        }
+    }
+
+    /// 将一帧已 rescale 的音频帧写入 `audio_fifo`，凑满 `frame_size` 后送出。
+    ///
+    /// 固定帧长编码器必须在每次 `send_frame` 时恰好给出 `frame_size` 个样本，
+    /// 因此先把待编码帧写入 `audio_fifo` 累积，凑满 `frame_size` 再送编码器；
+    /// 不足 `frame_size` 的剩余样本，由 `flush` 阶段作为末帧截取。
+    fn buffer_audio_frame(&mut self, frame: AVFrame) -> Result<()> {
+        let frame_size = self.frame_size();
+        if self.audio_fifo.is_none() {
+            let channels = self.ch_layout().nb_channels;
+            let sample_fmt = self.sample_fmt() as _;
+            // 首次缓冲时记录起始 pts（编码器时间基下的样本位置）
+            self.audio_pts = if frame.pts != ffi::AV_NOPTS_VALUE {
+                frame.pts
+            } else {
+                0
+            };
+            self.audio_fifo = Some(AVAudioFifo::new(sample_fmt, channels, frame_size));
+        }
+        unsafe {
+            self.audio_fifo
+                .as_mut()
+                .unwrap()
+                .write(frame.data.as_ptr(), frame.nb_samples)?;
+        }
+        self.drain_audio_fifo(frame_size)
+    }
+
+    /// 从 `audio_fifo` 中取出满帧长样本，拼成帧送编码器，直至剩余不足一帧。
+    fn drain_audio_fifo(&mut self, frame_size: i32) -> Result<()> {
+        while self.audio_fifo.as_ref().unwrap().size() >= frame_size {
+            let mut frame = AVFrame::new();
+            frame.set_nb_samples(frame_size);
+            frame.set_ch_layout(self.ch_layout().clone().into_inner());
+            frame.set_format(self.sample_fmt() as _);
+            frame.set_sample_rate(self.sample_rate());
+            frame.set_time_base(self.time_base());
+            unsafe {
+                frame
+                    .alloc_buffer()
+                    .context("Failed to allocate audio frame buffer")?;
+                self.audio_fifo
+                    .as_mut()
+                    .unwrap()
+                    .read(frame.data.as_ptr(), frame_size)?;
+            }
+            frame.set_pts(self.audio_pts);
+            self.audio_pts += frame_size as i64;
+            self.check_frame(Some(&frame))?;
+            self.send_ready_frame(frame)?;
+        }
+        Ok(())
+    }
+
+    /// 冲刷音频缓冲中不足一帧的剩余样本，作为末帧送编码器。
+    fn flush_audio_fifo(&mut self) -> Result<()> {
+        let sample_fmt = self.sample_fmt() as _;
+        let ch_layout = self.ch_layout().clone().into_inner();
+        let sample_rate = self.sample_rate();
+        let time_base = self.time_base();
+        let Some(fifo) = self.audio_fifo.as_mut() else {
+            return Ok(());
+        };
+        let remaining = fifo.size();
+        if remaining <= 0 {
+            return Ok(());
+        }
+        let mut frame = AVFrame::new();
+        frame.set_nb_samples(remaining);
+        frame.set_ch_layout(ch_layout);
+        frame.set_format(sample_fmt);
+        frame.set_sample_rate(sample_rate);
+        frame.set_time_base(time_base);
+        unsafe {
+            frame
+                .alloc_buffer()
+                .context("Failed to allocate audio frame buffer")?;
+            fifo.read(frame.data.as_ptr(), remaining)?;
+        }
+        frame.set_pts(self.audio_pts);
+        self.audio_pts += remaining as i64;
+        self.check_frame(Some(&frame))?;
+        self.send_ready_frame(frame)
+    }
+
+    /// 向编码器发送一帧已就绪（rescale/校验完成）的帧；若缓冲已满（EAGAIN），
+    /// 先排空已就绪包，再重试发送。
+    fn send_ready_frame(&mut self, frame: AVFrame) -> Result<()> {
         loop {
-            match self.context.send_frame(Some(&hw_frame)) {
+            match self.context.send_frame(Some(&frame)) {
                 Ok(()) => break,
                 Err(rsmpeg::error::RsmpegError::SendFrameAgainError) => {
                     self.drain_encoder_packets()?;
@@ -883,17 +993,10 @@ impl Encoder {
                     }
                 }
 
-                // variable frame size, do nothing
-                // if fixed frame size, require frame size
-                if !self.config.support_variable_frame_size()
-                    && frame.nb_samples != self.frame_size()
-                {
-                    return Err(Error::msg(format!(
-                        "Unsupported encode frame sample size: {:?}, expect {:?}",
-                        frame.nb_samples,
-                        self.frame_size()
-                    )));
-                }
+                // 注意：不在此校验 `nb_samples == frame_size`。固定帧长音频编码器
+                // 已由 `audio_fifo` 缓冲切帧（切出帧恒为 frame_size，flushed 末帧
+                // 允许不足一帧），此处切出的帧长短不由待编码帧决定；且末帧不足一帧
+                // 是编码器合法接受的，故帧长正确性由缓冲路径保证，不在此拦截。
             }
             _ => {}
         }
@@ -1050,6 +1153,9 @@ impl Encoder {
                 self.send_frame_post_filter(frame)?;
             }
         }
+
+        // 冲刷音频缓冲中不足一帧的剩余样本（作为末帧送编码器）
+        self.flush_audio_fifo()?;
 
         // EOF: Notify the encoder that the last frame has been sent.
         self.send_frame_to_encoder(None)?;
@@ -1772,6 +1878,7 @@ mod tests {
         let mut total_samples = 0u64;
         let mut decoded_frames = 0usize;
         while let Some(frame) = decoder.decode::<f32>()? {
+            assert_eq!(frame.audio_format(), Some(format), "sample format mismatch");
             assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
             assert_eq!(frame.nb_channels, channels, "channel count mismatch");
             total_samples += frame.nb_samples as u64;
@@ -1785,6 +1892,289 @@ mod tests {
         assert!(decoded_frames > 0, "no audio frames decoded");
 
         let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// 末帧不足一帧（非 frame_size 整倍数）时，应作为合法末帧编码，而非被 `check_frame`
+    /// 的帧长校验拒绝。回归测试：无滤镜向 aac 发非整倍数样本总数。
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_encode_audio_partial_last_frame() -> Result<()> {
+        use crate::frame::MediaFrame;
+        use crate::{DecoderBuilder, MediaType};
+
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
+        let format = SampleFormat::FLTP;
+        // AAC frame_size = 1024；故意发非整倍数：3×1000 = 3000 样本
+        let samples_per_frame = 1000u32;
+        let frames_to_write = 3u32;
+
+        let path = std::env::temp_dir().join("rsmedia_audio_partial.m4a");
+        let _ = std::fs::remove_file(&path);
+
+        let mut encoder =
+            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
+                .build_wrapped(path.as_path())?;
+        for _ in 0..frames_to_write {
+            encoder.write_frame(MediaFrame::<f32>::new_audio_frame(
+                format,
+                channels,
+                samples_per_frame,
+                sample_rate,
+                time::new_rational(1, sample_rate as i32),
+            )?)?;
+        }
+        encoder.finish()?;
+
+        let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+        let mut total_samples = 0u64;
+        while let Some(frame) = decoder.decode::<f32>()? {
+            assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
+            assert_eq!(frame.nb_channels, channels, "channel count mismatch");
+            total_samples += frame.nb_samples as u64;
+        }
+        let expected = frames_to_write as u64 * samples_per_frame as u64;
+        assert!(
+            total_samples >= expected,
+            "decoded {total_samples} samples, expected >= {expected}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// 音频转码（重编码）往返测试：编码源文件 → 解码读出 → 重编码到新文件 → 解码校验。
+    ///
+    /// 覆盖音频「解码→编码」完整链路，验证重编码结果采样率/声道数/采样格式与样本量不丢失。
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_audio_transcode_roundtrip() -> Result<()> {
+        use crate::frame::MediaFrame;
+        use crate::{DecoderBuilder, EncoderBuilder, MediaType, SampleFormat};
+
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
+        let format = SampleFormat::FLTP;
+        let samples_per_frame = 1024u32;
+        let frames_to_write = 10u32;
+
+        let src = std::env::temp_dir().join("rsmedia_audio_transcode_src.m4a");
+        let dst = std::env::temp_dir().join("rsmedia_audio_transcode_dst.m4a");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+
+        // 1) 生成源音频文件
+        let mut enc =
+            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
+                .build_wrapped(src.as_path())?;
+        for _ in 0..frames_to_write {
+            enc.write_frame(MediaFrame::<f32>::new_audio_frame(
+                format,
+                channels,
+                samples_per_frame,
+                sample_rate,
+                time::new_rational(1, sample_rate as i32),
+            )?)?;
+        }
+        enc.finish()?;
+        let src_samples = frames_to_write as u64 * samples_per_frame as u64;
+
+        // 2) 转码：解码源 → 重编码到新文件
+        let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(src.as_path())?;
+        let mut enc2 =
+            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
+                .build_wrapped(dst.as_path())?;
+        let mut transcoded_samples = 0u64;
+        while let Some(frame) = dec.decode::<f32>()? {
+            transcoded_samples += frame.nb_samples as u64;
+            enc2.write_frame(frame)?;
+        }
+        enc2.finish()?;
+        assert!(
+            transcoded_samples >= src_samples,
+            "decoded {transcoded_samples} source samples, expected >= {src_samples}"
+        );
+
+        // 3) 解码转码结果并校验
+        let mut out = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(dst.as_path())?;
+        let mut total = 0u64;
+        while let Some(frame) = out.decode::<f32>()? {
+            assert_eq!(frame.audio_format(), Some(format), "sample format mismatch");
+            assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
+            assert_eq!(frame.nb_channels, channels, "channel count mismatch");
+            total += frame.nb_samples as u64;
+        }
+        assert!(
+            total >= src_samples,
+            "transcoded decoded {total} samples, expected >= {src_samples}"
+        );
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+        Ok(())
+    }
+
+    /// 生成一帧全幅正弦波（FLTP）音频帧，供音频滤镜往返测试使用。
+    #[cfg(feature = "ndarray")]
+    fn sine_audio_frame(
+        freq: f32,
+        channels: u32,
+        nb_samples: u32,
+        sample_rate: u32,
+    ) -> MediaFrame<f32> {
+        use crate::frame::MediaFrame;
+        let mut frame = MediaFrame::<f32>::new_audio_frame(
+            SampleFormat::FLTP,
+            channels,
+            nb_samples,
+            sample_rate,
+            time::new_rational(1, sample_rate as i32),
+        )
+        .unwrap();
+        for i in 0..nb_samples as usize {
+            for c in 0..channels as usize {
+                let t = i as f32 / sample_rate as f32;
+                frame.data[[0, i, c]] = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.5;
+            }
+        }
+        frame
+    }
+
+    /// 音频滤镜全量往返测试：编码时对每个滤镜逐一应用，再解码验证。
+    ///
+    /// 覆盖所有不依赖外部资源/设备的音频滤镜（与视频滤镜对称，验证编码管线中的
+    /// 滤镜初始化、EOF/flush 冲刷不丢帧、不报错）。验证：
+    ///   1) 滤镜在音频编码管线中可正常初始化、不报错；
+    ///   2) EOF / flush 阶段不丢帧、不报 "cannot decode after flushed"；
+    ///   3) 时长保持类滤镜输出采样数不丢失（>= 输入采样数）。
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_audio_filters_roundtrip() -> Result<()> {
+        use crate::filter::{self, audio};
+        use crate::{DecoderBuilder, MediaType};
+
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
+        let format = SampleFormat::FLTP;
+        let samples_per_frame = 1024u32;
+        let frames_to_write = 12u32;
+        let input_samples = frames_to_write as u64 * samples_per_frame as u64;
+
+        // (名称, Filter, 时长保持 ?)。时长保持类滤镜不解散采样量，可断言 `>= 输入采样数`；
+        // 时长变化类（延时/变速/裁剪/时间戳重排/响度测量）只断言能正常解码出帧。
+        type FilterCase = (&'static str, crate::filter::Filter, bool);
+        let cases: Vec<FilterCase> = vec![
+            // 时长保持类
+            ("volume", audio::volume(0.8), true),
+            ("equalizer", audio::equalizer(1000, 3.0, 200), true),
+            (
+                "compressor",
+                audio::compressor(4.0, None, None).unwrap(),
+                true,
+            ),
+            ("highpass", audio::highpass(100), true),
+            ("lowpass", audio::lowpass(4000), true),
+            ("atempo", audio::atempo(1.0), true),
+            ("fft_denoise", audio::fft_denoise(12, -50), true),
+            ("denoise", audio::denoise(12.0), true),
+            ("anlm_denoise", audio::anlm_denoise(None, None, None), true),
+            (
+                "three_band_equalizer",
+                audio::three_band_equalizer(2.0, 0.0, 2.0),
+                true,
+            ),
+            ("format", audio::format(channels, sample_rate, format), true),
+            (
+                "resample",
+                audio::resample(channels, sample_rate, format),
+                true,
+            ),
+            // 时长变化类
+            ("adelay", audio::adelay(100), false),
+            ("loudnorm", audio::loudnorm(-16.0), false),
+            (
+                "asetpts",
+                filter::setpts(MediaType::AUDIO, "PTS-STARTPTS"),
+                false,
+            ),
+            ("atrim", filter::trim(MediaType::AUDIO, 0.0, 0.2), false),
+        ];
+
+        for (name, audio_filter, duration_preserving) in cases {
+            println!("AUDFILT {name}");
+            let path = std::env::temp_dir().join(format!("rsmedia_afilt_{name}.m4a"));
+            let _ = std::fs::remove_file(&path);
+
+            let mut enc = match EncoderBuilder::new_audio(
+                128_000,
+                channels as i32,
+                sample_rate as i32,
+                format,
+            )
+            .with_filters(vec![audio_filter])
+            .build_wrapped(path.as_path())
+            {
+                Ok(enc) => enc,
+                Err(e) => {
+                    // 部分滤镜（如 `fft_denoise`/`anlm_denoise`/`loudnorm`）依赖特定 FFmpeg
+                    // 编译配置，未编译时初始化失败，这里优雅跳过，避免环境差异导致测试失败。
+                    let low = format!("{e:#}").to_lowercase();
+                    if low.contains("no such filter")
+                        || low.contains("filter not found")
+                        || low.contains("not found")
+                    {
+                        println!("SKIP {name}: not available ({e:#})");
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            for _ in 0..frames_to_write {
+                enc.write_frame(sine_audio_frame(
+                    440.0,
+                    channels,
+                    samples_per_frame,
+                    sample_rate,
+                ))?;
+            }
+            enc.finish()?;
+
+            // 解码验证：不报错、能解出帧；时长保持类滤镜采样量不丢失。
+            let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+            let mut total_samples = 0u64;
+            let mut decoded = 0usize;
+            while let Some(frame) = dec.decode::<f32>()? {
+                assert_eq!(
+                    frame.sample_rate, sample_rate,
+                    "{name}: sample rate mismatch"
+                );
+                assert_eq!(
+                    frame.audio_format(),
+                    Some(format),
+                    "{name}: sample format mismatch"
+                );
+                assert_eq!(
+                    frame.nb_channels, channels,
+                    "{name}: channel count mismatch"
+                );
+                total_samples += frame.nb_samples as u64;
+                decoded += 1;
+            }
+            assert!(
+                decoded > 0,
+                "{name}: no audio frames decoded (possible EOF loss)"
+            );
+            if duration_preserving {
+                assert!(
+                    total_samples >= input_samples,
+                    "{name}: lost samples, decoded {total_samples}, expected >= {input_samples}"
+                );
+            }
+
+            let _ = std::fs::remove_file(&path);
+        }
         Ok(())
     }
 

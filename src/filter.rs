@@ -747,9 +747,15 @@ pub mod audio {
     }
 
     /// 延时（ms）
-    pub fn adelay(delay_ms: i32, channels: i32) -> Filter {
-        let delays = vec![delay_ms.to_string(); channels as usize].join("|");
-        Filter::new("adelay", MediaType::AUDIO, format!("delays={delays}"))
+    ///
+    /// 注意：不能使用 `delays=100|100` 逐通道写法，因为 `|` 在滤镜图中是滤镜链
+    /// 分隔符，会导致图解析失败；统一用 `all=1` 应用到所有通道。
+    pub fn adelay(delay_ms: i32) -> Filter {
+        Filter::new(
+            "adelay",
+            MediaType::AUDIO,
+            format!("adelay=delays={delay_ms}:all=1"),
+        )
     }
 
     /// 创建FFT降噪过滤器
@@ -985,7 +991,18 @@ impl FilterGraph {
             .alloc_filter_context(&buffersink, c"out")
             .context("Failed to allocate video buffer sink")?;
 
-        // 先分配再设置选项、最后初始化，兼容 FFmpeg 8 中 `pix_fmts` 为非运行时选项的限制
+        // 先分配再设置选项、最后初始化。FFmpeg 8 将 `pix_fmts`(binary) 废弃为数组选项
+        // `pixel_formats`，二者均为非运行时选项，须在 init 之前设置。
+        #[cfg(feature = "ffmpeg8")]
+        sink_ctx
+            .opt_set_array(
+                c"pixel_formats",
+                0,
+                Some(&[ffi::AVPixelFormat::from(params.format)]),
+                ffi::AV_OPT_TYPE_PIXEL_FMT,
+            )
+            .context("Failed to set video sink filter context pixel format")?;
+        #[cfg(not(feature = "ffmpeg8"))]
         sink_ctx
             .opt_set_bin(c"pix_fmts", &(ffi::AVPixelFormat::from(params.format)))
             .context("Failed to set video sink filter context pixel format")?;
@@ -1040,9 +1057,47 @@ impl FilterGraph {
             .alloc_filter_context(&buffersink, c"out")
             .context("Failed to allocate audio buffer sink")?;
 
-        // 先分配再设置选项、最后初始化，兼容 FFmpeg 8 中 sink 选项为非运行时选项的限制
+        // 先分配再设置选项、最后初始化，兼容 FFmpeg 8 中 sink 选项为非运行时选项的限制。
+        // FFmpeg8 将如下参数废弃, 且新旧选项不能混用:
+        // - buffersink ：新数组选项 pixel_formats （旧 pix_fmts 已废弃）
+        // - abuffersink ：新数组选项 `sample_formats`/`samplerates`/`channel_layouts` （旧 `sample_fmts`/`sample_rates`/`ch_layouts`(binary/string) 已废弃）
+        #[cfg(feature = "ffmpeg8")]
+        sink_ctx.opt_set_array(
+            c"sample_formats",
+            0,
+            Some(&[params.format as i32]),
+            ffi::AV_OPT_TYPE_SAMPLE_FMT,
+        )?;
+        #[cfg(not(feature = "ffmpeg8"))]
         sink_ctx.opt_set_bin(c"sample_fmts", &(params.format as i32))?;
+        #[cfg(feature = "ffmpeg8")]
+        sink_ctx.opt_set_array(
+            c"samplerates",
+            0,
+            Some(&[params.sample_rate]),
+            ffi::AV_OPT_TYPE_INT,
+        )?;
+        #[cfg(not(feature = "ffmpeg8"))]
         sink_ctx.opt_set_bin(c"sample_rates", &params.sample_rate)?;
+        #[cfg(feature = "ffmpeg8")]
+        {
+            // `AVChannelLayout::into_inner` 移出所有权，av_opt_set_array 会复制该布局，
+            // 故设置完成后需手动 uninit 释放。
+            let layout = AVChannelLayout::from_nb_channels(params.nb_channels).into_inner();
+            let mut layouts = [layout];
+            sink_ctx
+                .opt_set_array(
+                    c"channel_layouts",
+                    0,
+                    Some(&layouts),
+                    ffi::AV_OPT_TYPE_CHLAYOUT,
+                )
+                .context("Failed to set audio sink channel layout")?;
+            unsafe {
+                ffi::av_channel_layout_uninit(&mut layouts[0]);
+            }
+        }
+        #[cfg(not(feature = "ffmpeg8"))]
         sink_ctx.opt_set(c"ch_layouts", &channel_desc)?;
         sink_ctx
             .init_str(None)
