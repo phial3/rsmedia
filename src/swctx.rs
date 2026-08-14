@@ -117,7 +117,7 @@ fn setup_scaler(
 /// # Safety
 ///
 /// ffi::sws_scale_frame
-pub fn scale(
+pub fn scale_frame(
     src_frame: &AVFrame,
     dst_width: i32,
     dst_height: i32,
@@ -132,8 +132,6 @@ pub fn scale(
     )
 }
 
-/// 与 [`scale`] 相同，但可指定缩放算法 [`ScaleAlgorithm`]。
-///
 /// # Safety
 ///
 /// ffi::sws_scale_frame
@@ -169,20 +167,6 @@ pub fn scale_with_flags(
 
     let ret = unsafe {
         let dst_frame_ptr = dst_frame.as_mut_ptr();
-        // set color properties:
-        // 指定像素分量值（Y, U, V 或 R, G, B）的范围
-        // - AVCOL_RANGE_MPEG (或 AVCOL_RANGE_LIMITED): 有限范围，通常用于广播电视标准（如 BT.709），Y 值范围通常是 16-235，UV 值范围是 16-240
-        // - AVCOL_RANGE_JPEG (或 AVCOL_RANGE_FULL): 全范围，通常用于计算机图形和数字摄影，YUV 或 RGB 值范围通常是 0-255
-        (*dst_frame_ptr).color_range = ffi::AVCOL_RANGE_JPEG;
-        // 表示的颜色范围, 决定了图像的色域
-        (*dst_frame_ptr).color_primaries = ffi::AVCOL_PRI_RESERVED0;
-        // 伽马校正（Gamma）:描述了编码的像素值（数字信号）和实际场景光线强度之间的非线性关系
-        (*dst_frame_ptr).color_trc = ffi::AVCOL_TRC_RESERVED0;
-        // 转换矩阵系数: 与 color_primaries 紧密相关，因为转换矩阵通常依赖于原色定义
-        (*dst_frame_ptr).colorspace = ffi::AVCOL_SPC_RGB;
-        // 指定色度样本（U, V）相对于亮度样本（Y）的采样位置, 不做要求
-        (*dst_frame_ptr).chroma_location = ffi::AVCHROMA_LOC_UNSPECIFIED;
-
         ffi::sws_scale_frame(sws_ctx.as_mut_ptr(), dst_frame_ptr, src_frame.as_ptr())
     };
     if ret < 0 {
@@ -191,57 +175,6 @@ pub fn scale_with_flags(
 
     log::debug!(
         "Sws scale from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
-        src_frame.width,
-        src_frame.height,
-        PixelFormat::from(src_frame.format),
-        dst_width,
-        dst_height,
-        dst_pix_fmt
-    );
-
-    Ok(dst_frame)
-}
-
-/// 将 AVFrame YUV420P 转换为 RGB24 格式
-pub fn scale_frame(
-    src_frame: &AVFrame,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: PixelFormat,
-) -> Result<AVFrame> {
-    if !src_frame.hw_frames_ctx.is_null() {
-        anyhow::bail!("Hardware frames are not supported in this software scalar");
-    }
-
-    let mut dst_frame = AVFrame::new();
-    dst_frame.set_width(dst_width);
-    dst_frame.set_height(dst_height);
-    dst_frame.set_format(dst_pix_fmt.into());
-    dst_frame
-        .alloc_buffer()
-        .context("Failed to allocate destination frame buffer")?;
-    imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
-
-    let mut sws_ctx = setup_scaler(
-        src_frame.width,
-        src_frame.height,
-        src_frame.format,
-        dst_width,
-        dst_height,
-        dst_pix_fmt.into(),
-        ScaleAlgorithm::default().flags(),
-    )
-    .context("Failed to create swscale context.")?;
-
-    sws_ctx
-        .scale_frame(src_frame, 0, src_frame.height, &mut dst_frame)
-        .context(format!(
-            "Failed to scale frame from [fmt:{}, size:{}x{}] to [fmt:{:?}, size:{}x{}]",
-            src_frame.format, src_frame.width, src_frame.height, dst_pix_fmt, dst_width, dst_height
-        ))?;
-
-    log::debug!(
-        "Sws scale_frame from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
         src_frame.width,
         src_frame.height,
         PixelFormat::from(src_frame.format),

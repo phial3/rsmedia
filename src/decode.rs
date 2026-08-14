@@ -7,6 +7,7 @@ use crate::io::Reader;
 use crate::options::Options;
 use crate::stream::StreamInfo;
 use crate::swctx::ScaleAlgorithm;
+use crate::resize::Resize;
 use crate::{swctx, utils, Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
@@ -28,6 +29,7 @@ pub struct DecoderBuilder {
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
     scale_algorithm: ScaleAlgorithm,
+    resize: Option<Resize>,
 }
 
 impl DecoderBuilder {
@@ -46,6 +48,7 @@ impl DecoderBuilder {
             thread_count: num_cpus::get(),
             flags: AvCodecFlags::LOW_DELAY,
             scale_algorithm: ScaleAlgorithm::default(),
+            resize: None,
         }
     }
 
@@ -96,6 +99,16 @@ impl DecoderBuilder {
     /// line default, or [`ScaleAlgorithm::Area`] when downscaling.
     pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
         self.scale_algorithm = algorithm;
+        self
+    }
+
+    /// Set the resize strategy applied to decoded video frames.
+    ///
+    /// Controls the output dimensions: [`Resize::Exact`] forces an exact size,
+    /// [`Resize::Fit`]/[`Resize::FitEven`] keep the aspect ratio while fitting
+    /// within the given bounds. When `None`, frames keep their source size.
+    pub fn with_resize(mut self, resize: Resize) -> Self {
+        self.resize = Some(resize);
         self
     }
 
@@ -285,6 +298,7 @@ impl DecoderBuilder {
             context: decode_ctx,
             state: DecoderState::Normal,
             scale_algorithm: self.scale_algorithm,
+            resize: self.resize,
         })
     }
 }
@@ -320,6 +334,7 @@ pub struct Decoder {
     media_type: MediaType,
     state: DecoderState,
     scale_algorithm: ScaleAlgorithm,
+    resize: Option<Resize>,
 }
 
 impl Decoder {
@@ -701,26 +716,30 @@ impl Decoder {
         let decoded_frame = match self.decoder_receive_frame() {
             Ok(Some(f)) => f,
             Ok(None) => {
-                // 解码器无更多帧。
-                // - Drained：仍需更多输入，暂不刷新 filter，返回 None 让外层继续喂包。
-                // - Flushed：到达 EOF，此时驱动 filter graph 冲刷内部缓冲帧（如
-                //   fps/setpts 等带延迟滤镜）。逐帧调用 `process_frame(None)`，
-                //   每帧返回一帧，直到 graph 进入 Flushed 状态，无需额外队列字段。
-                if self.is_drained() {
-                    return Ok(None);
-                }
-                if let Some(graph) = self.filter_graph.as_mut() {
-                    if !graph.is_flushed() {
-                        match graph.process_frame(None)? {
-                            Some(frame) => return Ok(Some(frame)),
-                            None => {
-                                // 已无更多缓冲帧（graph 此时已 Flushed）
-                                debug_assert!(graph.is_flushed());
+                // 解码器当前无帧可出。按状态区分是"仍需更多输入"还是"已到 EOF"：
+                // - Normal / Drained：读阶段或 drain 阶段的 EAGAIN，需要继续喂包，
+                //   此时绝不能刷新 filter（否则会给 buffersrc 发 EOF，后续真实帧
+                //   提交会得到 AVERROR_EOF）。
+                // - Flushed：解码器到达 EOF，此时驱动 filter graph 冲刷内部缓冲帧
+                //   （如 fps/setpts 等带延迟滤镜）。逐帧调用 `process_frame(None)`，
+                //   每帧返回一帧，直到 graph 进入 Flushed 状态。
+                match self.state {
+                    DecoderState::Normal | DecoderState::Drained => return Ok(None),
+                    DecoderState::Flushed => {
+                        if let Some(graph) = self.filter_graph.as_mut() {
+                            if !graph.is_flushed() {
+                                match graph.process_frame(None)? {
+                                    Some(frame) => return Ok(Some(frame)),
+                                    None => {
+                                        // 已无更多缓冲帧（graph 此时已 Flushed）
+                                        debug_assert!(graph.is_flushed());
+                                    }
+                                }
                             }
                         }
+                        return Ok(None);
                     }
                 }
-                return Ok(None);
             }
             Err(e) => return Err(e),
         };
@@ -749,11 +768,26 @@ impl Decoder {
         let raw_frame = match self.media_type {
             MediaType::VIDEO => {
                 let target_sw_pix_fmt = PixelFormat::YUV420P;
-                if sw_frame.format != target_sw_pix_fmt.into() {
+                // 计算目标尺寸：无 resize 时保持源尺寸，有 resize 时按策略计算
+                let (out_w, out_h) = match self.resize {
+                    Some(resize) => resize
+                        .compute_for((sw_frame.width as u32, sw_frame.height as u32))
+                        .ok_or_else(|| {
+                            let (w, h) = (sw_frame.width, sw_frame.height);
+                            Error::msg(format!(
+                                "Cannot resize frame {w}x{h} into {resize:?}"
+                            ))
+                        })?,
+                    None => (sw_frame.width as u32, sw_frame.height as u32),
+                };
+                if sw_frame.format != target_sw_pix_fmt.into()
+                    || sw_frame.width != out_w as i32
+                    || sw_frame.height != out_h as i32
+                {
                     swctx::scale_with_flags(
                         &sw_frame,
-                        sw_frame.width,
-                        sw_frame.height,
+                        out_w as i32,
+                        out_h as i32,
                         target_sw_pix_fmt,
                         self.scale_algorithm,
                     )?
@@ -1005,6 +1039,7 @@ impl<R: Reader> DecoderWrapper<R> {
 mod tests {
     use super::*;
     use crate::filter;
+    use std::collections::HashSet;
 
     #[test]
     #[ignore = "need a video file"]
@@ -1068,6 +1103,83 @@ mod tests {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "need a video file"]
+    fn test_decode_video_with_resize() -> Result<()> {
+        use crate::Resize;
+
+        let video_path = std::path::Path::new("/tmp/test.mp4");
+
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_resize(Resize::Exact(320, 240))
+            .build_wrapped(video_path)?;
+
+        let mut frames = 0usize;
+        while let Some(frame) = decoder.decode_raw()? {
+            assert_eq!(frame.width, 320);
+            assert_eq!(frame.height, 240);
+            frames += 1;
+        }
+        assert!(frames > 0, "expected at least one decoded frame");
+
+        Ok(())
+    }
+
+    /// 验证 `with_resize` 与 `scale` filter 两种缩放方式结果一致，且同时使用时
+    /// 按「先 resize 后 filter」的顺序叠加，不冲突。
+    #[test]
+    #[ignore = "need a video file"]
+    fn test_resize_vs_filter_scale() -> Result<()> {
+        use crate::Resize;
+
+        let video_path = std::path::Path::new("/tmp/test.mp4");
+
+        // A) 仅 with_resize
+        eprintln!("[A] with_resize only");
+        let mut dec_a = DecoderBuilder::new(MediaType::VIDEO)
+            .with_resize(Resize::Exact(320, 240))
+            .build_wrapped(video_path)?;
+        let mut a_dims = HashSet::new();
+        while let Some(f) = dec_a.decode_raw()? {
+            a_dims.insert((f.width, f.height));
+        }
+
+        // B) 仅 scale filter
+        eprintln!("[B] filter only");
+        let mut dec_b = DecoderBuilder::new(MediaType::VIDEO)
+            .with_filters(vec![filter::video::scale(320, 240, None)])
+            .build_wrapped(video_path)?;
+        let mut b_dims = HashSet::new();
+        while let Some(f) = dec_b.decode_raw()? {
+            b_dims.insert((f.width, f.height));
+        }
+
+        // A 与 B 应得到完全相同的尺寸集合
+        assert_eq!(
+            a_dims, b_dims,
+            "with_resize and filter scale produced different dimensions"
+        );
+        assert_eq!(a_dims.len(), 1, "expected a single uniform output size");
+
+        // C) 同时使用：resize(320x240) -> filter scale(640x480)，输出应为 filter 尺寸
+        eprintln!("[C] resize + filter");
+        let mut dec_c = DecoderBuilder::new(MediaType::VIDEO)
+            .with_resize(Resize::Exact(320, 240))
+            .with_filters(vec![filter::video::scale(640, 480, None)])
+            .build_wrapped(video_path)?;
+        let mut c_dims = HashSet::new();
+        while let Some(f) = dec_c.decode_raw()? {
+            c_dims.insert((f.width, f.height));
+        }
+        assert_eq!(
+            c_dims,
+            HashSet::from([(640i32, 480i32)]),
+            "resize+filter should compose to the filter size"
+        );
 
         Ok(())
     }
