@@ -5,11 +5,13 @@ use std::io::{SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow};
 use image::DynamicImage;
-use rsmedia::swctx;
 use rsmedia::PixelFormat;
+use rsmedia::swctx;
 
+use super::av_convert;
+use rsmedia::codec::CodecConfig;
 use rsmpeg::ffi;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext, AVPacket},
@@ -18,8 +20,6 @@ use rsmpeg::{
     },
     avutil::{self, AVFrame, AVMem, AVRational},
 };
-
-use super::av_convert;
 
 /// multimedia file input decoding
 pub struct Decoder {
@@ -191,14 +191,17 @@ pub fn open_output_file(
         .with_context(|| anyhow!("encoder({}) not found.", ffi::AV_CODEC_ID_H264))?;
 
     let mut encode_context = AVCodecContext::new(&encoder);
+    let codec_config = CodecConfig::from_codec(encoder);
     encode_context.set_height(decode_context.height);
     encode_context.set_width(decode_context.width);
     encode_context.set_sample_aspect_ratio(decode_context.sample_aspect_ratio);
-    encode_context.set_pix_fmt(if let Some(pix_fmts) = encoder.pix_fmts() {
-        pix_fmts[0]
-    } else {
-        decode_context.pix_fmt
-    });
+    encode_context.set_pix_fmt(
+        if let Some(pix_fmts) = codec_config.supported_pixel_formats()? {
+            pix_fmts[0]
+        } else {
+            decode_context.pix_fmt
+        },
+    );
     encode_context.set_time_base(avutil::av_inv_q(decode_context.framerate));
 
     // Some formats want stream headers to be separate.
@@ -277,14 +280,18 @@ pub fn open_output_file_custom(
         .with_context(|| anyhow!("encoder({}) not found.", ffi::AV_CODEC_ID_H264))?;
 
     let mut encode_context = AVCodecContext::new(&encoder);
+    let codec_config = CodecConfig::from_codec(encoder);
+
     encode_context.set_width(width);
     encode_context.set_height(height);
     encode_context.set_sample_aspect_ratio(ratio);
-    encode_context.set_pix_fmt(if let Some(pix_fmts) = encoder.pix_fmts() {
-        pix_fmts[0]
-    } else {
-        ffi::AV_PIX_FMT_YUV420P
-    });
+    encode_context.set_pix_fmt(
+        if let Some(pix_fmts) = codec_config.supported_pixel_formats()? {
+            pix_fmts[0]
+        } else {
+            ffi::AV_PIX_FMT_YUV420P
+        },
+    );
 
     encode_context.set_time_base(avutil::av_inv_q(avutil::av_mul_q(
         framerate,

@@ -1,4 +1,4 @@
-use rsmedia::{colors, filter, frame::MediaFrame, time, EncoderBuilder, PixelFormat};
+use rsmedia::{EncoderBuilder, PixelFormat, colors, filter, frame::MediaFrame, time};
 
 use std::path::Path;
 
@@ -34,7 +34,9 @@ fn main() -> anyhow::Result<()> {
                 .build(),
         );
     } else {
-        eprintln!("WARN: drawtext filter unavailable (FFmpeg built without libfreetype), skipping watermark");
+        eprintln!(
+            "WARN: drawtext filter unavailable (FFmpeg built without libfreetype), skipping watermark"
+        );
     }
 
     let output_path = Path::new("/tmp/rainbow.mp4");

@@ -1,9 +1,10 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/transcode_aac.c
-use anyhow::{bail, Context as AnyhowContext, Result};
+use anyhow::{Context as AnyhowContext, Result, bail};
+use rsmedia::codec::CodecConfig;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avformat::{AVFormatContextInput, AVFormatContextOutput},
-    avutil::{ra, AVAudioFifo, AVChannelLayout, AVFrame, AVSamples},
+    avutil::{AVAudioFifo, AVChannelLayout, AVFrame, AVSamples, ra},
     error::RsmpegError,
     ffi,
     swresample::SwrContext,
@@ -48,12 +49,13 @@ fn open_output_file(
         AVCodec::find_encoder(ffi::AV_CODEC_ID_AAC).context("Failed to find aac encoder")?;
 
     let mut encode_context = AVCodecContext::new(&encode_codec);
+    let codec_config = CodecConfig::from_codec(encode_codec);
 
     // Set the basic encoder parameters.
     // The input file's sample rate is used to avoid a sample rate conversion.
     encode_context.set_ch_layout(AVChannelLayout::from_nb_channels(OUTPUT_CHANNELS).into_inner());
     encode_context.set_sample_rate(decode_context.sample_rate);
-    encode_context.set_sample_fmt(encode_codec.sample_fmts().unwrap()[0]);
+    encode_context.set_sample_fmt(codec_config.supported_sample_formats()?.unwrap()[0]);
     encode_context.set_bit_rate(OUTPUT_BIT_RATE);
 
     // Open the encoder for the audio stream to use it later.

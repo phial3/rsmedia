@@ -4,7 +4,7 @@
 //! rsmedia 的 `EncoderWrapper::write_frame` + `EncoderBuilder::preset_h264_yuv420p`
 //! 即可逐帧写出，时间戳自动维护。
 
-use rsmedia::{frame::MediaFrame, time, EncoderBuilder, PixelFormat};
+use rsmedia::{EncoderBuilder, PixelFormat, frame::MediaFrame, time};
 
 fn main() -> anyhow::Result<()> {
     rsmedia::init()?;

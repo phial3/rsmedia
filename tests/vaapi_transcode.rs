@@ -1,6 +1,6 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/vaapi_transcode.c
 
-use anyhow::{anyhow, bail, Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use std::ffi::CStr;
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
@@ -9,24 +9,26 @@ use rsmpeg::avutil::{self, AVFrame, AVHWDeviceContext, AVPixelFormat};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::ffi::{
-    AVHWDeviceType, AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VAAPI, AV_PIX_FMT_CUDA,
-    AV_PIX_FMT_NV12, AV_PIX_FMT_VAAPI,
+    AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VAAPI, AV_PIX_FMT_CUDA, AV_PIX_FMT_NV12,
+    AV_PIX_FMT_VAAPI, AVHWDeviceType,
 };
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn hwaccel_get_format(
     ctx: *mut ffi::AVCodecContext,
     pix_fmts: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
-    let mut p = pix_fmts;
-    let hw_format = (*ctx).opaque as ffi::AVPixelFormat;
-    while *p != ffi::AV_PIX_FMT_NONE {
-        if *p == hw_format {
-            return *p;
+    unsafe {
+        let mut p = pix_fmts;
+        let hw_format = (*ctx).opaque as ffi::AVPixelFormat;
+        while *p != ffi::AV_PIX_FMT_NONE {
+            if *p == hw_format {
+                return *p;
+            }
+            p = p.add(1);
         }
-        p = p.add(1);
+        ffi::AV_PIX_FMT_NONE
     }
-    ffi::AV_PIX_FMT_NONE
 }
 
 fn set_hwframe_ctx(
@@ -241,14 +243,14 @@ fn encode_write_frame(
     ofmt_ctx: &mut AVFormatContextOutput,
     stream_index: usize,
 ) -> Result<()> {
-    if let Some(filt_frame) = filt_frame.as_mut() {
-        if filt_frame.pts != ffi::AV_NOPTS_VALUE {
-            filt_frame.set_pts(avutil::av_rescale_q(
-                filt_frame.pts,
-                filt_frame.time_base,
-                enc_ctx.time_base,
-            ));
-        }
+    if let Some(filt_frame) = filt_frame.as_mut()
+        && filt_frame.pts != ffi::AV_NOPTS_VALUE
+    {
+        filt_frame.set_pts(avutil::av_rescale_q(
+            filt_frame.pts,
+            filt_frame.time_base,
+            enc_ctx.time_base,
+        ));
     }
 
     enc_ctx

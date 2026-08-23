@@ -374,7 +374,7 @@ unsafe impl<R: Reader> Sync for Demuxer<R> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{utils, EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter};
+    use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter, utils};
 
     use anyhow::{Context, Result};
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};

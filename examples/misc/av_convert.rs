@@ -1,7 +1,7 @@
 use anyhow::Result;
 use image::RgbImage;
-use rsmedia::swctx;
 use rsmedia::PixelFormat;
+use rsmedia::swctx;
 use rsmpeg::{avutil::AVFrame, ffi};
 
 /// 将 RgbImage 转换为 AVFrame

@@ -58,33 +58,11 @@ pub enum AvFormatFlags {
     NO_BINSEARCH = ffi::AVFMT_NOBINSEARCH,
     NO_GENSEARCH = ffi::AVFMT_NOGENSEARCH,
     NO_BYTE_SEEK = ffi::AVFMT_NO_BYTE_SEEK,
-    #[cfg(not(feature = "ffmpeg8"))]
+    #[cfg(not(any(feature = "ffmpeg8", feature = "ffmpeg9")))]
     ALLOW_FLUSH = ffi::AVFMT_ALLOW_FLUSH,
     TS_NONSTRICT = ffi::AVFMT_TS_NONSTRICT,
     TS_NEGATIVE = ffi::AVFMT_TS_NEGATIVE,
     SEEK_TO_PTS = ffi::AVFMT_SEEK_TO_PTS,
-}
-
-#[repr(u32)]
-#[allow(non_camel_case_types)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum AvFormatContextFlags {
-    GENPTS = ffi::AVFMT_FLAG_GENPTS,
-    IGNIDX = ffi::AVFMT_FLAG_IGNIDX,
-    NONBLOCK = ffi::AVFMT_FLAG_NONBLOCK,
-    IGNDTS = ffi::AVFMT_FLAG_IGNDTS,
-    NOFILLIN = ffi::AVFMT_FLAG_NOFILLIN,
-    NOPARSE = ffi::AVFMT_FLAG_NOPARSE,
-    NOBUFFER = ffi::AVFMT_FLAG_NOBUFFER,
-    CUSTOM_IO = ffi::AVFMT_FLAG_CUSTOM_IO,
-    DISCARD_CORRUPT = ffi::AVFMT_FLAG_DISCARD_CORRUPT,
-    FLUSH_PACKETS = ffi::AVFMT_FLAG_FLUSH_PACKETS,
-    BITEXACT = ffi::AVFMT_FLAG_BITEXACT,
-    SORT_DTS = ffi::AVFMT_FLAG_SORT_DTS,
-    FAST_SEEK = ffi::AVFMT_FLAG_FAST_SEEK,
-    #[cfg(not(feature = "ffmpeg8"))]
-    SHORTEST = ffi::AVFMT_FLAG_SHORTEST,
-    AUTO_BSF = ffi::AVFMT_FLAG_AUTO_BSF,
 }
 
 // compile error on win32:  expected `u32`, found `i32`

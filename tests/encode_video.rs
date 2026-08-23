@@ -1,8 +1,8 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/encode_video.c
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
-    avutil::{opt_set, ra, AVFrame},
+    avutil::{AVFrame, opt_set, ra},
     error::RsmpegError,
     ffi,
 };

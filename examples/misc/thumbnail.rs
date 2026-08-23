@@ -1,4 +1,5 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use rsmedia::codec::CodecConfig;
 use rsmpeg::ffi;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
@@ -57,16 +58,19 @@ fn thumbnail(
     let mut encode_context = {
         let encoder = AVCodec::find_encoder(ffi::AV_CODEC_ID_MJPEG).context("Encoder not found")?;
         let mut encode_context = AVCodecContext::new(&encoder);
+        let codec_config = CodecConfig::from_codec(encoder);
 
         encode_context.set_bit_rate(decode_context.bit_rate);
         encode_context.set_width(width.unwrap_or(decode_context.width));
         encode_context.set_height(height.unwrap_or(decode_context.height));
         encode_context.set_time_base(avutil::av_inv_q(decode_context.framerate));
-        encode_context.set_pix_fmt(if let Some(pix_fmts) = encoder.pix_fmts() {
-            pix_fmts[0]
-        } else {
-            decode_context.pix_fmt
-        });
+        encode_context.set_pix_fmt(
+            if let Some(pix_fmts) = codec_config.supported_pixel_formats()? {
+                pix_fmts[0]
+            } else {
+                decode_context.pix_fmt
+            },
+        );
         encode_context.open(None)?;
 
         encode_context

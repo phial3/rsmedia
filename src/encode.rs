@@ -10,7 +10,7 @@ use crate::pixel::PixelFormat;
 use crate::stream::StreamInfo;
 use crate::swctx::ScaleAlgorithm;
 use crate::time::Rescale;
-use crate::{swctx, time, utils, Location, MediaType, SampleFormat, StreamWriter};
+use crate::{Location, MediaType, SampleFormat, StreamWriter, swctx, time, utils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket};
 use rsmpeg::avutil::{self, AVAudioFifo, AVChannelLayout, AVChannelLayoutRef, AVFrame};
@@ -370,7 +370,7 @@ impl EncoderBuilder {
                     _ => {
                         return Err(Error::msg(
                             format!("Unsupported media type:{media_type:?}",),
-                        ))
+                        ));
                     }
                 }
             };
@@ -380,7 +380,7 @@ impl EncoderBuilder {
 
         let mut encode_ctx = AVCodecContext::new(&codec);
         self.setup_codec_context(&mut encode_ctx)?;
-        let config = CodecConfig::new_with_ctx(&encode_ctx);
+        let config = CodecConfig::from_codec(codec);
 
         // 在 hw_device_config / codec_opts 被 move 之前构造 filter graph：
         // 此位置 self 尚未被部分 move，可直接借用 self 计算 time_base。
@@ -451,18 +451,20 @@ impl EncoderBuilder {
                     encode_ctx.set_time_base(avutil::av_inv_q(out_fr));
                 }
             }
-            if let Some((fw, fh)) = filter_size {
-                if fw > 0 && fh > 0 && (fw != encode_ctx.width || fh != encode_ctx.height) {
-                    log::info!(
-                        "Filter changes size: {}x{} -> {}x{}",
-                        encode_ctx.width,
-                        encode_ctx.height,
-                        fw,
-                        fh
-                    );
-                    encode_ctx.set_width(fw);
-                    encode_ctx.set_height(fh);
-                }
+            if let Some((fw, fh)) = filter_size
+                && fw > 0
+                && fh > 0
+                && (fw != encode_ctx.width || fh != encode_ctx.height)
+            {
+                log::info!(
+                    "Filter changes size: {}x{} -> {}x{}",
+                    encode_ctx.width,
+                    encode_ctx.height,
+                    fw,
+                    fh
+                );
+                encode_ctx.set_width(fw);
+                encode_ctx.set_height(fh);
             }
         }
 
@@ -476,7 +478,7 @@ impl EncoderBuilder {
                 // codec support or not for hardware acceleration
                 log::info!(
                     "Video Encoder with HW acceleration codec: {:?}, config: {:#?}",
-                    codec.name(),
+                    self.codec_name,
                     cfg
                 );
 
@@ -948,49 +950,34 @@ impl Encoder {
                 if !frame.hw_frames_ctx.is_null() {
                     return Ok(());
                 }
-                let pix_fmts_opt = self.config.supported_pixel_formats()?;
-                if let Some(pix_fmts) = pix_fmts_opt {
-                    if !pix_fmts.contains(&frame.format) {
-                        return Err(Error::msg(format!(
-                            "Unsupported video encoder frame pixel format: {:?}",
-                            frame.format
-                        )));
-                    }
+                if !self.config.is_support_pixel_format(frame.format) {
+                    return Err(Error::msg(format!(
+                        "Unsupported video encoder frame pixel format: {:?}",
+                        frame.format
+                    )));
                 }
             }
 
             MediaType::AUDIO => {
-                let ch_layouts_opt = self.config.supported_channel_layouts()?;
-                if let Some(ch_layouts) = ch_layouts_opt {
-                    ch_layouts
-                        .iter()
-                        .find(|ch_layout| ch_layout.nb_channels == frame.ch_layout.nb_channels)
-                        .ok_or_else(|| {
-                            Error::msg(format!(
-                                "Unsupported audio encoder frame channel layout: {:?}",
-                                frame.ch_layout.nb_channels
-                            ))
-                        })?;
+                if !self.config.is_support_sample_format(frame.format) {
+                    return Err(Error::msg(format!(
+                        "Unsupported encode audio frame sample format: {:?}",
+                        frame.format
+                    )));
                 }
 
-                let sample_fmts_opt = self.config.supported_sample_formats()?;
-                if let Some(sample_fmts) = sample_fmts_opt {
-                    if !sample_fmts.contains(&frame.format) {
-                        return Err(Error::msg(format!(
-                            "Unsupported encode frame sample format: {:?}",
-                            frame.format
-                        )));
-                    }
+                if !self.config.is_support_frame_rates(self.context.framerate) {
+                    return Err(Error::msg(format!(
+                        "Unsupported encode audio frame rate: {:?}",
+                        self.context.framerate
+                    )));
                 }
 
-                let sample_rates_opt = self.config.supported_sample_rates()?;
-                if let Some(sample_rates) = sample_rates_opt {
-                    if !sample_rates.contains(&frame.sample_rate) {
-                        return Err(Error::msg(format!(
-                            "Unsupported encode frame sample rate: {:?}",
-                            frame.sample_rate
-                        )));
-                    }
+                if !self.config.is_support_sample_rate(frame.sample_rate) {
+                    return Err(Error::msg(format!(
+                        "Unsupported encode audio frame sample rate: {:?}",
+                        frame.sample_rate
+                    )));
                 }
 
                 // 注意：不在此校验 `nb_samples == frame_size`。固定帧长音频编码器
@@ -1142,7 +1129,7 @@ impl Encoder {
         // 如果编码器不支持延迟，那么就没有必要进行 flush 操作，因为在这种情况下，编码器不会保留任何未处理的数据。
         // 如果编码器支持延迟（delay），则在结束编码之前发送 EOS 包是有必要的，
         // 因为编码器可能还在缓冲一些数据，直到接收到 EOS 信号才会处理完这些数据并输出剩余的包。
-        if !self.config.support_delayed_frame() {
+        if !self.config.is_support_delayed_frame() {
             return Ok(());
         }
 
@@ -1678,7 +1665,7 @@ mod tests {
     #[cfg(feature = "ndarray")]
     #[test]
     fn test_encode_delayed_filter_roundtrip() -> Result<()> {
-        use crate::{filter::Filter, DecoderBuilder, MediaType};
+        use crate::{DecoderBuilder, MediaType, filter::Filter};
 
         let width = 64usize;
         let height = 64usize;

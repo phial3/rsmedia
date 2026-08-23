@@ -8,7 +8,7 @@ use crate::options::Options;
 use crate::resize::Resize;
 use crate::stream::StreamInfo;
 use crate::swctx::ScaleAlgorithm;
-use crate::{swctx, utils, Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
+use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time, swctx, utils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
 use rsmpeg::avformat::AVStream;
@@ -738,14 +738,14 @@ impl Decoder {
                 match self.state {
                     DecoderState::Normal | DecoderState::Drained => return Ok(None),
                     DecoderState::Flushed => {
-                        if let Some(graph) = self.filter_graph.as_mut() {
-                            if !graph.is_flushed() {
-                                match graph.process_frame(None)? {
-                                    Some(frame) => return Ok(Some(frame)),
-                                    None => {
-                                        // 已无更多缓冲帧（graph 此时已 Flushed）
-                                        debug_assert!(graph.is_flushed());
-                                    }
+                        if let Some(graph) = self.filter_graph.as_mut()
+                            && !graph.is_flushed()
+                        {
+                            match graph.process_frame(None)? {
+                                Some(frame) => return Ok(Some(frame)),
+                                None => {
+                                    // 已无更多缓冲帧（graph 此时已 Flushed）
+                                    debug_assert!(graph.is_flushed());
                                 }
                             }
                         }

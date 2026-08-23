@@ -99,7 +99,7 @@ pub unsafe fn from_c_char(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    let cstr = CStr::from_ptr(ptr);
+    let cstr = unsafe { CStr::from_ptr(ptr) };
     match cstr.to_str() {
         Ok(s) => s.to_owned(),
         Err(_) => {

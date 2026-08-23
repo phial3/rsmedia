@@ -1,7 +1,7 @@
 use super::avio;
 /// Simplified transcoding test, select the first video stream in given video file
 /// and transcode it. Store the output in memory.
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rsmpeg::ffi;
 use rsmpeg::{
     avcodec::AVCodecContext, avformat::AVFormatContextOutput, avutil::AVFrame, error::RsmpegError,

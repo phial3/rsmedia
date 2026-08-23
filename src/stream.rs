@@ -1,6 +1,6 @@
 use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
-use crate::{utils, MediaType, Options, PixelFormat, SampleFormat};
+use crate::{MediaType, Options, PixelFormat, SampleFormat, utils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecParametersRef, AVPacket};
 use rsmpeg::avformat::{AVInputFormatRef, AVStream};

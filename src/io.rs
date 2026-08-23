@@ -1006,35 +1006,37 @@ unsafe extern "C" fn log_callback(
         let mut line = [0; 1024];
         let mut print_prefix: std::ffi::c_int = 1;
         // Use the ffmpeg default formatting.
-        let ret = ffi::av_log_format_line2(
-            avcl,
-            level_no,
-            fmt,
-            vl,
-            line.as_mut_ptr(),
-            (line.len()) as std::ffi::c_int,
-            (&mut print_prefix) as *mut std::ffi::c_int,
-        );
+        let ret = unsafe {
+            ffi::av_log_format_line2(
+                avcl,
+                level_no,
+                fmt,
+                vl,
+                line.as_mut_ptr(),
+                (line.len()) as std::ffi::c_int,
+                (&mut print_prefix) as *mut std::ffi::c_int,
+            )
+        };
         // Simply discard the log message if formatting fails.
-        if ret > 0 {
-            if let Ok(line) = std::ffi::CStr::from_ptr(line.as_mut_ptr()).to_str() {
-                let line = line.trim();
-                if log_filter_hacks(line) {
-                    match level_no as u32 {
-                        // These are all error states.
-                        ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
-                            tracing::error!(target: "rsmedia", "{}", line)
-                        }
-                        ffi::AV_LOG_WARNING => tracing::warn!(target: "rsmedia", "{}", line),
-                        ffi::AV_LOG_INFO => tracing::info!(target: "rsmedia", "{}", line),
-                        // There is no "verbose" in `log`, so we just put it in the "debug" category.
-                        ffi::AV_LOG_VERBOSE | ffi::AV_LOG_DEBUG => {
-                            tracing::debug!(target: "rsmedia", "{}", line)
-                        }
-                        ffi::AV_LOG_TRACE => tracing::trace!(target: "rsmedia", "{}", line),
-                        _ => {}
-                    };
-                }
+        if ret > 0
+            && let Ok(line) = unsafe { std::ffi::CStr::from_ptr(line.as_mut_ptr()) }.to_str()
+        {
+            let line = line.trim();
+            if log_filter_hacks(line) {
+                match level_no as u32 {
+                    // These are all error states.
+                    ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
+                        tracing::error!(target: "rsmedia", "{}", line)
+                    }
+                    ffi::AV_LOG_WARNING => tracing::warn!(target: "rsmedia", "{}", line),
+                    ffi::AV_LOG_INFO => tracing::info!(target: "rsmedia", "{}", line),
+                    // There is no "verbose" in `log`, so we just put it in the "debug" category.
+                    ffi::AV_LOG_VERBOSE | ffi::AV_LOG_DEBUG => {
+                        tracing::debug!(target: "rsmedia", "{}", line)
+                    }
+                    ffi::AV_LOG_TRACE => tracing::trace!(target: "rsmedia", "{}", line),
+                    _ => {}
+                };
             }
         }
     }

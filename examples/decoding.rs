@@ -1,6 +1,6 @@
 use image::{ImageBuffer, Rgb};
 
-use rsmedia::{filter, DecoderBuilder, MediaFrame, MediaType};
+use rsmedia::{DecoderBuilder, MediaFrame, MediaType, filter};
 
 use anyhow::{Context, Result};
 use futures::future::join_all;

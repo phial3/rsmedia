@@ -1,7 +1,7 @@
 use rsmedia::{
+    EncoderBuilder, MediaType, Options, PixelFormat, SampleFormat, StreamWriterBuilder,
     hwaccel::HWDeviceType,
     mux::{Demuxer, Muxer},
-    EncoderBuilder, MediaType, Options, PixelFormat, SampleFormat, StreamWriterBuilder,
 };
 
 use std::path::Path;

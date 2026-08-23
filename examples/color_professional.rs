@@ -5,7 +5,7 @@
 //! 2. **Explicit RGB -> YUV color matrices** (BT.601 / BT.709 / BT.2020) via `yuv`.
 //! 3. **Colormap pseudo-color rendering** via `colorous`.
 
-use rsmedia::{colors, frame::MediaFrame, time, PixelFormat};
+use rsmedia::{PixelFormat, colors, frame::MediaFrame, time};
 
 fn main() -> anyhow::Result<()> {
     // 1. Perceptual color difference (CIEDE2000)

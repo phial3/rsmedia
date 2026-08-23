@@ -9,94 +9,8 @@ use rsmpeg::{
 };
 
 use anyhow::{Context, Result};
+use rsmedia::codec::CodecConfig;
 use std::ffi::CStr;
-
-/// 编码器能力描述结构体
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct CodecConfig {
-    /// 支持的帧率列表（视频编码器）
-    pub supported_frame_rates: Option<Vec<ffi::AVRational>>,
-    /// 支持的采样率列表（音频编码器）
-    pub supported_sample_rates: Vec<i32>,
-    /// 支持的像素格式列表（视频编码器）
-    pub supported_pix_fmts: Vec<ffi::AVPixelFormat>,
-    /// 支持的采样格式列表（音频编码器）
-    pub supported_sample_fmts: Vec<ffi::AVSampleFormat>,
-    /// 典型帧大小（单位：样本数/视频帧）
-    pub frame_size: i32,
-}
-
-impl CodecConfig {
-    /// 从AVCodec动态获取编码器配置
-    pub fn new(codec: &AVCodec) -> Self {
-        // 获取视频相关参数
-        let supported_frame_rates = codec.supported_framerates().map(|rates| rates.to_vec());
-
-        let supported_pix_fmts = codec
-            .pix_fmts()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|&&fmt| fmt != ffi::AV_PIX_FMT_NONE)
-            .cloned()
-            .collect();
-
-        // 获取音频相关参数
-        let supported_sample_fmts = codec
-            .sample_fmts()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|&&fmt| fmt != ffi::AV_SAMPLE_FMT_NONE)
-            .cloned()
-            .collect();
-
-        let supported_sample_rates = codec
-            .supported_samplerates()
-            .unwrap_or(&[44_100, 48_000])
-            .to_vec();
-
-        let frame_size = if codec.capabilities & ffi::AV_CODEC_CAP_VARIABLE_FRAME_SIZE as i32 != 0 {
-            1024
-        } else {
-            match codec.id {
-                ffi::AV_CODEC_ID_FLAC => 4608,
-                ffi::AV_CODEC_ID_ALAC => 4096,
-                ffi::AV_CODEC_ID_WMAV2 => 2048,
-                ffi::AV_CODEC_ID_AC3 => 1536,
-                ffi::AV_CODEC_ID_MP2 => 1152,
-                ffi::AV_CODEC_ID_MP3 => 1152,
-                ffi::AV_CODEC_ID_OPUS => 960,
-                ffi::AV_CODEC_ID_DTS => 512,
-                ffi::AV_CODEC_ID_AMR_NB => 160,
-                ffi::AV_CODEC_ID_VORBIS => 64,
-                _ => 1024,
-            }
-        };
-
-        Self {
-            supported_frame_rates,
-            supported_sample_rates,
-            supported_pix_fmts,
-            supported_sample_fmts,
-            frame_size,
-        }
-    }
-
-    /// 检查采样格式是否支持
-    pub fn is_sample_fmt_supported(&self, fmt: ffi::AVSampleFormat) -> bool {
-        self.supported_sample_fmts.contains(&fmt)
-    }
-
-    /// 获取默认采样格式（优先级：FLTP > S16P > 首个支持格式）
-    #[allow(dead_code)]
-    pub fn default_sample_fmt(&self) -> Option<ffi::AVSampleFormat> {
-        [ffi::AV_SAMPLE_FMT_FLTP, ffi::AV_SAMPLE_FMT_S16P]
-            .iter()
-            .find(|&&fmt| self.supported_sample_fmts.contains(&fmt))
-            .copied()
-            .or_else(|| self.supported_sample_fmts.first().copied())
-    }
-}
 
 /// 生成正弦波音频样本（优化内存访问）
 fn generate_sine_wave(frame: &mut AVFrame, frequency: f64, sample_rate: i32) -> Result<()> {
@@ -268,25 +182,15 @@ fn encode_audio(
     let codec =
         AVCodec::find_encoder(codec_id).context(format!("Failed to find encoder: {}", codec_id))?;
     let mut encode_ctx = AVCodecContext::new(&codec);
-
-    let codec_config = CodecConfig::new(&codec);
-    let sample_rate = codec_config
-        .supported_sample_rates
-        .first()
-        .copied()
-        .unwrap();
+    let codec_config = CodecConfig::from_codec(codec);
+    let sample_rate = codec_config.supported_sample_rates().unwrap().unwrap()[0];
 
     println!(
-        "encode_audio: output_path:{}, codec_id:{}, sample_format:{}, codec_config: {:#?}",
+        "encode_audio: output_path:{}, codec_id:{}, sample_format:{}, sample_rate: {}",
         output_path.to_string_lossy(),
         codec_id,
         sample_format,
-        codec_config
-    );
-
-    assert!(
-        codec_config.is_sample_fmt_supported(sample_format),
-        "Unsupported sample format"
+        sample_rate
     );
 
     // 配置编码参数
@@ -317,7 +221,7 @@ fn encode_audio(
 
     // 初始化音频帧（带自动内存管理）
     let mut frame = AVFrame::new();
-    frame.set_nb_samples(codec_config.frame_size);
+    frame.set_nb_samples(1);
     frame.set_ch_layout(encode_ctx.ch_layout);
     frame.set_format(encode_ctx.sample_fmt);
     frame

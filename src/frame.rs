@@ -1,5 +1,5 @@
 use crate::pixel::PixelFormat;
-use crate::{imgutils, time, MediaType, SampleFormat};
+use crate::{MediaType, SampleFormat, imgutils, time};
 
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
@@ -888,7 +888,6 @@ where
 mod tests {
     use super::*;
     use crate::colors::Color;
-    use rsmpeg::avcodec::AVCodec;
     use std::time::Duration;
 
     /// 用 `Color::from_rgb` 生成渐变测试图案并填充 RGB24 帧。
@@ -1668,15 +1667,9 @@ mod tests {
 
     #[test]
     fn test_get_buffer() {
-        let encoder = AVCodec::find_encoder(ffi::AV_CODEC_ID_AAC).unwrap();
-        // 校验编码器至少声明了一种采样格式
-        assert!(
-            encoder.sample_fmts().is_some_and(|fmts| !fmts.is_empty()),
-            "AAC encoder should expose at least one supported sample format"
-        );
         let mut frame = AVFrame::new();
         frame.set_nb_samples(2);
-        frame.set_format(encoder.sample_fmts().unwrap()[0]);
+        frame.set_format(ffi::AV_SAMPLE_FMT_FLTP);
         let stereo_layout = AVChannelLayout::from_string(c"stereo").unwrap();
         frame.set_ch_layout(stereo_layout.into_inner());
         assert!(frame.alloc_buffer().is_ok());

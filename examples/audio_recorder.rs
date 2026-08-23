@@ -278,8 +278,8 @@ fn main() -> Result<()> {
     controller.start_recording()?;
 
     // 查找并播放最新录制的音频
-    if let Ok(entries) = std::fs::read_dir(".") {
-        if let Some(latest_recording) = entries
+    if let Ok(entries) = std::fs::read_dir(".")
+        && let Some(latest_recording) = entries
             .filter_map(|entry| entry.ok())
             .filter(|e| {
                 e.path()
@@ -288,10 +288,9 @@ fn main() -> Result<()> {
                     .unwrap_or(false)
             })
             .max_by_key(|e| e.metadata().unwrap().modified().unwrap())
-        {
-            println!("\n播放录音...");
-            controller.play_recording(latest_recording.path().to_str().unwrap())?;
-        }
+    {
+        println!("\n播放录音...");
+        controller.play_recording(latest_recording.path().to_str().unwrap())?;
     }
 
     Ok(())

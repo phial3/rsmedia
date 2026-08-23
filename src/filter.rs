@@ -993,7 +993,7 @@ impl FilterGraph {
 
         // 先分配再设置选项、最后初始化。FFmpeg 8 将 `pix_fmts`(binary) 废弃为数组选项
         // `pixel_formats`，二者均为非运行时选项，须在 init 之前设置。
-        #[cfg(feature = "ffmpeg8")]
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         sink_ctx
             .opt_set_array(
                 c"pixel_formats",
@@ -1002,7 +1002,7 @@ impl FilterGraph {
                 ffi::AV_OPT_TYPE_PIXEL_FMT,
             )
             .context("Failed to set video sink filter context pixel format")?;
-        #[cfg(not(feature = "ffmpeg8"))]
+        #[cfg(not(any(feature = "ffmpeg8", feature = "ffmpeg9")))]
         sink_ctx
             .opt_set_bin(c"pix_fmts", &(ffi::AVPixelFormat::from(params.format)))
             .context("Failed to set video sink filter context pixel format")?;
@@ -1061,25 +1061,25 @@ impl FilterGraph {
         // FFmpeg8 将如下参数废弃, 且新旧选项不能混用:
         // - buffersink ：新数组选项 pixel_formats （旧 pix_fmts 已废弃）
         // - abuffersink ：新数组选项 `sample_formats`/`samplerates`/`channel_layouts` （旧 `sample_fmts`/`sample_rates`/`ch_layouts`(binary/string) 已废弃）
-        #[cfg(feature = "ffmpeg8")]
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         sink_ctx.opt_set_array(
             c"sample_formats",
             0,
             Some(&[params.format as i32]),
             ffi::AV_OPT_TYPE_SAMPLE_FMT,
         )?;
-        #[cfg(not(feature = "ffmpeg8"))]
+        #[cfg(not(any(feature = "ffmpeg8", feature = "ffmpeg9")))]
         sink_ctx.opt_set_bin(c"sample_fmts", &(params.format as i32))?;
-        #[cfg(feature = "ffmpeg8")]
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         sink_ctx.opt_set_array(
             c"samplerates",
             0,
             Some(&[params.sample_rate]),
             ffi::AV_OPT_TYPE_INT,
         )?;
-        #[cfg(not(feature = "ffmpeg8"))]
+        #[cfg(not(any(feature = "ffmpeg8", feature = "ffmpeg9")))]
         sink_ctx.opt_set_bin(c"sample_rates", &params.sample_rate)?;
-        #[cfg(feature = "ffmpeg8")]
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         {
             // `AVChannelLayout::into_inner` 移出所有权，av_opt_set_array 会复制该布局，
             // 故设置完成后需手动 uninit 释放。
@@ -1097,7 +1097,7 @@ impl FilterGraph {
                 ffi::av_channel_layout_uninit(&mut layouts[0]);
             }
         }
-        #[cfg(not(feature = "ffmpeg8"))]
+        #[cfg(not(any(feature = "ffmpeg8", feature = "ffmpeg9")))]
         sink_ctx.opt_set(c"ch_layouts", &channel_desc)?;
         sink_ctx
             .init_str(None)

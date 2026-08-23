@@ -1,9 +1,9 @@
 use crate::pixel::PixelFormat;
-use crate::{imgutils, utils, Options};
+use crate::{Options, imgutils, utils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
-use rsmpeg::{ffi, UnsafeDerefMut};
+use rsmpeg::{UnsafeDerefMut, ffi};
 
 use anyhow::{Context, Error, Result};
 use once_cell::sync::Lazy;
@@ -630,18 +630,20 @@ impl From<HWDeviceType> for ffi::AVHWDeviceType {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn hwaccel_get_format(
     ctx: *mut ffi::AVCodecContext,
     pix_fmts: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
-    let mut p = pix_fmts;
-    let hw_format = (*ctx).opaque as ffi::AVPixelFormat;
-    while *p != ffi::AV_PIX_FMT_NONE {
-        if *p == hw_format {
-            return *p;
+    unsafe {
+        let mut p = pix_fmts;
+        let hw_format = (*ctx).opaque as ffi::AVPixelFormat;
+        while *p != ffi::AV_PIX_FMT_NONE {
+            if *p == hw_format {
+                return *p;
+            }
+            p = p.add(1);
         }
-        p = p.add(1);
+        ffi::AV_PIX_FMT_NONE
     }
-    ffi::AV_PIX_FMT_NONE
 }

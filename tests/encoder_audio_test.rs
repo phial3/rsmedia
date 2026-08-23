@@ -2,7 +2,8 @@
 mod tests {
     use anyhow::{Context, Result};
     use dasp::Signal;
-    use rsmedia::{filter, utils, EncoderBuilder, SampleFormat};
+    use rsmedia::codec::CodecConfig;
+    use rsmedia::{EncoderBuilder, SampleFormat, filter, utils};
     use rsmpeg::avcodec::AVCodec;
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
     use rsmpeg::ffi;
@@ -139,37 +140,37 @@ mod tests {
         // 2、通过编码器获取支持的参数
         let codec = AVCodec::find_encoder_by_name(&utils::from_str(encoder_name))
             .unwrap_or_else(|| panic!("Failed to find encoder: {}", encoder_name));
+        let codec_config = CodecConfig::from_codec(codec);
 
         // 获取视频相关参数
-        let supported_frame_rates = codec.supported_framerates().map(|rates| rates.to_vec());
-
-        let supported_pix_fmts = codec
-            .pix_fmts()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|&&fmt| fmt != ffi::AV_PIX_FMT_NONE)
-            .cloned()
-            .collect();
+        let supported_frame_rates = codec_config
+            .supported_frame_rates()
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let supported_pix_fmts = codec_config
+            .supported_pixel_formats()
+            .unwrap()
+            .unwrap()
+            .to_vec();
 
         // 获取音频相关参数
-        let supported_sample_fmts = codec
-            .sample_fmts()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|&&fmt| fmt != ffi::AV_SAMPLE_FMT_NONE)
-            .cloned()
-            .collect();
-
-        let supported_sample_rates = codec
-            .supported_samplerates()
+        let supported_sample_fmts = codec_config
+            .supported_sample_formats()
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let supported_sample_rates = codec_config
+            .supported_sample_rates()
+            .unwrap()
             .unwrap_or(&[44_100, 48_000])
             .to_vec();
 
         // 根据编码器类型确定帧大小，如果编码器支持可变帧大小，使用默认值
-        let frame_size = if codec.capabilities & ffi::AV_CODEC_CAP_VARIABLE_FRAME_SIZE as i32 != 0 {
+        let frame_size = if codec_config.is_support_variable_frame_size() {
             1024
         } else {
-            match codec.id {
+            match codec_config.id() {
                 ffi::AV_CODEC_ID_FLAC => 4608,
                 ffi::AV_CODEC_ID_ALAC => 4096,
                 ffi::AV_CODEC_ID_WMAV2 => 2048,
@@ -185,18 +186,18 @@ mod tests {
         };
 
         // 根据编码器特性调整通道数
-        let adjusted_channels = match codec.id {
+        let adjusted_channels = match codec_config.id() {
             ffi::AV_CODEC_ID_AMR_NB | ffi::AV_CODEC_ID_GSM => 1, // 这些只支持单声道
             ffi::AV_CODEC_ID_MP3 | ffi::AV_CODEC_ID_MP2 | ffi::AV_CODEC_ID_WMAV2 => channels.min(2), // 最多支持双声道
             ffi::AV_CODEC_ID_AC3 => channels.min(6), // 最多支持6声道
             _ => channels,
         };
 
-        let codec_name = codec.name().to_string_lossy().to_string();
+        let codec_name = codec_config.name().to_string_lossy().to_string();
 
         // 3、创建并返回参数结构体
         AudioFormatParams {
-            supported_frame_rates,
+            supported_frame_rates: Some(supported_frame_rates),
             supported_pix_fmts,
             supported_sample_rates,
             supported_sample_fmts,

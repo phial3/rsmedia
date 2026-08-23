@@ -1,4 +1,4 @@
-use crate::{imgutils, time, PixelFormat, SampleFormat};
+use crate::{PixelFormat, SampleFormat, imgutils, time};
 
 use rsmpeg::avutil::{AVFrame, AVSamples};
 use rsmpeg::ffi;
@@ -343,7 +343,7 @@ pub fn convert_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{time, SampleFormat};
+    use crate::{SampleFormat, time};
     use anyhow::{Context, Result};
     use rsmpeg::avutil::AVChannelLayout;
     use rsmpeg::ffi;
@@ -436,10 +436,9 @@ mod tests {
             ($type:ty, $max_val:expr) => {
                 if is_planar {
                     for ch in 0..nb_channels {
-                        let data = std::slice::from_raw_parts_mut(
-                            frame.data[ch] as *mut $type,
-                            nb_samples,
-                        );
+                        let data = unsafe {
+                            std::slice::from_raw_parts_mut(frame.data[ch] as *mut $type, nb_samples)
+                        };
                         for (i, sample) in data.iter_mut().enumerate() {
                             *sample = ((i * nb_channels + ch) as f64
                                 / (nb_samples * nb_channels) as f64
@@ -447,10 +446,12 @@ mod tests {
                         }
                     }
                 } else {
-                    let data = std::slice::from_raw_parts_mut(
-                        frame.data[0] as *mut $type,
-                        nb_samples * nb_channels,
-                    );
+                    let data = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            frame.data[0] as *mut $type,
+                            nb_samples * nb_channels,
+                        )
+                    };
                     for i in 0..(nb_samples * nb_channels) {
                         data[i] = (i as f64 / (nb_samples * nb_channels) as f64 * $max_val as f64)
                             as $type;

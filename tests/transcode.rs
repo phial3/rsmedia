@@ -1,11 +1,12 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/transcode.c
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use rsmedia::codec::CodecConfig;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut},
     avformat::{AVFormatContextInput, AVFormatContextOutput},
     avutil::{
-        av_inv_q, av_rescale_q, get_sample_fmt_name, ra, AVChannelLayout, AVDictionary, AVFrame,
+        AVChannelLayout, AVDictionary, AVFrame, av_inv_q, av_rescale_q, get_sample_fmt_name, ra,
     },
     error::RsmpegError,
     ffi,
@@ -54,10 +55,10 @@ fn open_input_file(filename: &CStr) -> Result<(Vec<Option<AVCodecContext>>, AVFo
                 )
             })?;
             dec_ctx.set_pkt_timebase(input_stream.time_base);
-            if codec_type.is_video() {
-                if let Some(framerate) = input_stream.guess_framerate() {
-                    dec_ctx.set_framerate(framerate);
-                }
+            if codec_type.is_video()
+                && let Some(framerate) = input_stream.guess_framerate()
+            {
+                dec_ctx.set_framerate(framerate);
             }
             dec_ctx
                 .open(None)
@@ -93,35 +94,34 @@ fn open_output_file(
             .with_context(|| anyhow!("encoder({}) not found.", dec_ctx.codec_id))?;
 
         let mut enc_ctx = AVCodecContext::new(&encoder);
+        let codec_config = CodecConfig::from_codec(encoder);
 
         if dec_ctx.codec_type == ffi::AVMEDIA_TYPE_VIDEO {
             enc_ctx.set_height(dec_ctx.height);
             enc_ctx.set_width(dec_ctx.width);
             enc_ctx.set_sample_aspect_ratio(dec_ctx.sample_aspect_ratio);
-            #[cfg(not(feature = "ffmpeg7"))]
-            enc_ctx.set_pix_fmt(encoder.pix_fmts().unwrap()[0]);
-            #[cfg(feature = "ffmpeg7")]
-            enc_ctx.set_pix_fmt(
-                dec_ctx
-                    .get_supported_pix_fmts(None)
-                    .ok()
-                    .and_then(|x| x.first().copied())
-                    .unwrap_or(dec_ctx.pix_fmt),
-            );
+
+            let pix_fmts = codec_config
+                .supported_pixel_formats()
+                .ok()
+                .unwrap()
+                .and_then(|x| x.first().copied())
+                .unwrap_or(dec_ctx.pix_fmt);
+
+            enc_ctx.set_pix_fmt(pix_fmts);
             enc_ctx.set_time_base(av_inv_q(dec_ctx.framerate));
         } else if dec_ctx.codec_type == ffi::AVMEDIA_TYPE_AUDIO {
             enc_ctx.set_sample_rate(dec_ctx.sample_rate);
             enc_ctx.set_ch_layout(dec_ctx.ch_layout().clone().into_inner());
-            #[cfg(not(feature = "ffmpeg7"))]
-            enc_ctx.set_sample_fmt(encoder.sample_fmts().unwrap()[0]);
-            #[cfg(feature = "ffmpeg7")]
-            enc_ctx.set_sample_fmt(
-                dec_ctx
-                    .get_supported_sample_fmts(None)
-                    .ok()
-                    .and_then(|x| x.first().copied())
-                    .unwrap_or(dec_ctx.sample_fmt),
-            );
+
+            let sample_fmts = codec_config
+                .supported_sample_formats()
+                .ok()
+                .unwrap()
+                .and_then(|x| x.first().copied())
+                .unwrap_or(dec_ctx.sample_fmt);
+
+            enc_ctx.set_sample_fmt(sample_fmts);
             enc_ctx.set_time_base(ra(1, dec_ctx.sample_rate));
         } else {
             bail!(
@@ -138,7 +138,7 @@ fn open_output_file(
         enc_ctx.open(None).with_context(|| {
             anyhow!(
                 "Cannot open {} encoder for stream #{}",
-                encoder.name().to_str().unwrap(),
+                codec_config.name().to_str().unwrap(),
                 i
             )
         })?;
@@ -333,14 +333,14 @@ fn encode_write_frame(
     ofmt_ctx: &mut AVFormatContextOutput,
     stream_index: usize,
 ) -> Result<()> {
-    if let Some(filt_frame) = filt_frame.as_mut() {
-        if filt_frame.pts != ffi::AV_NOPTS_VALUE {
-            filt_frame.set_pts(av_rescale_q(
-                filt_frame.pts,
-                filt_frame.time_base,
-                enc_ctx.time_base,
-            ));
-        }
+    if let Some(filt_frame) = filt_frame.as_mut()
+        && filt_frame.pts != ffi::AV_NOPTS_VALUE
+    {
+        filt_frame.set_pts(av_rescale_q(
+            filt_frame.pts,
+            filt_frame.time_base,
+            enc_ctx.time_base,
+        ));
     }
 
     enc_ctx
@@ -445,7 +445,7 @@ pub fn transcode(
                 let mut frame = match decode_context.receive_frame() {
                     Ok(frame) => frame,
                     Err(RsmpegError::DecoderDrainError) | Err(RsmpegError::DecoderFlushedError) => {
-                        break
+                        break;
                     }
                     Err(e) => bail!(e),
                 };
