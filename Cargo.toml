@@ -51,15 +51,15 @@ rsmpeg = { git = "https://github.com/phial3/rsmpeg", branch = "ffmpeg9", default
 libc = "0.2"
 camino = "1.2"
 chrono = "0.4"
-ringbuf = "0.5"
-ctor = "1.0"
-dtor = "1.0"
+#ringbuf = "0.5"
+#ctor = "1.0"
+#dtor = "1.0"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
 ab_glyph = "0.2"
-libblur = "0.24"
-pic-scale = "0.7"
-fast_image_resize = "6.0"
-histogram_equalization = "0.2"
+#libblur = "0.24"
+#pic-scale = "0.7"
+#fast_image_resize = "6.0"
+#histogram_equalization = "0.2"
 ## security & async
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }

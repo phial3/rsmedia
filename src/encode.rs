@@ -2065,7 +2065,14 @@ mod tests {
             ("atempo", audio::atempo(1.0), true),
             ("fft_denoise", audio::fft_denoise(12, -50), true),
             ("denoise", audio::denoise(12.0), true),
-            ("anlm_denoise", audio::anlm_denoise(None, None, None), true),
+            // FIXME:
+            // ("anlm_denoise", audio::anlm_denoise(None, None, None), true),
+            // anlm_denoise 暂不纳入测试：FFmpeg 9.0 的 anlmdn 滤镜存在堆越界写 bug ——
+            // EOF 冲刷不满一窗的尾巴帧时（libavfilter/avfilter.c 在 status_in 时将 min
+            // 降为队列剩余样本数），filter_channel 仍向按尾巴尺寸分配的输出缓冲写满
+            // H 个样本（默认 44.1kHz 下 H=177），越界 408 字节/声道。堆被污染后会使
+            // 其它测试随机 SIGSEGV/malloc abort（即本测试套件曾经的偶发失败根因）。
+            // 上游 master 尚未修复；等修复发布后再恢复此用例。
             (
                 "three_band_equalizer",
                 audio::three_band_equalizer(2.0, 0.0, 2.0),

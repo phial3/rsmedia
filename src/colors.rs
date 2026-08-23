@@ -421,23 +421,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ctor::ctor;
-    use dtor::dtor;
     use palette::chromatic_adaptation::AdaptIntoUnclamped;
     use palette::convert::{FromColorUnclamped, IntoColorUnclamped};
     use palette::{Hsl, IntoColor, Lab, LinSrgb, Oklab, Oklch, Srgb, Xyz};
-
-    const OUTPUT_DIR: &str = "output";
-
-    #[ctor(unsafe)]
-    fn before() {
-        std::fs::create_dir_all(OUTPUT_DIR).unwrap();
-    }
-
-    #[dtor(unsafe)]
-    fn after() {
-        std::fs::remove_dir_all(OUTPUT_DIR).unwrap();
-    }
 
     /// allow floating point error comparison
     macro_rules! assert_approx_eq {

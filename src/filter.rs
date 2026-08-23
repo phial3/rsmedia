@@ -796,6 +796,15 @@ pub mod audio {
     /// `strength`: Denoising strength (0 to inf, default 1e-05).
     /// `patch_size`: Patch size (default 7).
     /// `search_range`: Research range (default 15).
+    ///
+    /// # Known upstream issue (FFmpeg <= 9.0)
+    ///
+    /// FFmpeg 的 `anlmdn` 滤镜在流结束（EOF）冲刷不满一窗的尾巴帧时存在**堆越界写**：
+    /// 输出缓冲按尾巴帧的样本数分配，而 `filter_channel` 固定写入完整窗口（默认
+    /// 44.1kHz 下 H=177 样本）。当输入总样本数不是 H 的整数倍时会越界写堆内存，
+    /// 可能导致进程随机崩溃。上游尚未修复；若使用本滤镜，建议保证输入总样本数为
+    /// 窗口尺寸（`H = 2*round(pd*sample_rate/1e6)+1`，默认参数 44.1kHz 下为 177）
+    /// 的整数倍，或改用 [`fft_denoise`](Self::fft_denoise) / [`denoise`](Self::denoise)。
     pub fn anlm_denoise(
         strength: Option<f32>,
         patch_size: Option<i32>,

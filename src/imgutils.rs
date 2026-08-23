@@ -556,6 +556,7 @@ mod tests {
 
     #[test]
     fn test_image_text() -> Result<()> {
+        std::fs::create_dir_all(OUTPUT_DIR)?;
         let rgb = create_image_with_text(640, 480, "Hello, world!");
         rgb.save(format!("{}/image_with_text.png", OUTPUT_DIR))?;
         Ok(())
