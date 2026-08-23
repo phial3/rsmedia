@@ -433,7 +433,7 @@ jobs:
           echo "FFMPEG_INCLUDE_DIR=${FFMPEG_INCLUDE_DIR}"
           echo "FFMPEG_LIBS_DIR=${FFMPEG_LIBS_DIR}"
           echo "FFMPEG_PKG_CONFIG_PATH=${FFMPEG_PKG_CONFIG_PATH}"
-          ffmpeg -version
+          /opt/ffmpeg/bin/ffmpeg -version
           pkg-config --modversion libavutil
           pkg-config --modversion libavcodec
           pkg-config --modversion libavformat
