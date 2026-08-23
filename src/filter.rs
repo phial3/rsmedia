@@ -1081,21 +1081,15 @@ impl FilterGraph {
         sink_ctx.opt_set_bin(c"sample_rates", &params.sample_rate)?;
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         {
-            // `AVChannelLayout::into_inner` 移出所有权，av_opt_set_array 会复制该布局，
-            // 故设置完成后需手动 uninit 释放。
             let layout = AVChannelLayout::from_nb_channels(params.nb_channels).into_inner();
-            let mut layouts = [layout];
             sink_ctx
                 .opt_set_array(
                     c"channel_layouts",
                     0,
-                    Some(&layouts),
+                    Some(&[layout]),
                     ffi::AV_OPT_TYPE_CHLAYOUT,
                 )
                 .context("Failed to set audio sink channel layout")?;
-            unsafe {
-                ffi::av_channel_layout_uninit(&mut layouts[0]);
-            }
         }
         #[cfg(not(any(feature = "ffmpeg8", feature = "ffmpeg9")))]
         sink_ctx.opt_set(c"ch_layouts", &channel_desc)?;

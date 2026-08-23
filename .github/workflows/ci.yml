@@ -11,11 +11,14 @@ on:
       - 'README.md'
 
 env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-  RUST_LOG: "debug"
-  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: "always"
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUST_LOG: "DEBUG"
   RUSTFLAGS: "-D warnings"
+  RUST_TEST_THREADS: "1"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_NET_RETRY: "10"
 
 jobs:
   lints:
@@ -44,7 +47,7 @@ jobs:
     name: clippy / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: ${{ matrix.runner }}
     container:
-      # jrottenberg/ffmpeg 8.1 开始有 amd64 + arm64，8.1 之前只有 amd64
+      # jrottenberg/ffmpeg 8.0 开始有 amd64 + arm64，8.0 之前只有 amd64
       image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404
       options: --pull always
 
@@ -176,7 +179,9 @@ jobs:
           components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
 
       - name: Verify FFmpeg version
-        run: ffmpeg -version
+        run: |
+          ldconfig
+          ffmpeg -version
 
       - name: Check
         run: cargo check --all --all-targets --no-default-features --features ${{ matrix.feature }}
@@ -244,7 +249,7 @@ jobs:
     name: test / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: ${{ matrix.runner }}
     container:
-      # jrottenberg/ffmpeg 8.1 开始有 amd64 + arm64，8.1 之前只有 amd64
+      # jrottenberg/ffmpeg 8.0 开始有 amd64 + arm64，8.0 之前只有 amd64
       image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404
       options: --pull always
 
@@ -387,7 +392,9 @@ jobs:
           components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
 
       - name: Verify FFmpeg version
-        run: ffmpeg -version
+        run: |
+          ldconfig
+          ffmpeg -version
 
       - name: Run Test
         run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
