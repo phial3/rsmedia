@@ -315,14 +315,6 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get purge -y \
-            libavcodec-dev \
-            libavformat-dev \
-            libavutil-dev \
-            libswscale-dev \
-            libswresample-dev \
-            libavfilter-dev \
-            libavdevice-dev || true
           sudo apt-get install -y --no-install-recommends \
             nasm \
             yasm \
@@ -437,6 +429,17 @@ jobs:
           pkg-config --modversion libavutil
           pkg-config --modversion libavcodec
           pkg-config --modversion libavformat
+
+      # ubuntu runner 镜像可能预装系统 FFmpeg 开发库，它们会与下载的 BtbN FFmpeg
+      # (soname 不同) 同时被链接进测试二进制，导致 AVFrame 由一套 libavutil 分配、
+      # 另一套释放，触发堆损坏 (SIGABRT)。这里清除系统 FFmpeg 开发库，确保只用 /opt/ffmpeg。
+      - name: Remove system FFmpeg dev libraries
+        run: |
+          sudo apt-get purge -y \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev \
+            libavfilter-dev libavdevice-dev || true
+          sudo ldconfig
 
       - name: Run Test
         run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
