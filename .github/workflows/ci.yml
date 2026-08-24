@@ -16,7 +16,6 @@ env:
   RUST_BACKTRACE: "1"
   RUST_LOG: "DEBUG"
   RUSTFLAGS: "-D warnings"
-  RUST_TEST_THREADS: "1"
   CARGO_BUILD_JOBS: "2"
   CARGO_NET_RETRY: "10"
 
@@ -184,10 +183,13 @@ jobs:
           ffmpeg -version
 
       - name: Check
-        run: cargo check --all --all-targets --no-default-features --features ${{ matrix.feature }}
+        run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
 
       - name: Clippy
-        run: cargo clippy --all --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+
+      - name: Doc Test
+        run: cargo test --doc --workspace --no-default-features --features ${{ matrix.feature }} --verbose
 
   build-macos:
     name: build / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
@@ -237,13 +239,13 @@ jobs:
         run: brew install pkg-config ${{ matrix.brew_formula }}
 
       - name: Check
-        run: cargo check --all --all-targets --no-default-features --features ${{ matrix.feature }}
+        run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
 
       - name: Clippy
-        run: cargo clippy --all --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
       - name: Run Test
-        run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
+        run: cargo test --workspace --all-targets --no-default-features --features ${{ matrix.feature }} --verbose
 
   test-linux:
     name: test / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
@@ -441,8 +443,14 @@ jobs:
             libavfilter-dev libavdevice-dev || true
           sudo ldconfig
 
+      - name: Check
+        run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+
       - name: Run Test
-        run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
+        run: cargo test --workspace --all-targets --no-default-features --features ${{ matrix.feature }} --verbose
 
   build-windows:
     name: build / windows / ffmpeg-${{ matrix.ffmpeg_version }}
@@ -493,11 +501,10 @@ jobs:
         run: ffmpeg -version
 
       - name: Check
-        run: cargo check --all --all-targets --no-default-features --features ${{ matrix.feature }}
+        run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
 
       - name: Clippy
-        run: cargo clippy --all --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
       - name: Run Test
-        run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
-
+        run: cargo test --workspace --all-targets --no-default-features --features ${{ matrix.feature }} --verbose
