@@ -207,8 +207,9 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     let linesize = frame.linesize[plane_idx] as usize;
 
     // 创建一个新的缓冲区，只包含实际的像素数据（不包括填充）
-    let mut result =
-        Vec::with_capacity(plane_height as usize * plane_width as usize * bytes_per_pixel as usize);
+    let bytes_per_row = plane_width as usize * bytes_per_pixel as usize;
+    let total_size = plane_height as usize * bytes_per_row;
+    let mut result = Vec::with_capacity(total_size);
 
     unsafe {
         // 计算平面数据在缓冲区中的偏移量
@@ -224,16 +225,19 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
         let src_ptr = (*buf_ptr).data.add(data_offset);
 
         // 确保不会超出缓冲区的大小
-        let bytes_per_row = plane_width as usize * bytes_per_pixel as usize;
         if data_offset + (plane_height as usize - 1) * linesize + bytes_per_row > (*buf_ptr).size {
             return Err(anyhow::anyhow!("Buffer too small for plane {}", plane_idx));
         }
 
-        // 逐行复制数据，跳过填充字节
+        // Set the actual length
+        result.set_len(total_size);
+
+        // 使用批量复制操作逐行复制数据，跳过填充字节
+        let dst_ptr: *mut u8 = result.as_mut_ptr();
         for y in 0..plane_height as usize {
-            let row_ptr = src_ptr.add(y * linesize);
-            let row_data = std::slice::from_raw_parts(row_ptr, bytes_per_row);
-            result.extend_from_slice(row_data);
+            let row_src_ptr = src_ptr.add(y * linesize);
+            let row_dst_ptr = dst_ptr.add(y * bytes_per_row);
+            std::ptr::copy_nonoverlapping(row_src_ptr, row_dst_ptr, bytes_per_row);
         }
     }
 
