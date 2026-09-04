@@ -1052,11 +1052,7 @@ fn log_filter_hacks(line: &str) -> bool {
     /* Hack 1 */
     const HACK_1_PELCO_NEEDLE_1: &str = "SEI type 5 size";
     const HACK_1_PELCO_NEEDLE_2: &str = "truncated at";
-    if line.contains(HACK_1_PELCO_NEEDLE_1) && line.contains(HACK_1_PELCO_NEEDLE_2) {
-        return false;
-    }
-
-    true
+    !(line.contains(HACK_1_PELCO_NEEDLE_1) && line.contains(HACK_1_PELCO_NEEDLE_2))
 }
 
 /// Create SDP file contents for the given output. Useful for RTP muxers.

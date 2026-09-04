@@ -6,10 +6,11 @@ use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
 use rsmpeg::{UnsafeDerefMut, ffi};
 
 use anyhow::{Context, Error, Result};
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Hardware device configuration.
 /// This struct contains all the necessary information to create a hardware device context.
@@ -157,8 +158,8 @@ impl std::fmt::Display for HWDeviceConfig {
 }
 
 /// `HWContext` cache for safe sharing of hardware device contexts.
-static HW_CTX_CACHE: Lazy<Mutex<HashMap<HWDeviceConfig, Arc<HWContext>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+/// Uses DashMap for better concurrent read/write performance.
+static HW_CTX_CACHE: Lazy<DashMap<HWDeviceConfig, Arc<HWContext>>> = Lazy::new(DashMap::new);
 
 /// `HWContext` represents a hardware context.
 ///
@@ -172,9 +173,8 @@ pub struct HWContext {
 impl HWContext {
     /// create a new HWContext with the given HWDeviceConfig
     pub fn new(config: HWDeviceConfig) -> Result<Arc<HWContext>> {
-        let mut cache = HW_CTX_CACHE.lock().unwrap();
-
-        if let Some(ctx) = cache.get(&config) {
+        // Try to get existing context from cache (lock-free read)
+        if let Some(ctx) = HW_CTX_CACHE.get(&config) {
             log::debug!("Reusing existing hardware device context. config:{config:?}");
             return Ok(ctx.clone());
         }
@@ -193,7 +193,8 @@ impl HWContext {
             config: config.clone(),
             device_ctx: UnsafeCell::new(hw_device_ctx),
         });
-        cache.insert(config, ctx.clone());
+        // Insert into cache (lock-free write)
+        HW_CTX_CACHE.insert(config, ctx.clone());
 
         Ok(ctx)
     }
@@ -428,11 +429,7 @@ impl HWContext {
         }
 
         // 检查帧格式是否匹配硬件像素格式
-        if frame.format != self.get_format(true) {
-            return false;
-        }
-
-        true
+        frame.format == self.get_format(true)
     }
 
     /// Check if a frame is in software memory format

@@ -851,8 +851,8 @@ where
         // frame.data[0] -> [L0][L1][L2]...  // 左声道所有样本
         // frame.data[1] -> [R0][R1][R2]...  // 右声道所有样本
         // 检查所有通道
-        for ch in 0..channels {
-            if frame.data[ch].is_null() {
+        for (ch, plane) in frame.data.iter().enumerate().take(channels) {
+            if plane.is_null() {
                 return Err(Error::msg(format!("Channel {ch} data pointer is null")));
             }
         }
@@ -862,10 +862,10 @@ where
         // - 交错格式：所有通道的字节数（samples * channels * sizeof(format)）
         // 但在访问单个样本时，我们不需要使用 linesize，因为音频数据是连续存储的
         for s in 0..samples {
-            for ch in 0..channels {
+            for plane in frame.data.iter().take(channels) {
                 unsafe {
                     // 获取当前通道的数据指针
-                    let plane_ptr = frame.data[ch] as *const T;
+                    let plane_ptr = *plane as *const T;
                     buffer.push(*plane_ptr.add(s));
                 }
             }
@@ -1522,11 +1522,8 @@ mod tests {
         // data[1]: [R1 R2 R3 ...] (右声道所有样本)
         let total_samples = (nb_samples * nb_channels) as usize;
         unsafe {
-            for ch in 0..nb_channels as usize {
-                let data = std::slice::from_raw_parts_mut(
-                    frame.data[ch].cast::<f32>(),
-                    nb_samples as usize,
-                );
+            for (ch, plane) in frame.data.iter().enumerate().take(nb_channels as usize) {
+                let data = std::slice::from_raw_parts_mut(plane.cast::<f32>(), nb_samples as usize);
                 for (i, sample) in data.iter_mut().enumerate() {
                     *sample = (i * nb_channels as usize + ch) as f32 / total_samples as f32;
                 }
