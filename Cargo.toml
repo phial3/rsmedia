@@ -45,7 +45,7 @@ once_cell = "1.21"
 num_cpus = "1.17"
 ndarray = { version = "0.17", optional = true }
 # use custom rsmpeg
-rsmpeg = { git = "https://gitee.com/phial3/rsmpeg", branch = "fix_avcodec", default-features = false }
+rsmpeg = { git = "https://github.com/phial3/rsmpeg", branch = "ffmpeg9", default-features = false }
 
 [dev-dependencies]
 libc = "0.2"
