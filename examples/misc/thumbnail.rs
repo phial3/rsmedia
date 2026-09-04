@@ -63,7 +63,13 @@ fn thumbnail(
         encode_context.set_bit_rate(decode_context.bit_rate);
         encode_context.set_width(width.unwrap_or(decode_context.width));
         encode_context.set_height(height.unwrap_or(decode_context.height));
-        encode_context.set_time_base(avutil::av_inv_q(decode_context.framerate));
+        // 图片输入（如 mjpeg）的 framerate 可能为 0/0，此时回退 25fps 保证 time_base 有效
+        let frame_rate = if decode_context.framerate.num > 0 {
+            decode_context.framerate
+        } else {
+            avutil::ra(1, 25)
+        };
+        encode_context.set_time_base(avutil::av_inv_q(frame_rate));
         encode_context.set_pix_fmt(
             if let Some(pix_fmts) = codec_config.supported_pixel_formats()? {
                 pix_fmts[0]
@@ -131,13 +137,12 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "thumbnail_test0 测试运行依赖测试文件，暂时忽略"]
     fn thumbnail_test0() {
         std::fs::create_dir_all("tests/output/thumbnail").unwrap();
 
         thumbnail(
             c"assets/mp4.mp4",
-            c"tests/output/thumbnail/bear.jpg",
+            c"tests/output/thumbnail/mp4.jpg",
             Some(192),
             Some(108),
         )
@@ -145,13 +150,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "thumbnail_test1 测试运行依赖测试文件，暂时忽略"]
     fn thumbnail_test1() {
         std::fs::create_dir_all("tests/output/thumbnail").unwrap();
 
         thumbnail(
-            c"tests/assets/vids/video.mp4",
-            c"tests/output/thumbnail/test1_video.jpg",
+            c"assets/cat.jpg",
+            c"tests/output/thumbnail/cat.jpg",
             Some(280),
             Some(240),
         )
@@ -159,12 +163,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "thumbnail_test2 测试运行依赖测试文件，暂时忽略"]
+    #[ignore = "depends on an unreachable internal network stream (127.0.0.1)"]
     fn thumbnail_test2() {
         std::fs::create_dir_all("tests/output/thumbnail").unwrap();
 
         thumbnail(
-            c"http://172.24.82.2/video/final_134_raw.mp4",
+            c"http://127.0.0.1:8080/video/final_134_raw.mp4",
             c"tests/output/thumbnail/test2_video.jpg",
             Some(900),
             Some(600),

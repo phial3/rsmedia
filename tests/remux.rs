@@ -85,12 +85,7 @@ fn remux(input_path: &CStr, output_path: &CStr) -> Result<()> {
 
 /// Remux MP4 to MOV, with h.264 codec.
 #[test]
-#[ignore = "Remux MP4 to MOV, with h.264 codec 测试运行依赖测试文件，暂时忽略"]
 fn remux_test0() {
     std::fs::create_dir_all("tests/output/remux/").unwrap();
-    remux(
-        c"tests/assets/vids/big_buck_bunny.mp4",
-        c"tests/output/remux/big_buck_bunny.mov",
-    )
-    .unwrap();
+    remux(c"assets/mp4.mp4", c"tests/output/remux/mp4.mov").unwrap();
 }

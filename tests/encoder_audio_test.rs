@@ -36,7 +36,10 @@ mod tests {
     }
 
     /// 获取特定音频格式的详细参数
-    fn get_format_parameters(container_type: &str, requested_channels: usize) -> AudioFormatParams {
+    fn get_format_parameters(
+        container_type: &str,
+        requested_channels: usize,
+    ) -> Result<AudioFormatParams> {
         // 限制在1-8通道范围内
         let channels = requested_channels.clamp(1, 8);
 
@@ -138,31 +141,37 @@ mod tests {
             };
 
         // 2、通过编码器获取支持的参数
-        let codec = AVCodec::find_encoder_by_name(&utils::from_str(encoder_name))
-            .unwrap_or_else(|| panic!("Failed to find encoder: {}", encoder_name));
+        // 编码器是否存在取决于 FFmpeg 编译配置，缺失时返回 Err 由调用方统计报告
+        let codec =
+            AVCodec::find_encoder_by_name(&utils::from_str(encoder_name)).with_context(|| {
+                format!("encoder {encoder_name} not available in this FFmpeg build")
+            })?;
         let codec_config = CodecConfig::from_codec(codec);
 
-        // 获取视频相关参数
+        // 音频编码器没有 frame_rates/pix_fmts（视频专用），返回 None 时回退默认值
         let supported_frame_rates = codec_config
             .supported_frame_rates()
-            .unwrap()
-            .unwrap()
-            .to_vec();
+            .ok()
+            .flatten()
+            .map(|rates| rates.to_vec());
         let supported_pix_fmts = codec_config
             .supported_pixel_formats()
-            .unwrap()
-            .unwrap()
-            .to_vec();
+            .ok()
+            .flatten()
+            .map(|fmts| fmts.to_vec())
+            .unwrap_or_default();
 
         // 获取音频相关参数
         let supported_sample_fmts = codec_config
             .supported_sample_formats()
-            .unwrap()
-            .unwrap()
-            .to_vec();
+            .ok()
+            .flatten()
+            .map(|fmts| fmts.to_vec())
+            .unwrap_or_default();
         let supported_sample_rates = codec_config
             .supported_sample_rates()
-            .unwrap()
+            .ok()
+            .flatten()
             .unwrap_or(&[44_100, 48_000])
             .to_vec();
 
@@ -196,8 +205,8 @@ mod tests {
         let codec_name = codec_config.name().to_string_lossy().to_string();
 
         // 3、创建并返回参数结构体
-        AudioFormatParams {
-            supported_frame_rates: Some(supported_frame_rates),
+        Ok(AudioFormatParams {
+            supported_frame_rates,
             supported_pix_fmts,
             supported_sample_rates,
             supported_sample_fmts,
@@ -207,7 +216,7 @@ mod tests {
             channels: adjusted_channels,
             codec_options,
             format_options,
-        }
+        })
     }
 
     /// 生成多声道正弦波PCM数据
@@ -477,7 +486,7 @@ mod tests {
         let output_path = Path::new(output_file.as_str());
 
         // 获取特定格式参数
-        let audio_params = get_format_parameters(container_type, 2);
+        let audio_params = get_format_parameters(container_type, 2)?;
         let sample_rate = audio_params.supported_sample_rates[0];
         let sample_format = SampleFormat::from(audio_params.supported_sample_fmts[0]);
         let frame_size = audio_params.frame_size;
@@ -545,7 +554,6 @@ mod tests {
 
     #[test]
     #[rustfmt::skip]
-    #[ignore = "ignore encode audio output files"]
     fn test_encode_audio() -> Result<()> {
 
         let audio_formats = [
@@ -620,6 +628,11 @@ mod tests {
         if !err_encoder.is_empty() {
             eprintln!("Failed encoders: {:#?}", err_encoder)
         }
+        // 至少一个容器要成功编码，防止环境异常时测试空壳通过
+        assert!(
+            err_encoder.len() < audio_formats.len(),
+            "all audio container encodings failed"
+        );
 
         Ok(())
     }

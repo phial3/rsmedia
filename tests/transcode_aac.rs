@@ -274,23 +274,13 @@ fn transcode_aac(input_file: &CStr, output_file: &CStr) -> Result<()> {
 }
 
 #[test]
-#[ignore = "transcode_aac_test0 测试运行依赖测试文件，暂时忽略"]
 fn transcode_aac_test0() {
     std::fs::create_dir_all("tests/output/transcode_aac/").unwrap();
-    transcode_aac(
-        c"tests/assets/audios/sample1_short.aac",
-        c"tests/output/transcode_aac/output_short.aac",
-    )
-    .unwrap();
+    transcode_aac(c"assets/wav.wav", c"tests/output/transcode_aac/wav.aac").unwrap();
 }
 
 #[test]
-#[ignore = "transcode_aac_test1 测试运行依赖测试文件，暂时忽略"]
 fn transcode_aac_test1() {
     std::fs::create_dir_all("tests/output/transcode_aac/").unwrap();
-    transcode_aac(
-        c"tests/assets/vids/big_buck_bunny.mp4",
-        c"tests/output/transcode_aac/big_buck_bunny.aac",
-    )
-    .unwrap();
+    transcode_aac(c"assets/mp4.mp4", c"tests/output/transcode_aac/mp4.aac").unwrap();
 }

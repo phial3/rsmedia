@@ -271,12 +271,20 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[ignore = "skip test_supported_audio_codec_name"]
     fn test_supported_audio_codec_name() {
+        // 外部编码器是否存在取决于 FFmpeg 编译配置（如 libvorbis 并非总是启用），
+        // 缺失时跳过该编码器；但至少要有一个可用，否则视为构建异常。
+        let mut available = 0;
         for name in [c"libmp3lame", c"libopus", c"libvorbis"] {
+            if AVCodec::find_encoder_by_name(name).is_none() {
+                println!("skip codec {name:?}: not available in this FFmpeg build");
+                continue;
+            }
             let config = CodecConfig::new_with_name(name)
                 .unwrap_or_else(|e| panic!("could not find codec {name:?}: {e}"));
             assert_audio_config(&config, &format!("audio codec {name:?}"));
+            available += 1;
         }
+        assert!(available > 0, "no external audio codecs available");
     }
 }

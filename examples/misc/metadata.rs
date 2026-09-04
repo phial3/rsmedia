@@ -55,38 +55,21 @@ mod tests {
     use super::metadata;
 
     #[test]
-    #[ignore = "metadata_test0 测试运行依赖测试文件，暂时忽略"]
     fn metadata_test0() {
         assert_eq!(
             metadata("assets/mp4.mp4").unwrap(),
             vec![
-                ("image_path".into(), "assets/mp4.mp4".into()),
-                ("duration".into(), "1068118".into()),
-                ("bit_rate".into(), "307823".into()),
-                ("major_brand".into(), "isom".into()),
-                ("minor_version".into(), "1".into()),
-                ("compatible_brands".into(), "isomavc1".into()),
-                ("creation_time".into(), "2009-07-09T17:29:47.000000Z".into()),
-                ("frame_rate".into(), "29.97002997002997".into()),
-                ("width".into(), "320".into()),
-                ("height".into(), "180".into()),
-            ]
-        );
-    }
-
-    #[test]
-    #[ignore = "metadata_test1 测试运行依赖测试文件，暂时忽略"]
-    fn metadata_test1() {
-        assert_eq!(
-            metadata("tests/assets/vids/vp8.mp4").unwrap(),
-            vec![
-                ("image_path".into(), "tests/assets/vids/vp8.mp4".into()),
-                ("duration".into(), "17600000".into()),
-                ("bit_rate".into(), "242823".into()),
-                ("encoder".into(), "whammy".into()),
-                ("frame_rate".into(), "5".into()),
-                ("width".into(), "604".into()),
-                ("height".into(), "604".into()),
+                ("file_path".into(), "assets/mp4.mp4".into()),
+                ("duration".into(), "5568000".into()),
+                ("bit_rate".into(), "551193".into()),
+                ("major_brand".into(), "mp42".into()),
+                ("minor_version".into(), "0".into()),
+                ("compatible_brands".into(), "mp42isomavc1".into()),
+                ("creation_time".into(), "2010-03-20T21:29:11.000000Z".into()),
+                ("encoder".into(), "HandBrake 0.9.4 2009112300".into()),
+                ("frame_rate".into(), "30".into()),
+                ("width".into(), "560".into()),
+                ("height".into(), "320".into()),
             ]
         );
     }

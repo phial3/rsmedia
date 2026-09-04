@@ -1480,11 +1480,15 @@ mod tests {
             codec_name
         );
 
-        let filters = vec![
-            filter::video::scale(1920, 1080, None),
-            filter::video::DrawText::new("Watermark", 50, 50, 24, "white@0.5").build(),
-            filter::video::crop(0, 0, 640, 360),
-        ];
+        // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用，不可用时降级为 scale+crop
+        let mut filters = vec![filter::video::scale(1920, 1080, None)];
+        if rsmpeg::avfilter::AVFilter::get_by_name(c"drawtext").is_some() {
+            filters
+                .push(filter::video::DrawText::new("Watermark", 50, 50, 24, "white@0.5").build());
+        } else {
+            println!("SKIP drawtext (libfreetype not available)");
+        }
+        filters.push(filter::video::crop(0, 0, 640, 360));
 
         // 视频编码参数
         let width = 1280;
@@ -1540,10 +1544,9 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "ndarray")]
     #[test]
     #[rustfmt::skip]
-    #[ignore = "ignore video output file"]
+    #[cfg(feature = "ndarray")]
     fn test_encode_video() -> Result<()> {
 
         let video_formats = [
@@ -1613,6 +1616,11 @@ mod tests {
         if !err_encoder.is_empty() {
             eprintln!("Failed encoders: {:#?}", err_encoder)
         }
+        // 至少一个容器要成功编码，防止环境异常时测试空壳通过
+        assert!(
+            err_encoder.len() < video_formats.len(),
+            "all video container encodings failed"
+        );
 
         Ok(())
     }

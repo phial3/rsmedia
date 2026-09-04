@@ -109,7 +109,6 @@ fn extract_mvs(video_path: &CStr) -> Result<()> {
 }
 
 #[test]
-#[ignore = "extract_mvs_test 测试运行依赖测试文件，暂时忽略"]
 fn extract_mvs_test() {
     let video_path = &CString::new("assets/mp4.mp4").unwrap();
     extract_mvs(video_path).unwrap();
