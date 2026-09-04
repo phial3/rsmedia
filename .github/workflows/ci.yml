@@ -272,12 +272,12 @@ jobs:
             runner: ubuntu-latest
             ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-16-13-00/ffmpeg-n7.1.5-16-g9a4bb2c579-linux64-gpl-shared-7.1.tar.xz"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1.tar.xz"
           - arch: linux/arm64
             runner: ubuntu-24.04-arm
             ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-16-13-00/ffmpeg-n7.1.5-16-g9a4bb2c579-linuxarm64-gpl-shared-7.1.tar.xz"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linuxarm64-gpl-shared-7.1.tar.xz"
 
           - arch: linux/amd64
             runner: ubuntu-latest
@@ -432,16 +432,56 @@ jobs:
           pkg-config --modversion libavcodec
           pkg-config --modversion libavformat
 
-      # ubuntu runner 镜像可能预装系统 FFmpeg 开发库，它们会与下载的 BtbN FFmpeg
-      # (soname 不同) 同时被链接进测试二进制，导致 AVFrame 由一套 libavutil 分配、
-      # 另一套释放，触发堆损坏 (SIGABRT)。这里清除系统 FFmpeg 开发库，确保只用 /opt/ffmpeg。
+      # The hosted runner image preinstalls a system FFmpeg whose shared/static libraries can be
+      # scattered under /usr in any multi-arch directory (not guaranteed to be /usr/lib/x86_64-linux-gnu).
+      # If those are linked into the test binary alongside the downloaded BtbN FFmpeg (different
+      # sonames), an AVFrame allocated by one libavutil may be freed by another, corrupting the heap
+      # (SIGABRT). Here we explicitly echo the located libs, delete all system FFmpeg library files,
+      # and purge the packages to guarantee the tests only use the single /opt/ffmpeg copy.
       - name: Remove system FFmpeg dev libraries
         run: |
+          set -euo pipefail
+          echo "==== Before cleanup: system-visible FFmpeg shared libs ===="
+          ldconfig -p | grep -Ei 'libav(codec|device|format|util|filter)|libsw(scale|resample)' || echo "(none)"
+
+          echo "==== Locating system FFmpeg library files (excluding /opt/ffmpeg, /proc, /sys, /dev) ===="
+          sudo find / \( -path /opt/ffmpeg -o -path /proc -o -path /sys -o -path /dev \) -prune -o \
+            -type f \( -name 'libav*.so*' -o -name 'libav*.a' \
+                       -o -name 'libsw*.so*' -o -name 'libsw*.a' \) -print 2>/dev/null \
+            | tee /tmp/sys_ffmpeg_libs.txt
+          if [ -s /tmp/sys_ffmpeg_libs.txt ]; then
+            echo "--- Deleting the listed library files ---"
+            while IFS= read -r f; do echo "rm $f"; sudo rm -f "$f"; done < /tmp/sys_ffmpeg_libs.txt
+          else
+            echo "(no system FFmpeg library files found)"
+          fi
+
+          # Purge system FFmpeg packages (dev / runtime / ffmpeg itself) to clear package-level leftovers
           sudo apt-get purge -y \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
-            libavfilter-dev libavdevice-dev || true
+            libavcodec-dev \
+            libavformat-dev \
+            libavfilter-dev \
+            libavdevice-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libswresample-dev \
+            libavcodec* \
+            libavformat* \
+            libavutil* \
+            libswscale* \
+            libswresample* \
+            libavfilter* \
+            libavdevice* ffmpeg 2>/dev/null || true
           sudo ldconfig
+
+          echo "==== Post-cleanup check: no FFmpeg should remain in the system cache ===="
+          if ldconfig -p | grep -Eiq 'libav(codec|device|format|util|filter)|libsw(scale|resample)'; then
+            echo "!! WARNING: entries still present:"
+            ldconfig -p | grep -Ei 'libav(codec|device|format|util|filter)|libsw(scale|resample)'
+            exit 1
+          else
+            echo "OK: no FFmpeg in system link/runtime cache"
+          fi
 
       - name: Check
         run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
