@@ -10,7 +10,9 @@ use rsmpeg::{
 
 use anyhow::{Context, Result};
 use rsmedia::codec::CodecConfig;
+use rsmedia::{EncoderBuilder, SampleFormat, filter, utils};
 use std::ffi::CStr;
+use std::path::Path;
 
 /// 生成正弦波音频样本（优化内存访问）
 fn generate_sine_wave(frame: &mut AVFrame, frequency: f64, sample_rate: i32) -> Result<()> {
@@ -427,4 +429,114 @@ fn test_encode_audio_amr() {
         1,
     )
     .unwrap();
+}
+
+/// 市场上常见通用的音频容器与对应编码器（容器, 编码器名, 码率；码率 0 表示无损）。
+/// 仅保留主流格式：冷门/仅解码/需 experimental 开关的格式不纳入测试。
+const COMMON_AUDIO_CONTAINERS: &[(&str, &str, i64)] = &[
+    ("wav", "pcm_s16le", 1_411_200),
+    ("aiff", "pcm_s16be", 1_411_200),
+    ("flac", "flac", 0),
+    ("mp3", "libmp3lame", 192_000),
+    ("aac", "aac", 128_000),
+    ("m4a", "aac", 128_000),
+    ("adts", "aac", 128_000),
+    ("wma", "wmav2", 128_000),
+    ("ac3", "ac3", 384_000),
+    ("mp2", "mp2", 192_000),
+    ("au", "pcm_mulaw", 64_000),
+    ("opus", "libopus", 128_000),
+];
+
+/// 使用 rsmedia `EncoderBuilder` 对常见音频容器做编码测试：
+/// 按编码器能力自动选择采样格式/采样率，套用音频滤镜链（音量/高通/变速），
+/// 编码 1 秒立体声正弦波并封装到对应容器。
+fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64) -> Result<()> {
+    // 编码器是否存在取决于 FFmpeg 编译配置（如 libmp3lame、libopus），
+    // 缺失时跳过该容器而不是失败
+    let Some(codec) = AVCodec::find_encoder_by_name(&utils::from_str(codec_name)) else {
+        anyhow::bail!("encoder {codec_name} not available in this FFmpeg build");
+    };
+    let codec_config = CodecConfig::from_codec(codec);
+
+    let sample_format = SampleFormat::from(
+        codec_config
+            .supported_sample_formats()
+            .ok()
+            .flatten()
+            .and_then(|fmts| fmts.first().copied())
+            .with_context(|| format!("encoder {codec_name} has no supported sample formats"))?,
+    );
+
+    // 固定速率编码器（PCM/FLAC 等）不暴露采样率列表，回退 44100
+    let sample_rate = codec_config
+        .supported_sample_rates()
+        .ok()
+        .flatten()
+        .and_then(|rates| rates.first().copied())
+        .unwrap_or(44_100);
+
+    let channels = 2;
+
+    let output_dir = Path::new("tests/output/encode_audio");
+    std::fs::create_dir_all(output_dir)?;
+    let output_path = output_dir.join(format!("sine.{container_type}"));
+
+    let audio_filters = vec![
+        filter::audio::volume(1.2),  // 音量提升
+        filter::audio::highpass(80), // 切除 80Hz 以下低频
+        filter::audio::atempo(1.25), // 加速 25%
+    ];
+
+    let mut encoder = EncoderBuilder::new_audio(bit_rate, channels, sample_rate, sample_format)
+        .with_codec_name(codec_name.to_string())
+        .with_filters(audio_filters)
+        .build_wrapped(output_path.as_path())?;
+
+    // rsmedia 编码器内部对固定帧大小编码器做 AVAudioFifo 缓冲，
+    // 这里统一用 1024 样本块驱动即可
+    let frame_size = 1024;
+    let duration_seconds = 1;
+    let total_samples = (duration_seconds * sample_rate) as i64;
+
+    let mut frame = AVFrame::new();
+    frame.set_nb_samples(frame_size);
+    frame.set_ch_layout(AVChannelLayout::from_nb_channels(channels).into_inner());
+    frame.set_sample_rate(sample_rate);
+    frame.set_format(sample_format as _);
+    frame
+        .alloc_buffer()
+        .context("Failed to allocate frame buffer")?;
+
+    for pts in (0..total_samples).step_by(frame_size as usize) {
+        generate_sine_wave(&mut frame, 440.0, sample_rate).context("Failed to generate samples")?;
+        frame.set_pts(pts);
+        encoder.encode_raw(frame.clone())?;
+    }
+
+    // flush encoder and write trailer
+    encoder.finish()?;
+
+    Ok(())
+}
+
+/// 遍历常见音频容器逐一编码；编码器缺失的容器跳过并报告，
+/// 但要求至少一个容器成功，防止环境异常时测试空壳通过。
+#[test]
+fn test_encode_audio_containers() {
+    let mut skipped = Vec::new();
+    let mut encoded = 0;
+
+    for (container_type, codec_name, bit_rate) in COMMON_AUDIO_CONTAINERS {
+        match encode_audio_container(container_type, codec_name, *bit_rate) {
+            Ok(()) => encoded += 1,
+            Err(e) if e.to_string().contains("not available in this FFmpeg build") => {
+                skipped.push(*container_type)
+            }
+            Err(e) => panic!("encode {container_type} failed: {e:#}"),
+        }
+    }
+
+    println!("encoded {encoded} containers, skipped: {skipped:?}");
+    assert!(encoded > 0, "all audio container encodings were skipped");
 }

@@ -509,7 +509,7 @@ mod tests {
     use anyhow::Context;
     use image::{ImageBuffer, Rgb};
 
-    const OUTPUT_DIR: &str = "output";
+    const OUTPUT_DIR: &str = "tests/output";
 
     /// Create an image with the given text and a gradient color.
     fn create_image_with_text(
