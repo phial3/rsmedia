@@ -37,8 +37,8 @@ fn frame_save(frame: &AVFrame, channels: usize, data_size: usize, mut file: &Fil
     let nb_samples: usize = frame.nb_samples.try_into().context("nb_samples overflow")?;
     // ATTENTION: This is only valid for planar sample formats.
     for i in 0..nb_samples {
-        for channel in 0..channels {
-            let data = unsafe { from_raw_parts(frame.data[channel].add(data_size * i), data_size) };
+        for plane in frame.data.iter().take(channels) {
+            let data = unsafe { from_raw_parts(plane.add(data_size * i), data_size) };
             file.write_all(data).context("Write data failed.")?;
         }
     }

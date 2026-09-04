@@ -428,11 +428,7 @@ impl HWContext {
         }
 
         // 检查帧格式是否匹配硬件像素格式
-        if frame.format != self.get_format(true) {
-            return false;
-        }
-
-        true
+        frame.format == self.get_format(true)
     }
 
     /// Check if a frame is in software memory format
