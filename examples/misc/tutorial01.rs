@@ -109,11 +109,7 @@ mod tests {
     #[test]
     #[ignore = "tutorial01_test1 测试运行依赖测试文件，暂时忽略"]
     fn tutorial01_test1() {
-        dump_frame(
-            c"tests/assets/vids/bear.mp4",
-            "tests/output/tutorial01/bear",
-        )
-        .unwrap();
+        dump_frame(c"assets/mp4.mp4", "tests/output/tutorial01/bear").unwrap();
     }
 
     #[test]

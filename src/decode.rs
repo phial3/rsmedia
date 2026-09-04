@@ -1052,18 +1052,28 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    #[ignore = "need a video file"]
     fn test_decode_video() -> Result<()> {
-        let video_path = std::path::Path::new("/tmp/test.mp4");
+        let video_path = std::path::Path::new("assets/mp4.mp4");
 
-        let filters = vec![
-            filter::video::scale(1280, 720, None),
-            filter::video::DrawText::new("Hello", 10, 10, 24, "white").build(),
-        ];
-
-        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(filters)
-            .build_wrapped(video_path)?;
+        // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用，失败时降级为仅 scale。
+        let scale = filter::video::scale(1280, 720, None);
+        let drawtext = filter::video::DrawText::new("Hello", 10, 10, 24, "white").build();
+        let build_decoder = |filters| {
+            DecoderBuilder::new(MediaType::VIDEO)
+                .with_filters(filters)
+                .build_wrapped(video_path)
+        };
+        let mut decoder = match build_decoder(vec![scale, drawtext]) {
+            Ok(d) => d,
+            Err(e)
+                if format!("{e:#}").to_lowercase().contains("no such filter")
+                    || format!("{e:#}").to_lowercase().contains("not found") =>
+            {
+                println!("SKIP drawtext (libfreetype not available): {e:#}");
+                build_decoder(vec![filter::video::scale(1280, 720, None)])?
+            }
+            Err(e) => return Err(e),
+        };
 
         loop {
             match decoder.decode_raw() {
@@ -1085,9 +1095,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "need a audio file"]
     fn test_decode_audio() -> Result<()> {
-        let audio_path = std::path::Path::new("/tmp/test.mp4");
+        let audio_path = std::path::Path::new("assets/wav.wav");
 
         let filters = vec![
             filter::audio::resample(2, 48000, SampleFormat::FLTP),
@@ -1118,11 +1127,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "need a video file"]
     fn test_decode_video_with_resize() -> Result<()> {
         use crate::Resize;
 
-        let video_path = std::path::Path::new("/tmp/test.mp4");
+        let video_path = std::path::Path::new("assets/mp4.mp4");
 
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
             .with_resize(Resize::Exact(320, 240))
@@ -1142,11 +1150,10 @@ mod tests {
     /// 验证 `with_resize` 与 `scale` filter 两种缩放方式结果一致，且同时使用时
     /// 按「先 resize 后 filter」的顺序叠加，不冲突。
     #[test]
-    #[ignore = "need a video file"]
     fn test_resize_vs_filter_scale() -> Result<()> {
         use crate::Resize;
 
-        let video_path = std::path::Path::new("/tmp/test.mp4");
+        let video_path = std::path::Path::new("assets/mp4.mp4");
 
         // A) 仅 with_resize
         eprintln!("[A] with_resize only");

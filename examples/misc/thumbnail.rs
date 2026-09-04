@@ -136,7 +136,7 @@ mod tests {
         std::fs::create_dir_all("tests/output/thumbnail").unwrap();
 
         thumbnail(
-            c"tests/assets/vids/bear.mp4",
+            c"assets/mp4.mp4",
             c"tests/output/thumbnail/bear.jpg",
             Some(192),
             Some(108),

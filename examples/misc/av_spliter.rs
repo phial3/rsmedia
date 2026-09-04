@@ -96,7 +96,7 @@ mod tests {
     fn test_av_spliter1() {
         std::fs::create_dir_all("tests/output/av_spliter").unwrap();
         av_spliter(
-            c"tests/assets/vids/bear.mp4",
+            c"assets/mp4.mp4",
             "tests/output/av_spliter/out_video_bear.h264",
             c"tests/output/av_spliter/out_audio_bear.aac",
         )

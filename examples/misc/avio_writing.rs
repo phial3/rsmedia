@@ -246,11 +246,7 @@ mod tests {
     #[ignore = "avio_writing_test2 测试运行依赖测试文件，暂时忽略"]
     fn avio_writing_test2() {
         std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
-        transcoding(
-            c"tests/assets/vids/bear.mp4",
-            c"tests/output/avio_writing/bear.mp4",
-        )
-        .unwrap();
+        transcoding(c"assets/mp4.mp4", c"tests/output/avio_writing/bear.mp4").unwrap();
     }
 
     #[test]

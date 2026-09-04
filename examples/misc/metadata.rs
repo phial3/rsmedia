@@ -58,9 +58,9 @@ mod tests {
     #[ignore = "metadata_test0 测试运行依赖测试文件，暂时忽略"]
     fn metadata_test0() {
         assert_eq!(
-            metadata("tests/assets/vids/bear.mp4").unwrap(),
+            metadata("assets/mp4.mp4").unwrap(),
             vec![
-                ("image_path".into(), "tests/assets/vids/bear.mp4".into()),
+                ("image_path".into(), "assets/mp4.mp4".into()),
                 ("duration".into(), "1068118".into()),
                 ("bit_rate".into(), "307823".into()),
                 ("major_brand".into(), "isom".into()),

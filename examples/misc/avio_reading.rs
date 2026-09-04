@@ -93,7 +93,7 @@ mod tests {
     #[test]
     #[ignore = "test_avio_reading0 测试运行依赖测试文件，暂时忽略"]
     fn test_avio_reading0() {
-        avio_file_reading(c"tests/assets/vids/bear.mp4").unwrap();
+        avio_file_reading(c"assets/mp4.mp4").unwrap();
     }
 
     #[test]
