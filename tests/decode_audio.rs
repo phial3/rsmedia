@@ -1,7 +1,7 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/decode_audio.c
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rsmpeg::{
-    avcodec::{AVCodecContext, AVCodecParserContext, AVPacket},
+    avcodec::{AVCodecContext, AVPacket},
     avformat::AVFormatContextInput,
     avutil::{
         AVFrame, AVSampleFormat, get_bytes_per_sample, get_packed_sample_fmt, get_sample_fmt_name,
@@ -14,7 +14,7 @@ use rsmpeg::{
 use std::{
     ffi::CString,
     fs::{self, File},
-    io::{Read, Write},
+    io::Write,
     path::Path,
     slice::from_raw_parts,
 };
@@ -72,61 +72,31 @@ fn decode(
 }
 
 fn decode_audio(audio_path: &str, out_file_path: &str) -> Result<()> {
-    const AUDIO_INBUF_SIZE: usize = 20480;
+    // safety, &str ensures no internal null bytes.
+    let audio_path_c = CString::new(audio_path).unwrap();
+    let mut input_format_context =
+        AVFormatContextInput::open(&audio_path_c).context("Open audio file failed.")?;
+    let (stream_index, decoder) = input_format_context
+        .find_best_stream(ffi::AVMEDIA_TYPE_AUDIO)
+        .context("Find best stream failed.")?
+        .context("Cannot find audio stream in this file.")?;
+    let mut decode_context = AVCodecContext::new(&decoder);
+    decode_context
+        .apply_codecpar(&input_format_context.streams()[stream_index].codecpar())
+        .context("Apply codecpar failed.")?;
+    decode_context.open(None).context("Could not open codec")?;
+    input_format_context.dump(stream_index, &audio_path_c)?;
 
-    let (decoder, mut decode_context) = {
-        // safety, &str ensures no internal null bytes.
-        let audio_path = CString::new(audio_path).unwrap();
-        let mut input_format_context =
-            AVFormatContextInput::open(&audio_path).context("Open audio file failed.")?;
-        let (stream_index, decoder) = input_format_context
-            .find_best_stream(ffi::AVMEDIA_TYPE_AUDIO)
-            .context("Find best stream failed.")?
-            .context("Cannot find audio stream in this file.")?;
-        let mut decode_context = AVCodecContext::new(&decoder);
-        decode_context
-            .apply_codecpar(&input_format_context.streams()[stream_index].codecpar())
-            .context("Apply codecpar failed.")?;
-        decode_context.open(None).context("Could not open codec")?;
-        input_format_context.dump(stream_index, &audio_path)?;
-        (decoder, decode_context)
-    };
-
-    let mut inbuf = [0u8; AUDIO_INBUF_SIZE + ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize];
-
-    let mut audio_file =
-        File::open(audio_path).with_context(|| anyhow!("Could not open {}", audio_path))?;
     fs::create_dir_all(Path::new(out_file_path).parent().unwrap()).unwrap();
     let out_file = File::create(out_file_path).context("Open out file failed.")?;
 
-    let mut parser_context = AVCodecParserContext::init(decoder.id).context("Parser not found")?;
-    let mut packet = AVPacket::new();
-
-    loop {
-        let len = audio_file
-            .read(&mut inbuf[..AUDIO_INBUF_SIZE])
-            .context("Read input file failed.")?;
-        if len == 0 {
-            break;
+    while let Some(packet) = input_format_context
+        .read_packet()
+        .context("Read packet failed.")?
+    {
+        if packet.stream_index == stream_index as i32 {
+            decode(&mut decode_context, Some(&packet), &out_file)?;
         }
-        let mut parsed_offset = 0;
-        while parsed_offset < len {
-            let (get_packet, offset) = parser_context
-                .parse_packet(&mut decode_context, &mut packet, &inbuf[parsed_offset..len])
-                .context("Error while parsing")?;
-            parsed_offset += offset;
-            if get_packet {
-                decode(&mut decode_context, Some(&packet), &out_file)?;
-            }
-        }
-    }
-
-    // Flush parser
-    let (get_packet, _) = parser_context
-        .parse_packet(&mut decode_context, &mut packet, &[])
-        .context("Error while parsing")?;
-    if get_packet {
-        decode(&mut decode_context, Some(&packet), &out_file)?;
     }
 
     // Flush decoder
@@ -155,11 +125,6 @@ fn decode_audio(audio_path: &str, out_file_path: &str) -> Result<()> {
 }
 
 #[test]
-#[ignore = "decode_audio_test 测试运行依赖测试文件，暂时忽略"]
 fn decode_audio_test() {
-    decode_audio(
-        "tests/assets/audios/sample1_short.aac",
-        "tests/output/decode_audio/sample1_short.pcm",
-    )
-    .unwrap();
+    decode_audio("assets/wav.wav", "tests/output/decode_audio/wav.pcm").unwrap();
 }

@@ -476,7 +476,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "demux video"]
     fn test_mux_demux_video() -> Result<()> {
         let output_path = Path::new("/tmp/test_mux_demux_video.mp4");
 
@@ -532,7 +531,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "test_mux_demux_audio_aac is need write file"]
     fn test_mux_demux_audio_aac() -> Result<()> {
         let output_path = Path::new("/tmp/test_mux_demux_audio_aac.aac");
         let sample_rate = 44_100;
@@ -602,7 +600,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "test_mux_demux_audio_mp3 is need write file"]
     fn test_mux_demux_audio_mp3() -> Result<()> {
         let output_path = Path::new("/tmp/test_mux_demux_audio_mp3.mp3");
         let sample_rate = 44_100;
@@ -655,7 +652,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "demux test_multiple_streams need a file"]
     fn test_multiple_streams() -> Result<()> {
         // 视频参数
         pub const VIDEO_WIDTH: usize = 1280;
@@ -845,9 +841,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "mux transcode need a file"]
     fn test_transcode() -> Result<()> {
-        transcode("/tmp/test.mp4", "/tmp/test_transcode.mov")?;
+        transcode("assets/mp4.mp4", "/tmp/test_transcode.mov")?;
         Ok(())
     }
 }

@@ -1380,9 +1380,55 @@ mod tests {
 
     use std::collections::HashMap;
 
-    /// 生成一帧纯色（RGB24）测试帧，颜色随相位 `p` 在彩虹色相上变化。
+    // ====================================================================
+    // 公共测试辅助
+    // ====================================================================
+
+    /// 测试输出统一放系统临时目录
+    fn temp_path(name: impl std::fmt::Display) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{name}"))
+    }
+
+    fn remove_temp(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 滤镜因 FFmpeg 构建配置缺失（如 `drawtext` 依赖 libfreetype、`gamma` 等）
+    /// 初始化失败时优雅跳过，避免环境差异导致测试失败。
+    fn is_filter_unavailable(e: &anyhow::Error) -> bool {
+        let low = format!("{e:#}").to_lowercase();
+        low.contains("no such filter")
+            || low.contains("filter not found")
+            || low.contains("not found")
+            || low.contains("freetype")
+    }
+
+    /// 编码器因 FFmpeg 构建配置缺失（如 libmp3lame/libtheora/libx265）时跳过
+    fn is_encoder_unavailable(e: &anyhow::Error) -> bool {
+        e.to_string().contains("not available in this FFmpeg build")
+    }
+
+    /// 汇总容器遍历测试结果：任何非跳过失败都断言失败；至少一个容器成功，
+    /// 防止环境异常时测试空壳通过。
+    fn assert_container_results(
+        kind: &str,
+        passed: Vec<&'static str>,
+        skipped: Vec<&'static str>,
+        failed: Vec<(&'static str, String)>,
+    ) {
+        println!(
+            "{kind}: {} passed {passed:?}, {} skipped {skipped:?}, {} failed",
+            passed.len(),
+            skipped.len(),
+            failed.len()
+        );
+        assert!(failed.is_empty(), "{kind} encodings failed: {failed:#?}");
+        assert!(!passed.is_empty(), "all {kind} encodings failed");
+    }
+
+    /// 生成一帧纯色（RGB24）测试视频帧，颜色随相位 `p` 在彩虹色相上变化。
     #[cfg(feature = "ndarray")]
-    fn rainbow_frame(w: usize, h: usize, p: f32) -> MediaFrame<u8> {
+    fn rainbow_video_frame(w: usize, h: usize, p: f32) -> MediaFrame<u8> {
         use crate::colors;
         let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
         let mut frame =
@@ -1398,621 +1444,55 @@ mod tests {
         frame
     }
 
-    /// 动态码率/帧率调整、关键帧间隔控制
-    /// 完善主流编码格式支持（H.264/265, VP9/AV1, AAC/Opus）
+    /// 正弦波帧的采样类型映射：[-1, 1] 归一化值 → 各采样格式的存储类型。
     ///
-    /// | 容器格式 | 标准时间基         | 说明                      |
-    /// | :------- | :-------------- | :------------------------|
-    /// | MP4      | 1/90_000        | 90kHz，源自MPEG-2标准      |
-    /// | MOV      | 1/10_000_000    | 10MHz，苹果QuickTime格式   |
-    /// | MKV      | 1/1_000_000_000 | 纳秒级精度                 |
-    /// | FLV      | 1/1_000         | 毫秒级，Flash视频标准       |
-    /// | TS       | 1/90_000        | 90kHz，MPEG传输流          |
-    /// | AVI      | 1/{帧率}         | 基于帧计数，或1/1000        |
-    /// | WebM     | 1/1_000_000_000 | 纳秒级，基于MKV            |
-    /// | 3GP      | 1/90_000        | 移动设备视频标准            |
-    /// | ASF/WMV  | 1/10_000_000    | 100纳秒单位，Windows Media |
-    /// | OGG/OGV  | 1/1_000_000     | 微秒级，开源标准            |
-    /// | MPEG     | 1/90_000        | 90kHz，MPEG标准           |
-    #[cfg(feature = "ndarray")]
-    fn test_encode_video_for_container(container_type: &str, fps: f64) -> Result<()> {
-        use crate::filter;
-        use crate::time::Time;
-        use std::path::Path;
-
-        // 使用单一match获取基本参数
-        let (codec_name, time_base, codec_options) = match container_type {
-            // 常见流媒体/通用格式
-            "mp4" => (None, (1, 90_000), None),        // 90kHz
-            "mov" => (None, (1, 90_000), None),        // 90kHz
-            "mkv" => (None, (1, 1_000_000_000), None), // 纳秒级
-            "webm" => (Some("libvpx-vp9".to_string()), (1, 1_000_000_000), None),
-            "flv" => (None, (1, 1_000), None), // 毫秒级
-            "ts" | "mts" | "m2ts" => (None, (1, 90_000), None),
-            "avi" => {
-                // AVI通常使用帧率作为时间基
-                let fps_rounded = fps.round() as i32;
-                let mut codec_opts = HashMap::new();
-                codec_opts.insert("profile".to_string(), "baseline".to_string());
-                codec_opts.insert("level".to_string(), "3.0".to_string());
-                (None, (1, fps_rounded), Some(codec_opts))
-            }
-            "3gp" => (None, (1, 90_000), None), // 通常为90kHz
-            "wmv" | "asf" => (None, (1, 10_000_000), None), // 100纳秒单位
-            "ogg" | "ogv" => (Some("libtheora".to_string()), (1, 1_000_000), None), // 微秒级
-            "mpg" | "mpeg" => (None, (1, 90_000), None),
-
-            // 专业广电格式
-            "mxf" => {
-                let mut codec_opts = HashMap::new();
-                codec_opts.insert("profile".to_string(), "main".to_string());
-                codec_opts.insert("r".to_string(), "25".to_string());
-                codec_opts.insert("g".to_string(), "15".to_string());
-                codec_opts.insert("b".to_string(), "5M".to_string());
-                (Some("mpeg2video".to_string()), (1, 25), Some(codec_opts))
-            }
-            "gxf" | "ps" => (Some("mpeg2video".to_string()), (1, 90_000), None),
-            "xavc" => (None, (1, 90_000), None),
-
-            // 硬件设备格式
-            "vob" => (Some("mpeg2video".to_string()), (1, 90_000), None),
-            "rmvb" | "divx" => (None, (1, 90_000), None),
-
-            // 特殊格式
-            "heif" => {
-                let mut codec_opts = HashMap::new();
-                codec_opts.insert("x265-params".to_string(), "lossless=1".to_string());
-                (Some("libx265".to_string()), (1, 90_000), Some(codec_opts))
-            }
-            "f4v" | "dav" | "evo" | "h264" => (None, (1, 90_000), None),
-            "h265" => (Some("libx265".to_string()), (1, 90_000), None),
-            "cmaf" => (None, (1, 90_000), None),
-
-            // 默认值（用于未明确定义的格式）
-            _ => (None, (1, 90_000), None), // 90kHz为最安全的默认值
-        };
-
-        let codec_name = utils::from_str(&codec_name.unwrap_or_else(|| "libx264".to_string()));
-        let codec_config = CodecConfig::new_with_name(&codec_name)?;
-        assert!(
-            codec_config.is_encoder(),
-            "Codec:'{:?}' is not an encoder.",
-            codec_name
-        );
-
-        let filters = vec![
-            filter::video::scale(1920, 1080, None),
-            filter::video::DrawText::new("Watermark", 50, 50, 24, "white@0.5").build(),
-            filter::video::crop(0, 0, 640, 360),
-        ];
-
-        // 视频编码参数
-        let width = 1280;
-        let height = 720;
-        // 确定输出路径和扩展名
-        let output_file = format!("/tmp/test_encode_video.{}", container_type);
-        let output_path = Path::new(output_file.as_str());
-
-        // 创建编码器
-        let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
-            .with_codec_name(codec_name.to_str()?.to_string())
-            .with_options(codec_options.map(|opts| opts.into()))
-            .with_filters(filters)
-            .build_wrapped(output_path)?;
-
-        let actual_timebase = encoder.time_base();
-        let frame_duration_seconds = 1.0 / fps;
-
-        // 将秒转换为对应时间基单位
-        let duration_units = (frame_duration_seconds * actual_timebase.den as f64
-            / actual_timebase.num as f64)
-            .round() as i64;
-
-        let duration = Time::new(Some(duration_units), actual_timebase);
-
-        // 初始化position时使用正确的时间基
-        let mut position = Time::new(Some(0), time::new_rational(time_base.0, time_base.1));
-
-        println!(
-            "Encoding {} with actual timebase: {}/{}, duration units: {}, fps: {}",
-            container_type, actual_timebase.num, actual_timebase.den, duration_units, fps
-        );
-
-        // 帧编码并写入文件
-        for i in 0..10 {
-            let mut frame = rainbow_frame(width as usize, height as usize, i as f32 / 10.0);
-            frame.set_pts(
-                position
-                    .aligned_with_rational(encoder.time_base())
-                    .into_value()
-                    .unwrap(),
-            );
-
-            encoder.encode(frame)?;
-
-            // 使用aligned_with确保时间基一致进行加法操作
-            position = position.aligned_with(duration).add();
-        }
-
-        // flush encoder
-        encoder.finish().unwrap();
-
-        Ok(())
+    /// 编码器原生采样格式各不相同（aac→FLTP、libopus→S16、mp2→S32P），
+    /// 由 `CodecConfig::supported_sample_formats` 协商后据此选择帧数据类型。
+    trait SineSample: crate::frame::MediaFrameType {
+        /// 该存储类型对应的采样格式
+        fn format() -> SampleFormat;
+        /// 归一化浮点值 → 存储值
+        fn from_norm(v: f32) -> Self;
     }
 
-    #[cfg(feature = "ndarray")]
-    #[test]
-    #[rustfmt::skip]
-    #[ignore = "ignore video output file"]
-    fn test_encode_video() -> Result<()> {
-
-        let video_formats = [
-            // 通用/主流视频容器
-            "mp4",   // MPEG-4 Part 14，最通用的视频格式
-            "mkv",   // Matroska，开源高灵活性容器
-            "webm",  // Web优化的Matroska子集
-            "avi",   // Audio Video Interleave，传统通用格式
-            "mov",   // QuickTime格式，苹果生态常用
-            "wmv",   // Windows Media Video
-            "flv",   // Flash Video，流媒体
-            "mpg",   // MPEG-1/2 Program Stream
-            "mpeg",  // 同上
-            "asf",   // Advanced Systems Format
-
-            // 广播/专业视频容器
-            "mxf",   // Material eXchange Format，广电行业标准
-            "gxf",   // General eXchange Format，磁带元数据
-            "ts",    // MPEG Transport Stream，广播流
-            "m2ts",  // Blu-ray MPEG-2 Transport Stream
-            "mts",   // 同上
-            "xavc",  // Sony's 4K/8K专业格式
-            "ps",    // MPEG-2 Program Stream (专业用途)
-
-            // 流媒体/网络视频容器
-            "f4v",   // Adobe Flash MP4衍生格式
-            "cmaf",  // Common Media Application Format (DASH/HLS)
-            "ismv",  // Microsoft Smooth Streaming
-
-            // 移动设备/特殊视频容器
-            "3gp",   // 3GPP移动多媒体格式
-            "3g2",   // 3GPP2多媒体格式
-            "ogv",   // Ogg Video
-            "rmvb",  // RealMedia Variable Bitrate
-            "rm",    // RealMedia
-            "vob",   // DVD Video Object
-            "divx",  // DivX Media Format
-            "amv",   // Anime Music Video
-
-            // 图像序列/原始视频格式
-            "heif",  // High Efficiency Image File Format
-            "heic",  // HEIF的iOS实现
-            "dav",   // 大华监控专用
-            "h264",  // 裸H.264比特流
-            "h265",  // 裸H.265/HEVC比特流
-            "y4m",   // YUV4MPEG2原始格式
-
-            // 旧版/特殊格式
-            "swf",   // Shockwave Flash
-            "evo",   // HD-DVD格式
-            "ifo",   // DVD信息文件
-            "m4v",   // MPEG-4视频文件
-        ];
-
-        let mut err_encoder = Vec::new();
-        for format in video_formats {
-            println!("Testing format: {}...", format);
-            match test_encode_video_for_container(format, 24.0) {
-                Ok(_) => println!("Testing format: {} passed.", format),
-                Err(e) => {
-                    println!("Testing format: {} failed: {}", format, e);
-                    err_encoder.push(format.to_string());
-                }
-            }
+    impl SineSample for f32 {
+        fn format() -> SampleFormat {
+            SampleFormat::FLTP
         }
-
-        if !err_encoder.is_empty() {
-            eprintln!("Failed encoders: {:#?}", err_encoder)
+        fn from_norm(v: f32) -> Self {
+            v
         }
-
-        Ok(())
     }
 
-    /// 自包含的编解码往返测试：编码若干帧到临时文件，再解码回，验证帧数与尺寸一致。
-    /// 不依赖任何外部媒体文件，可自动运行。
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_encode_decode_roundtrip() -> Result<()> {
-        use crate::{DecoderBuilder, MediaType};
-
-        let width = 64usize;
-        let height = 64usize;
-        let n_frames = 10;
-        let fps = 25.0;
-
-        let path = std::env::temp_dir().join("rsmedia_roundtrip.mp4");
-        let _ = std::fs::remove_file(&path);
-
-        // 1) 编码：用 write_frame 自动维护 pts
-        let mut encoder = EncoderBuilder::new_video(width, height)
-            .with_fps(fps)
-            .build_wrapped(path.as_path())?;
-        for i in 0..n_frames {
-            let frame = rainbow_frame(width, height, i as f32 / n_frames as f32);
-            encoder.write_frame(frame)?;
+    impl SineSample for i16 {
+        fn format() -> SampleFormat {
+            SampleFormat::S16
         }
-        encoder.finish()?;
-
-        // 2) 解码回：验证帧数与解码尺寸
-        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
-        let mut decoded = 0usize;
-        while let Some(frame) = decoder.decode_frame()? {
-            assert_eq!(frame.width, width);
-            assert_eq!(frame.height, height);
-            decoded += 1;
+        fn from_norm(v: f32) -> Self {
+            (v * 32767.0) as Self
         }
-        assert_eq!(
-            decoded, n_frames,
-            "decoded frame count mismatch: got {decoded}, expected {n_frames}"
-        );
-
-        let _ = std::fs::remove_file(&path);
-        Ok(())
     }
 
-    /// 回归测试：带延迟滤镜（framerate，内部缓冲运动插值帧、flush 时才输出剩余帧）
-    /// 编码时，flush() 阶段取出的缓冲帧必须全部写盘，不能因再次送入已 flushed 的
-    /// filter 而被丢弃。
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_encode_delayed_filter_roundtrip() -> Result<()> {
-        use crate::{DecoderBuilder, MediaType, filter::Filter};
-
-        let width = 64usize;
-        let height = 64usize;
-        let n_frames = 30;
-        let fps = 30.0;
-
-        let path = std::env::temp_dir().join("rsmedia_delayed_filter.mp4");
-        let _ = std::fs::remove_file(&path);
-
-        // framerate 滤镜内部缓冲运动插值帧，输入 30 帧@30fps=1s，输出仍约 30 帧，
-        // 其中尾部的插值帧要等 flush(EOF) 才输出。若 flush 缓冲帧被丢弃会偏少。
-        let mut encoder = EncoderBuilder::new_video(width, height)
-            .with_fps(fps as f32)
-            .with_filters(vec![Filter::new(
-                "framerate",
-                MediaType::VIDEO,
-                "framerate=fps=30".to_string(),
-            )])
-            .build_wrapped(path.as_path())?;
-        for i in 0..n_frames {
-            let frame = rainbow_frame(width, height, i as f32 / n_frames as f32);
-            encoder.write_frame(frame)?;
+    impl SineSample for i32 {
+        fn format() -> SampleFormat {
+            SampleFormat::S32P
         }
-        encoder.finish()?;
-
-        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
-        let mut decoded = 0usize;
-        while let Some(_frame) = decoder.decode_frame()? {
-            decoded += 1;
+        fn from_norm(v: f32) -> Self {
+            (v * 2147483647.0) as Self
         }
-        assert!(
-            decoded >= n_frames,
-            "delayed filter roundtrip lost frames: got {decoded}, expected >= {n_frames}"
-        );
-
-        let _ = std::fs::remove_file(&path);
-        Ok(())
     }
 
-    /// 验证 `write_frame` 自动维护的 pts 单调递增且与帧率一致（不含 B 帧时每帧
-    /// 时长为 1/fps，按编码器时间基换算）。
+    /// 生成一帧全幅正弦波（幅度 0.5）音频帧，帧数据类型与采样格式自动匹配。
     #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_write_frame_auto_pts() -> Result<()> {
-        use crate::{DecoderBuilder, MediaType};
-
-        let width = 64usize;
-        let height = 64usize;
-        let n_frames = 8;
-        let fps: f64 = 30.0;
-
-        let path = std::env::temp_dir().join("rsmedia_auto_pts.mp4");
-        let _ = std::fs::remove_file(&path);
-
-        let mut encoder = EncoderBuilder::new_video(width, height)
-            .with_fps(fps as f32)
-            .build_wrapped(path.as_path())?;
-
-        // 帧时长 = 1/fps（秒）。解码输出的 pts 位于输出流 time_base（movenc
-        // 可能调整，如 MP4 用 1/15360），故在解码后按实际帧 time_base 计算期望增量。
-        for i in 0..n_frames {
-            let frame = rainbow_frame(width, height, i as f32 / n_frames as f32);
-            encoder.write_frame(frame)?;
-        }
-        encoder.finish()?;
-
-        // 解码回，收集真实 pts，验证相邻帧 pts 差恒定
-        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
-        let mut pts_list: Vec<i64> = Vec::new();
-        while let Some(frame) = decoder.decode_frame()? {
-            pts_list.push(frame.pts);
-        }
-        assert_eq!(pts_list.len(), n_frames);
-
-        // 解码 pts 位于输出流 time_base（movenc 可能调整，如 MP4 用 1/15360）
-        let tb = decoder.decoder_mut().time_base();
-        let expected_delta = (tb.den as f64 / tb.num as f64 / fps).round() as i64;
-
-        // 排除 B 帧重排的影响：仅断言存在一致的正增量（B 帧可能为 0/负，取出现最多的增量）
-        let mut counts: HashMap<i64, usize> = HashMap::new();
-        for d in pts_list.windows(2).map(|w| w[1] - w[0]) {
-            if d > 0 {
-                *counts.entry(d).or_default() += 1;
-            }
-        }
-        let delta = counts
-            .into_iter()
-            .max_by_key(|(_, c)| *c)
-            .map(|(d, _)| d)
-            .unwrap_or(expected_delta);
-        assert_eq!(delta, expected_delta, "pts delta mismatch vs 1/fps");
-
-        let _ = std::fs::remove_file(&path);
-        Ok(())
-    }
-
-    /// 验证不同帧率下：编码器 time_base 恒为 `1/fps`，且编码→解码往返帧数一致。
-    ///
-    /// 这是对 fps → time_base 推导（`av_inv_q`）与末帧 duration 修复的回归测试。
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_encode_video_multiple_fps() -> Result<()> {
-        use crate::{DecoderBuilder, MediaType};
-
-        for fps in [24.0f32, 25.0, 30.0, 60.0, 29.97] {
-            let path = std::env::temp_dir().join(format!("rsmedia_fps_{fps}.mp4"));
-            let _ = std::fs::remove_file(&path);
-
-            let n_frames = 12;
-            let mut encoder = EncoderBuilder::new_video(64, 64)
-                .with_fps(fps)
-                .build_wrapped(path.as_path())?;
-
-            // 1) 编码器 time_base 必须等于 1/fps
-            let tb = encoder.time_base();
-            let expected_tb = avutil::av_inv_q(avutil::av_d2q(fps as f64, EncoderBuilder::FPS_MAX));
-            assert_eq!(
-                (tb.num, tb.den),
-                (expected_tb.num, expected_tb.den),
-                "fps={fps}: time_base {}/{} != 1/fps",
-                tb.num,
-                tb.den
-            );
-
-            for i in 0..n_frames {
-                let frame = rainbow_frame(64, 64, i as f32 / n_frames as f32);
-                encoder.write_frame(frame)?;
-            }
-            encoder.finish()?;
-
-            // 2) 解码回，帧数必须与编码一致（验证末帧未被 muxer 丢弃）
-            let mut decoder =
-                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
-            let mut decoded = 0usize;
-            while let Some(frame) = decoder.decode_frame()? {
-                assert_eq!(frame.width, 64);
-                assert_eq!(frame.height, 64);
-                decoded += 1;
-            }
-            assert_eq!(
-                decoded, n_frames,
-                "fps={fps}: decoded {decoded} frames, expected {n_frames}"
-            );
-
-            let _ = std::fs::remove_file(&path);
-        }
-        Ok(())
-    }
-
-    /// 音频编解码往返测试：编码若干 AAC 音频帧，解码回验证采样率/通道数/总采样数。
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_encode_decode_audio_roundtrip() -> Result<()> {
-        use crate::frame::MediaFrame;
-        use crate::{DecoderBuilder, MediaType};
-
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
-        let format = SampleFormat::FLTP;
-        // AAC 默认 frame_size = 1024 采样/帧
-        let samples_per_frame = 1024u32;
-        let frames_to_write = 10u32;
-
-        let path = std::env::temp_dir().join("rsmedia_audio_roundtrip.m4a");
-        let _ = std::fs::remove_file(&path);
-
-        let mut encoder =
-            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                .build_wrapped(path.as_path())?;
-
-        // 1) 音频 time_base 应为 1/sample_rate
-        let tb = encoder.time_base();
-        let expected_tb = time::new_rational(1, sample_rate as i32);
-        assert_eq!(
-            (tb.num, tb.den),
-            (expected_tb.num, expected_tb.den),
-            "audio time_base {}/{} != 1/sample_rate",
-            tb.num,
-            tb.den
-        );
-
-        for _ in 0..frames_to_write {
-            let frame = MediaFrame::<f32>::new_audio_frame(
-                format,
-                channels,
-                samples_per_frame,
-                sample_rate,
-                time::new_rational(1, sample_rate as i32),
-            )?;
-            encoder.write_frame(frame)?;
-        }
-        encoder.finish()?;
-
-        // 2) 解码验证：采样率、通道数、采样量（AAC 有编码延迟/padding，总采样数应覆盖输入）
-        // 音频 FLTP 用 f32 解码（decode_frame 固定返回 u8，仅适用于视频）。
-        let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
-        let mut total_samples = 0u64;
-        let mut decoded_frames = 0usize;
-        while let Some(frame) = decoder.decode::<f32>()? {
-            assert_eq!(frame.audio_format(), Some(format), "sample format mismatch");
-            assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
-            assert_eq!(frame.nb_channels, channels, "channel count mismatch");
-            total_samples += frame.nb_samples as u64;
-            decoded_frames += 1;
-        }
-        let expected = frames_to_write as u64 * samples_per_frame as u64;
-        assert!(
-            total_samples >= expected,
-            "decoded {total_samples} samples, expected >= {expected}"
-        );
-        assert!(decoded_frames > 0, "no audio frames decoded");
-
-        let _ = std::fs::remove_file(&path);
-        Ok(())
-    }
-
-    /// 末帧不足一帧（非 frame_size 整倍数）时，应作为合法末帧编码，而非被 `check_frame`
-    /// 的帧长校验拒绝。回归测试：无滤镜向 aac 发非整倍数样本总数。
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_encode_audio_partial_last_frame() -> Result<()> {
-        use crate::frame::MediaFrame;
-        use crate::{DecoderBuilder, MediaType};
-
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
-        let format = SampleFormat::FLTP;
-        // AAC frame_size = 1024；故意发非整倍数：3×1000 = 3000 样本
-        let samples_per_frame = 1000u32;
-        let frames_to_write = 3u32;
-
-        let path = std::env::temp_dir().join("rsmedia_audio_partial.m4a");
-        let _ = std::fs::remove_file(&path);
-
-        let mut encoder =
-            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                .build_wrapped(path.as_path())?;
-        for _ in 0..frames_to_write {
-            encoder.write_frame(MediaFrame::<f32>::new_audio_frame(
-                format,
-                channels,
-                samples_per_frame,
-                sample_rate,
-                time::new_rational(1, sample_rate as i32),
-            )?)?;
-        }
-        encoder.finish()?;
-
-        let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
-        let mut total_samples = 0u64;
-        while let Some(frame) = decoder.decode::<f32>()? {
-            assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
-            assert_eq!(frame.nb_channels, channels, "channel count mismatch");
-            total_samples += frame.nb_samples as u64;
-        }
-        let expected = frames_to_write as u64 * samples_per_frame as u64;
-        assert!(
-            total_samples >= expected,
-            "decoded {total_samples} samples, expected >= {expected}"
-        );
-
-        let _ = std::fs::remove_file(&path);
-        Ok(())
-    }
-
-    /// 音频转码（重编码）往返测试：编码源文件 → 解码读出 → 重编码到新文件 → 解码校验。
-    ///
-    /// 覆盖音频「解码→编码」完整链路，验证重编码结果采样率/声道数/采样格式与样本量不丢失。
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_audio_transcode_roundtrip() -> Result<()> {
-        use crate::frame::MediaFrame;
-        use crate::{DecoderBuilder, EncoderBuilder, MediaType, SampleFormat};
-
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
-        let format = SampleFormat::FLTP;
-        let samples_per_frame = 1024u32;
-        let frames_to_write = 10u32;
-
-        let src = std::env::temp_dir().join("rsmedia_audio_transcode_src.m4a");
-        let dst = std::env::temp_dir().join("rsmedia_audio_transcode_dst.m4a");
-        let _ = std::fs::remove_file(&src);
-        let _ = std::fs::remove_file(&dst);
-
-        // 1) 生成源音频文件
-        let mut enc =
-            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                .build_wrapped(src.as_path())?;
-        for _ in 0..frames_to_write {
-            enc.write_frame(MediaFrame::<f32>::new_audio_frame(
-                format,
-                channels,
-                samples_per_frame,
-                sample_rate,
-                time::new_rational(1, sample_rate as i32),
-            )?)?;
-        }
-        enc.finish()?;
-        let src_samples = frames_to_write as u64 * samples_per_frame as u64;
-
-        // 2) 转码：解码源 → 重编码到新文件
-        let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(src.as_path())?;
-        let mut enc2 =
-            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                .build_wrapped(dst.as_path())?;
-        let mut transcoded_samples = 0u64;
-        while let Some(frame) = dec.decode::<f32>()? {
-            transcoded_samples += frame.nb_samples as u64;
-            enc2.write_frame(frame)?;
-        }
-        enc2.finish()?;
-        assert!(
-            transcoded_samples >= src_samples,
-            "decoded {transcoded_samples} source samples, expected >= {src_samples}"
-        );
-
-        // 3) 解码转码结果并校验
-        let mut out = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(dst.as_path())?;
-        let mut total = 0u64;
-        while let Some(frame) = out.decode::<f32>()? {
-            assert_eq!(frame.audio_format(), Some(format), "sample format mismatch");
-            assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
-            assert_eq!(frame.nb_channels, channels, "channel count mismatch");
-            total += frame.nb_samples as u64;
-        }
-        assert!(
-            total >= src_samples,
-            "transcoded decoded {total} samples, expected >= {src_samples}"
-        );
-
-        let _ = std::fs::remove_file(&src);
-        let _ = std::fs::remove_file(&dst);
-        Ok(())
-    }
-
-    /// 生成一帧全幅正弦波（FLTP）音频帧，供音频滤镜往返测试使用。
-    #[cfg(feature = "ndarray")]
-    fn sine_audio_frame(
+    fn sine_audio_frame<T: SineSample>(
         freq: f32,
         channels: u32,
         nb_samples: u32,
         sample_rate: u32,
-    ) -> MediaFrame<f32> {
+    ) -> MediaFrame<T> {
         use crate::frame::MediaFrame;
-        let mut frame = MediaFrame::<f32>::new_audio_frame(
-            SampleFormat::FLTP,
+        let mut frame = MediaFrame::<T>::new_audio_frame(
+            T::format(),
             channels,
             nb_samples,
             sample_rate,
@@ -2022,432 +1502,1295 @@ mod tests {
         for i in 0..nb_samples as usize {
             for c in 0..channels as usize {
                 let t = i as f32 / sample_rate as f32;
-                frame.data[[0, i, c]] = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.5;
+                frame.data[[0, i, c]] =
+                    T::from_norm((2.0 * std::f32::consts::PI * freq * t).sin() * 0.5);
             }
         }
         frame
     }
 
-    /// 音频滤镜全量往返测试：编码时对每个滤镜逐一应用，再解码验证。
-    ///
-    /// 覆盖所有不依赖外部资源/设备的音频滤镜（与视频滤镜对称，验证编码管线中的
-    /// 滤镜初始化、EOF/flush 冲刷不丢帧、不报错）。验证：
-    ///   1) 滤镜在音频编码管线中可正常初始化、不报错；
-    ///   2) EOF / flush 阶段不丢帧、不报 "cannot decode after flushed"；
-    ///   3) 时长保持类滤镜输出采样数不丢失（>= 输入采样数）。
+    // ====================================================================
+    // 视频编码测试
+    // ====================================================================
     #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_audio_filters_roundtrip() -> Result<()> {
-        use crate::filter::{self, audio};
-        use crate::{DecoderBuilder, MediaType};
+    mod video_tests {
+        use super::*;
+        use rsmpeg::avcodec::AVCodec;
 
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
-        let format = SampleFormat::FLTP;
-        let samples_per_frame = 1024u32;
-        let frames_to_write = 12u32;
-        let input_samples = frames_to_write as u64 * samples_per_frame as u64;
+        /// 视频容器规格：一个容器对应一条完整的编码配置。
+        ///
+        /// 常见视频容器的标准时间基（源自各容器规范）：
+        ///
+        /// | 容器格式 | 标准时间基      | 说明                       |
+        /// | :------- | :------------- | :------------------------- |
+        /// | MP4/F4V/M4V/3GP/TS | 1/90_000 | 90kHz，源自 MPEG-2 标准 |
+        /// | MOV      | 1/10_000_000   | 10MHz，苹果 QuickTime 格式 |
+        /// | MKV/WebM | 1/1_000_000_000| 纳秒级精度                 |
+        /// | FLV      | 1/1_000        | 毫秒级，Flash 视频标准     |
+        /// | AVI      | 1/{帧率}       | 基于帧计数                 |
+        /// | ASF/WMV  | 1/10_000_000   | 100 纳秒单位，Windows Media|
+        /// | OGG/OGV  | 1/1_000_000    | 微秒级，开源标准           |
+        /// | MPEG     | 1/90_000       | 90kHz，MPEG 标准           |
+        struct VideoContainerSpec {
+            /// 容器扩展名（同时决定输出 muxer）
+            container: &'static str,
+            /// 编码器名，`None` = 默认 `libx264`
+            codec: Option<&'static str>,
+            /// 该容器的标准时间基 `(num, den)`
+            time_base: (i32, i32),
+            /// 目标码率，`0` = 不设置（未压缩/由编码器默认）
+            bit_rate: u64,
+            /// 编码器 AVCodecContext 私有选项
+            options: Option<&'static [(&'static str, &'static str)]>,
+        }
 
-        // (名称, Filter, 时长保持 ?)。时长保持类滤镜不解散采样量，可断言 `>= 输入采样数`；
-        // 时长变化类（延时/变速/裁剪/时间戳重排/响度测量）只断言能正常解码出帧。
-        type FilterCase = (&'static str, crate::filter::Filter, bool);
-        let cases: Vec<FilterCase> = vec![
-            // 时长保持类
-            ("volume", audio::volume(0.8), true),
-            ("equalizer", audio::equalizer(1000, 3.0, 200), true),
-            (
-                "compressor",
-                audio::compressor(4.0, None, None).unwrap(),
-                true,
+        const fn vc(
+            container: &'static str,
+            codec: Option<&'static str>,
+            time_base: (i32, i32),
+            bit_rate: u64,
+            options: Option<&'static [(&'static str, &'static str)]>,
+        ) -> VideoContainerSpec {
+            VideoContainerSpec {
+                container,
+                codec,
+                time_base,
+                bit_rate,
+                options,
+            }
+        }
+
+        /// 市场常见视频容器 → 编码器/时间基/码率/选项 映射表。
+        /// 仅保留 FFmpeg 有 muxer 且无需专用硬件的通用格式。
+        const VIDEO_CONTAINERS: &[VideoContainerSpec] = &[
+            // ---- 容器,           编码器(None=libx264),      标准时间基,          码率,     选项 ----
+            // 通用/主流容器
+            vc("mp4", None, (1, 90_000), 2_000_000, None),
+            vc("mkv", None, (1, 1_000_000_000), 2_000_000, None),
+            vc(
+                "webm",
+                Some("libvpx-vp9"),
+                (1, 1_000_000_000),
+                1_000_000,
+                None,
             ),
-            ("highpass", audio::highpass(100), true),
-            ("lowpass", audio::lowpass(4000), true),
-            ("atempo", audio::atempo(1.0), true),
-            ("fft_denoise", audio::fft_denoise(12, -50), true),
-            ("denoise", audio::denoise(12.0), true),
-            // FIXME:
-            // ("anlm_denoise", audio::anlm_denoise(None, None, None), true),
-            // anlm_denoise 暂不纳入测试：FFmpeg 9.0 的 anlmdn 滤镜存在堆越界写 bug ——
-            // EOF 冲刷不满一窗的尾巴帧时（libavfilter/avfilter.c 在 status_in 时将 min
-            // 降为队列剩余样本数），filter_channel 仍向按尾巴尺寸分配的输出缓冲写满
-            // H 个样本（默认 44.1kHz 下 H=177），越界 408 字节/声道。堆被污染后会使
-            // 其它测试随机 SIGSEGV/malloc abort（即本测试套件曾经的偶发失败根因）。
-            // 上游 master 尚未修复；等修复发布后再恢复此用例。
-            (
-                "three_band_equalizer",
-                audio::three_band_equalizer(2.0, 0.0, 2.0),
-                true,
+            // AVI 时间基基于帧率（测试固定 25fps）
+            vc(
+                "avi",
+                None,
+                (1, 25),
+                2_000_000,
+                Some(&[("profile", "baseline"), ("level", "3.0")]),
             ),
-            ("format", audio::format(channels, sample_rate, format), true),
-            (
-                "resample",
-                audio::resample(channels, sample_rate, format),
-                true,
-            ),
-            // 时长变化类
-            ("adelay", audio::adelay(100), false),
-            ("loudnorm", audio::loudnorm(-16.0), false),
-            (
-                "asetpts",
-                filter::setpts(MediaType::AUDIO, "PTS-STARTPTS"),
-                false,
-            ),
-            ("atrim", filter::trim(MediaType::AUDIO, 0.0, 0.2), false),
+            vc("mov", None, (1, 90_000), 2_000_000, None),
+            vc("wmv", None, (1, 10_000_000), 2_000_000, None),
+            vc("flv", None, (1, 1_000), 2_000_000, None),
+            vc("mpg", None, (1, 90_000), 2_000_000, None),
+            vc("mpeg", None, (1, 90_000), 2_000_000, None),
+            vc("asf", None, (1, 10_000_000), 2_000_000, None),
+            // 广播/流媒体容器
+            vc("ts", None, (1, 90_000), 2_000_000, None),
+            vc("m2ts", None, (1, 90_000), 2_000_000, None),
+            vc("mts", None, (1, 90_000), 2_000_000, None),
+            vc("f4v", None, (1, 90_000), 2_000_000, None),
+            vc("ismv", None, (1, 90_000), 2_000_000, None),
+            // 移动/特殊容器
+            vc("3gp", None, (1, 90_000), 2_000_000, None),
+            vc("3g2", None, (1, 90_000), 2_000_000, None),
+            vc("ogv", Some("libtheora"), (1, 1_000_000), 1_000_000, None),
+            vc("rm", None, (1, 90_000), 2_000_000, None),
+            vc("vob", Some("mpeg2video"), (1, 90_000), 2_000_000, None),
+            // 原始/裸流格式
+            vc("h264", None, (1, 90_000), 2_000_000, None),
+            vc("h265", Some("libx265"), (1, 90_000), 2_000_000, None),
+            // YUV4MPEG2 只接受未压缩视频
+            vc("y4m", Some("rawvideo"), (1, 90_000), 0, None),
+            // SWF 只接受 Flash 系编码器（FLV1 编码器注册名为 `flv`）
+            vc("swf", Some("flv"), (1, 1_000), 2_000_000, None),
+            vc("m4v", None, (1, 90_000), 2_000_000, None),
         ];
 
-        for (name, audio_filter, duration_preserving) in cases {
-            println!("AUDFILT {name}");
-            let path = std::env::temp_dir().join(format!("rsmedia_afilt_{name}.m4a"));
-            let _ = std::fs::remove_file(&path);
+        /// 对指定视频容器执行「编码 10 秒视频 → flush」完整流程。
+        fn encode_video_for_container(spec: &VideoContainerSpec, fps: f64) -> Result<()> {
+            use crate::filter;
+            use crate::time::Time;
 
-            let mut enc = match EncoderBuilder::new_audio(
-                128_000,
-                channels as i32,
-                sample_rate as i32,
-                format,
-            )
-            .with_filters(vec![audio_filter])
-            .build_wrapped(path.as_path())
-            {
-                Ok(enc) => enc,
-                Err(e) => {
-                    // 部分滤镜（如 `fft_denoise`/`anlm_denoise`/`loudnorm`）依赖特定 FFmpeg
-                    // 编译配置，未编译时初始化失败，这里优雅跳过，避免环境差异导致测试失败。
-                    let low = format!("{e:#}").to_lowercase();
-                    if low.contains("no such filter")
-                        || low.contains("filter not found")
-                        || low.contains("not found")
-                    {
-                        println!("SKIP {name}: not available ({e:#})");
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    return Err(e);
-                }
-            };
-            for _ in 0..frames_to_write {
-                enc.write_frame(sine_audio_frame(
-                    440.0,
-                    channels,
-                    samples_per_frame,
-                    sample_rate,
-                ))?;
+            let codec_name = spec.codec.unwrap_or("libx264");
+            // 编码器存在性取决于 FFmpeg 构建配置（如 libtheora/libx265），缺失时跳过
+            if AVCodec::find_encoder_by_name(&utils::from_str(codec_name)).is_none() {
+                anyhow::bail!("encoder {codec_name} not available in this FFmpeg build");
             }
-            enc.finish()?;
+            let codec_name = utils::from_str(codec_name);
+            let codec_config = CodecConfig::new_with_name(&codec_name)?;
+            assert!(
+                codec_config.is_encoder(),
+                "Codec:'{:?}' is not an encoder.",
+                codec_name
+            );
 
-            // 解码验证：不报错、能解出帧；时长保持类滤镜采样量不丢失。
-            let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
-            let mut total_samples = 0u64;
+            // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用，不可用时降级为仅 scale+crop
+            let mut filters = vec![filter::video::scale(1920, 1080, None)];
+            if rsmpeg::avfilter::AVFilter::get_by_name(c"drawtext").is_some() {
+                filters.push(
+                    filter::video::DrawText::new("Watermark", 50, 50, 24, "white@0.5").build(),
+                );
+            } else {
+                println!("SKIP drawtext (libfreetype not available)");
+            }
+            filters.push(filter::video::crop(0, 0, 640, 360));
+
+            // 视频编码参数
+            let width = 1280;
+            let height = 720;
+            let output_path = temp_path(format!("test_encode_video.{}", spec.container));
+            remove_temp(&output_path);
+
+            // 按容器规格创建编码器（fps 必须传入编码器，保证 time_base = 1/fps，
+            // 否则编码器运行在默认 30fps，与帧 pts 的 25fps 语义不一致，
+            // 会导致 flv 等严格 muxer 报 "Invalid pts <= last"）
+            let mut builder = EncoderBuilder::new_video(width as usize, height as usize)
+                .with_codec_name(codec_name.to_str()?.to_string())
+                .with_fps(fps as f32)
+                .with_filters(filters);
+            if spec.bit_rate > 0 {
+                builder = builder.with_bit_rate(spec.bit_rate as i64);
+            }
+            if let Some(opts) = spec.options {
+                let opts: HashMap<String, String> = opts
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                builder = builder.with_options(Some(Into::into(opts)));
+            }
+            let mut encoder = builder.build_wrapped(output_path.as_path())?;
+
+            // 按容器标准时间基计算帧间隔（验证不同时间基下 pts 均匀）
+            let actual_timebase = encoder.time_base();
+            let frame_duration_seconds = 1.0 / fps;
+            let duration_units = (frame_duration_seconds * actual_timebase.den as f64
+                / actual_timebase.num as f64)
+                .round() as i64;
+            let duration = Time::new(Some(duration_units), actual_timebase);
+            let container_tb = time::new_rational(spec.time_base.0, spec.time_base.1);
+            let mut position = Time::new(Some(0), container_tb);
+
+            println!(
+                "Encoding {} with actual timebase: {}/{}, duration units: {}, fps: {}",
+                spec.container, actual_timebase.num, actual_timebase.den, duration_units, fps
+            );
+
+            // 帧编码并写入文件：5 秒 × fps
+            const VIDEO_DURATION_SECS: f64 = 5.0;
+            let n_frames = (VIDEO_DURATION_SECS * fps).round() as usize;
+            for i in 0..n_frames {
+                let mut frame = rainbow_video_frame(
+                    width as usize,
+                    height as usize,
+                    i as f32 / n_frames as f32,
+                );
+                frame.set_pts(
+                    position
+                        .aligned_with_rational(encoder.time_base())
+                        .into_value()
+                        .unwrap(),
+                );
+
+                encoder.encode(frame)?;
+
+                // 使用aligned_with确保时间基一致进行加法操作
+                position = position.aligned_with(duration).add();
+            }
+
+            // flush encoder
+            encoder.finish().unwrap();
+
+            Ok(())
+        }
+
+        /// 遍历视频容器映射表逐一编码。
+        /// 编码器缺失的容器跳过并报告；其余失败视为测试失败（严格模式），
+        /// 但要求至少一个容器成功，防止环境异常时测试空壳通过。
+        #[test]
+        fn test_encode_video() {
+            let mut passed = Vec::new();
+            let mut skipped = Vec::new();
+            let mut failed = Vec::new();
+            let fps = 25.0;
+
+            for spec in VIDEO_CONTAINERS {
+                println!("Testing format: {}...", spec.container);
+                match encode_video_for_container(spec, fps) {
+                    Ok(()) => {
+                        println!("Testing format: {} passed.", spec.container);
+                        passed.push(spec.container);
+                    }
+                    Err(e) if is_encoder_unavailable(&e) => {
+                        println!("SKIP {}: {e:#}", spec.container);
+                        skipped.push(spec.container);
+                    }
+                    Err(e) => failed.push((spec.container, format!("{e:#}"))),
+                }
+            }
+
+            assert_container_results("video containers", passed, skipped, failed);
+        }
+
+        /// 自包含的编解码往返测试：编码若干帧到临时文件，再解码回，验证帧数与尺寸一致。
+        /// 不依赖任何外部媒体文件，可自动运行。
+        #[test]
+        fn test_encode_decode_roundtrip() -> Result<()> {
+            use crate::{DecoderBuilder, MediaType};
+
+            let width = 64usize;
+            let height = 64usize;
+            let n_frames = 10;
+            let fps = 25.0;
+
+            let path = temp_path("rsmedia_roundtrip.mp4");
+            remove_temp(&path);
+
+            // 1) 编码：用 write_frame 自动维护 pts
+            let mut encoder = EncoderBuilder::new_video(width, height)
+                .with_fps(fps)
+                .build_wrapped(path.as_path())?;
+            for i in 0..n_frames {
+                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                encoder.write_frame(frame)?;
+            }
+            encoder.finish()?;
+
+            // 2) 解码回：验证帧数与解码尺寸
+            let mut decoder =
+                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
             let mut decoded = 0usize;
-            while let Some(frame) = dec.decode::<f32>()? {
-                assert_eq!(
-                    frame.sample_rate, sample_rate,
-                    "{name}: sample rate mismatch"
-                );
-                assert_eq!(
-                    frame.audio_format(),
-                    Some(format),
-                    "{name}: sample format mismatch"
-                );
-                assert_eq!(
-                    frame.nb_channels, channels,
-                    "{name}: channel count mismatch"
-                );
-                total_samples += frame.nb_samples as u64;
+            while let Some(frame) = decoder.decode_frame()? {
+                assert_eq!(frame.width, width);
+                assert_eq!(frame.height, height);
+                decoded += 1;
+            }
+            assert_eq!(
+                decoded, n_frames,
+                "decoded frame count mismatch: got {decoded}, expected {n_frames}"
+            );
+
+            remove_temp(&path);
+            Ok(())
+        }
+
+        /// 回归测试：带延迟滤镜（framerate，内部缓冲运动插值帧、flush 时才输出剩余帧）
+        /// 编码时，flush() 阶段取出的缓冲帧必须全部写盘，不能因再次送入已 flushed 的
+        /// filter 而被丢弃。
+        #[test]
+        fn test_encode_delayed_filter_roundtrip() -> Result<()> {
+            use crate::{DecoderBuilder, MediaType};
+
+            let width = 64usize;
+            let height = 64usize;
+            let n_frames = 30;
+            let fps = 30.0;
+
+            let path = temp_path("rsmedia_delayed_filter.mp4");
+            remove_temp(&path);
+
+            // framerate 滤镜内部缓冲运动插值帧，输入 30 帧@30fps=1s，输出仍约 30 帧，
+            // 其中尾部的插值帧要等 flush(EOF) 才输出。若 flush 缓冲帧被丢弃会偏少。
+            let mut encoder = EncoderBuilder::new_video(width, height)
+                .with_fps(fps as f32)
+                .with_filters(vec![Filter::new(
+                    "framerate",
+                    MediaType::VIDEO,
+                    "framerate=fps=30".to_string(),
+                )])
+                .build_wrapped(path.as_path())?;
+            for i in 0..n_frames {
+                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                encoder.write_frame(frame)?;
+            }
+            encoder.finish()?;
+
+            let mut decoder =
+                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let mut decoded = 0usize;
+            while let Some(_frame) = decoder.decode_frame()? {
                 decoded += 1;
             }
             assert!(
-                decoded > 0,
-                "{name}: no audio frames decoded (possible EOF loss)"
+                decoded >= n_frames,
+                "delayed filter roundtrip lost frames: got {decoded}, expected >= {n_frames}"
             );
-            if duration_preserving {
-                assert!(
-                    total_samples >= input_samples,
-                    "{name}: lost samples, decoded {total_samples}, expected >= {input_samples}"
-                );
-            }
 
-            let _ = std::fs::remove_file(&path);
+            remove_temp(&path);
+            Ok(())
         }
-        Ok(())
-    }
 
-    /// 综合参数组合往返测试：编码→解码，覆盖 编解码器 / fps / 源尺寸 / resize /
-    /// 缩放算法 / 延迟滤镜 的交叉组合，验证：
-    ///   1) 解码器 resize 后输出尺寸正确；
-    ///   2) 解码帧数与编码一致（末帧不被丢弃）；
-    ///   3) 延迟滤镜（framerate）在 EOF 冲刷后不丢帧、不报 "cannot decode after flushed"。
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_param_combination_roundtrip() -> Result<()> {
-        use crate::filter::Filter;
-        use crate::{DecoderBuilder, MediaType, Resize, ScaleAlgorithm};
+        /// 验证 `write_frame` 自动维护的 pts 单调递增且与帧率一致（不含 B 帧时每帧
+        /// 时长为 1/fps，按编码器时间基换算）。
+        #[test]
+        fn test_write_frame_auto_pts() -> Result<()> {
+            use crate::{DecoderBuilder, MediaType};
 
-        let codecs: &[(&str, bool)] = &[
-            ("libx264", true), // 支持延迟滤镜插值
-            ("mpeg4", false),  // 简单编码器，检验无延迟路径
-        ];
-        let srces: &[(usize, usize)] = &[(64, 64), (96, 48)];
-        let resizes: &[Option<Resize>] = &[
-            None,                          // 不缩放，期望原尺寸
-            Some(Resize::Exact(32, 32)),   // 精确尺寸
-            Some(Resize::FitEven(16, 16)), // 保持宽高比、偶数尺寸
-        ];
-        let algos: &[ScaleAlgorithm] = &[
-            ScaleAlgorithm::Bicubic,
-            ScaleAlgorithm::Point,
-            ScaleAlgorithm::Lanczos,
-        ];
-        let fps_list: &[f32] = &[24.0, 30.0];
+            let width = 64usize;
+            let height = 64usize;
+            let n_frames = 8;
+            let fps: f64 = 30.0;
 
-        for &(codec, delayed) in codecs {
-            for &(w, h) in srces {
-                for &fps in fps_list {
-                    for &resize in resizes {
-                        // 期望尺寸：resize 实际输出的尺寸（按宽高比计算），None 则为原尺寸
-                        let (ew, eh) = match resize {
-                            Some(r) => {
-                                let (dw, dh) = r.compute_for((w as u32, h as u32)).unwrap();
-                                (dw as usize, dh as usize)
-                            }
-                            None => (w, h),
-                        };
-                        for &algo in algos {
-                            println!(
-                                "COMB codec={codec} src={w}x{h} fps={fps} resize={resize:?} algo={algo:?}"
-                            );
-                            let n_frames = 12usize;
-                            let path = std::env::temp_dir().join(format!(
-                                "rsmedia_param_{codec}_{w}x{h}_{fps}_{:?}_{:?}.mp4",
-                                resize.map(|r| format!("{r:?}")),
-                                algo
-                            ));
-                            let _ = std::fs::remove_file(&path);
+            let path = temp_path("rsmedia_auto_pts.mp4");
+            remove_temp(&path);
 
-                            // 编码
-                            let mut enc = EncoderBuilder::new_video(w, h)
-                                .with_codec_name(Some(codec.to_string()))
-                                .with_fps(fps)
-                                .with_filters(if delayed {
-                                    Some(vec![Filter::new(
-                                        "framerate",
-                                        MediaType::VIDEO,
-                                        "framerate=fps=30".to_string(),
-                                    )])
-                                } else {
-                                    None
-                                })
-                                .build_wrapped(path.as_path())?;
-                            for i in 0..n_frames {
-                                enc.write_frame(rainbow_frame(w, h, i as f32 / n_frames as f32))?;
-                            }
-                            enc.finish()?;
+            let mut encoder = EncoderBuilder::new_video(width, height)
+                .with_fps(fps as f32)
+                .build_wrapped(path.as_path())?;
 
-                            // 解码（可选 resize + 缩放算法）
-                            let mut dec_builder =
-                                DecoderBuilder::new(MediaType::VIDEO).with_scale_algorithm(algo);
-                            if let Some(r) = resize {
-                                dec_builder = dec_builder.with_resize(r);
-                            }
-                            let mut dec = dec_builder.build_wrapped(path.as_path())?;
-                            let mut decoded = 0usize;
-                            while let Some(frame) = dec.decode_frame()? {
-                                assert_eq!(
-                                    frame.width, ew,
-                                    "{codec} {w}x{h} fps={fps} resize={resize:?} {algo:?}: width got {} exp {ew}",
-                                    frame.width
+            // 帧时长 = 1/fps（秒）。解码输出的 pts 位于输出流 time_base（movenc
+            // 可能调整，如 MP4 用 1/15360），故在解码后按实际帧 time_base 计算期望增量。
+            for i in 0..n_frames {
+                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                encoder.write_frame(frame)?;
+            }
+            encoder.finish()?;
+
+            // 解码回，收集真实 pts，验证相邻帧 pts 差恒定
+            let mut decoder =
+                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let mut pts_list: Vec<i64> = Vec::new();
+            while let Some(frame) = decoder.decode_frame()? {
+                pts_list.push(frame.pts);
+            }
+            assert_eq!(pts_list.len(), n_frames);
+
+            // 解码 pts 位于输出流 time_base（movenc 可能调整，如 MP4 用 1/15360）
+            let tb = decoder.decoder_mut().time_base();
+            let expected_delta = (tb.den as f64 / tb.num as f64 / fps).round() as i64;
+
+            // 排除 B 帧重排的影响：仅断言存在一致的正增量（B 帧可能为 0/负，取出现最多的增量）
+            let mut counts: HashMap<i64, usize> = HashMap::new();
+            for d in pts_list.windows(2).map(|w| w[1] - w[0]) {
+                if d > 0 {
+                    *counts.entry(d).or_default() += 1;
+                }
+            }
+            let delta = counts
+                .into_iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(d, _)| d)
+                .unwrap_or(expected_delta);
+            assert_eq!(delta, expected_delta, "pts delta mismatch vs 1/fps");
+
+            remove_temp(&path);
+            Ok(())
+        }
+
+        /// 验证不同帧率下：编码器 time_base 恒为 `1/fps`，且编码→解码往返帧数一致。
+        ///
+        /// 这是对 fps → time_base 推导（`av_inv_q`）与末帧 duration 修复的回归测试。
+        #[test]
+        fn test_encode_video_multiple_fps() -> Result<()> {
+            use crate::{DecoderBuilder, MediaType};
+
+            for fps in [24.0f32, 25.0, 30.0, 60.0, 29.97] {
+                let path = temp_path(format!("rsmedia_fps_{fps}.mp4"));
+                remove_temp(&path);
+
+                let n_frames = 12;
+                let mut encoder = EncoderBuilder::new_video(64, 64)
+                    .with_fps(fps)
+                    .build_wrapped(path.as_path())?;
+
+                // 1) 编码器 time_base 必须等于 1/fps
+                let tb = encoder.time_base();
+                let expected_tb =
+                    avutil::av_inv_q(avutil::av_d2q(fps as f64, EncoderBuilder::FPS_MAX));
+                assert_eq!(
+                    (tb.num, tb.den),
+                    (expected_tb.num, expected_tb.den),
+                    "fps={fps}: time_base {}/{} != 1/fps",
+                    tb.num,
+                    tb.den
+                );
+
+                for i in 0..n_frames {
+                    let frame = rainbow_video_frame(64, 64, i as f32 / n_frames as f32);
+                    encoder.write_frame(frame)?;
+                }
+                encoder.finish()?;
+
+                // 2) 解码回，帧数必须与编码一致（验证末帧未被 muxer 丢弃）
+                let mut decoder =
+                    DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+                let mut decoded = 0usize;
+                while let Some(frame) = decoder.decode_frame()? {
+                    assert_eq!(frame.width, 64);
+                    assert_eq!(frame.height, 64);
+                    decoded += 1;
+                }
+                assert_eq!(
+                    decoded, n_frames,
+                    "fps={fps}: decoded {decoded} frames, expected {n_frames}"
+                );
+
+                remove_temp(&path);
+            }
+            Ok(())
+        }
+
+        /// 综合参数组合往返测试：编码→解码，覆盖 编解码器 / fps / 源尺寸 / resize /
+        /// 缩放算法 / 延迟滤镜 的交叉组合，验证：
+        ///   1) 解码器 resize 后输出尺寸正确；
+        ///   2) 解码帧数与编码一致（末帧不被丢弃）；
+        ///   3) 延迟滤镜（framerate）在 EOF 冲刷后不丢帧、不报 "cannot decode after flushed"。
+        #[test]
+        fn test_param_combination_roundtrip() -> Result<()> {
+            use crate::filter::Filter;
+            use crate::{DecoderBuilder, MediaType, Resize, ScaleAlgorithm};
+
+            let codecs: &[(&str, bool)] = &[
+                ("libx264", true), // 支持延迟滤镜插值
+                ("mpeg4", false),  // 简单编码器，检验无延迟路径
+            ];
+            let srces: &[(usize, usize)] = &[(64, 64), (96, 48)];
+            let resizes: &[Option<Resize>] = &[
+                None,                          // 不缩放，期望原尺寸
+                Some(Resize::Exact(32, 32)),   // 精确尺寸
+                Some(Resize::FitEven(16, 16)), // 保持宽高比、偶数尺寸
+            ];
+            let algos: &[ScaleAlgorithm] = &[
+                ScaleAlgorithm::Bicubic,
+                ScaleAlgorithm::Point,
+                ScaleAlgorithm::Lanczos,
+            ];
+            let fps_list: &[f32] = &[24.0, 30.0];
+
+            for &(codec, delayed) in codecs {
+                for &(w, h) in srces {
+                    for &fps in fps_list {
+                        for &resize in resizes {
+                            // 期望尺寸：resize 实际输出的尺寸（按宽高比计算），None 则为原尺寸
+                            let (ew, eh) = match resize {
+                                Some(r) => {
+                                    let (dw, dh) = r.compute_for((w as u32, h as u32)).unwrap();
+                                    (dw as usize, dh as usize)
+                                }
+                                None => (w, h),
+                            };
+                            for &algo in algos {
+                                println!(
+                                    "COMB codec={codec} src={w}x{h} fps={fps} resize={resize:?} algo={algo:?}"
                                 );
-                                assert_eq!(
-                                    frame.height, eh,
-                                    "{codec} {w}x{h} fps={fps} resize={resize:?} {algo:?}: height got {} exp {eh}",
-                                    frame.height
-                                );
-                                decoded += 1;
-                            }
-                            assert!(
-                                decoded >= n_frames,
-                                "{codec} {w}x{h} fps={fps} resize={resize:?} {algo:?}: decoded {decoded}, expected >= {n_frames}"
-                            );
+                                let n_frames = 12usize;
+                                let path = temp_path(format!(
+                                    "rsmedia_param_{codec}_{w}x{h}_{fps}_{:?}_{:?}.mp4",
+                                    resize.map(|r| format!("{r:?}")),
+                                    algo
+                                ));
+                                remove_temp(&path);
 
-                            let _ = std::fs::remove_file(&path);
+                                // 编码
+                                let mut enc = EncoderBuilder::new_video(w, h)
+                                    .with_codec_name(Some(codec.to_string()))
+                                    .with_fps(fps)
+                                    .with_filters(if delayed {
+                                        Some(vec![Filter::new(
+                                            "framerate",
+                                            MediaType::VIDEO,
+                                            "framerate=fps=30".to_string(),
+                                        )])
+                                    } else {
+                                        None
+                                    })
+                                    .build_wrapped(path.as_path())?;
+                                for i in 0..n_frames {
+                                    enc.write_frame(rainbow_video_frame(
+                                        w,
+                                        h,
+                                        i as f32 / n_frames as f32,
+                                    ))?;
+                                }
+                                enc.finish()?;
+
+                                // 解码（可选 resize + 缩放算法）
+                                let mut dec_builder = DecoderBuilder::new(MediaType::VIDEO)
+                                    .with_scale_algorithm(algo);
+                                if let Some(r) = resize {
+                                    dec_builder = dec_builder.with_resize(r);
+                                }
+                                let mut dec = dec_builder.build_wrapped(path.as_path())?;
+                                let mut decoded = 0usize;
+                                while let Some(frame) = dec.decode_frame()? {
+                                    assert_eq!(
+                                        frame.width, ew,
+                                        "{codec} {w}x{h} fps={fps} resize={resize:?} {algo:?}: width got {} exp {ew}",
+                                        frame.width
+                                    );
+                                    assert_eq!(
+                                        frame.height, eh,
+                                        "{codec} {w}x{h} fps={fps} resize={resize:?} {algo:?}: height got {} exp {eh}",
+                                        frame.height
+                                    );
+                                    decoded += 1;
+                                }
+                                assert!(
+                                    decoded >= n_frames,
+                                    "{codec} {w}x{h} fps={fps} resize={resize:?} {algo:?}: decoded {decoded}, expected >= {n_frames}"
+                                );
+
+                                remove_temp(&path);
+                            }
                         }
                     }
                 }
             }
+            Ok(())
         }
-        Ok(())
-    }
 
-    /// 视频滤镜全量往返测试：编码时对每个滤镜逐一应用，再解码验证。
-    ///
-    /// 覆盖所有不依赖外部文件/设备的视频滤镜（`subtitles`/`zoompan`/`drawtext` 等
-    /// 需要外部资源或帧率语义特殊，已排除）。验证：
-    ///   1) 滤镜在编码管线中可正常初始化、不报错；
-    ///   2) EOF / flush 阶段不丢帧、不报 "cannot decode after flushed"；
-    ///   3) 尺寸保持类滤镜输出尺寸不变，尺寸改变类（scale/crop/pad/rotate/transpose）
-    ///      输出尺寸符合预期。
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_video_filters_roundtrip() -> Result<()> {
-        use crate::filter::video;
-        use crate::{DecoderBuilder, MediaType};
+        /// 视频滤镜全量往返测试：编码时对每个滤镜逐一应用，再解码验证。
+        ///
+        /// 覆盖所有不依赖外部文件/设备的视频滤镜（`subtitles`/`zoompan`/`drawtext` 等
+        /// 需要外部资源或帧率语义特殊，已排除）。验证：
+        ///   1) 滤镜在编码管线中可正常初始化、不报错；
+        ///   2) EOF / flush 阶段不丢帧、不报 "cannot decode after flushed"；
+        ///   3) 尺寸保持类滤镜输出尺寸不变，尺寸改变类（scale/crop/pad/rotate/transpose）
+        ///      输出尺寸符合预期。
+        #[test]
+        fn test_video_filters_roundtrip() -> Result<()> {
+            use crate::filter::video;
+            use crate::{DecoderBuilder, MediaType};
 
-        let width = 64usize;
-        let height = 64usize;
-        let n_frames = 12;
-        let fps = 24.0;
+            let width = 64usize;
+            let height = 64usize;
+            let n_frames = 12;
+            let fps = 25.0;
 
-        // (名称, Filter, 期望最小解码帧数, 期望尺寸(Some 则精确断言，None 则不断言))
-        // 注：尺寸改变类滤镜（`scale`/`crop`/`pad`/`rotate`/`transpose`）在编码管线中
-        // 存在已知崩溃（SIGSEGV），与滤镜本身无关，属编码-滤镜尺寸同步缺陷，已隔离到
-        // 专项调查，暂不纳入本列表阻塞其它滤镜测试。此处仅覆盖尺寸保持类滤镜。
-        type FilterCase = (
-            &'static str,
-            crate::filter::Filter,
-            usize,
-            Option<(usize, usize)>,
-        );
-        let cases: Vec<FilterCase> = vec![
-            // 尺寸保持类
-            ("hflip", video::hflip(), n_frames, Some((width, height))),
-            ("vflip", video::vflip(), n_frames, Some((width, height))),
-            ("negate", video::negate(), n_frames, Some((width, height))),
-            ("hue", video::hue(30), n_frames, Some((width, height))),
-            ("gamma", video::gamma(1.2), n_frames, Some((width, height))),
-            ("noise", video::noise(10), n_frames, Some((width, height))),
-            (
-                "saturation",
-                video::saturation(1.5),
-                n_frames,
-                Some((width, height)),
-            ),
-            (
-                "vibrance",
-                video::vibrance(0.4),
-                n_frames,
-                Some((width, height)),
-            ),
-            ("deblock", video::deblock(), n_frames, Some((width, height))),
-            ("unsharp", video::unsharp(), n_frames, Some((width, height))),
-            ("blur", video::blur(2.0), n_frames, Some((width, height))),
-            ("eq", video::eq(0.2, 1.5), n_frames, Some((width, height))),
-            (
-                "hqdn3d",
-                video::hqdn3d(2.0, 2.0),
-                n_frames,
-                Some((width, height)),
-            ),
-            (
-                "nlmeans",
-                video::nlmeans(1.0),
-                n_frames,
-                Some((width, height)),
-            ),
-            (
-                "setdar",
-                video::setdar(16, 9),
-                n_frames,
-                Some((width, height)),
-            ),
-            (
-                "setsar",
-                video::setsar(1, 1),
-                n_frames,
-                Some((width, height)),
-            ),
-            (
-                "drawbox",
-                video::drawbox(0, 0, 32, 32, "red", 2),
-                n_frames,
-                Some((width, height)),
-            ),
-            (
-                "delogo",
-                video::delogo(1, 1, 30, 30),
-                n_frames,
-                Some((width, height)),
-            ),
-            (
-                "fade_in",
-                video::fade_in(6),
-                n_frames,
-                Some((width, height)),
-            ),
-            (
-                "fade_out",
-                video::fade_out(n_frames as u32, 6),
-                n_frames,
-                Some((width, height)),
-            ),
-            // 帧率保持类（`fps` 按时间戳取整，末帧可能被舍去，故最小帧数放宽一帧）
-            ("fps", video::fps(24.0), n_frames - 1, Some((width, height))),
-            // drawtext 依赖 FFmpeg 以 libfreetype 编译
-            (
-                "drawtext",
-                video::DrawText::new("Hello", 5, 5, 16, "white").build(),
-                n_frames,
-                Some((width, height)),
-            ),
-        ];
+            // (名称, Filter, 期望最小解码帧数, 期望尺寸(Some 则精确断言，None 则不断言))
+            // 注：尺寸改变类滤镜（`scale`/`crop`/`pad`/`rotate`/`transpose`）在编码管线中
+            // 存在已知崩溃（SIGSEGV），与滤镜本身无关，属编码-滤镜尺寸同步缺陷，已隔离到
+            // 专项调查，暂不纳入本列表阻塞其它滤镜测试。此处仅覆盖尺寸保持类滤镜。
+            type FilterCase = (
+                &'static str,
+                crate::filter::Filter,
+                usize,
+                Option<(usize, usize)>,
+            );
+            let cases: Vec<FilterCase> = vec![
+                // 尺寸保持类
+                ("hflip", video::hflip(), n_frames, Some((width, height))),
+                ("vflip", video::vflip(), n_frames, Some((width, height))),
+                ("negate", video::negate(), n_frames, Some((width, height))),
+                ("hue", video::hue(30), n_frames, Some((width, height))),
+                ("gamma", video::gamma(1.2), n_frames, Some((width, height))),
+                ("noise", video::noise(10), n_frames, Some((width, height))),
+                (
+                    "saturation",
+                    video::saturation(1.5),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                (
+                    "vibrance",
+                    video::vibrance(0.4),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                ("deblock", video::deblock(), n_frames, Some((width, height))),
+                ("unsharp", video::unsharp(), n_frames, Some((width, height))),
+                ("blur", video::blur(2.0), n_frames, Some((width, height))),
+                ("eq", video::eq(0.2, 1.5), n_frames, Some((width, height))),
+                (
+                    "hqdn3d",
+                    video::hqdn3d(2.0, 2.0),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                (
+                    "nlmeans",
+                    video::nlmeans(1.0),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                (
+                    "setdar",
+                    video::setdar(16, 9),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                (
+                    "setsar",
+                    video::setsar(1, 1),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                (
+                    "drawbox",
+                    video::drawbox(0, 0, 32, 32, "red", 2),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                (
+                    "delogo",
+                    video::delogo(1, 1, 30, 30),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                (
+                    "fade_in",
+                    video::fade_in(6),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                (
+                    "fade_out",
+                    video::fade_out(n_frames as u32, 6),
+                    n_frames,
+                    Some((width, height)),
+                ),
+                // 帧率保持类（`fps` 按时间戳取整，末帧可能被舍去，故最小帧数放宽一帧）
+                ("fps", video::fps(24.0), n_frames - 1, Some((width, height))),
+                // drawtext 依赖 FFmpeg 以 libfreetype 编译
+                (
+                    "drawtext",
+                    video::DrawText::new("Hello", 5, 5, 16, "white").build(),
+                    n_frames,
+                    Some((width, height)),
+                ),
+            ];
 
-        for (name, filter, min_frames, dims) in cases {
-            println!("VIDFILT {name}");
-            let path = std::env::temp_dir().join(format!("rsmedia_vfilt_{name}.mp4"));
-            let _ = std::fs::remove_file(&path);
+            for (name, filter, min_frames, dims) in cases {
+                println!("VIDFILT {name}");
+                let path = temp_path(format!("rsmedia_vfilt_{name}.mp4"));
+                remove_temp(&path);
 
-            // 编码（应用该滤镜）
-            let mut enc = match EncoderBuilder::new_video(width, height)
-                .with_fps(fps)
-                .with_filters(vec![filter])
-                .build_wrapped(path.as_path())
-            {
-                Ok(enc) => enc,
-                Err(e) => {
-                    // 部分滤镜（如 `gamma`）依赖特定 FFmpeg 编译配置，未编译时初始化会失败，
-                    // 这里优雅跳过，避免环境差异导致测试失败。
-                    let low = format!("{e:#}").to_lowercase();
-                    if low.contains("no such filter")
-                        || low.contains("filter not found")
-                        || low.contains("drawtext")
-                        || low.contains("freetype")
-                    {
+                // 编码（应用该滤镜）；滤镜缺失时优雅跳过
+                let mut enc = match EncoderBuilder::new_video(width, height)
+                    .with_fps(fps)
+                    .with_filters(vec![filter])
+                    .build_wrapped(path.as_path())
+                {
+                    Ok(enc) => enc,
+                    Err(e) if is_filter_unavailable(&e) => {
                         println!("SKIP {name}: not available ({e:#})");
-                        let _ = std::fs::remove_file(&path);
+                        remove_temp(&path);
                         continue;
                     }
-                    return Err(e);
+                    Err(e) => return Err(e),
+                };
+                for i in 0..n_frames {
+                    enc.write_frame(rainbow_video_frame(
+                        width,
+                        height,
+                        i as f32 / n_frames as f32,
+                    ))?;
                 }
-            };
-            for i in 0..n_frames {
-                enc.write_frame(rainbow_frame(width, height, i as f32 / n_frames as f32))?;
-            }
-            enc.finish()?;
+                enc.finish()?;
 
-            // 解码验证
-            let mut dec = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
-            let mut decoded = 0usize;
-            while let Some(frame) = dec.decode_frame()? {
-                if let Some((ew, eh)) = dims {
-                    assert_eq!(
-                        frame.width, ew,
-                        "{name}: width got {} exp {ew}",
-                        frame.width
-                    );
-                    assert_eq!(
-                        frame.height, eh,
-                        "{name}: height got {} exp {eh}",
-                        frame.height
-                    );
+                // 解码验证
+                let mut dec =
+                    DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+                let mut decoded = 0usize;
+                while let Some(frame) = dec.decode_frame()? {
+                    if let Some((ew, eh)) = dims {
+                        assert_eq!(
+                            frame.width, ew,
+                            "{name}: width got {} exp {ew}",
+                            frame.width
+                        );
+                        assert_eq!(
+                            frame.height, eh,
+                            "{name}: height got {} exp {eh}",
+                            frame.height
+                        );
+                    }
+                    decoded += 1;
                 }
-                decoded += 1;
+                assert!(
+                    decoded >= min_frames,
+                    "{name}: decoded {decoded}, expected >= {min_frames}"
+                );
+
+                remove_temp(&path);
             }
-            assert!(
-                decoded >= min_frames,
-                "{name}: decoded {decoded}, expected >= {min_frames}"
+            Ok(())
+        }
+    }
+
+    // ====================================================================
+    // 音频编码测试
+    // ====================================================================
+    #[cfg(feature = "ndarray")]
+    mod audio_tests {
+        use super::*;
+        use rsmpeg::avcodec::AVCodec;
+
+        /// 音频容器规格：一个容器对应一条完整的编码配置。
+        ///
+        /// 注意：采样格式属于**编码器能力**而非容器属性（如 libopus 原生 s16/flt、
+        /// mp2 原生 s32p、aac 原生 fltp），由 `CodecConfig` 在运行时协商，
+        /// 测试帧的数据类型随之匹配（FLTP→f32 / S16→i16 / S32P→i32）。
+        struct AudioContainerSpec {
+            /// 容器扩展名（同时决定输出 muxer）
+            container: &'static str,
+            /// 编码器名，`None` = 默认 `aac`
+            codec: Option<&'static str>,
+            /// 目标码率，`0` = 无损/未压缩（编码器自动决定）
+            bit_rate: u64,
+            /// 期望采样率（编码器不支持时回退其支持列表首项，如 Opus 固定 48kHz 族）
+            sample_rate: u32,
+            /// 声道数
+            channels: u32,
+        }
+
+        const fn ac(
+            container: &'static str,
+            codec: Option<&'static str>,
+            bit_rate: u64,
+            sample_rate: u32,
+            channels: u32,
+        ) -> AudioContainerSpec {
+            AudioContainerSpec {
+                container,
+                codec,
+                bit_rate,
+                sample_rate,
+                channels,
+            }
+        }
+
+        /// 市场常见音频容器 → 编码器/码率/采样率 映射表。
+        /// 分三档：有损压缩 / 无损压缩 / 未压缩 PCM。
+        const AUDIO_CONTAINERS: &[AudioContainerSpec] = &[
+            // ---- 容器,   编码器(None=aac),          码率,      采样率,  声道 ----
+            // 有损压缩
+            ac("m4a", None, 128_000, 44_100, 2),  // AAC，通用默认
+            ac("aac", None, 128_000, 44_100, 2),  // AAC 裸流
+            ac("adts", None, 128_000, 44_100, 2), // AAC + ADTS 头
+            ac("mp3", Some("libmp3lame"), 192_000, 44_100, 2), // 最通用
+            ac("opus", Some("libopus"), 96_000, 48_000, 2), // 流媒体/低延迟
+            ac("ogg", Some("libopus"), 96_000, 48_000, 2), // Ogg 封装 Opus
+            ac("webm", Some("libopus"), 96_000, 48_000, 2), // WebM 纯音频
+            ac("ac3", Some("ac3"), 192_000, 48_000, 2), // 影院/电视
+            ac("mp2", Some("mp2"), 256_000, 44_100, 2), // 广播
+            ac("wma", Some("wmav2"), 128_000, 44_100, 2), // Windows Media
+            // 无损压缩
+            ac("flac", Some("flac"), 0, 44_100, 2),
+            // 未压缩 PCM
+            ac("wav", Some("pcm_s16le"), 0, 44_100, 2),
+            ac("aiff", Some("pcm_s16be"), 0, 44_100, 2),
+            ac("au", Some("pcm_s16be"), 0, 44_100, 2),
+            ac("caf", Some("pcm_s16le"), 0, 44_100, 2),
+        ];
+
+        /// 对指定音频容器执行「编码 5 秒正弦波 → 解码校验」完整流程：
+        /// 验证音频 time_base = 1/sample_rate、解码采样率/声道数不变、采样量不丢失。
+        fn encode_audio_for_container(spec: &AudioContainerSpec) -> Result<()> {
+            use crate::{DecoderBuilder, MediaType};
+
+            let codec_name = spec.codec.unwrap_or("aac");
+            // 编码器存在性取决于 FFmpeg 构建配置（如 libmp3lame/libopus），缺失时跳过
+            let Some(codec) = AVCodec::find_encoder_by_name(&utils::from_str(codec_name)) else {
+                anyhow::bail!("encoder {codec_name} not available in this FFmpeg build");
+            };
+            let config = CodecConfig::from_codec(codec);
+
+            // 采样格式：取编码器支持列表首项（帧数据类型随之匹配）
+            let sample_format = SampleFormat::from(
+                config
+                    .supported_sample_formats()
+                    .ok()
+                    .flatten()
+                    .and_then(|fmts| fmts.first().copied())
+                    .with_context(|| {
+                        format!("encoder {codec_name} has no supported sample formats")
+                    })?,
+            );
+            // 采样率：优先使用表值；编码器不支持时回退其支持列表首项
+            let rates = config.supported_sample_rates().ok().flatten();
+            let sample_rate = match rates {
+                Some(rates) if !rates.is_empty() => {
+                    if rates.contains(&(spec.sample_rate as i32)) {
+                        spec.sample_rate
+                    } else {
+                        rates[0] as u32
+                    }
+                }
+                _ => spec.sample_rate, // 固定速率编码器（PCM 等）无列表，直接用表值
+            };
+
+            let path = temp_path(format!("rsmedia_audio_container.{}", spec.container));
+            remove_temp(&path);
+
+            // 按容器规格创建编码器
+            let mut encoder = EncoderBuilder::new_audio(
+                spec.bit_rate as i64,
+                spec.channels as i32,
+                sample_rate as i32,
+                sample_format,
+            )
+            .with_codec_name(codec_name.to_string())
+            .build_wrapped(path.as_path())?;
+
+            // 1) 音频 time_base 应为 1/sample_rate
+            let tb = encoder.time_base();
+            let expected_tb = time::new_rational(1, sample_rate as i32);
+            assert_eq!(
+                (tb.num, tb.den),
+                (expected_tb.num, expected_tb.den),
+                "{}: audio time_base {}/{} != 1/sample_rate",
+                spec.container,
+                tb.num,
+                tb.den
             );
 
-            let _ = std::fs::remove_file(&path);
+            // 2) 编码 5 秒正弦波（1024 采样/帧，末尾不足一帧的余数忽略）；
+            //    帧数据类型按协商出的采样格式自动匹配（FLTP/FLT→f32 / S16→i16 / S32P→i32）
+            const AUDIO_DURATION_SECS: u32 = 5;
+            let samples_per_frame = 1024u32;
+            let frames_to_write = AUDIO_DURATION_SECS * sample_rate / samples_per_frame;
+            let input_samples = frames_to_write as u64 * samples_per_frame as u64;
+            match sample_format {
+                SampleFormat::FLTP | SampleFormat::FLT => {
+                    for _ in 0..frames_to_write {
+                        encoder.write_frame(sine_audio_frame::<f32>(
+                            440.0,
+                            spec.channels,
+                            samples_per_frame,
+                            sample_rate,
+                        ))?;
+                    }
+                }
+                SampleFormat::S16 | SampleFormat::S16P => {
+                    for _ in 0..frames_to_write {
+                        encoder.write_frame(sine_audio_frame::<i16>(
+                            440.0,
+                            spec.channels,
+                            samples_per_frame,
+                            sample_rate,
+                        ))?;
+                    }
+                }
+                SampleFormat::S32P => {
+                    for _ in 0..frames_to_write {
+                        encoder.write_frame(sine_audio_frame::<i32>(
+                            440.0,
+                            spec.channels,
+                            samples_per_frame,
+                            sample_rate,
+                        ))?;
+                    }
+                }
+                other => anyhow::bail!("unsupported test sample format: {other:?}"),
+            }
+            encoder.finish()?;
+            println!(
+                "  {} encoded: codec={codec_name}, fmt={sample_format:?}, rate={sample_rate}, ch={}",
+                spec.container, spec.channels
+            );
+
+            // 3) 解码验证：采样率/声道数不变，采样量不丢失。
+            //    解码数据类型必须与解码器输出格式匹配（rsmedia 解码不做格式转换；
+            //    部分编码器的解码器输出格式与编码格式不同，如 libopus 编码 s16、解码 fltp）。
+            let mut decoder =
+                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+            let out_format = decoder.decoder_mut().sample_fmt();
+            let mut total_samples = 0u64;
+            let mut decoded_frames = 0usize;
+            macro_rules! decode_check {
+                ($t:ty) => {
+                    while let Some(frame) = decoder.decode::<$t>()? {
+                        assert_eq!(
+                            frame.sample_rate, sample_rate,
+                            "{}: sample rate mismatch",
+                            spec.container
+                        );
+                        assert_eq!(
+                            frame.nb_channels, spec.channels,
+                            "{}: channel count mismatch",
+                            spec.container
+                        );
+                        total_samples += frame.nb_samples as u64;
+                        decoded_frames += 1;
+                    }
+                };
+            }
+            match out_format {
+                SampleFormat::FLTP | SampleFormat::FLT => decode_check!(f32),
+                SampleFormat::S16 | SampleFormat::S16P => decode_check!(i16),
+                SampleFormat::S32P => decode_check!(i32),
+                other => anyhow::bail!("unsupported decoded sample format: {other:?}"),
+            }
+            assert!(
+                decoded_frames > 0,
+                "{}: no audio frames decoded",
+                spec.container
+            );
+            // 有损编码器存在固有的初始编码延迟（ac3 ~1 帧、wmav2 ~1 超帧，且无
+            // priming/skip 元数据补偿），解码采样量容忍最多 8192 采样（≈0.19s）缺失，
+            // 主要验证不丢大块数据
+            const MAX_ENCODER_DELAY: u64 = 8192;
+            assert!(
+                total_samples + MAX_ENCODER_DELAY >= input_samples,
+                "{}: decoded {total_samples} samples, expected >= {}",
+                spec.container,
+                input_samples.saturating_sub(MAX_ENCODER_DELAY)
+            );
+
+            remove_temp(&path);
+            Ok(())
         }
-        Ok(())
+
+        /// 遍历音频容器映射表逐一编码。
+        /// 编码器缺失的容器跳过并报告；其余失败视为测试失败（严格模式），
+        /// 但要求至少一个容器成功，防止环境异常时测试空壳通过。
+        #[test]
+        fn test_encode_audio_containers() {
+            let mut passed = Vec::new();
+            let mut skipped = Vec::new();
+            let mut failed = Vec::new();
+
+            for spec in AUDIO_CONTAINERS {
+                println!(
+                    "Testing audio container: {} (codec: {}, bitrate: {}, rate: {}, ch: {})...",
+                    spec.container,
+                    spec.codec.unwrap_or("aac"),
+                    spec.bit_rate,
+                    spec.sample_rate,
+                    spec.channels
+                );
+                match encode_audio_for_container(spec) {
+                    Ok(()) => {
+                        println!("Testing audio container: {} passed.", spec.container);
+                        passed.push(spec.container);
+                    }
+                    Err(e) if is_encoder_unavailable(&e) => {
+                        println!("SKIP {}: {e:#}", spec.container);
+                        skipped.push(spec.container);
+                    }
+                    Err(e) => failed.push((spec.container, format!("{e:#}"))),
+                }
+            }
+
+            assert_container_results("audio containers", passed, skipped, failed);
+        }
+
+        /// 音频编解码往返测试：编码若干 AAC 音频帧，解码回验证采样率/通道数/总采样数。
+        #[test]
+        fn test_encode_decode_audio_roundtrip() -> Result<()> {
+            use crate::frame::MediaFrame;
+            use crate::{DecoderBuilder, MediaType};
+
+            let sample_rate = 44_100u32;
+            let channels = 2u32;
+            let format = SampleFormat::FLTP;
+            // AAC 默认 frame_size = 1024 采样/帧
+            let samples_per_frame = 1024u32;
+            let frames_to_write = 10u32;
+
+            let path = temp_path("rsmedia_audio_roundtrip.m4a");
+            remove_temp(&path);
+
+            let mut encoder =
+                EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
+                    .build_wrapped(path.as_path())?;
+
+            // 1) 音频 time_base 应为 1/sample_rate
+            let tb = encoder.time_base();
+            let expected_tb = time::new_rational(1, sample_rate as i32);
+            assert_eq!(
+                (tb.num, tb.den),
+                (expected_tb.num, expected_tb.den),
+                "audio time_base {}/{} != 1/sample_rate",
+                tb.num,
+                tb.den
+            );
+
+            for _ in 0..frames_to_write {
+                let frame = MediaFrame::<f32>::new_audio_frame(
+                    format,
+                    channels,
+                    samples_per_frame,
+                    sample_rate,
+                    time::new_rational(1, sample_rate as i32),
+                )?;
+                encoder.write_frame(frame)?;
+            }
+            encoder.finish()?;
+
+            // 2) 解码验证：采样率、通道数、采样量（AAC 有编码延迟/padding，总采样数应覆盖输入）
+            // 音频 FLTP 用 f32 解码（decode_frame 固定返回 u8，仅适用于视频）。
+            let mut decoder =
+                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+            let mut total_samples = 0u64;
+            let mut decoded_frames = 0usize;
+            while let Some(frame) = decoder.decode::<f32>()? {
+                assert_eq!(frame.audio_format(), Some(format), "sample format mismatch");
+                assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
+                assert_eq!(frame.nb_channels, channels, "channel count mismatch");
+                total_samples += frame.nb_samples as u64;
+                decoded_frames += 1;
+            }
+            let expected = frames_to_write as u64 * samples_per_frame as u64;
+            assert!(
+                total_samples >= expected,
+                "decoded {total_samples} samples, expected >= {expected}"
+            );
+            assert!(decoded_frames > 0, "no audio frames decoded");
+
+            remove_temp(&path);
+            Ok(())
+        }
+
+        /// 末帧不足一帧（非 frame_size 整倍数）时，应作为合法末帧编码，而非被 `check_frame`
+        /// 的帧长校验拒绝。回归测试：无滤镜向 aac 发非整倍数样本总数。
+        #[test]
+        fn test_encode_audio_partial_last_frame() -> Result<()> {
+            use crate::frame::MediaFrame;
+            use crate::{DecoderBuilder, MediaType};
+
+            let sample_rate = 44_100u32;
+            let channels = 2u32;
+            let format = SampleFormat::FLTP;
+            // AAC frame_size = 1024；故意发非整倍数：3×1000 = 3000 样本
+            let samples_per_frame = 1000u32;
+            let frames_to_write = 3u32;
+
+            let path = temp_path("rsmedia_audio_partial.m4a");
+            remove_temp(&path);
+
+            let mut encoder =
+                EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
+                    .build_wrapped(path.as_path())?;
+            for _ in 0..frames_to_write {
+                encoder.write_frame(MediaFrame::<f32>::new_audio_frame(
+                    format,
+                    channels,
+                    samples_per_frame,
+                    sample_rate,
+                    time::new_rational(1, sample_rate as i32),
+                )?)?;
+            }
+            encoder.finish()?;
+
+            let mut decoder =
+                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+            let mut total_samples = 0u64;
+            while let Some(frame) = decoder.decode::<f32>()? {
+                assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
+                assert_eq!(frame.nb_channels, channels, "channel count mismatch");
+                total_samples += frame.nb_samples as u64;
+            }
+            let expected = frames_to_write as u64 * samples_per_frame as u64;
+            assert!(
+                total_samples >= expected,
+                "decoded {total_samples} samples, expected >= {expected}"
+            );
+
+            remove_temp(&path);
+            Ok(())
+        }
+
+        /// 音频转码（重编码）往返测试：编码源文件 → 解码读出 → 重编码到新文件 → 解码校验。
+        ///
+        /// 覆盖音频「解码→编码」完整链路，验证重编码结果采样率/声道数/采样格式与样本量不丢失。
+        #[test]
+        fn test_audio_transcode_roundtrip() -> Result<()> {
+            use crate::frame::MediaFrame;
+            use crate::{DecoderBuilder, EncoderBuilder, MediaType, SampleFormat};
+
+            let sample_rate = 44_100u32;
+            let channels = 2u32;
+            let format = SampleFormat::FLTP;
+            let samples_per_frame = 1024u32;
+            let frames_to_write = 10u32;
+
+            let src = temp_path("rsmedia_audio_transcode_src.m4a");
+            let dst = temp_path("rsmedia_audio_transcode_dst.m4a");
+            remove_temp(&src);
+            remove_temp(&dst);
+
+            // 1) 生成源音频文件
+            let mut enc =
+                EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
+                    .build_wrapped(src.as_path())?;
+            for _ in 0..frames_to_write {
+                enc.write_frame(MediaFrame::<f32>::new_audio_frame(
+                    format,
+                    channels,
+                    samples_per_frame,
+                    sample_rate,
+                    time::new_rational(1, sample_rate as i32),
+                )?)?;
+            }
+            enc.finish()?;
+            let src_samples = frames_to_write as u64 * samples_per_frame as u64;
+
+            // 2) 转码：解码源 → 重编码到新文件
+            let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(src.as_path())?;
+            let mut enc2 =
+                EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
+                    .build_wrapped(dst.as_path())?;
+            let mut transcoded_samples = 0u64;
+            while let Some(frame) = dec.decode::<f32>()? {
+                transcoded_samples += frame.nb_samples as u64;
+                enc2.write_frame(frame)?;
+            }
+            enc2.finish()?;
+            assert!(
+                transcoded_samples >= src_samples,
+                "decoded {transcoded_samples} source samples, expected >= {src_samples}"
+            );
+
+            // 3) 解码转码结果并校验
+            let mut out = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(dst.as_path())?;
+            let mut total = 0u64;
+            while let Some(frame) = out.decode::<f32>()? {
+                assert_eq!(frame.audio_format(), Some(format), "sample format mismatch");
+                assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
+                assert_eq!(frame.nb_channels, channels, "channel count mismatch");
+                total += frame.nb_samples as u64;
+            }
+            assert!(
+                total >= src_samples,
+                "transcoded decoded {total} samples, expected >= {src_samples}"
+            );
+
+            remove_temp(&src);
+            remove_temp(&dst);
+            Ok(())
+        }
+
+        /// 音频滤镜全量往返测试：编码时对每个滤镜逐一应用，再解码验证。
+        ///
+        /// 覆盖所有不依赖外部资源/设备的音频滤镜（与视频滤镜对称，验证编码管线中的
+        /// 滤镜初始化、EOF/flush 冲刷不丢帧、不报错）。验证：
+        ///   1) 滤镜在音频编码管线中可正常初始化、不报错；
+        ///   2) EOF / flush 阶段不丢帧、不报 "cannot decode after flushed"；
+        ///   3) 时长保持类滤镜输出采样数不丢失（>= 输入采样数）。
+        #[test]
+        fn test_audio_filters_roundtrip() -> Result<()> {
+            use crate::filter::{self, audio};
+            use crate::{DecoderBuilder, MediaType};
+
+            let sample_rate = 44_100u32;
+            let channels = 2u32;
+            let format = SampleFormat::FLTP;
+            let samples_per_frame = 1024u32;
+            let frames_to_write = 12u32;
+            let input_samples = frames_to_write as u64 * samples_per_frame as u64;
+
+            // (名称, Filter, 时长保持 ?)。时长保持类滤镜不解散采样量，可断言 `>= 输入采样数`；
+            // 时长变化类（延时/变速/裁剪/时间戳重排/响度测量）只断言能正常解码出帧。
+            type FilterCase = (&'static str, Filter, bool);
+            let cases: Vec<FilterCase> = vec![
+                // 时长保持类
+                ("volume", audio::volume(0.8), true),
+                ("equalizer", audio::equalizer(1000, 3.0, 200), true),
+                (
+                    "compressor",
+                    audio::compressor(4.0, None, None).unwrap(),
+                    true,
+                ),
+                ("highpass", audio::highpass(100), true),
+                ("lowpass", audio::lowpass(4000), true),
+                ("atempo", audio::atempo(1.0), true),
+                ("fft_denoise", audio::fft_denoise(12, -50), true),
+                ("denoise", audio::denoise(12.0), true),
+                // FIXME:
+                // ("anlm_denoise", audio::anlm_denoise(None, None, None), true),
+                // anlm_denoise 暂不纳入测试：FFmpeg 9.0 的 anlmdn 滤镜存在堆越界写 bug ——
+                // EOF 冲刷不满一窗的尾巴帧时（libavfilter/avfilter.c 在 status_in 时将 min
+                // 降为队列剩余样本数），filter_channel 仍向按尾巴尺寸分配的输出缓冲写满
+                // H 个样本（默认 44.1kHz 下 H=177），越界 408 字节/声道。堆被污染后会使
+                // 其它测试随机 SIGSEGV/malloc abort（即本测试套件曾经的偶发失败根因）。
+                // 上游 master 尚未修复；等修复发布后再恢复此用例。
+                (
+                    "three_band_equalizer",
+                    audio::three_band_equalizer(2.0, 0.0, 2.0),
+                    true,
+                ),
+                ("format", audio::format(channels, sample_rate, format), true),
+                (
+                    "resample",
+                    audio::resample(channels, sample_rate, format),
+                    true,
+                ),
+                // 时长变化类
+                ("adelay", audio::adelay(100), false),
+                ("loudnorm", audio::loudnorm(-16.0), false),
+                (
+                    "asetpts",
+                    filter::setpts(MediaType::AUDIO, "PTS-STARTPTS"),
+                    false,
+                ),
+                ("atrim", filter::trim(MediaType::AUDIO, 0.0, 0.2), false),
+            ];
+
+            for (name, audio_filter, duration_preserving) in cases {
+                println!("AUDFILT {name}");
+                let path = temp_path(format!("rsmedia_afilt_{name}.m4a"));
+                remove_temp(&path);
+
+                let mut enc = match EncoderBuilder::new_audio(
+                    128_000,
+                    channels as i32,
+                    sample_rate as i32,
+                    format,
+                )
+                .with_filters(vec![audio_filter])
+                .build_wrapped(path.as_path())
+                {
+                    Ok(enc) => enc,
+                    // 部分滤镜（如 `fft_denoise`/`loudnorm`）依赖特定 FFmpeg 编译配置，
+                    // 未编译时初始化失败，这里优雅跳过，避免环境差异导致测试失败。
+                    Err(e) if is_filter_unavailable(&e) => {
+                        println!("SKIP {name}: not available ({e:#})");
+                        remove_temp(&path);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                for _ in 0..frames_to_write {
+                    enc.write_frame(sine_audio_frame::<f32>(
+                        440.0,
+                        channels,
+                        samples_per_frame,
+                        sample_rate,
+                    ))?;
+                }
+                enc.finish()?;
+
+                // 解码验证：不报错、能解出帧；时长保持类滤镜采样量不丢失。
+                let mut dec =
+                    DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+                let mut total_samples = 0u64;
+                let mut decoded = 0usize;
+                while let Some(frame) = dec.decode::<f32>()? {
+                    assert_eq!(
+                        frame.sample_rate, sample_rate,
+                        "{name}: sample rate mismatch"
+                    );
+                    assert_eq!(
+                        frame.audio_format(),
+                        Some(format),
+                        "{name}: sample format mismatch"
+                    );
+                    assert_eq!(
+                        frame.nb_channels, channels,
+                        "{name}: channel count mismatch"
+                    );
+                    total_samples += frame.nb_samples as u64;
+                    decoded += 1;
+                }
+                assert!(
+                    decoded > 0,
+                    "{name}: no audio frames decoded (possible EOF loss)"
+                );
+                if duration_preserving {
+                    assert!(
+                        total_samples >= input_samples,
+                        "{name}: lost samples, decoded {total_samples}, expected >= {input_samples}"
+                    );
+                }
+
+                remove_temp(&path);
+            }
+            Ok(())
+        }
     }
 }

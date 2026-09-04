@@ -97,38 +97,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "tutorial01_test0 测试运行依赖测试文件，暂时忽略"]
-    fn tutorial01_test0() {
-        dump_frame(
-            c"tests/assets/vids/centaur.mpg",
-            "tests/output/tutorial01/centaur",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "tutorial01_test1 测试运行依赖测试文件，暂时忽略"]
-    fn tutorial01_test1() {
-        dump_frame(
-            c"tests/assets/vids/bear.mp4",
-            "tests/output/tutorial01/bear",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "tutorial01_test2 测试运行依赖测试文件，暂时忽略"]
-    fn tutorial01_test2() {
-        dump_frame(
-            c"tests/assets/vids/mov_sample.mov",
-            "tests/output/tutorial01/mov_sample",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "tutorial01_test3 测试运行依赖测试文件，暂时忽略"]
-    fn tutorial01_test3() {
-        dump_frame(c"tests/assets/vids/vp8.mp4", "tests/output/tutorial01/vp8").unwrap();
+    fn tutorial01_test() {
+        dump_frame(c"assets/mp4.mp4", "tests/output/tutorial01/mp4").unwrap();
     }
 }

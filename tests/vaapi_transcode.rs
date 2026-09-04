@@ -367,7 +367,7 @@ fn vaapi_transcode_test_vaapi() {
     std::fs::create_dir_all("tests/output/vaapi_transcode/").unwrap();
 
     hw_transcode(
-        c"tests/assets/vids/bear.mp4",
+        c"assets/mp4.mp4",
         c"tests/output/vaapi_transcode/vaapi_transcode_h264_vaapi.mp4",
         c"h264_vaapi",
         c"h264_vaapi",
@@ -383,7 +383,7 @@ fn vaapi_transcode_test_vaapi() {
 fn nvenc_transcode_test_nvenc() {
     std::fs::create_dir_all("tests/output/nvenc_transcode/").unwrap();
     hw_transcode(
-        c"tests/assets/vids/bear.mp4",
+        c"assets/mp4.mp4",
         c"tests/output/nvenc_transcode/nvenc_transcode_h264_nvenc.mp4",
         c"h264_cuvid",
         c"h264_nvenc",

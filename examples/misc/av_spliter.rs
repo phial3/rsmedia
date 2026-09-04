@@ -80,25 +80,12 @@ mod tests {
     use super::av_spliter;
 
     #[test]
-    #[ignore = "test_av_spliter0 测试运行依赖测试文件，暂时忽略"]
-    fn test_av_spliter0() {
+    fn test_av_spliter() {
         std::fs::create_dir_all("tests/output/av_spliter").unwrap();
         av_spliter(
-            c"tests/assets/vids/bunny.flv",
-            "tests/output/av_spliter/out_video_bunny.h264",
-            c"tests/output/av_spliter/out_audio_bunny.aac",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "test_av_spliter1 测试运行依赖测试文件，暂时忽略"]
-    fn test_av_spliter1() {
-        std::fs::create_dir_all("tests/output/av_spliter").unwrap();
-        av_spliter(
-            c"tests/assets/vids/bear.mp4",
-            "tests/output/av_spliter/out_video_bear.h264",
-            c"tests/output/av_spliter/out_audio_bear.aac",
+            c"assets/mp4.mp4",
+            "tests/output/av_spliter/out_video.h264",
+            c"tests/output/av_spliter/out_audio.aac",
         )
         .unwrap();
     }

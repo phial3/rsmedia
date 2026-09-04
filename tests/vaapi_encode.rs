@@ -152,7 +152,7 @@ fn hw_encode(config: &HwEncodeConfig<'_>) -> Result<()> {
 #[ignore = "Github actions doesn't have vaapi device"]
 fn vaapi_encode_test_vaapi() {
     std::fs::create_dir_all("tests/output/vaapi_encode/").unwrap();
-    // Produced by ffmpeg -i tests/assets/vids/bear.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
+    // Produced by ffmpeg -i assets/mp4.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
     hw_encode(&HwEncodeConfig {
         input: Path::new("tests/assets/vids/bear.yuv"),
         output: Path::new("tests/output/vaapi_encode/vaapi_encode_test_vaapi.h264"),
@@ -178,7 +178,7 @@ fn vaapi_encode_test_vaapi() {
 #[ignore = "Github actions doesn't have nvdia graphics card"]
 fn nvenc_encode_test_nvenc() {
     std::fs::create_dir_all("tests/output/nvenc_encode/").unwrap();
-    // Produced by ffmpeg -i tests/assets/vids/bear.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
+    // Produced by ffmpeg -i assets/mp4.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
     hw_encode(&HwEncodeConfig {
         input: Path::new("tests/assets/vids/bear.yuv"),
         output: Path::new("tests/output/nvenc_encode/nvenc_encode_test_nvenc.h264"),
@@ -196,7 +196,7 @@ fn nvenc_encode_test_nvenc() {
 #[ignore = "Github actions doesn't have macOS videotoolbox graphics card"]
 fn toolbox_encode_test_videotoolbox() {
     std::fs::create_dir_all("tests/output/toolbox_encode/").unwrap();
-    // Produced by ffmpeg -i tests/assets/vids/bear.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
+    // Produced by ffmpeg -i assets/mp4.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
     hw_encode(&HwEncodeConfig {
         input: Path::new("tests/assets/vids/bear.yuv"),
         output: Path::new("tests/output/toolbox_encode/toolbox_encode_test_h264.h264"),
