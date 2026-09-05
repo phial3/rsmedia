@@ -191,8 +191,8 @@ jobs:
       - name: Doc Test
         run: cargo test --doc --workspace --no-default-features --features ${{ matrix.feature }} --verbose
 
-  build-macos:
-    name: build / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
+  test-macos:
+    name: test / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -492,8 +492,234 @@ jobs:
       - name: Run Test
         run: cargo test --workspace --all-targets --no-default-features --features ${{ matrix.feature }} --verbose
 
-  build-windows:
-    name: build / windows / ffmpeg-${{ matrix.ffmpeg_version }}
+  # valgrind memory check for FFmpeg-heavy paths (frame encode/decode/convert, mux, swresample, ...),
+  # exercised across every supported FFmpeg version.  Only runs on linux/amd64 because valgrind has
+  # no reliable, fully supported build for arm64.
+  # --errors-for-leak-kinds=definite,possible  fails the job on real leaks/invalid access
+  # (invalid-free / munmap_chunk invalid pointer included), while ignoring the benign "still
+  # reachable" entries FFmpeg codecs leave behind at at-exit.
+  test-valgrind:
+    name: test / valgrind-${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "6.1"
+            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-08-31-13-00/ffmpeg-n6.1.3-linux64-gpl-shared-6.1.tar.xz"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1.tar.xz"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "9.0"
+            feature: "ndarray,ffmpeg9,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-shared-9.0.tar.xz"
+
+    env:
+      FFMPEG_DIR: /opt/ffmpeg
+      FFMPEG_INCLUDE_DIR: /opt/ffmpeg/include
+      FFMPEG_LIBS_DIR: /opt/ffmpeg/lib
+      FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
+      PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
+      LD_LIBRARY_PATH: /opt/ffmpeg/lib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm \
+            yasm \
+            curl \
+            wget \
+            unzip \
+            gnupg \
+            clang \
+            cmake \
+            libtool \
+            autoconf \
+            automake \
+            binutils \
+            xz-utils \
+            pkg-config \
+            llvm-dev \
+            libc++1 \
+            libva2 \
+            libva-drm2 \
+            libva-x11-2 \
+            libvdpau1 \
+            libxv1 \
+            libclang-dev \
+            linux-libc-dev \
+            build-essential \
+            ca-certificates \
+            libva-dev \
+            libvpx-dev \
+            libaom-dev \
+            libass-dev \
+            libdrm-dev \
+            libv4l-dev \
+            libx264-dev \
+            libx264-164 \
+            libx265-dev \
+            libx265-199 \
+            libzimg-dev \
+            libdav1d-dev \
+            libwebp-dev \
+            libbluray-dev \
+            libtheora-dev \
+            libvidstab-dev \
+            libsvtav1-dev \
+            libxvidcore-dev \
+            libopenjp2-7-dev \
+            libgsm1-dev \
+            libsoxr-dev \
+            libopus-dev \
+            libpulse-dev \
+            libshine-dev \
+            libspeex-dev \
+            libbs2b-dev \
+            libvorbis-dev \
+            libfdk-aac-dev \
+            libasound2-dev \
+            libmp3lame-dev \
+            libmp3lame0 \
+            libtwolame-dev \
+            libjack-jackd2-dev \
+            libopencore-amrnb-dev \
+            libopencore-amrwb-dev \
+            libva-dev \
+            libdrm-dev \
+            libnuma-dev \
+            libvdpau-dev \
+            ocl-icd-opencl-dev \
+            libxml2-dev \
+            libfribidi-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libssh-dev \
+            libzmq5-dev \
+            libssl-dev \
+            librtmp-dev \
+            libiec61883-dev \
+            libgnutls28-dev \
+            libsmbclient-dev \
+            libtiff-dev \
+            libpng-dev \
+            libraw-dev \
+            libjpeg-dev \
+            zlib1g-dev \
+            libsdl2-dev \
+            liblzma-dev \
+            libzvbi-dev \
+            libpostproc-dev \
+            librubberband-dev \
+            valgrind
+
+      - name: Install BtbN FFmpeg
+        run: |
+          sudo rm -rf "${FFMPEG_DIR}"
+          sudo mkdir -p "${FFMPEG_DIR}"
+          wget --retry-connrefused --tries=5 --waitretry=3 \
+            -O ffmpeg.tar.xz \
+            "${{ matrix.download_url }}"
+          sudo tar -xJf ffmpeg.tar.xz \
+            -C "${FFMPEG_DIR}" \
+            --strip-components=1
+          sudo ldconfig
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - name: Verify FFmpeg version
+        run: |
+          /opt/ffmpeg/bin/ffmpeg -version
+          pkg-config --modversion libavutil
+          pkg-config --modversion libavcodec
+          pkg-config --modversion libavformat
+          valgrind --version
+
+      # Same rationale as test-linux: a second copy of libavutil in the system tree would let an
+      # AVFrame be freed by a different libavutil than the one that allocated it, corrupting the heap
+      # (SIGABRT / munmap_chunk invalid pointer). Keep only the single /opt/ffmpeg copy so valgrind
+      # reports are meaningful.
+      - name: Remove system FFmpeg dev libraries
+        run: |
+          set -euo pipefail
+          sudo apt-get purge -y \
+            libavcodec-dev \
+            libavformat-dev \
+            libavfilter-dev \
+            libavdevice-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libswresample-dev \
+            libavcodec* \
+            libavformat* \
+            libavutil* \
+            libswscale* \
+            libswresample* \
+            libavfilter* \
+            libavdevice* ffmpeg 2>/dev/null || true
+          sudo ldconfig
+          if ldconfig -p | grep -Eiq 'libav(codec|device|format|util|filter)|libsw(scale|resample)'; then
+            echo "!! WARNING: FFmpeg entries still present:"
+            ldconfig -p | grep -Ei 'libav(codec|device|format|util|filter)|libsw(scale|resample)'
+            exit 1
+          else
+            echo "OK: no FFmpeg in system link/runtime cache"
+          fi
+
+      # Build the lib test binary once; src-level tests (frame/encode/decode/mux/swctx/codec/resize)
+      # are the FFI-touching code paths most likely to leak or double-free.
+      - name: Build library tests
+        run: cargo test --lib --no-default-features --features ${{ matrix.feature }} --no-run
+
+      - name: Run tests under Valgrind memcheck
+        run: |
+          set -uo pipefail
+          test_bin=$(ls -t target/debug/deps/rsmedia-* | head -1)
+          echo "Using test binary: ${test_bin}"
+          valgrind \
+            --tool=memcheck \
+            --leak-check=full \
+            --show-leak-kinds=definite,possible \
+            --errors-for-leak-kinds=definite,possible \
+            --error-exitcode=99 \
+            --error-limit=no \
+            --num-callers=40 \
+            "${test_bin}" --test-threads=1 \
+            2> /tmp/valgrind.err
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo ":::: valgrind reported errors / leaks (definite/possible) or the tests failed ::::"
+            cat /tmp/valgrind.err
+            echo "==== valgrind HEAP SUMMARY ===="
+            sed -n '/HEAP SUMMARY/,/All heap blocks were freed/p' /tmp/valgrind.err
+            exit $rc
+          fi
+          echo "valgrind: OK (no definite/possible leaks, no invalid access)"
+
+  test-windows:
+    name: test / windows / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: windows-latest
 
     strategy:
@@ -509,7 +735,7 @@ jobs:
             download_url: "https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-full_build-shared.7z"
           - ffmpeg_version: "8.1"
             feature: "ndarray,ffmpeg8,link_vcpkg_ffmpeg"
-            download_url: "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-full_build-shared.7z"
+            download_url: "https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/ffmpeg-8.1.2-full_build-shared.7z"
           - ffmpeg_version: "9.0"
             feature: "ndarray,ffmpeg9,link_vcpkg_ffmpeg"
             download_url: "https://github.com/GyanD/codexffmpeg/releases/download/9.0.1/ffmpeg-9.0.1-full_build-shared.7z"
