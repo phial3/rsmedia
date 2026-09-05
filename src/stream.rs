@@ -561,9 +561,7 @@ impl PacketSideData<'_> {
     pub fn as_ptr(&self) -> *const ffi::AVPacketSideData {
         self.ptr as *const _
     }
-}
 
-impl PacketSideData<'_> {
     pub fn kind(&self) -> ffi::AVPacketSideDataType {
         unsafe { ffi::AVPacketSideDataType::from((*self.as_ptr()).type_) }
     }

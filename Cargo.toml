@@ -23,13 +23,13 @@ link_system_ffmpeg = ["rsmpeg/link_system_ffmpeg"]
 link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg"]
 
 [dependencies]
-pix = "1.0"
-rgb = "0.8"
-color = "0.3"
+#pix = "1.0"
+#rgb = "0.8"
+#color = "0.3"
+palette = "0.7"
 yuv = { version = "0.8", features = ["rayon", "professional_mode"] }
 colorous = "1.0"
 colorutils-rs = "0.8"
-palette = "0.7"
 image = "0.25"
 imageproc = "0.27"
 num-traits = "0.2"
@@ -65,6 +65,8 @@ tokio = { version = "1", features = ["full"] }
 ## sound & audio
 cpal = "0.18"
 wavers = "1.5"
+#rubato = "5.0"
+#dasp = { version = "0.11", features = ["all"] }
 rodio = { version = "0.22", features = ["symphonia-all", "tracing"] }
 
 [package.metadata.docs.rs]

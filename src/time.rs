@@ -199,7 +199,7 @@ impl<T: Into<i64> + Clone> Rescale for T {
         S: Into<AVRational>,
         D: Into<AVRational>,
     {
-        unsafe { ffi::av_rescale_q(self.clone().into(), source.into(), destination.into()) }
+        avutil::av_rescale_q(self.clone().into(), source.into(), destination.into())
     }
 
     fn rescale_with<S, D>(&self, source: S, destination: D, rounding: ffi::AVRounding) -> i64
@@ -207,14 +207,12 @@ impl<T: Into<i64> + Clone> Rescale for T {
         S: Into<AVRational>,
         D: Into<AVRational>,
     {
-        unsafe {
-            ffi::av_rescale_q_rnd(
-                self.clone().into(),
-                source.into(),
-                destination.into(),
-                rounding,
-            )
-        }
+        avutil::av_rescale_q_rnd(
+            self.clone().into(),
+            source.into(),
+            destination.into(),
+            rounding,
+        )
     }
 }
 

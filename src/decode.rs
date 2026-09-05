@@ -1099,7 +1099,7 @@ mod tests {
         let audio_path = std::path::Path::new("assets/wav.wav");
 
         let filters = vec![
-            // filter::audio::resample(2, 48000, SampleFormat::FLTP),
+            filter::audio::resample(2, 48000, SampleFormat::FLTP),
             filter::audio::volume(1.5),
         ];
 
