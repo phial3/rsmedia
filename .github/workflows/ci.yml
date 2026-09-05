@@ -696,7 +696,18 @@ jobs:
       - name: Run tests under Valgrind memcheck
         run: |
           set -uo pipefail
-          test_bin=$(ls -t target/debug/deps/rsmedia-* | head -1)
+          # Query cargo for the exact test harness path instead of globbing target/debug/deps: the
+          # unit-test executable is emitted under target/debug/build/rsmedia/<hash>/out/ for crates
+          # with a build script, so fixed path guesses are unreliable.
+          test_bin=$(
+            cargo test --lib --no-default-features --features ${{ matrix.feature }} --no-run \
+              --message-format=json-render-diagnostics 2>/dev/null \
+            | python3 -c 'import json,sys;d=[json.loads(l) for l in sys.stdin if l.strip()];n=[m["executable"] for m in d if m.get("reason")=="compiler-artifact" and m.get("profile",{}).get("test") and m.get("executable")];print(n[0] if n else "")'
+          )
+          if [ -z "${test_bin}" ]; then
+            echo ":::: could not locate the rsmedia lib test executable via cargo message format ::::"
+            exit 1
+          fi
           echo "Using test binary: ${test_bin}"
           valgrind \
             --tool=memcheck \
