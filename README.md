@@ -216,7 +216,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
           yuv_frame
             .video_format()
             .map(|f| f.get_pix_fmt_name())
-            .unwrap_or_else(|| "n/a".to_string())
+            .unwrap_or_else(|| "N/A".to_string())
         );
         
         // processing frame here...

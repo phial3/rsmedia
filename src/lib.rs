@@ -3,7 +3,7 @@ pub mod encode;
 #[cfg(feature = "ndarray")]
 pub mod frame;
 #[cfg(feature = "ndarray")]
-pub use frame::MediaFrame;
+pub use frame::{MediaFrame, MediaFrameFormat, MediaFrameType};
 pub mod codec;
 pub mod colors;
 pub mod filter;

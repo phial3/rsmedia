@@ -1,6 +1,6 @@
 use image::{ImageBuffer, Rgb};
 
-use rsmedia::{DecoderBuilder, MediaFrame, MediaType, filter};
+use rsmedia::{DecoderBuilder, MediaFrame, MediaFrameFormat, MediaType, filter};
 
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -59,8 +59,11 @@ async fn main() -> Result<()> {
                     yuv_frame.pts,
                     yuv_frame.media_type,
                     yuv_frame
-                        .video_format()
-                        .map(|f| f.get_pix_fmt_name())
+                        .format()
+                        .map(|f| match f {
+                            MediaFrameFormat::Pixel(p) => p.get_pix_fmt_name(),
+                            _ => "N/A",
+                        })
                         .unwrap_or("N/A")
                 );
 

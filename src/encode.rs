@@ -2217,6 +2217,7 @@ mod tests {
     #[cfg(feature = "ndarray")]
     mod audio_tests {
         use super::*;
+        use crate::frame::MediaFrameFormat;
         use rsmpeg::avcodec::AVCodec;
 
         /// 音频容器规格：一个容器对应一条完整的编码配置。
@@ -2519,7 +2520,11 @@ mod tests {
             let mut total_samples = 0u64;
             let mut decoded_frames = 0usize;
             while let Some(frame) = decoder.decode::<f32>()? {
-                assert_eq!(frame.audio_format(), Some(format), "sample format mismatch");
+                assert_eq!(
+                    frame.format(),
+                    Some(MediaFrameFormat::Sample(format)),
+                    "sample format mismatch"
+                );
                 assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
                 assert_eq!(frame.nb_channels, channels, "channel count mismatch");
                 total_samples += frame.nb_samples as u64;
@@ -2637,10 +2642,15 @@ mod tests {
             );
 
             // 3) 解码转码结果并校验
-            let mut out = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(dst.as_path())?;
+            let mut out: crate::decode::DecoderWrapper<crate::StreamReader> =
+                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(dst.as_path())?;
             let mut total = 0u64;
             while let Some(frame) = out.decode::<f32>()? {
-                assert_eq!(frame.audio_format(), Some(format), "sample format mismatch");
+                assert_eq!(
+                    frame.format(),
+                    Some(MediaFrameFormat::Sample(format)),
+                    "sample format mismatch"
+                );
                 assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
                 assert_eq!(frame.nb_channels, channels, "channel count mismatch");
                 total += frame.nb_samples as u64;
@@ -2766,8 +2776,8 @@ mod tests {
                         "{name}: sample rate mismatch"
                     );
                     assert_eq!(
-                        frame.audio_format(),
-                        Some(format),
+                        frame.format(),
+                        Some(MediaFrameFormat::Sample(format)),
                         "{name}: sample format mismatch"
                     );
                     assert_eq!(

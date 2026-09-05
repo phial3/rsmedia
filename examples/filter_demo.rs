@@ -10,7 +10,7 @@
 
 use image::{ImageBuffer, Rgb};
 
-use rsmedia::{DecoderBuilder, MediaFrame, MediaType, filter};
+use rsmedia::{DecoderBuilder, MediaFrame, MediaFrameFormat, MediaType, filter};
 
 use anyhow::{Context, Result};
 
@@ -70,9 +70,12 @@ fn main() -> Result<()> {
         match decoder.decode_frame() {
             Ok(Some(frame)) => {
                 let fmt = frame
-                    .video_format()
-                    .map(|f| f.get_pix_fmt_name().to_string())
-                    .unwrap_or_else(|| "n/a".to_string());
+                    .format()
+                    .map(|f| match f {
+                        MediaFrameFormat::Pixel(p) => p.get_pix_fmt_name().to_string(),
+                        _ => "N/A".to_string(),
+                    })
+                    .unwrap_or_else(|| "N/A".to_string());
                 println!(
                     "frame[{decoded}] pts={} size={}x{} fmt={}",
                     frame.pts, frame.width, frame.height, fmt

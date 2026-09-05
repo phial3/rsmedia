@@ -34,9 +34,9 @@ fn main() -> anyhow::Result<()> {
     let auto = rgb.convert_rgb_to_yuv()?; // SD resolution -> BT.601 (automatic)
     let bt709 = rgb.convert_rgb_to_yuv_with_matrix(yuv::YuvStandardMatrix::Bt709)?;
     let bt2020 = rgb.convert_rgb_to_yuv_with_matrix(yuv::YuvStandardMatrix::Bt2020)?;
-    println!("auto   -> {:?}", auto.video_format());
-    println!("BT709  -> {:?}", bt709.video_format());
-    println!("BT2020 -> {:?}", bt2020.video_format());
+    println!("auto   -> {:?}", auto.format());
+    println!("BT709  -> {:?}", bt709.format());
+    println!("BT2020 -> {:?}", bt2020.format());
 
     // 3. Colormap pseudo-color rendering (viridis)
     use ndarray::Array2;

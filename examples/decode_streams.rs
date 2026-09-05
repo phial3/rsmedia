@@ -5,7 +5,7 @@
 //! - `DecoderBuilder::new(MediaType::VIDEO|AUDIO|SUBTITLE)` + `build_wrapped`
 //! - `DecoderWrapper::decode_frame`（视频原始帧）
 //! - `DecoderWrapper::decode::<f32>`（音频帧）
-//! - `MediaFrame::audio_format` / 帧字段（pts、sample_rate、nb_channels、nb_samples）
+//! - `MediaFrame::format` / 帧字段（pts、sample_rate、nb_channels、nb_samples）
 
 use rsmedia::{DecoderBuilder, MediaType};
 

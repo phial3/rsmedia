@@ -6,9 +6,11 @@
 //! - `EncoderWrapper::encode` / `EncoderWrapper::finish`
 //! - `DecoderBuilder::new(MediaType::AUDIO)` + `build_wrapped` —— 音频解码器
 //! - `DecoderWrapper::decode::<f32>` —— 解码为音频 [`MediaFrame`]
-//! - `MediaFrame::audio_format` —— 读取音频帧的采样格式（类型安全访问器）
+//! - `MediaFrame::format` —— 读取音频帧的采样格式（`MediaFrameFormat::Sample` 变体）
 
-use rsmedia::{DecoderBuilder, EncoderBuilder, MediaFrame, MediaType, SampleFormat};
+use rsmedia::{
+    DecoderBuilder, EncoderBuilder, MediaFrame, MediaFrameFormat, MediaType, SampleFormat,
+};
 
 use anyhow::Result;
 use rsmedia::time;
@@ -70,9 +72,12 @@ fn decode_audio(source: &Path) -> Result<()> {
     let mut total_samples = 0i64;
     while let Some(frame) = decoder.decode::<f32>()? {
         let fmt = frame
-            .audio_format()
-            .map(|f| f.get_sample_fmt_name())
-            .unwrap_or_else(|| "n/a".to_string());
+            .format()
+            .map(|f| match f {
+                MediaFrameFormat::Sample(s) => s.get_sample_fmt_name().to_string(),
+                _ => "N/A".to_string(),
+            })
+            .unwrap_or_else(|| "N/A".to_string());
         println!(
             "[decode] pts={}, sample_rate={}, channels={}, samples={}, format={fmt}",
             frame.pts, frame.sample_rate, frame.nb_channels, frame.nb_samples
