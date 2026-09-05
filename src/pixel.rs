@@ -1,5 +1,3 @@
-use crate::utils;
-
 use rsmpeg::avutil::AVPixFmtDescriptorRef;
 use rsmpeg::ffi;
 
@@ -1248,16 +1246,25 @@ impl From<PixelFormat> for ffi::AVPixelFormat {
 //////////////////////////////////////////////////////////
 
 impl PixelFormat {
-    /// 获取像素格式描述符
-    pub fn descriptor(&self) -> AVPixFmtDescriptorRef {
-        AVPixFmtDescriptorRef::get((*self).into()).unwrap()
+    /// 获取像素格式描述符；未知/无效格式返回错误而非 panic。
+    pub fn descriptor(&self) -> Result<AVPixFmtDescriptorRef> {
+        AVPixFmtDescriptorRef::get((*self).into()).ok_or_else(|| {
+            Error::msg(format!(
+                "No pix_fmt descriptor for {}",
+                self.get_pix_fmt_name()
+            ))
+        })
     }
 
-    /// 获取像素格式名称
-    pub fn get_pix_fmt_name(&self) -> String {
+    /// 获取像素格式名称（FFmpeg 返回静态字符串，借用即可，避免每次分配 String）
+    pub fn get_pix_fmt_name(&self) -> &'static str {
         unsafe {
             let name = ffi::av_get_pix_fmt_name((*self).into());
-            utils::from_c_char(name)
+            if name.is_null() {
+                "unknown"
+            } else {
+                std::ffi::CStr::from_ptr(name).to_str().unwrap_or("unknown")
+            }
         }
     }
 

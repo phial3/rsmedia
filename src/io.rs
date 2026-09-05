@@ -110,8 +110,10 @@ impl<'a> StreamReaderBuilder<'a> {
     /// Build [`StreamReader`].
     pub fn build(self) -> Result<StreamReader> {
         let src_path = self.source.as_path().to_str().unwrap();
-        let protocol =
-            unsafe { ffi::avio_find_protocol_name(utils::to_c_char(src_path) as *const _) };
+        // RAII CString，FFI 使用后由析构自动释放
+        let src_cstr = std::ffi::CString::new(src_path)
+            .map_err(|e| Error::msg(format!("Invalid source path '{src_path}': {e}")))?;
+        let protocol = unsafe { ffi::avio_find_protocol_name(src_cstr.as_ptr()) };
         if protocol.is_null() {
             return Err(Error::msg(format!(
                 "Unsupported input source protocol: {src_path}"
@@ -458,8 +460,8 @@ impl BufferWriter {
         BufferWriterBuilder::new(format).build()
     }
 
-    fn begin_write(&mut self) {
-        output_raw_buf_start(&mut self.output);
+    fn begin_write(&mut self) -> Result<()> {
+        output_raw_buf_start(&mut self.output)
     }
 
     fn end_write(&mut self) -> Vec<u8> {
@@ -548,7 +550,7 @@ impl PacketizedBufWriter {
         PacketizedBufWriterBuilder::new(format).build()
     }
 
-    fn begin_write(&mut self) {
+    fn begin_write(&mut self) -> Result<()> {
         output_raw_packetized_buf_start(
             &mut self.output,
             // Note: `ffi::output_raw_packetized_bug_start` requires that this value lives until
@@ -557,7 +559,7 @@ impl PacketizedBufWriter {
             // (see the implementation) of `Write` for `PacketizedBufWriter`.
             &mut self.buffers,
             Self::PACKET_SIZE,
-        );
+        )
     }
 
     fn end_write(&mut self) {
@@ -635,27 +637,27 @@ pub(crate) mod private {
         type Out = Buf;
 
         fn write_header(&mut self) -> Result<Buf> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_header(&mut None)?;
             Ok(self.end_write())
         }
 
         fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Buf> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_frame(packet)?;
             flush_output(&mut self.output)?;
             Ok(self.end_write())
         }
 
         fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Buf> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.interleaved_write_frame(packet)?;
             flush_output(&mut self.output)?;
             Ok(self.end_write())
         }
 
         fn write_trailer(&mut self) -> Result<Buf> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_trailer()?;
             Ok(self.end_write())
         }
@@ -665,14 +667,14 @@ pub(crate) mod private {
         type Out = Bufs;
 
         fn write_header(&mut self) -> Result<Bufs> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_header(&mut None)?;
             self.end_write();
             Ok(self.take_buffers())
         }
 
         fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Bufs> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_frame(packet)?;
             flush_output(&mut self.output)?;
             self.end_write();
@@ -680,7 +682,7 @@ pub(crate) mod private {
         }
 
         fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Bufs> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.interleaved_write_frame(packet)?;
             flush_output(&mut self.output)?;
             self.end_write();
@@ -688,7 +690,7 @@ pub(crate) mod private {
         }
 
         fn write_trailer(&mut self) -> Result<Bufs> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_trailer()?;
             self.end_write();
             Ok(self.take_buffers())
@@ -791,7 +793,7 @@ pub(crate) fn output_raw(format: &str) -> Result<AVFormatContextOutput> {
 /// # Arguments
 ///
 /// * `output` - Output context to start write on.
-pub(crate) fn output_raw_buf_start(output: &mut AVFormatContextOutput) {
+pub(crate) fn output_raw_buf_start(output: &mut AVFormatContextOutput) -> Result<()> {
     unsafe {
         // Here we initialize a raw pointer (mutable) as nullptr initially. We then call the
         // `avio_open_dyn_buf` which expects a ptr ptr, and place the result in p. In case of
@@ -800,10 +802,11 @@ pub(crate) fn output_raw_buf_start(output: &mut AVFormatContextOutput) {
         match ffi::avio_open_dyn_buf((&mut p) as *mut *mut ffi::AVIOContext) {
             0 => {
                 (*output.as_mut_ptr()).pb = p;
+                Ok(())
             }
-            _ => {
-                panic!("Failed to open dynamic buffer for output context.");
-            }
+            _ => Err(Error::msg(
+                "Failed to open dynamic buffer for output context.",
+            )),
         }
     }
 }
@@ -861,7 +864,7 @@ pub fn output_raw_packetized_buf_start(
     output: &mut AVFormatContextOutput,
     packet_buffer: &mut Vec<Vec<u8>>,
     max_packet_size: usize,
-) {
+) -> Result<()> {
     unsafe {
         let buffer = ffi::av_malloc(max_packet_size) as *mut u8;
 
@@ -889,12 +892,23 @@ pub fn output_raw_packetized_buf_start(
             None,
         );
 
+        // `avio_alloc_context` 可能因 OOM 等等返回 NULL，必须先判空，
+        // 否则下方解引用 (*io) 即空指针解引用（UB）。
+        if io.is_null() {
+            // 释放刚才 av_malloc 的 buffer，避免泄漏
+            if !buffer.is_null() {
+                ffi::av_free(buffer as *mut std::ffi::c_void);
+            }
+            return Err(Error::msg("Failed to allocate AVIOContext"));
+        }
+
         // Setting `max_packet_size` will let the underlying IO stream know that this buffer must be
         // treated as packetized.
         (*io).max_packet_size = max_packet_size.try_into().unwrap();
 
         // Assign IO to output context.
         (*output.as_mut_ptr()).pb = io;
+        Ok(())
     }
 }
 

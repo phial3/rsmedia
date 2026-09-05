@@ -174,7 +174,7 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     }
 
     // 获取像素格式的描述信息
-    let desc = PixelFormat::from(frame.format).descriptor();
+    let desc = PixelFormat::from(frame.format).descriptor()?;
 
     // 计算平面的实际尺寸
     let plane_height = if desc.log2_chroma_h > 0 && plane_idx > 0 {
@@ -274,7 +274,7 @@ pub fn fill_plane_from_buffer(
     }
 
     // 获取格式描述符
-    let desc = PixelFormat::from(frame.format).descriptor();
+    let desc = PixelFormat::from(frame.format).descriptor()?;
     let planes = PixelFormat::from(frame.format).count_planes()?;
 
     // 检查平面索引

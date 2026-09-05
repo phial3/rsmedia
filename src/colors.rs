@@ -313,7 +313,9 @@ pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> [f32; 3] {
 
 /// Convert HSV to RGB color space.
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
-    let h = h % 360.0; // H limited to 0-360
+    // rem_euclid 将负 hue 归一到 [0,360)，否则 `% 360` 对负值得到负角度，
+    // 后面 `(h/60.0) as u32` 会落入错误的色相扇区，与文档的 0-360 不符。
+    let h = h.rem_euclid(360.0); // H limited to 0-360
     let s = s.clamp(0.0, 100.0); // S limited to 0-100
     let v = v.clamp(0.0, 100.0); // V limited to 0-100
 

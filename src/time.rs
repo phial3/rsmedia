@@ -132,6 +132,11 @@ impl Time {
 
     /// Get number of seconds as floating point value.
     pub fn as_secs(&self) -> f32 {
+        // time_base 无效（num/den 为 0）时回退为 0.0，避免产生 NaN，
+        // 否则下游 Duration::from_secs_f64(NaN) 等会直接 panic
+        if self.time_base.num == 0 || self.time_base.den == 0 {
+            return 0.0;
+        }
         if let Some(time) = self.time {
             (time as f32) * (self.time_base.num as f32 / self.time_base.den as f32)
         } else {
@@ -141,6 +146,9 @@ impl Time {
 
     /// Get number of seconds as floating point value.
     pub fn as_secs_f64(&self) -> f64 {
+        if self.time_base.num == 0 || self.time_base.den == 0 {
+            return 0.0;
+        }
         if let Some(time) = self.time {
             (time as f64) * (self.time_base.num as f64 / self.time_base.den as f64)
         } else {

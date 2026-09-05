@@ -164,11 +164,17 @@ impl StreamInfo {
             None
         };
 
+        // descriptor() 返回 Result，未知格式时返回错误而非 panic
+        let pix_fmt_desc = if codec_type.is_video() {
+            Some(PixelFormat::from(codecpar.format).descriptor()?)
+        } else {
+            None
+        };
+
         let (bits_per_sample, exact_bits_per_sample, bits_per_pixel, padded_bits_per_pixel) = unsafe {
             let bits_sample = ffi::av_get_bits_per_sample(codecpar.codec_id);
             let exact_bits_sample = ffi::av_get_exact_bits_per_sample(codecpar.codec_id);
-            let (bits_pixel, padded_bits_pixel) = if codec_type.is_video() {
-                let pix_fmt_desc = PixelFormat::from(codecpar.format).descriptor();
+            let (bits_pixel, padded_bits_pixel) = if let Some(pix_fmt_desc) = pix_fmt_desc {
                 (
                     ffi::av_get_bits_per_pixel(pix_fmt_desc.deref()),
                     ffi::av_get_padded_bits_per_pixel(pix_fmt_desc.deref()),
@@ -418,7 +424,7 @@ impl std::fmt::Debug for StreamInfo {
         };
         let format = {
             if self.media_type == MediaType::VIDEO {
-                PixelFormat::from(self.format).get_pix_fmt_name()
+                PixelFormat::from(self.format).get_pix_fmt_name().to_owned()
             } else if self.media_type == MediaType::AUDIO {
                 SampleFormat::from(self.format).get_sample_fmt_name()
             } else {

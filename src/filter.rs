@@ -625,28 +625,26 @@ pub mod audio {
 
     /// 创建音频重采样过滤器
     pub fn resample(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
-        let channel_desc = AVChannelLayout::from_nb_channels(nb_channels as i32)
-            .describe()
-            .unwrap();
+        // 统一走解析函数以便复用 channel_desc 处理，避免 describe().unwrap() panic
+        let channel_desc = audio_channel_desc(nb_channels);
 
-        // async=1 might be better default for realtime to avoid buffer issues.
+        // async=1 可能更适合实时场景，避免缓冲问题。
         let spec_str = format!(
             "aresample=osr={}:osf={}:ochl={}:async=1",
             sample_rate,
             format.get_sample_fmt_name(),
-            channel_desc.to_string_lossy(),
+            channel_desc,
         );
 
-        Filter::new("resample", MediaType::AUDIO, spec_str)
+        // 注意：滤镜本体是 aresample，name 必须与之保持一致，避免与真实滤镜名混淆
+        Filter::new("aresample", MediaType::AUDIO, spec_str)
     }
 
     /// Converts audio sample format.
     /// `format`: <https://ffmpeg.org/ffmpeg-filters.html#format>
     /// `aformat`: <https://ffmpeg.org/ffmpeg-filters.html#aformat-1.
     pub fn format(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
-        let channel_desc = AVChannelLayout::from_nb_channels(nb_channels as i32)
-            .describe()
-            .unwrap();
+        let channel_desc = audio_channel_desc(nb_channels);
 
         Filter::new(
             "aformat",
@@ -655,9 +653,17 @@ pub mod audio {
                 "aformat=sample_fmts={}:sample_rates={}:channel_layouts={}",
                 format.get_sample_fmt_name(),
                 sample_rate,
-                channel_desc.to_string_lossy()
+                channel_desc
             ),
         )
+    }
+
+    /// 把通道数解析为 FFmpeg 通道布局描述；失败时回退到数字通道数，避免 panic。
+    fn audio_channel_desc(nb_channels: u32) -> String {
+        AVChannelLayout::from_nb_channels(nb_channels as i32)
+            .describe()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_else(|_| format!("{nb_channels}"))
     }
 
     /// 音量调整

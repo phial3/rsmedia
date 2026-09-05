@@ -703,12 +703,32 @@ where
         return Err(Error::msg("Batch audio not supported"));
     }
 
+    // 校验 T 的大小与帧实际采样格式元素大小一致，避免因大小不符造成越界写
+    let sample_size = match frame.format {
+        ffi::AV_SAMPLE_FMT_U8 | ffi::AV_SAMPLE_FMT_U8P => 1,
+        ffi::AV_SAMPLE_FMT_S16 | ffi::AV_SAMPLE_FMT_S16P => 2,
+        ffi::AV_SAMPLE_FMT_S32 | ffi::AV_SAMPLE_FMT_S32P => 4,
+        ffi::AV_SAMPLE_FMT_FLT | ffi::AV_SAMPLE_FMT_FLTP => 4,
+        ffi::AV_SAMPLE_FMT_DBL | ffi::AV_SAMPLE_FMT_DBLP => 8,
+        ffi::AV_SAMPLE_FMT_S64 | ffi::AV_SAMPLE_FMT_S64P => 8,
+        _ => return Err(Error::msg("Unsupported sample format")),
+    };
+    validate_format_type_size::<T>(frame.format, sample_size)?;
+
     // 分配视频缓冲区
     frame
         .alloc_buffer()
         .context("Failed to allocate audio buffer")?;
 
     if let Some(buffer) = data.as_standard_layout().as_slice() {
+        if buffer.len() != samples * channels {
+            return Err(Error::msg(format!(
+                "Audio data length {} != samples * channels {}*{}",
+                buffer.len(),
+                samples,
+                channels
+            )));
+        }
         unsafe {
             if SampleFormat::from(frame.format).is_planar() {
                 // 平面布局：每个声道单独存储

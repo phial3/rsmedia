@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
                     yuv_frame
                         .video_format()
                         .map(|f| f.get_pix_fmt_name())
-                        .unwrap_or_else(|| "n/a".to_string())
+                        .unwrap_or("N/A")
                 );
 
                 process_frame(yuv_frame)?;

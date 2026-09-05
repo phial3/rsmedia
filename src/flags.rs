@@ -143,7 +143,8 @@ impl From<ffi::AVMediaType> for MediaType {
             ffi::AVMEDIA_TYPE_DATA => MediaType::DATA,
             ffi::AVMEDIA_TYPE_SUBTITLE => MediaType::SUBTITLE,
             ffi::AVMEDIA_TYPE_ATTACHMENT => MediaType::ATTACHMENT,
-            _ => panic!("Invalid media type"),
+            // 遇到未知/版本差异的类型时回退为 UNKNOWN 而非 panic，避免库内部直接崩溃
+            _ => MediaType::UNKNOWN,
         }
     }
 }
@@ -218,7 +219,8 @@ impl From<ffi::AVSampleFormat> for SampleFormat {
             ffi::AV_SAMPLE_FMT_DBLP => SampleFormat::DBLP,
             ffi::AV_SAMPLE_FMT_S64 => SampleFormat::S64,
             ffi::AV_SAMPLE_FMT_S64P => SampleFormat::S64P,
-            _ => panic!("Invalid sample format"),
+            // 遇到未知/版本差异的格式时回退为 NONE 而非 panic，避免库内部直接崩溃
+            _ => SampleFormat::NONE,
         }
     }
 }

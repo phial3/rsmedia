@@ -109,16 +109,6 @@ pub unsafe fn from_c_char(ptr: *const c_char) -> String {
     }
 }
 
-/// 将 Rust 字符串转换为 C 字符串指针
-///
-/// # Safety
-///
-/// 返回的指针需要手动释放，否则会造成内存泄漏
-/// 使用 `free_cstr` 函数释放内存
-pub unsafe fn to_c_char(s: &str) -> *mut c_char {
-    CString::new(s).unwrap().into_raw()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

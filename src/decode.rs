@@ -886,7 +886,18 @@ impl Drop for Decoder {
         // We need to drain the items still in the decoders queue.
         match self.send_packet_to_decoder(None) {
             Ok(_) => {
+                // 兜底上限：个别解码器可能持续返回 EAGAIN 而迟迟不结束，
+                // 与 encode.rs 的 1_000 保护一致，防止 Drop 排空无限循环。
+                const MAX_DRAIN_ITERATIONS: usize = 1_000;
+                let mut iterations = 0usize;
                 loop {
+                    if iterations >= MAX_DRAIN_ITERATIONS {
+                        log::warn!(
+                            "Decoder drain exceeded {MAX_DRAIN_ITERATIONS} iterations, forcing EOF."
+                        );
+                        break;
+                    }
+                    iterations += 1;
                     match self.decoder_receive_frame() {
                         Ok(Some(_frame)) => {
                             // If receive a frame, we continue to drain the queue.

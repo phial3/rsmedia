@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 /// Hardware device configuration.
@@ -279,9 +280,17 @@ impl HWContext {
                     "decoder hw_frames_ctx is null, is_hwaccel:{}",
                     decoder.is_hwaccel()
                 );
-                decoder.set_hw_frames_ctx(AVHWFramesContext::from_raw(
-                    std::ptr::NonNull::new(hw_frame.hw_frames_ctx).unwrap(),
-                ));
+                // 通过 av_buffer_ref 为解码器申请一份独立引用，
+                // 而不是把 hw_frame 自身的 hw_frames_ctx 指针直接搬走（from_raw 会转移所有权）。
+                // 否则 hw_frame 析构（unref）后 decoder->hw_frames_ctx 变成悬空指针 → double-free/UAF。
+                let ref_counter = ffi::av_buffer_ref(hw_frame.hw_frames_ctx);
+                if ref_counter.is_null() {
+                    return Err(Error::msg(
+                        "Failed to av_buffer_ref hw_frames_ctx for decoder",
+                    ));
+                }
+                let frames_ctx = AVHWFramesContext::from_raw(NonNull::new_unchecked(ref_counter));
+                decoder.set_hw_frames_ctx(frames_ctx);
             }
         }
 
@@ -358,9 +367,10 @@ impl HWContext {
         hw_frame.set_width(sw_frame.width);
         hw_frame.set_height(sw_frame.height);
         hw_frame.set_format(self.get_format(true));
-        unsafe {
-            (*hw_frame.as_mut_ptr()).hw_frames_ctx = hw_frames_ctx.as_mut_ptr();
-        }
+        // 注意：这里不要再手动把 hw_frames_ctx 赋给 hw_frame。
+        // av_hwframe_get_buffer 会在 frame->hw_frames_ctx 为 NULL 时自动 av_buffer_ref；
+        // 若预先赋成与编码器共享同一 ref，则 hw_frame.unref 会把共享 ref 减到 0，
+        // 造成编码器 hw_frames_ctx 悬空 → double-free。
 
         // 分配硬件缓冲区
         hw_frames_ctx
