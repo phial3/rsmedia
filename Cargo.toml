@@ -3,7 +3,6 @@ name = "rsmedia"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89.0"
-readme = "README.md"
 license = "MIT OR Apache-2.0"
 description = "High-level video toolkit based on ffmpeg."
 keywords = ["video", "ffmpeg", "encoding", "decoding", "muxing"]

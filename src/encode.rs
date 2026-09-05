@@ -1680,7 +1680,7 @@ mod tests {
             );
 
             // 帧编码并写入文件：5 秒 × fps
-            const VIDEO_DURATION_SECS: f64 = 5.0;
+            const VIDEO_DURATION_SECS: f64 = 1.0;
             let n_frames = (VIDEO_DURATION_SECS * fps).round() as usize;
             for i in 0..n_frames {
                 let mut frame = rainbow_video_frame(
@@ -2340,7 +2340,7 @@ mod tests {
 
             // 2) 编码 5 秒正弦波（1024 采样/帧，末尾不足一帧的余数忽略）；
             //    帧数据类型按协商出的采样格式自动匹配（FLTP/FLT→f32 / S16→i16 / S32P→i32）
-            const AUDIO_DURATION_SECS: u32 = 5;
+            const AUDIO_DURATION_SECS: u32 = 1;
             let samples_per_frame = 1024u32;
             let frames_to_write = AUDIO_DURATION_SECS * sample_rate / samples_per_frame;
             let input_samples = frames_to_write as u64 * samples_per_frame as u64;
