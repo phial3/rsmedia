@@ -980,12 +980,7 @@ pub fn init_logging() {
     unsafe {
         ffi::av_log_set_callback(Some(log_callback));
         ffi::av_log_set_level(ffi::AV_LOG_TRACE as _);
-        ffi::av_log_set_flags(
-            (ffi::AV_LOG_SKIP_REPEATED
-                | ffi::AV_LOG_PRINT_LEVEL
-                | ffi::AV_LOG_PRINT_TIME
-                | ffi::AV_LOG_PRINT_DATETIME) as _,
-        )
+        // ffi::av_log_set_flags()
     }
 }
 
