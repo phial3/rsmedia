@@ -14,6 +14,10 @@ pub fn avio_reading(file_path: &CStr) -> Result<()> {
     let (video_stream_index, mut input_format_context, mut decode_context) =
         avio::open_input_file(file_path)?;
 
+    let frame_index = AtomicI32::new(0);
+    let output_dir = std::path::PathBuf::from("tests/output/avio_reading");
+    std::fs::create_dir_all(&output_dir)?;
+
     loop {
         let packet = match input_format_context.read_packet() {
             Ok(Some(x)) => x,
@@ -30,7 +34,6 @@ pub fn avio_reading(file_path: &CStr) -> Result<()> {
             .send_packet(Some(&packet))
             .context("Send packet failed")?;
 
-        let frame_index = AtomicI32::new(0);
         loop {
             let mut frame = match decode_context.receive_frame() {
                 Ok(frame) => frame,
@@ -42,15 +45,14 @@ pub fn avio_reading(file_path: &CStr) -> Result<()> {
 
             frame.set_pts(frame.best_effort_timestamp);
 
-            // avio::pgm_save(&frame, &format!("{}/frame_{}.pgm", "/tmp", frame_index.fetch_add(1, atomic::Ordering::SeqCst)))?;
-            avio::save_avframe_to_image(
-                &frame,
-                &format!(
-                    "{}/frame_{}.jpeg",
-                    "/tmp",
+            let filename = output_dir
+                .join(format!(
+                    "frame_{}.jpeg",
                     frame_index.fetch_add(1, atomic::Ordering::SeqCst)
-                ),
-            )?;
+                ))
+                .to_string_lossy()
+                .into_owned();
+            avio::save_avframe_to_image(&frame, &filename)?;
         }
     }
 

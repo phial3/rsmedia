@@ -137,7 +137,8 @@ mod tests {
         assert_eq!(img.width(), yuv_frame.width as u32);
         assert_eq!(img.height(), yuv_frame.height as u32);
 
-        img.save("/tmp/test_avframe_to_image.png")
+        std::fs::create_dir_all("tests/output/av_convert").unwrap();
+        img.save("tests/output/av_convert/test_avframe_to_image.png")
             .expect("avframe_to_image error");
 
         Ok(())
