@@ -198,7 +198,7 @@ fn setup_resampler(
     out_sample_fmt: ffi::AVSampleFormat,
     out_sample_rate: i32,
 ) -> Result<SwrContext> {
-    let mut resample_context = SwrContext::new(
+    let mut swr_ctx = SwrContext::new(
         &out_ch_layout,
         out_sample_fmt,
         out_sample_rate,
@@ -208,11 +208,9 @@ fn setup_resampler(
     )
     .context("Could not allocate resample context")?;
 
-    resample_context
-        .init()
-        .context("Could not open resample context")?;
+    swr_ctx.init().context("Could not open resample context")?;
 
-    Ok(resample_context)
+    Ok(swr_ctx)
 }
 
 /// Audio resampling frame
@@ -230,7 +228,7 @@ pub fn convert(
         return Err(Error::msg("Invalid input frame."));
     }
 
-    let mut resample_context = setup_resampler(
+    let mut swr_ctx = setup_resampler(
         src_frame.ch_layout,
         src_frame.format,
         src_frame.sample_rate,
@@ -249,7 +247,7 @@ pub fn convert(
     .context("Create samples buffer failed.")?;
 
     let ret = unsafe {
-        resample_context
+        swr_ctx
             .convert(
                 output_samples.audio_data.as_mut_ptr(),
                 output_samples.nb_samples,
@@ -296,7 +294,7 @@ pub fn convert_frame(
         return Err(Error::msg("Invalid input frame."));
     }
 
-    let resample_context = setup_resampler(
+    let swr_ctx = setup_resampler(
         src_frame.ch_layout,
         src_frame.format,
         src_frame.sample_rate,
@@ -311,7 +309,13 @@ pub fn convert_frame(
     imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
     dst_frame.set_format(out_sample_fmt);
     dst_frame.set_ch_layout(out_ch_layout);
-    dst_frame.set_nb_samples(src_frame.nb_samples);
+    // 输出帧的缓冲必须按重采样后的输出样本数分配，而不是简单地使用输入样本数。
+    // 当输入/输出采样率不同时，swr_convert_frame() 会写入比输入样本数更多的输出样本，
+    // 但 FFmpeg 不会自动扩大已分配的输出缓冲（只把放不下的部分存入内部 FIFO），
+    // 若这里 mb_samples 设得过小，将导致 swr_convert 越界写。
+    // 用 swr_get_out_samples() 得到所需输出样本数的上界来分配缓冲。
+    let out_samples = swr_ctx.get_out_samples(src_frame.nb_samples).max(1);
+    dst_frame.set_nb_samples(out_samples);
     dst_frame.set_sample_rate(out_sample_rate);
     dst_frame.set_time_base(time::new_rational(1, out_sample_rate));
     dst_frame
@@ -323,7 +327,7 @@ pub fn convert_frame(
     // 如果输出 AVFrame 没有分配数据指针，则将在调用 av_frame_get_buffer() 分配帧时设置 nb_samples 字段。
     // 输出的 AVFrame 可以是 NULL，或者分配的样本少于所需的数量。在这种情况下，未写入输出的剩余样本将被添加到内部 FIFO 缓冲区，在下次调用此函数或 swr_convert() 时返回。
     // 如果转换采样率，内部重采样延迟缓冲区中可能会有剩余数据。要以输出方式获取这些数据，请调用此函数或 swr_convert()，并输入 NULL。
-    resample_context
+    swr_ctx
         .convert_frame(Some(src_frame), &mut dst_frame)
         .context("Failed to convert frame.")?;
 
