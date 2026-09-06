@@ -551,8 +551,21 @@ jobs:
       - name: Install BtbN FFmpeg
         shell: pwsh
         run: |
-          $VCINSTALLDIR = $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
-          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\x64\bin"
+          # bindgen needs a libclang.dll whose machine type matches the host. On the
+          # x64 runner the LLVM shipped with Visual Studio's x64 Clang toolset is fine.
+          # On the ARM64 runner that x64 libclang.dll cannot be loaded by the ARM64
+          # process, so fetch the native Windows-on-ARM64 LLVM ("woa64") build instead.
+          $isArm64 = ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64')
+          if ($isArm64) {
+            Invoke-WebRequest "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-woa64.exe" -OutFile llvm-arm64.exe
+            7z x llvm-arm64.exe -y -ollvm-arm64 | Out-Null
+            $libclang = @(Get-ChildItem llvm-arm64 -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if (-not $libclang) { throw "libclang.dll not found in the ARM64 LLVM extract" }
+            Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$($libclang[0].DirectoryName)"
+          } else {
+            $VCINSTALLDIR = $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
+            Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\x64\bin"
+          }
           Invoke-WebRequest "${{ matrix.download_url }}" -OutFile ffmpeg.zip
           Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg -Force
           # BtbN zips wrap everything in a single <package>/ dir; flatten it so
