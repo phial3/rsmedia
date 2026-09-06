@@ -1,5 +1,7 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/transcode_aac.c
+mod common;
 use anyhow::{Context as AnyhowContext, Result, bail};
+use common::test_output_path;
 use rsmedia::codec::CodecConfig;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
@@ -10,7 +12,7 @@ use rsmpeg::{
     swresample::SwrContext,
 };
 use std::{
-    ffi::CStr,
+    ffi::{CStr, CString},
     sync::atomic::{AtomicI64, Ordering},
 };
 
@@ -275,12 +277,14 @@ fn transcode_aac(input_file: &CStr, output_file: &CStr) -> Result<()> {
 
 #[test]
 fn transcode_aac_test0() {
-    std::fs::create_dir_all("tests/output/transcode_aac/").unwrap();
-    transcode_aac(c"assets/wav.wav", c"tests/output/transcode_aac/wav.aac").unwrap();
+    let output_path = test_output_path("transcode_aac", "wav.aac");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode_aac(c"assets/wav.wav", &output_path_c).unwrap();
 }
 
 #[test]
 fn transcode_aac_test1() {
-    std::fs::create_dir_all("tests/output/transcode_aac/").unwrap();
-    transcode_aac(c"assets/mp4.mp4", c"tests/output/transcode_aac/mp4.aac").unwrap();
+    let output_path = test_output_path("transcode_aac", "mp4.aac");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode_aac(c"assets/mp4.mp4", &output_path_c).unwrap();
 }

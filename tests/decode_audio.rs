@@ -1,5 +1,7 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/decode_audio.c
+mod common;
 use anyhow::{Context, Result};
+use common::test_output_path;
 use rsmpeg::{
     avcodec::{AVCodecContext, AVPacket},
     avformat::AVFormatContextInput,
@@ -126,5 +128,6 @@ fn decode_audio(audio_path: &str, out_file_path: &str) -> Result<()> {
 
 #[test]
 fn decode_audio_test() {
-    decode_audio("assets/wav.wav", "tests/output/decode_audio/wav.pcm").unwrap();
+    let output_path = test_output_path("decode_audio", "wav.pcm");
+    decode_audio("assets/wav.wav", output_path.to_str().unwrap()).unwrap();
 }

@@ -1263,8 +1263,11 @@ mod tests {
         ];
 
         for (i, (name, spec, n_frames, fps, min_frames)) in cases.iter().enumerate() {
-            let path = std::env::temp_dir().join(format!("rsmedia_decode_delayed_{i}.mp4"));
-            let _ = std::fs::remove_file(&path);
+            let path = crate::test_utils::test_output_path(
+                "decode",
+                &format!("rsmedia_decode_delayed_{i}.mp4"),
+            );
+            crate::test_utils::remove_test_output(&path);
             make_test_video(&path, width, height, *n_frames, *fps)?;
 
             let filters = vec![Filter::new(name, MediaType::VIDEO, spec.to_string())];

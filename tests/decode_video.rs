@@ -1,6 +1,8 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/decode_video.c
+mod common;
 use anyhow::{Context, Result};
 use camino::Utf8Path as Path;
+use common::test_output_path;
 use rsmpeg::{
     avcodec::{AVCodecContext, AVPacket},
     avformat::AVFormatContextInput,
@@ -103,5 +105,6 @@ fn decode_video(video_path: &str, out_dir: &str) -> Result<()> {
 
 #[test]
 fn decode_video_test() {
-    decode_video("assets/mp4.mp4", "tests/output/decode_video").unwrap();
+    let output_dir = test_output_path("decode_video", "");
+    decode_video("assets/mp4.mp4", output_dir.to_str().unwrap()).unwrap();
 }

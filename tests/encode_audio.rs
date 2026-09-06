@@ -1,5 +1,8 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/encode_audio.c
 
+mod common;
+use common::test_output_path;
+
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avformat::AVFormatContextOutput,
@@ -11,8 +14,7 @@ use rsmpeg::{
 use anyhow::{Context, Result};
 use rsmedia::codec::CodecConfig;
 use rsmedia::{EncoderBuilder, SampleFormat, filter, utils};
-use std::ffi::CStr;
-use std::path::Path;
+use std::ffi::{CStr, CString};
 
 /// 生成正弦波音频样本（优化内存访问）
 fn generate_sine_wave(frame: &mut AVFrame, frequency: f64, sample_rate: i32) -> Result<()> {
@@ -275,11 +277,18 @@ fn encode_audio(
     Ok(())
 }
 
+fn temp_output(name: &str) -> CString {
+    let path = test_output_path("encode_audio", name);
+    let path_str = path.to_string_lossy();
+    CString::new(path_str.as_bytes()).expect("temporary output path contains an embedded NUL byte")
+}
+
 #[test]
 fn test_encode_audio_aac() {
     // aac 有损格式 (192kbps)
+    let output = temp_output("encode_audio_output.aac");
     encode_audio(
-        c"/tmp/encode_audio_output.aac",
+        &output,
         ffi::AV_CODEC_ID_AAC,
         ffi::AV_SAMPLE_FMT_FLTP,
         192_000,
@@ -291,8 +300,9 @@ fn test_encode_audio_aac() {
 #[test]
 fn test_encode_audio_m4a() {
     // m4a AAC容器 (256kbps)
+    let output = temp_output("encode_audio_output.m4a");
     encode_audio(
-        c"/tmp/encode_audio_output.m4a",
+        &output,
         ffi::AV_CODEC_ID_AAC,
         ffi::AV_SAMPLE_FMT_FLTP,
         256_000,
@@ -304,8 +314,9 @@ fn test_encode_audio_m4a() {
 #[test]
 fn test_encode_audio_caf() {
     // caf ALAC无损格式
+    let output = temp_output("encode_audio_output.caf");
     encode_audio(
-        c"/tmp/encode_audio_output.caf",
+        &output,
         ffi::AV_CODEC_ID_ALAC,
         ffi::AV_SAMPLE_FMT_S32P,
         0,
@@ -317,8 +328,9 @@ fn test_encode_audio_caf() {
 #[test]
 fn test_encode_audio_mp3() {
     // mp3 有损格式 (128kbps)
+    let output = temp_output("encode_audio_output.mp3");
     encode_audio(
-        c"/tmp/encode_audio_output.mp3",
+        &output,
         ffi::AV_CODEC_ID_MP3,
         ffi::AV_SAMPLE_FMT_S16P,
         128_000,
@@ -330,21 +342,16 @@ fn test_encode_audio_mp3() {
 #[test]
 fn test_encode_audio_flac() {
     // flac 无损格式 (24-bit)
-    encode_audio(
-        c"/tmp/encode_audio_output.flac",
-        ffi::AV_CODEC_ID_FLAC,
-        ffi::AV_SAMPLE_FMT_S16,
-        0,
-        2,
-    )
-    .unwrap();
+    let output = temp_output("encode_audio_output.flac");
+    encode_audio(&output, ffi::AV_CODEC_ID_FLAC, ffi::AV_SAMPLE_FMT_S16, 0, 2).unwrap();
 }
 
 #[test]
 fn test_encode_audio_wav() {
     // wav - EBU R128标准 (24-bit/48kHz)
+    let output = temp_output("encode_audio_output.wav");
     encode_audio(
-        c"/tmp/encode_audio_output.wav",
+        &output,
         ffi::AV_CODEC_ID_PCM_S24LE,
         ffi::AV_SAMPLE_FMT_S32,
         2_304_000,
@@ -356,8 +363,9 @@ fn test_encode_audio_wav() {
 #[test]
 fn test_encode_audio_wav_16bit() {
     // WAV - 16-bit PCM
+    let output = temp_output("encode_audio_output_16bit.wav");
     encode_audio(
-        c"/tmp/encode_audio_output_16bit.wav",
+        &output,
         ffi::AV_CODEC_ID_PCM_S16LE,
         ffi::AV_SAMPLE_FMT_S16,
         1_536_000, // 48kHz * 16bit * 2ch
@@ -369,8 +377,9 @@ fn test_encode_audio_wav_16bit() {
 #[test]
 fn test_encode_audio_ac3() {
     // AC3 - 5.1声道 (640kbps)
+    let output = temp_output("encode_audio_output.ac3");
     encode_audio(
-        c"/tmp/encode_audio_output.ac3",
+        &output,
         ffi::AV_CODEC_ID_AC3,
         ffi::AV_SAMPLE_FMT_FLTP,
         640_000,
@@ -382,8 +391,9 @@ fn test_encode_audio_ac3() {
 #[test]
 fn test_encode_audio_opus() {
     // Opus - 低延迟语音编码 (64kbps)
+    let output = temp_output("encode_audio_output.opus");
     encode_audio(
-        c"/tmp/encode_audio_output.opus",
+        &output,
         ffi::AV_CODEC_ID_OPUS,
         ffi::AV_SAMPLE_FMT_FLT,
         64_000,
@@ -395,8 +405,9 @@ fn test_encode_audio_opus() {
 #[test]
 fn test_encode_audio_wmav2() {
     // WMA - Windows Media Audio (128kbps)
+    let output = temp_output("encode_audio_output.wma");
     encode_audio(
-        c"/tmp/encode_audio_output.wma",
+        &output,
         ffi::AV_CODEC_ID_WMAV2,
         ffi::AV_SAMPLE_FMT_FLTP,
         128_000,
@@ -408,8 +419,9 @@ fn test_encode_audio_wmav2() {
 #[test]
 fn test_encode_audio_aiff() {
     // AIFF - Apple无压缩格式 (24-bit)
+    let output = temp_output("encode_audio_output.aiff");
     encode_audio(
-        c"/tmp/encode_audio_output.aiff",
+        &output,
         ffi::AV_CODEC_ID_PCM_S24BE,
         ffi::AV_SAMPLE_FMT_S32,
         0,
@@ -421,8 +433,9 @@ fn test_encode_audio_aiff() {
 #[test]
 fn test_encode_audio_amr() {
     // AMR-NB - 移动语音编码 (12.2kbps)
+    let output = temp_output("encode_audio_output.amr");
     encode_audio(
-        c"/tmp/encode_audio_output.amr",
+        &output,
         ffi::AV_CODEC_ID_AMR_NB,
         ffi::AV_SAMPLE_FMT_S16,
         12200,
@@ -478,9 +491,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
 
     let channels = 2;
 
-    let output_dir = Path::new("tests/output/encode_audio");
-    std::fs::create_dir_all(output_dir)?;
-    let output_path = output_dir.join(format!("sine.{container_type}"));
+    let output_path = test_output_path("encode_audio", &format!("sine.{container_type}"));
 
     let audio_filters = vec![
         filter::audio::volume(1.2),  // 音量提升

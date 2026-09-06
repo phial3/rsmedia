@@ -1,7 +1,9 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/vaapi_transcode.c
 
+mod common;
 use anyhow::{Context, Error, Result, anyhow, bail};
-use std::ffi::CStr;
+use common::test_output_path;
+use std::ffi::{CStr, CString};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput};
@@ -364,11 +366,12 @@ fn hw_transcode(
 #[test]
 #[ignore = "Github actions doesn't have vaapi device"]
 fn vaapi_transcode_test_vaapi() {
-    std::fs::create_dir_all("tests/output/vaapi_transcode/").unwrap();
+    let output_path = test_output_path("vaapi_transcode", "vaapi_transcode_h264_vaapi.mp4");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
 
     hw_transcode(
         c"assets/mp4.mp4",
-        c"tests/output/vaapi_transcode/vaapi_transcode_h264_vaapi.mp4",
+        &output_path_c,
         c"h264_vaapi",
         c"h264_vaapi",
         AV_HWDEVICE_TYPE_VAAPI,
@@ -381,10 +384,11 @@ fn vaapi_transcode_test_vaapi() {
 #[test]
 #[ignore = "Github actions doesn't have nvdia graphics card"]
 fn nvenc_transcode_test_nvenc() {
-    std::fs::create_dir_all("tests/output/nvenc_transcode/").unwrap();
+    let output_path = test_output_path("nvenc_transcode", "nvenc_transcode_h264_nvenc.mp4");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
     hw_transcode(
         c"assets/mp4.mp4",
-        c"tests/output/nvenc_transcode/nvenc_transcode_h264_nvenc.mp4",
+        &output_path_c,
         c"h264_cuvid",
         c"h264_nvenc",
         AV_HWDEVICE_TYPE_CUDA,

@@ -1,5 +1,7 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/vaapi_encode.c
+mod common;
 use anyhow::{Context, Result};
+use common::test_output_path;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avutil::{AVFrame, AVHWDeviceContext, ra},
@@ -65,7 +67,7 @@ fn encode_write(
 
 struct HwEncodeConfig<'a> {
     input: &'a Path,
-    output: &'a Path,
+    output: &'a std::path::Path,
     width: i32,
     height: i32,
     encode_codec: &'a CStr,
@@ -151,11 +153,11 @@ fn hw_encode(config: &HwEncodeConfig<'_>) -> Result<()> {
 #[test]
 #[ignore = "Github actions doesn't have vaapi device"]
 fn vaapi_encode_test_vaapi() {
-    std::fs::create_dir_all("tests/output/vaapi_encode/").unwrap();
     // Produced by ffmpeg -i assets/mp4.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
+    let output_path = test_output_path("vaapi_encode", "vaapi_encode_test_vaapi.h264");
     hw_encode(&HwEncodeConfig {
         input: Path::new("tests/assets/vids/bear.yuv"),
-        output: Path::new("tests/output/vaapi_encode/vaapi_encode_test_vaapi.h264"),
+        output: &output_path,
         width: 320,
         height: 180,
         encode_codec: c"h264_vaapi",
@@ -177,11 +179,11 @@ fn vaapi_encode_test_vaapi() {
 #[test]
 #[ignore = "Github actions doesn't have nvdia graphics card"]
 fn nvenc_encode_test_nvenc() {
-    std::fs::create_dir_all("tests/output/nvenc_encode/").unwrap();
     // Produced by ffmpeg -i assets/mp4.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
+    let output_path = test_output_path("nvenc_encode", "nvenc_encode_test_nvenc.h264");
     hw_encode(&HwEncodeConfig {
         input: Path::new("tests/assets/vids/bear.yuv"),
-        output: Path::new("tests/output/nvenc_encode/nvenc_encode_test_nvenc.h264"),
+        output: &output_path,
         width: 320,
         height: 180,
         encode_codec: c"h264_nvenc",
@@ -195,11 +197,11 @@ fn nvenc_encode_test_nvenc() {
 #[test]
 #[ignore = "Github actions doesn't have macOS videotoolbox graphics card"]
 fn toolbox_encode_test_videotoolbox() {
-    std::fs::create_dir_all("tests/output/toolbox_encode/").unwrap();
     // Produced by ffmpeg -i assets/mp4.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
+    let output_path = test_output_path("toolbox_encode", "toolbox_encode_test_h264.h264");
     hw_encode(&HwEncodeConfig {
         input: Path::new("tests/assets/vids/bear.yuv"),
-        output: Path::new("tests/output/toolbox_encode/toolbox_encode_test_h264.h264"),
+        output: &output_path,
         width: 320,
         height: 180,
         encode_codec: c"h264_videotoolbox",

@@ -1,5 +1,7 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/encode_video.c
+mod common;
 use anyhow::{Context, Result, anyhow};
+use common::test_output_path;
 use rsmedia::{EncoderBuilder, utils};
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
@@ -9,9 +11,8 @@ use rsmpeg::{
 };
 use std::{
     ffi::CStr,
-    fs::{self, File},
+    fs::File,
     io::{BufWriter, Write},
-    path::Path,
 };
 
 const WIDTH: usize = 352;
@@ -137,9 +138,7 @@ fn encode_video_container(container_type: &str, codec_name: &str) -> Result<()> 
         anyhow::bail!("encoder {codec_name} not available in this FFmpeg build");
     }
 
-    let output_dir = Path::new("tests/output/encode_video");
-    fs::create_dir_all(output_dir)?;
-    let output_path = output_dir.join(format!("test.{container_type}"));
+    let output_path = test_output_path("encode_video", &format!("test.{container_type}"));
 
     let mut encoder = EncoderBuilder::new_video(WIDTH, HEIGHT)
         .with_fps(25.0)
@@ -193,12 +192,12 @@ fn encode_video_test_h264() {
         println!("skip test: libx264 not available in this FFmpeg build");
         return;
     }
-    fs::create_dir_all("tests/output/encode_video/").unwrap();
-    encode_video(c"libx264", "tests/output/encode_video/h264.h264").unwrap();
+    let output_path = test_output_path("encode_video", "h264.h264");
+    encode_video(c"libx264", output_path.to_str().unwrap()).unwrap();
 }
 
 #[test]
 fn encode_video_test_mpeg4() {
-    fs::create_dir_all("tests/output/encode_video/").unwrap();
-    encode_video(c"mpeg4", "tests/output/encode_video/mpeg4.m4v").unwrap();
+    let output_path = test_output_path("encode_video", "mpeg4.m4v");
+    encode_video(c"mpeg4", output_path.to_str().unwrap()).unwrap();
 }

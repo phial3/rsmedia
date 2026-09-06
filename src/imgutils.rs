@@ -528,8 +528,6 @@ mod tests {
     use anyhow::Context;
     use image::{ImageBuffer, Rgb};
 
-    const OUTPUT_DIR: &str = "tests/output";
-
     /// Create an image with the given text and a gradient color.
     fn create_image_with_text(
         width: u32,
@@ -579,9 +577,9 @@ mod tests {
 
     #[test]
     fn test_image_text() -> Result<()> {
-        std::fs::create_dir_all(OUTPUT_DIR)?;
+        let output_path = crate::test_utils::test_output_path("imgutils", "image_with_text.png");
         let rgb = create_image_with_text(640, 480, "Hello, world!");
-        rgb.save(format!("{}/image_with_text.png", OUTPUT_DIR))?;
+        rgb.save(output_path)?;
         Ok(())
     }
 

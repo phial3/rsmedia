@@ -1,5 +1,7 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/transcode.c
+mod common;
 use anyhow::{Context, Result, anyhow, bail};
+use common::test_output_path;
 use rsmedia::codec::CodecConfig;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
@@ -535,76 +537,52 @@ pub fn transcode(
 
 #[test]
 fn transcode_test0() {
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"assets/mp4.mp4",
-        c"tests/output/transcode/bear_t0.mov",
-        &mut None,
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode", "bear_t0.mov");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
 fn transcode_test1() {
     // transcode 按 codec_id 保持编码（AAC），故选用支持 AAC 的 MPEG-TS 容器。
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"assets/mp4.mp4",
-        c"tests/output/transcode/bear_t1.ts",
-        &mut None,
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode", "bear_t1.ts");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
 fn transcode_test2() {
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"assets/mp4.mp4",
-        c"tests/output/transcode/bear_t2.mp4",
-        &mut None,
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode", "bear_t2.mp4");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
 fn transcode_test3() {
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"assets/mp4.mp4",
-        c"tests/output/transcode/bear_t3.mkv",
-        &mut None,
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode", "bear_t3.mkv");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
 fn transcode_test4() {
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"assets/mp4.mp4",
-        c"tests/output/transcode/bear_t4.mp4",
-        &mut None,
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode", "bear_t4.mp4");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
 fn transcode_test5() {
     // Fragmented MP4 transcode.
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
+    let output_path = test_output_path("transcode", "bear_t5.fmp4.mp4");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
     let mut dict = Some(AVDictionary::new(
         c"movflags",
         c"frag_keyframe+empty_moov",
         0,
     ));
 
-    transcode(
-        c"assets/mp4.mp4",
-        c"tests/output/transcode/bear_t5.fmp4.mp4",
-        &mut dict,
-    )
-    .unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut dict).unwrap();
 
     // Ensure `dict` is consumed.
     assert!(dict.is_none());
