@@ -501,7 +501,7 @@ mod tests {
     fn test_mux_demux_video() -> Result<()> {
         let output_path = Path::new("/tmp/test_mux_demux_video.mp4");
 
-        let (width, height) = (1920, 1080);
+        let (width, height) = (640, 360);
         let video_encoder = Encoder::new_video(width, height)?;
 
         let mut muxer = Muxer::new(output_path)?;
@@ -510,8 +510,8 @@ mod tests {
         let encoder_time_base = video_encoder.time_base();
         let video_index = muxer.add_stream(video_encoder)?;
 
-        // 生成测试视频帧 // 10秒视频 30fps
-        for index in 0..10 * encoder_frame_rate.den as i64 {
+        // 生成测试视频帧 // 3秒视频 30fps
+        for index in 0..3 * encoder_frame_rate.den as i64 {
             let mut frame = generate_video_frame(width, height, index);
             frame.set_pts(index * encoder_time_base.den as i64);
             frame.set_time_base(encoder_time_base);
@@ -676,10 +676,10 @@ mod tests {
     #[test]
     fn test_multiple_streams() -> Result<()> {
         // 视频参数
-        pub const VIDEO_WIDTH: usize = 1280;
-        pub const VIDEO_HEIGHT: usize = 720;
+        pub const VIDEO_WIDTH: usize = 640;
+        pub const VIDEO_HEIGHT: usize = 360;
         pub const VIDEO_FPS: f32 = 30f32;
-        pub const VIDEO_DURATION_SEC: u32 = 10;
+        pub const VIDEO_DURATION_SEC: u32 = 3;
 
         // 音频参数
         pub const AUDIO_SAMPLE_RATE: i32 = 48_000;

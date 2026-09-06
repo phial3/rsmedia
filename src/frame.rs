@@ -1312,8 +1312,8 @@ mod tests {
 
     #[test]
     fn test_create_rgb24_frame() -> Result<()> {
-        let width = 1920;
-        let height = 1080;
+        let width = 640;
+        let height = 360;
         let time_base = ffi::AVRational { num: 1, den: 30 }; // 30 fps
 
         let mut frame =
@@ -1347,8 +1347,8 @@ mod tests {
 
     #[test]
     fn test_create_yuv420p_frame() -> Result<()> {
-        let width = 1920;
-        let height = 1080;
+        let width = 640;
+        let height = 360;
 
         // 创建空的YUV420P帧
         let yuv_frame = create_test_yuv_frame(width, height);

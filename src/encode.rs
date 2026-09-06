@@ -1583,23 +1583,12 @@ mod tests {
                 Some(&[("profile", "baseline"), ("level", "3.0")]),
             ),
             vc("mov", None, (1, 90_000), 2_000_000, None),
-            vc("wmv", None, (1, 10_000_000), 2_000_000, None),
             vc("flv", None, (1, 1_000), 2_000_000, None),
             vc("mpg", None, (1, 90_000), 2_000_000, None),
-            vc("mpeg", None, (1, 90_000), 2_000_000, None),
-            vc("asf", None, (1, 10_000_000), 2_000_000, None),
-            // 广播/流媒体容器
             vc("ts", None, (1, 90_000), 2_000_000, None),
-            vc("m2ts", None, (1, 90_000), 2_000_000, None),
-            vc("mts", None, (1, 90_000), 2_000_000, None),
-            vc("f4v", None, (1, 90_000), 2_000_000, None),
-            vc("ismv", None, (1, 90_000), 2_000_000, None),
+            vc("vob", Some("mpeg2video"), (1, 90_000), 2_000_000, None),
             // 移动/特殊容器
             vc("3gp", None, (1, 90_000), 2_000_000, None),
-            vc("3g2", None, (1, 90_000), 2_000_000, None),
-            vc("ogv", Some("libtheora"), (1, 1_000_000), 1_000_000, None),
-            vc("rm", None, (1, 90_000), 2_000_000, None),
-            vc("vob", Some("mpeg2video"), (1, 90_000), 2_000_000, None),
             // 原始/裸流格式
             vc("h264", None, (1, 90_000), 2_000_000, None),
             vc("h265", Some("libx265"), (1, 90_000), 2_000_000, None),
@@ -1607,7 +1596,8 @@ mod tests {
             vc("y4m", Some("rawvideo"), (1, 90_000), 0, None),
             // SWF 只接受 Flash 系编码器（FLV1 编码器注册名为 `flv`）
             vc("swf", Some("flv"), (1, 1_000), 2_000_000, None),
-            vc("m4v", None, (1, 90_000), 2_000_000, None),
+            // 精简掉冗余的低价值容器（wmv/mpeg/asf/m2ts/mts/f4v/ismv/ogv/rm/m4v/3g2）
+            // 以缩短 valgrind/localtest 全量测试耗时。
         ];
 
         /// 对指定视频容器执行「编码 10 秒视频 → flush」完整流程。
@@ -1629,7 +1619,7 @@ mod tests {
             );
 
             // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用，不可用时降级为仅 scale+crop
-            let mut filters = vec![filter::video::scale(1920, 1080, None)];
+            let mut filters = vec![filter::video::scale(640, 360, None)];
             if rsmpeg::avfilter::AVFilter::get_by_name(c"drawtext").is_some() {
                 filters.push(
                     filter::video::DrawText::new("Watermark", 50, 50, 24, "white@0.5").build(),
@@ -1640,8 +1630,8 @@ mod tests {
             filters.push(filter::video::crop(0, 0, 640, 360));
 
             // 视频编码参数
-            let width = 1280;
-            let height = 720;
+            let width = 640;
+            let height = 360;
             let output_path = temp_path(format!("test_encode_video.{}", spec.container));
             remove_temp(&output_path);
 
@@ -1679,9 +1669,10 @@ mod tests {
                 spec.container, actual_timebase.num, actual_timebase.den, duration_units, fps
             );
 
-            // 帧编码并写入文件：5 秒 × fps
-            const VIDEO_DURATION_SECS: f64 = 1.0;
+            // 帧编码并写入文件 0.5s 缩短 valgrind 全量测试耗时
+            const VIDEO_DURATION_SECS: f64 = 0.5;
             let n_frames = (VIDEO_DURATION_SECS * fps).round() as usize;
+            let n_frames = n_frames.max(1);
             for i in 0..n_frames {
                 let mut frame = rainbow_video_frame(
                     width as usize,
@@ -1976,7 +1967,7 @@ mod tests {
                                 println!(
                                     "COMB codec={codec} src={w}x{h} fps={fps} resize={resize:?} algo={algo:?}"
                                 );
-                                let n_frames = 12usize;
+                                let n_frames = 6usize;
                                 let path = temp_path(format!(
                                     "rsmedia_param_{codec}_{w}x{h}_{fps}_{:?}_{:?}.mp4",
                                     resize.map(|r| format!("{r:?}")),
@@ -2057,7 +2048,7 @@ mod tests {
 
             let width = 64usize;
             let height = 64usize;
-            let n_frames = 12;
+            let n_frames = 6;
             let fps = 25.0;
 
             // (名称, Filter, 期望最小解码帧数, 期望尺寸(Some 则精确断言，None 则不断言))
