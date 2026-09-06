@@ -206,14 +206,15 @@ pub mod video {
 
     /// 在视频上绘制文字的 Builder，对应 FFmpeg `drawtext` 滤镜。
     ///
-    /// `fontfile` 可选，缺省时使用 FFmpeg 默认字体；也支持给文字加描边盒子（`boxed`）。
+    /// `fontfile` 可选，缺省时使用项目内 `fonts/Arial.ttf`（避免依赖 system fontconfig，
+    /// 例如 Windows 等没有 fontconfig 配置的平台会崩溃）；也支持给文字加描边盒子（`boxed`）。
     ///
     /// # Examples
     ///
     /// ```
     /// use rsmedia::filter::video::DrawText;
     /// let f = DrawText::new("Hello", 10, 10, 24, "white")
-    ///     .fontfile("fonts/Arial.ttf")
+    ///     .fontfile("/path/to/your-font.ttf")
     ///     .boxed("black@0.5")
     ///     .build();
     /// ```
@@ -296,9 +297,12 @@ pub mod video {
                 "drawtext=text='{}':x={}:y={}:fontsize={}:fontcolor={}",
                 text_spec, self.x, self.y, self.fontsize, self.fontcolor
             );
-            if let Some(fontfile) = self.fontfile {
-                spec.push_str(&format!(":fontfile='{}'", escape_filter_str(&fontfile)));
-            }
+            // 缺省使用项目自带字体，避免依赖 system fontconfig（Windows 等平台没有
+            // fontconfig 配置会在查字体时崩溃）；用户显式指定字体时优先用用户的。
+            let fontfile = self
+                .fontfile
+                .unwrap_or_else(|| "fonts/Arial.ttf".to_string());
+            spec.push_str(&format!(":fontfile='{}'", escape_filter_str(&fontfile)));
             if self.box_enabled {
                 spec.push_str(&format!(
                     ":box=1:boxcolor={}:boxborderw={}",
