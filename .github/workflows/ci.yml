@@ -2,11 +2,11 @@ name: ci
 
 on:
   push:
-    branches: [ "main", "rsmpeg", "dev" ]
+    branches: [ "main", "master" ]
     paths-ignore:
       - 'README.md'
   pull_request:
-    branches: [ "main", "rsmpeg", "dev" ]
+    branches: [ "main", "master" ]
     paths-ignore:
       - 'README.md'
 
