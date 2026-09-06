@@ -629,6 +629,7 @@ jobs:
             libzvbi-dev \
             libpostproc-dev \
             librubberband-dev \
+            libc6-dbg \
             valgrind
 
       - name: Install BtbN FFmpeg
@@ -648,6 +649,27 @@ jobs:
         with:
           toolchain: nightly
           components: rustfmt, clippy
+
+      # cache the cargo-valgrind binaries so repeated jobs don't rebuild them from source.
+      - name: Cache valgrind
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/valgrind
+          key: valgrind-${{ runner.os }}
+
+      # cargo-valgrind builds "cargo test --no-run" and runs the lib test executable under memcheck,
+      # and it ships default suppressions for the Rust standard library. Without these, a full leak
+      # check reports a spurious "possibly lost 48 bytes" from std::thread::current() on nightly Rust
+      # (rust-lang/rust#135608), which the job would treat as fatal (exit 99) even though all tests
+      # pass - matching rsmpeg's own CI setup. Using the latest release pulls in the current
+      # suppression sets that stay in sync with nightly Rust.
+      - name: Install cargo-valgrind
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-valgrind --root "${{ github.workspace }}/valgrind"
+
+      - name: Add cargo-valgrind to PATH
+        run: echo "${{ github.workspace }}/valgrind/bin" >> "$GITHUB_PATH"
 
       - name: Verify FFmpeg version
         run: |
@@ -688,46 +710,8 @@ jobs:
             echo "OK: no FFmpeg in system link/runtime cache"
           fi
 
-      # Build the lib test binary once; src-level tests (frame/encode/decode/mux/swctx/codec/resize)
-      # are the FFI-touching code paths most likely to leak or double-free.
-      - name: Build library tests
-        run: cargo test --lib --no-default-features --features ${{ matrix.feature }} --no-run
-
-      - name: Run tests under Valgrind memcheck
-        run: |
-          set -uo pipefail
-          # Query cargo for the exact test harness path instead of globbing target/debug/deps: the
-          # unit-test executable is emitted under target/debug/build/rsmedia/<hash>/out/ for crates
-          # with a build script, so fixed path guesses are unreliable.
-          test_bin=$(
-            cargo test --lib --no-default-features --features ${{ matrix.feature }} --no-run \
-              --message-format=json-render-diagnostics 2>/dev/null \
-            | python3 -c 'import json,sys;d=[json.loads(l) for l in sys.stdin if l.strip()];n=[m["executable"] for m in d if m.get("reason")=="compiler-artifact" and m.get("profile",{}).get("test") and m.get("executable")];print(n[0] if n else "")'
-          )
-          if [ -z "${test_bin}" ]; then
-            echo ":::: could not locate the rsmedia lib test executable via cargo message format ::::"
-            exit 1
-          fi
-          echo "Using test binary: ${test_bin}"
-          valgrind \
-            --tool=memcheck \
-            --leak-check=full \
-            --show-leak-kinds=definite,possible \
-            --errors-for-leak-kinds=definite,possible \
-            --error-exitcode=99 \
-            --error-limit=no \
-            --num-callers=40 \
-            "${test_bin}" --test-threads=1 \
-            2> /tmp/valgrind.err
-          rc=$?
-          if [ $rc -ne 0 ]; then
-            echo ":::: valgrind reported errors / leaks (definite/possible) or the tests failed ::::"
-            cat /tmp/valgrind.err
-            echo "==== valgrind HEAP SUMMARY ===="
-            sed -n '/HEAP SUMMARY/,/All heap blocks were freed/p' /tmp/valgrind.err
-            exit $rc
-          fi
-          echo "valgrind: OK (no definite/possible leaks, no invalid access)"
+      - name: Run tests under Valgrind (cargo valgrind test)
+        run: cargo valgrind test --lib --no-default-features --features ${{ matrix.feature }}
 
   test-windows:
     name: test / windows / ffmpeg-${{ matrix.ffmpeg_version }}
