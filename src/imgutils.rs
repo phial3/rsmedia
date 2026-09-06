@@ -158,10 +158,7 @@ fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
     let desc = PixelFormat::from(frame.format).descriptor()?;
 
     let (shift_w, shift_h) = if plane_idx > 0 {
-        (
-            desc.log2_chroma_w.max(0) as u32,
-            desc.log2_chroma_h.max(0) as u32,
-        )
+        (desc.log2_chroma_w as u32, desc.log2_chroma_h as u32)
     } else {
         (0, 0)
     };
