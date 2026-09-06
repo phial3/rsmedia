@@ -1,12 +1,14 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/remux.c
+mod common;
 use anyhow::{Context, Result};
+use common::test_output_path;
 use rsmpeg::{
     avcodec::AVPacket,
     avformat::{AVFormatContextInput, AVFormatContextOutput},
     avutil::{ts2str, ts2timestr},
     ffi::AVRational,
 };
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
 fn log_packet(time_base: AVRational, pkt: &AVPacket, tag: &str) {
     println!(
@@ -34,7 +36,7 @@ fn remux(input_path: &CStr, output_path: &CStr) -> Result<()> {
         let mut stream_index = 0usize;
         input_format_context
             .streams()
-            .into_iter()
+            .iter()
             .map(|stream| {
                 let codec_type = stream.codecpar().codec_type();
                 if !codec_type.is_video() && !codec_type.is_audio() && !codec_type.is_subtitle() {
@@ -85,12 +87,8 @@ fn remux(input_path: &CStr, output_path: &CStr) -> Result<()> {
 
 /// Remux MP4 to MOV, with h.264 codec.
 #[test]
-#[ignore = "Remux MP4 to MOV, with h.264 codec 测试运行依赖测试文件，暂时忽略"]
 fn remux_test0() {
-    std::fs::create_dir_all("tests/output/remux/").unwrap();
-    remux(
-        c"tests/assets/vids/big_buck_bunny.mp4",
-        c"tests/output/remux/big_buck_bunny.mov",
-    )
-    .unwrap();
+    let output_path = test_output_path("remux", "mp4.mov");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    remux(c"assets/mp4.mp4", &output_path_c).unwrap();
 }

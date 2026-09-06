@@ -1,11 +1,14 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/transcode.c
-use anyhow::{anyhow, bail, Context, Result};
+mod common;
+use anyhow::{Context, Result, anyhow, bail};
+use common::test_output_path;
+use rsmedia::codec::CodecConfig;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut},
     avformat::{AVFormatContextInput, AVFormatContextOutput},
     avutil::{
-        av_inv_q, av_rescale_q, get_sample_fmt_name, ra, AVChannelLayout, AVDictionary, AVFrame,
+        AVChannelLayout, AVDictionary, AVFrame, av_inv_q, av_rescale_q, get_sample_fmt_name, ra,
     },
     error::RsmpegError,
     ffi,
@@ -39,7 +42,7 @@ fn open_input_file(filename: &CStr) -> Result<(Vec<Option<AVCodecContext>>, AVFo
     let mut ifmt_ctx = AVFormatContextInput::open(filename)?;
     let mut stream_ctx = Vec::with_capacity(ifmt_ctx.nb_streams as usize);
 
-    for (i, input_stream) in ifmt_ctx.streams().into_iter().enumerate() {
+    for (i, input_stream) in ifmt_ctx.streams().iter().enumerate() {
         let codecpar = input_stream.codecpar();
         let codec_type = codecpar.codec_type();
         let dec_ctx = if codec_type.is_video() || codec_type.is_audio() {
@@ -54,10 +57,10 @@ fn open_input_file(filename: &CStr) -> Result<(Vec<Option<AVCodecContext>>, AVFo
                 )
             })?;
             dec_ctx.set_pkt_timebase(input_stream.time_base);
-            if codec_type.is_video() {
-                if let Some(framerate) = input_stream.guess_framerate() {
-                    dec_ctx.set_framerate(framerate);
-                }
+            if codec_type.is_video()
+                && let Some(framerate) = input_stream.guess_framerate()
+            {
+                dec_ctx.set_framerate(framerate);
             }
             dec_ctx
                 .open(None)
@@ -93,35 +96,34 @@ fn open_output_file(
             .with_context(|| anyhow!("encoder({}) not found.", dec_ctx.codec_id))?;
 
         let mut enc_ctx = AVCodecContext::new(&encoder);
+        let codec_config = CodecConfig::from_codec(encoder);
 
         if dec_ctx.codec_type == ffi::AVMEDIA_TYPE_VIDEO {
             enc_ctx.set_height(dec_ctx.height);
             enc_ctx.set_width(dec_ctx.width);
             enc_ctx.set_sample_aspect_ratio(dec_ctx.sample_aspect_ratio);
-            #[cfg(not(feature = "ffmpeg7"))]
-            enc_ctx.set_pix_fmt(encoder.pix_fmts().unwrap()[0]);
-            #[cfg(feature = "ffmpeg7")]
-            enc_ctx.set_pix_fmt(
-                dec_ctx
-                    .get_supported_pix_fmts(None)
-                    .ok()
-                    .and_then(|x| x.get(0).copied())
-                    .unwrap_or(dec_ctx.pix_fmt),
-            );
+
+            let pix_fmts = codec_config
+                .supported_pixel_formats()
+                .ok()
+                .unwrap()
+                .and_then(|x| x.first().copied())
+                .unwrap_or(dec_ctx.pix_fmt);
+
+            enc_ctx.set_pix_fmt(pix_fmts);
             enc_ctx.set_time_base(av_inv_q(dec_ctx.framerate));
         } else if dec_ctx.codec_type == ffi::AVMEDIA_TYPE_AUDIO {
             enc_ctx.set_sample_rate(dec_ctx.sample_rate);
             enc_ctx.set_ch_layout(dec_ctx.ch_layout().clone().into_inner());
-            #[cfg(not(feature = "ffmpeg7"))]
-            enc_ctx.set_sample_fmt(encoder.sample_fmts().unwrap()[0]);
-            #[cfg(feature = "ffmpeg7")]
-            enc_ctx.set_sample_fmt(
-                dec_ctx
-                    .get_supported_sample_fmts(None)
-                    .ok()
-                    .and_then(|x| x.get(0).copied())
-                    .unwrap_or(dec_ctx.sample_fmt),
-            );
+
+            let sample_fmts = codec_config
+                .supported_sample_formats()
+                .ok()
+                .unwrap()
+                .and_then(|x| x.first().copied())
+                .unwrap_or(dec_ctx.sample_fmt);
+
+            enc_ctx.set_sample_fmt(sample_fmts);
             enc_ctx.set_time_base(ra(1, dec_ctx.sample_rate));
         } else {
             bail!(
@@ -138,7 +140,7 @@ fn open_output_file(
         enc_ctx.open(None).with_context(|| {
             anyhow!(
                 "Cannot open {} encoder for stream #{}",
-                encoder.name().to_str().unwrap(),
+                codec_config.name().to_str().unwrap(),
                 i
             )
         })?;
@@ -197,6 +199,18 @@ fn init_filter<'graph>(
             .alloc_filter_context(&buffersink, c"out")
             .context("Cannot create buffer sink")?;
 
+        // FFmpeg 8 将 buffersink 的 `pix_fmts`(binary) 废弃为新数组选项 `pixel_formats`，
+        // 新旧选项不能混用，须在 init 之前设置。
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        buffer_sink_context
+            .opt_set_array(
+                c"pixel_formats",
+                0,
+                Some(&[enc_ctx.pix_fmt]),
+                ffi::AV_OPT_TYPE_PIXEL_FMT,
+            )
+            .context("Cannot set output pixel format")?;
+        #[cfg(not(any(feature = "ffmpeg8", feature = "ffmpeg9")))]
         buffer_sink_context
             .opt_set_bin(c"pix_fmts", &enc_ctx.pix_fmt)
             .context("Cannot set output pixel format")?;
@@ -237,15 +251,48 @@ fn init_filter<'graph>(
         let mut buffersink_ctx = filter_graph
             .alloc_filter_context(&buffersink, c"out")
             .context("Cannot create audio buffer sink")?;
-        buffersink_ctx
-            .opt_set_bin(c"sample_fmts", &enc_ctx.sample_fmt)
-            .context("Cannot set output sample format")?;
-        buffersink_ctx
-            .opt_set(c"ch_layouts", &enc_ctx.ch_layout().describe().unwrap())
-            .context("Cannot set output channel layout")?;
-        buffersink_ctx
-            .opt_set_bin(c"sample_rates", &enc_ctx.sample_rate)
-            .context("Cannot set output sample rate")?;
+        // FFmpeg 8 将 abuffersink 的旧选项 `sample_fmts`/`sample_rates`(binary)、
+        // `ch_layouts`(string) 废弃为新数组选项 `sample_formats`/`samplerates`/`channel_layouts`，
+        // 新旧选项不能混用，须在 init 之前设置。
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        {
+            buffersink_ctx
+                .opt_set_array(
+                    c"sample_formats",
+                    0,
+                    Some(&[enc_ctx.sample_fmt]),
+                    ffi::AV_OPT_TYPE_SAMPLE_FMT,
+                )
+                .context("Cannot set output sample format")?;
+            buffersink_ctx
+                .opt_set_array(
+                    c"channel_layouts",
+                    0,
+                    Some(&[enc_ctx.ch_layout().clone().into_inner()]),
+                    ffi::AV_OPT_TYPE_CHLAYOUT,
+                )
+                .context("Cannot set output channel layout")?;
+            buffersink_ctx
+                .opt_set_array(
+                    c"samplerates",
+                    0,
+                    Some(&[enc_ctx.sample_rate]),
+                    ffi::AV_OPT_TYPE_INT,
+                )
+                .context("Cannot set output sample rate")?;
+        }
+        #[cfg(not(any(feature = "ffmpeg8", feature = "ffmpeg9")))]
+        {
+            buffersink_ctx
+                .opt_set_bin(c"sample_fmts", &enc_ctx.sample_fmt)
+                .context("Cannot set output sample format")?;
+            buffersink_ctx
+                .opt_set(c"ch_layouts", &enc_ctx.ch_layout().describe().unwrap())
+                .context("Cannot set output channel layout")?;
+            buffersink_ctx
+                .opt_set_bin(c"sample_rates", &enc_ctx.sample_rate)
+                .context("Cannot set output sample rate")?;
+        }
 
         // `av_buffersink_set_frame_size` will SIGSEGV even on FFmpeg 7.1, problem persists until
         // https://github.com/FFmpeg/FFmpeg/commit/6b402cdbf46e4398b3285277f3ff7c3654d57ce6.
@@ -290,8 +337,7 @@ fn init_filters(
 ) -> Result<Vec<Option<FilteringContext<'_>>>> {
     let mut filter_ctx = Vec::with_capacity(stream_contexts.len());
 
-    for (filter_graph, stream_context) in filter_graphs.iter_mut().zip(stream_contexts.into_iter())
-    {
+    for (filter_graph, stream_context) in filter_graphs.iter_mut().zip(stream_contexts) {
         let Some(stream_context) = stream_context else {
             filter_ctx.push(None);
             continue;
@@ -334,14 +380,14 @@ fn encode_write_frame(
     ofmt_ctx: &mut AVFormatContextOutput,
     stream_index: usize,
 ) -> Result<()> {
-    if let Some(filt_frame) = filt_frame.as_mut() {
-        if filt_frame.pts != ffi::AV_NOPTS_VALUE {
-            filt_frame.set_pts(av_rescale_q(
-                filt_frame.pts,
-                filt_frame.time_base,
-                enc_ctx.time_base,
-            ));
-        }
+    if let Some(filt_frame) = filt_frame.as_mut()
+        && filt_frame.pts != ffi::AV_NOPTS_VALUE
+    {
+        filt_frame.set_pts(av_rescale_q(
+            filt_frame.pts,
+            filt_frame.time_base,
+            enc_ctx.time_base,
+        ));
     }
 
     enc_ctx
@@ -446,7 +492,7 @@ pub fn transcode(
                 let mut frame = match decode_context.receive_frame() {
                     Ok(frame) => frame,
                     Err(RsmpegError::DecoderDrainError) | Err(RsmpegError::DecoderFlushedError) => {
-                        break
+                        break;
                     }
                     Err(e) => bail!(e),
                 };
@@ -466,111 +512,77 @@ pub fn transcode(
 
     // Flush the filter graph by pushing EOF packet to buffer_src_context.
     // Flush the encoder by pushing EOF frame to encode_context.
-    for filter_ctx in filter_ctx.iter_mut() {
-        match filter_ctx {
-            Some(FilteringContext {
-                dec_ctx: _,
-                enc_ctx,
-                stream_index,
-                buffersrc_ctx,
-                buffersink_ctx,
-            }) => {
-                filter_encode_write_frame(
-                    None,
-                    buffersrc_ctx,
-                    buffersink_ctx,
-                    enc_ctx,
-                    &mut ofmt_ctx,
-                    *stream_index,
-                )
-                .context("Flushing filter failed")?;
-                flush_encoder(enc_ctx, &mut ofmt_ctx, *stream_index)
-                    .context("Flushing encoder failed")?;
-            }
-            None => (),
-        }
+    for FilteringContext {
+        dec_ctx: _,
+        enc_ctx,
+        stream_index,
+        buffersrc_ctx,
+        buffersink_ctx,
+    } in filter_ctx.iter_mut().flatten()
+    {
+        filter_encode_write_frame(
+            None,
+            buffersrc_ctx,
+            buffersink_ctx,
+            enc_ctx,
+            &mut ofmt_ctx,
+            *stream_index,
+        )
+        .context("Flushing filter failed")?;
+        flush_encoder(enc_ctx, &mut ofmt_ctx, *stream_index).context("Flushing encoder failed")?;
     }
     ofmt_ctx.write_trailer()?;
     Ok(())
 }
 
 #[test]
-#[ignore = "transcode_test0 测试运行依赖测试文件，暂时忽略"]
 fn transcode_test0() {
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"tests/assets/vids/mov_sample.mov",
-        c"tests/output/transcode/mov_sample.mov",
-        &mut None,
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode", "bear_t0.mov");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
-#[ignore = "transcode_test1 测试运行依赖测试文件，暂时忽略"]
 fn transcode_test1() {
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"tests/assets/vids/centaur.mpg",
-        c"tests/output/transcode/centaur.mpg",
-        &mut None,
-    )
-    .unwrap();
+    // transcode 按 codec_id 保持编码（AAC），故选用支持 AAC 的 MPEG-TS 容器。
+    let output_path = test_output_path("transcode", "bear_t1.ts");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
-#[ignore = "transcode_test2 测试运行依赖测试文件，暂时忽略"]
 fn transcode_test2() {
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"tests/assets/vids/bear.mp4",
-        c"tests/output/transcode/bear.mp4",
-        &mut None,
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode", "bear_t2.mp4");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
-#[ignore = "transcode_test3 测试运行依赖测试文件，暂时忽略"]
 fn transcode_test3() {
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"tests/assets/vids/vp8.mp4",
-        c"tests/output/transcode/vp8.webm",
-        &mut None,
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode", "bear_t3.mkv");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
-#[ignore = "transcode_test4 测试运行依赖测试文件，暂时忽略"]
 fn transcode_test4() {
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
-    transcode(
-        c"tests/assets/vids/big_buck_bunny.mp4",
-        c"tests/output/transcode/big_buck_bunny.mp4",
-        &mut None,
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode", "bear_t4.mp4");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut None).unwrap();
 }
 
 #[test]
-#[ignore = "transcode_test5 测试运行依赖测试文件，暂时忽略"]
 fn transcode_test5() {
     // Fragmented MP4 transcode.
-    std::fs::create_dir_all("tests/output/transcode/").unwrap();
+    let output_path = test_output_path("transcode", "bear_t5.fmp4.mp4");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
     let mut dict = Some(AVDictionary::new(
         c"movflags",
         c"frag_keyframe+empty_moov",
         0,
     ));
 
-    transcode(
-        c"tests/assets/vids/big_buck_bunny.mp4",
-        c"tests/output/transcode/big_buck_bunny.fmp4.mp4",
-        &mut dict,
-    )
-    .unwrap();
+    transcode(c"assets/mp4.mp4", &output_path_c, &mut dict).unwrap();
 
     // Ensure `dict` is consumed.
     assert!(dict.is_none());

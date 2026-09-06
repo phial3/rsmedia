@@ -1,4 +1,4 @@
-use crate::{imgutils, time, PixelFormat, SampleFormat};
+use crate::{PixelFormat, SampleFormat, imgutils, time};
 
 use rsmpeg::avutil::{AVFrame, AVSamples};
 use rsmpeg::ffi;
@@ -11,6 +11,82 @@ use anyhow::{Context, Error, Result};
 ////////////////////////////// Video Scaler SwsContext ////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// 缩放算法选择。对应 FFmpeg 的 `sws_flags` 缩放算法位，多个质量相关 flag
+/// （`SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND | SWS_BITEXACT`）恒被附加。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ScaleAlgorithm {
+    /// 快速双线性插值（性能优先，质量略逊）
+    FastBilinear,
+    /// 双线性插值，与 FFmpeg 命令行默认一致
+    Bilinear,
+    /// 双三次插值（默认，质量/性能均衡）
+    #[default]
+    Bicubic,
+    /// 实验性算法（`SWS_X`）
+    Experimental,
+    /// 最近邻（阶跃边缘，无平滑）
+    Point,
+    /// 面积平均（适合缩小）
+    Area,
+    /// 双三次亮度 + 双线性色度（`SWS_BICUBLIN`）
+    BicubicLinear,
+    /// 高斯插值
+    Gaussian,
+    /// sinc 插值
+    Sinc,
+    /// Lanczos 插值（高质量）
+    Lanczos,
+    /// 三次 Keys 样条
+    Spline,
+}
+
+// FFmpeg `SwsFlags` 定义参考（对应 swscale 头的开关位，见
+// https://ffmpeg.org/doxygen/trunk/swscale_8h_source.html ）：
+//   SWS_STRICT         1 << 11   Return an error on underspecified conversions.
+//   SWS_PRINT_INFO     1 << 12   Emit verbose log of scaling parameters.
+//   SWS_FULL_CHR_H_INT 1 << 13   Perform full chroma upsampling when upscaling to RGB.
+//   SWS_FULL_CHR_H_INP 1 << 14   Perform full chroma interpolation when downscaling RGB.
+//   SWS_ACCURATE_RND   1 << 18   Force bit-exact output rounding.
+//   SWS_BITEXACT       1 << 19   Disable platform-specific optimizations for bit-exactness.
+//   SWS_UNSTABLE       1 << 20   Prefer experimental code paths.
+//   SWS_DIRECT_BGR     1 << 15   Deprecated: no effect.
+//   SWS_ERROR_DIFFUSION 1 << 23   Deprecated: set `SwsContext.dither` instead.
+//   SWS_FAST_BILINEAR  1 <<  0   fast bilinear filtering
+//   SWS_BILINEAR       1 <<  1   bilinear filtering
+//   SWS_BICUBIC        1 <<  2   2-tap cubic B-spline
+//   SWS_X              1 <<  3   experimental
+//   SWS_POINT          1 <<  4   nearest neighbor
+//   SWS_AREA           1 <<  5   area averaging
+//   SWS_BICUBLIN       1 <<  6   bicubic luma, bilinear chroma
+//   SWS_GAUSS          1 <<  7   gaussian approximation
+//   SWS_SINC           1 <<  8   unwindowed sinc
+//   SWS_LANCZOS        1 <<  9   3-tap sinc/sinc
+//   SWS_SPLINE         1 << 10   unwindowed natural cubic spline
+impl ScaleAlgorithm {
+    /// 返回该算法对应的完整 swscale flags（算法位 + 质量 flag）。
+    // 不同 FFmpeg 版本/平台下 `ffi::SWS_*` 常量类型不同（u32 / i32），统一转 u32
+    #[allow(clippy::unnecessary_cast)]
+    pub fn flags(self) -> u32 {
+        let mut flags = match self {
+            Self::FastBilinear => ffi::SWS_FAST_BILINEAR,
+            Self::Bilinear => ffi::SWS_BILINEAR,
+            Self::Bicubic => ffi::SWS_BICUBIC,
+            Self::Experimental => ffi::SWS_X,
+            Self::Point => ffi::SWS_POINT,
+            Self::Area => ffi::SWS_AREA,
+            Self::BicubicLinear => ffi::SWS_BICUBLIN,
+            Self::Gaussian => ffi::SWS_GAUSS,
+            Self::Sinc => ffi::SWS_SINC,
+            Self::Lanczos => ffi::SWS_LANCZOS,
+            Self::Spline => ffi::SWS_SPLINE,
+        } as u32;
+        flags |= ffi::SWS_FULL_CHR_H_INT as u32;
+        flags |= ffi::SWS_ACCURATE_RND as u32;
+        flags |= ffi::SWS_BITEXACT as u32;
+        flags
+    }
+}
+
 fn setup_scaler(
     src_width: i32,
     src_height: i32,
@@ -18,75 +94,9 @@ fn setup_scaler(
     dst_width: i32,
     dst_height: i32,
     dst_pix_fmt: ffi::AVPixelFormat,
+    flags: u32,
 ) -> Result<SwsContext> {
-    /*
-     * Scaler selection options. Only one may be active at a time.
-     */
-    // SWS_FAST_BILINEAR = 1 <<  0, ///< fast bilinear filtering
-    // SWS_BILINEAR      = 1 <<  1, ///< bilinear filtering
-    // SWS_BICUBIC       = 1 <<  2, ///< 2-tap cubic B-spline
-    // SWS_X             = 1 <<  3, ///< experimental
-    // SWS_POINT         = 1 <<  4, ///< nearest neighbor
-    // SWS_AREA          = 1 <<  5, ///< area averaging
-    // SWS_BICUBLIN      = 1 <<  6, ///< bicubic luma, bilinear chroma
-    // SWS_GAUSS         = 1 <<  7, ///< gaussian approximation
-    // SWS_SINC          = 1 <<  8, ///< unwindowed sinc
-    // SWS_LANCZOS       = 1 <<  9, ///< 3-tap sinc/sinc
-    // SWS_SPLINE        = 1 << 10, ///< cubic Keys spline
-
-    /*
-     * Return an error on underspecified conversions. Without this flag,
-     * unspecified fields are defaulted to sensible values.
-     */
-    // SWS_STRICT        = 1 << 11,
-
-    /*
-     * Emit verbose log of scaling parameters.
-     */
-    // SWS_PRINT_INFO    = 1 << 12,
-
-    /*
-     * Perform full chroma upsampling when upscaling to RGB.
-     *
-     * For example, when converting 50x50 yuv420p to 100x100 rgba, setting this flag
-     * will scale the chroma plane from 25x25 to 100x100 (4:4:4), and then convert
-     * the 100x100 yuv444p image to rgba in the final output step.
-     *
-     * Without this flag, the chroma plane is instead scaled to 50x100 (4:2:2),
-     * with a single chroma sample being re-used for both of the horizontally
-     * adjacent RGBA output pixels.
-     */
-    // SWS_FULL_CHR_H_INT = 1 << 13,
-
-    /*
-     * Perform full chroma interpolation when downscaling RGB sources.
-     *
-     * For example, when converting a 100x100 rgba source to 50x50 yuv444p, setting
-     * this flag will generate a 100x100 (4:4:4) chroma plane, which is then
-     * downscaled to the required 50x50.
-     *
-     * Without this flag, the chroma plane is instead generated at 50x100 (dropping
-     * every other pixel), before then being downscaled to the required 50x50
-     * resolution.
-     */
-    // SWS_FULL_CHR_H_INP = 1 << 14,
-
-    /*
-     * Force bit-exact output. This will prevent the use of platform-specific
-     * optimizations that may lead to slight difference in rounding, in favor
-     * of always maintaining exact bit output compatibility with the reference
-     * C code.
-     *
-     * Note: It is recommended to set both of these flags simultaneously.
-     */
-    // SWS_ACCURATE_RND   = 1 << 18,
-    // SWS_BITEXACT       = 1 << 19,
-
-    // 考虑性能和质量平衡
-    let flags =
-        ffi::SWS_BICUBIC | ffi::SWS_FULL_CHR_H_INT | ffi::SWS_ACCURATE_RND | ffi::SWS_BITEXACT;
-
-    // 创建转换上下文
+    // new sws_ctx
     let sws_ctx = SwsContext::get_context(
         src_width,
         src_height,
@@ -107,11 +117,30 @@ fn setup_scaler(
 /// # Safety
 ///
 /// ffi::sws_scale_frame
-pub fn scale(
+pub fn scale_frame(
     src_frame: &AVFrame,
     dst_width: i32,
     dst_height: i32,
     dst_pix_fmt: PixelFormat,
+) -> Result<AVFrame> {
+    scale_with_flags(
+        src_frame,
+        dst_width,
+        dst_height,
+        dst_pix_fmt,
+        ScaleAlgorithm::default(),
+    )
+}
+
+/// # Safety
+///
+/// ffi::sws_scale_frame
+pub fn scale_with_flags(
+    src_frame: &AVFrame,
+    dst_width: i32,
+    dst_height: i32,
+    dst_pix_fmt: PixelFormat,
+    scaler_algo: ScaleAlgorithm,
 ) -> Result<AVFrame> {
     if !src_frame.hw_frames_ctx.is_null() {
         anyhow::bail!("Hardware frames are not supported in this software scalar");
@@ -132,25 +161,12 @@ pub fn scale(
         dst_width,
         dst_height,
         dst_pix_fmt.into(),
+        scaler_algo.flags(),
     )
     .context("Failed to create swscale context.")?;
 
     let ret = unsafe {
         let dst_frame_ptr = dst_frame.as_mut_ptr();
-        // set color properties:
-        // 指定像素分量值（Y, U, V 或 R, G, B）的范围
-        // - AVCOL_RANGE_MPEG (或 AVCOL_RANGE_LIMITED): 有限范围，通常用于广播电视标准（如 BT.709），Y 值范围通常是 16-235，UV 值范围是 16-240
-        // - AVCOL_RANGE_JPEG (或 AVCOL_RANGE_FULL): 全范围，通常用于计算机图形和数字摄影，YUV 或 RGB 值范围通常是 0-255
-        (*dst_frame_ptr).color_range = ffi::AVCOL_RANGE_JPEG;
-        // 表示的颜色范围, 决定了图像的色域
-        (*dst_frame_ptr).color_primaries = ffi::AVCOL_PRI_RESERVED0;
-        // 伽马校正（Gamma）:描述了编码的像素值（数字信号）和实际场景光线强度之间的非线性关系
-        (*dst_frame_ptr).color_trc = ffi::AVCOL_TRC_RESERVED0;
-        // 转换矩阵系数: 与 color_primaries 紧密相关，因为转换矩阵通常依赖于原色定义
-        (*dst_frame_ptr).colorspace = ffi::AVCOL_SPC_RGB;
-        // 指定色度样本（U, V）相对于亮度样本（Y）的采样位置, 不做要求
-        (*dst_frame_ptr).chroma_location = ffi::AVCHROMA_LOC_UNSPECIFIED;
-
         ffi::sws_scale_frame(sws_ctx.as_mut_ptr(), dst_frame_ptr, src_frame.as_ptr())
     };
     if ret < 0 {
@@ -159,56 +175,6 @@ pub fn scale(
 
     log::debug!(
         "Sws scale from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
-        src_frame.width,
-        src_frame.height,
-        PixelFormat::from(src_frame.format),
-        dst_width,
-        dst_height,
-        dst_pix_fmt
-    );
-
-    Ok(dst_frame)
-}
-
-/// 将 AVFrame YUV420P 转换为 RGB24 格式
-pub fn scale_frame(
-    src_frame: &AVFrame,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: PixelFormat,
-) -> Result<AVFrame> {
-    if !src_frame.hw_frames_ctx.is_null() {
-        anyhow::bail!("Hardware frames are not supported in this software scalar");
-    }
-
-    let mut dst_frame = AVFrame::new();
-    dst_frame.set_width(dst_width);
-    dst_frame.set_height(dst_height);
-    dst_frame.set_format(dst_pix_fmt.into());
-    dst_frame
-        .alloc_buffer()
-        .context("Failed to allocate destination frame buffer")?;
-    imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
-
-    let mut sws_ctx = setup_scaler(
-        src_frame.width,
-        src_frame.height,
-        src_frame.format,
-        dst_width,
-        dst_height,
-        dst_pix_fmt.into(),
-    )
-    .context("Failed to create swscale context.")?;
-
-    sws_ctx
-        .scale_frame(src_frame, 0, src_frame.height, &mut dst_frame)
-        .context(format!(
-            "Failed to scale frame from [fmt:{}, size:{}x{}] to [fmt:{:?}, size:{}x{}]",
-            src_frame.format, src_frame.width, src_frame.height, dst_pix_fmt, dst_width, dst_height
-        ))?;
-
-    log::debug!(
-        "Sws scale_frame from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
         src_frame.width,
         src_frame.height,
         PixelFormat::from(src_frame.format),
@@ -232,7 +198,7 @@ fn setup_resampler(
     out_sample_fmt: ffi::AVSampleFormat,
     out_sample_rate: i32,
 ) -> Result<SwrContext> {
-    let mut resample_context = SwrContext::new(
+    let mut swr_ctx = SwrContext::new(
         &out_ch_layout,
         out_sample_fmt,
         out_sample_rate,
@@ -242,11 +208,9 @@ fn setup_resampler(
     )
     .context("Could not allocate resample context")?;
 
-    resample_context
-        .init()
-        .context("Could not open resample context")?;
+    swr_ctx.init().context("Could not open resample context")?;
 
-    Ok(resample_context)
+    Ok(swr_ctx)
 }
 
 /// Audio resampling frame
@@ -264,7 +228,7 @@ pub fn convert(
         return Err(Error::msg("Invalid input frame."));
     }
 
-    let mut resample_context = setup_resampler(
+    let mut swr_ctx = setup_resampler(
         src_frame.ch_layout,
         src_frame.format,
         src_frame.sample_rate,
@@ -283,7 +247,7 @@ pub fn convert(
     .context("Create samples buffer failed.")?;
 
     let ret = unsafe {
-        resample_context
+        swr_ctx
             .convert(
                 output_samples.audio_data.as_mut_ptr(),
                 output_samples.nb_samples,
@@ -330,7 +294,7 @@ pub fn convert_frame(
         return Err(Error::msg("Invalid input frame."));
     }
 
-    let resample_context = setup_resampler(
+    let swr_ctx = setup_resampler(
         src_frame.ch_layout,
         src_frame.format,
         src_frame.sample_rate,
@@ -345,7 +309,13 @@ pub fn convert_frame(
     imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
     dst_frame.set_format(out_sample_fmt);
     dst_frame.set_ch_layout(out_ch_layout);
-    dst_frame.set_nb_samples(src_frame.nb_samples);
+    // 输出帧的缓冲必须按重采样后的输出样本数分配，而不是简单地使用输入样本数。
+    // 当输入/输出采样率不同时，swr_convert_frame() 会写入比输入样本数更多的输出样本，
+    // 但 FFmpeg 不会自动扩大已分配的输出缓冲（只把放不下的部分存入内部 FIFO），
+    // 若这里 mb_samples 设得过小，将导致 swr_convert 越界写。
+    // 用 swr_get_out_samples() 得到所需输出样本数的上界来分配缓冲。
+    let out_samples = swr_ctx.get_out_samples(src_frame.nb_samples).max(1);
+    dst_frame.set_nb_samples(out_samples);
     dst_frame.set_sample_rate(out_sample_rate);
     dst_frame.set_time_base(time::new_rational(1, out_sample_rate));
     dst_frame
@@ -357,7 +327,7 @@ pub fn convert_frame(
     // 如果输出 AVFrame 没有分配数据指针，则将在调用 av_frame_get_buffer() 分配帧时设置 nb_samples 字段。
     // 输出的 AVFrame 可以是 NULL，或者分配的样本少于所需的数量。在这种情况下，未写入输出的剩余样本将被添加到内部 FIFO 缓冲区，在下次调用此函数或 swr_convert() 时返回。
     // 如果转换采样率，内部重采样延迟缓冲区中可能会有剩余数据。要以输出方式获取这些数据，请调用此函数或 swr_convert()，并输入 NULL。
-    resample_context
+    swr_ctx
         .convert_frame(Some(src_frame), &mut dst_frame)
         .context("Failed to convert frame.")?;
 
@@ -377,7 +347,7 @@ pub fn convert_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{time, SampleFormat};
+    use crate::{SampleFormat, time};
     use anyhow::{Context, Result};
     use rsmpeg::avutil::AVChannelLayout;
     use rsmpeg::ffi;
@@ -470,10 +440,9 @@ mod tests {
             ($type:ty, $max_val:expr) => {
                 if is_planar {
                     for ch in 0..nb_channels {
-                        let data = std::slice::from_raw_parts_mut(
-                            frame.data[ch] as *mut $type,
-                            nb_samples,
-                        );
+                        let data = unsafe {
+                            std::slice::from_raw_parts_mut(frame.data[ch] as *mut $type, nb_samples)
+                        };
                         for (i, sample) in data.iter_mut().enumerate() {
                             *sample = ((i * nb_channels + ch) as f64
                                 / (nb_samples * nb_channels) as f64
@@ -481,10 +450,12 @@ mod tests {
                         }
                     }
                 } else {
-                    let data = std::slice::from_raw_parts_mut(
-                        frame.data[0] as *mut $type,
-                        nb_samples * nb_channels,
-                    );
+                    let data = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            frame.data[0] as *mut $type,
+                            nb_samples * nb_channels,
+                        )
+                    };
                     for i in 0..(nb_samples * nb_channels) {
                         data[i] = (i as f64 / (nb_samples * nb_channels) as f64 * $max_val as f64)
                             as $type;
@@ -543,7 +514,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "skip test_format_conversion"]
     fn test_format_conversion() -> Result<()> {
         let sample_rate = 44100;
         let nb_samples = 1024;
@@ -587,7 +557,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "This test is too slow to run by default"]
     fn test_format_conversion_with_different_rates() -> Result<()> {
         let sample_rates = &[44100, 48000, 96000];
         let nb_samples = 1024;
@@ -626,7 +595,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "This test is too slow to run frequently"]
     fn test_channel_conversion() -> Result<()> {
         let nb_samples = 1024;
         let channel_layouts = &[1, 2];
@@ -640,7 +608,7 @@ mod tests {
                         in_fmt, in_rate, in_channels
                     );
 
-                    let src_frame = create_test_frame(&in_fmt, in_rate, in_channels, nb_samples)?;
+                    let src_frame = create_test_frame(in_fmt, in_rate, in_channels, nb_samples)?;
 
                     assert_eq!(src_frame.ch_layout.nb_channels, in_channels);
 

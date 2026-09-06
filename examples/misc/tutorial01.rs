@@ -22,7 +22,7 @@ fn dump_frame(file: &CStr, out_dir: &str) -> Result<()> {
 
     let video_stream_index = input_format_context
         .streams()
-        .into_iter()
+        .iter()
         .position(|stream| stream.codecpar().codec_type().is_video())
         .context("No video stream")?;
 
@@ -47,6 +47,9 @@ fn dump_frame(file: &CStr, out_dir: &str) -> Result<()> {
 
     let mut frame_rgb = AVFrameWithImage::new(image_buffer);
 
+    // 不同 FFmpeg 版本/平台下 `ffi::SWS_*` 类型不同（macOS 为 `u32`，Windows ffmpeg8 为 `i32`），
+    // 而 `get_context` 统一要求 `u32`，故统一转换并允许跨平台 lint。
+    #[allow(clippy::unnecessary_cast)]
     let mut sws_context = SwsContext::get_context(
         decode_context.width,
         decode_context.height,
@@ -54,7 +57,7 @@ fn dump_frame(file: &CStr, out_dir: &str) -> Result<()> {
         decode_context.width,
         decode_context.height,
         ffi::AV_PIX_FMT_RGB32,
-        ffi::SWS_BILINEAR,
+        ffi::SWS_BILINEAR as u32,
         None,
         None,
         None,
@@ -94,38 +97,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "tutorial01_test0 测试运行依赖测试文件，暂时忽略"]
-    fn tutorial01_test0() {
-        dump_frame(
-            c"tests/assets/vids/centaur.mpg",
-            "tests/output/tutorial01/centaur",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "tutorial01_test1 测试运行依赖测试文件，暂时忽略"]
-    fn tutorial01_test1() {
-        dump_frame(
-            c"tests/assets/vids/bear.mp4",
-            "tests/output/tutorial01/bear",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "tutorial01_test2 测试运行依赖测试文件，暂时忽略"]
-    fn tutorial01_test2() {
-        dump_frame(
-            c"tests/assets/vids/mov_sample.mov",
-            "tests/output/tutorial01/mov_sample",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "tutorial01_test3 测试运行依赖测试文件，暂时忽略"]
-    fn tutorial01_test3() {
-        dump_frame(c"tests/assets/vids/vp8.mp4", "tests/output/tutorial01/vp8").unwrap();
+    fn tutorial01_test() {
+        dump_frame(c"assets/mp4.mp4", "tests/output/tutorial01/mp4").unwrap();
     }
 }

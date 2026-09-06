@@ -1,15 +1,18 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/transcode_aac.c
-use anyhow::{bail, Context as AnyhowContext, Result};
+mod common;
+use anyhow::{Context as AnyhowContext, Result, bail};
+use common::test_output_path;
+use rsmedia::codec::CodecConfig;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avformat::{AVFormatContextInput, AVFormatContextOutput},
-    avutil::{ra, AVAudioFifo, AVChannelLayout, AVFrame, AVSamples},
+    avutil::{AVAudioFifo, AVChannelLayout, AVFrame, AVSamples, ra},
     error::RsmpegError,
     ffi,
     swresample::SwrContext,
 };
 use std::{
-    ffi::CStr,
+    ffi::{CStr, CString},
     sync::atomic::{AtomicI64, Ordering},
 };
 
@@ -48,12 +51,13 @@ fn open_output_file(
         AVCodec::find_encoder(ffi::AV_CODEC_ID_AAC).context("Failed to find aac encoder")?;
 
     let mut encode_context = AVCodecContext::new(&encode_codec);
+    let codec_config = CodecConfig::from_codec(encode_codec);
 
     // Set the basic encoder parameters.
     // The input file's sample rate is used to avoid a sample rate conversion.
     encode_context.set_ch_layout(AVChannelLayout::from_nb_channels(OUTPUT_CHANNELS).into_inner());
     encode_context.set_sample_rate(decode_context.sample_rate);
-    encode_context.set_sample_fmt(encode_codec.sample_fmts().unwrap()[0]);
+    encode_context.set_sample_fmt(codec_config.supported_sample_formats()?.unwrap()[0]);
     encode_context.set_bit_rate(OUTPUT_BIT_RATE);
 
     // Open the encoder for the audio stream to use it later.
@@ -272,23 +276,15 @@ fn transcode_aac(input_file: &CStr, output_file: &CStr) -> Result<()> {
 }
 
 #[test]
-#[ignore = "transcode_aac_test0 测试运行依赖测试文件，暂时忽略"]
 fn transcode_aac_test0() {
-    std::fs::create_dir_all("tests/output/transcode_aac/").unwrap();
-    transcode_aac(
-        c"tests/assets/audios/sample1_short.aac",
-        c"tests/output/transcode_aac/output_short.aac",
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode_aac", "wav.aac");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode_aac(c"assets/wav.wav", &output_path_c).unwrap();
 }
 
 #[test]
-#[ignore = "transcode_aac_test1 测试运行依赖测试文件，暂时忽略"]
 fn transcode_aac_test1() {
-    std::fs::create_dir_all("tests/output/transcode_aac/").unwrap();
-    transcode_aac(
-        c"tests/assets/vids/big_buck_bunny.mp4",
-        c"tests/output/transcode_aac/big_buck_bunny.aac",
-    )
-    .unwrap();
+    let output_path = test_output_path("transcode_aac", "mp4.aac");
+    let output_path_c = CString::new(output_path.to_string_lossy().as_bytes()).unwrap();
+    transcode_aac(c"assets/mp4.mp4", &output_path_c).unwrap();
 }

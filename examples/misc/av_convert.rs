@@ -1,7 +1,7 @@
 use anyhow::Result;
 use image::RgbImage;
-use rsmedia::swctx;
 use rsmedia::PixelFormat;
+use rsmedia::swctx;
 use rsmpeg::{avutil::AVFrame, ffi};
 
 /// 将 RgbImage 转换为 AVFrame
@@ -70,7 +70,7 @@ pub fn avframe_rgb24_to_image_rgb(rgb_frame: &AVFrame) -> Result<RgbImage> {
     // 使用 buffer 数据创建 RgbImage
     // 第一种方式（RgbImage） 更简洁、明确，并且适用于绝大多数场景，因为它将通道类型和缓冲区类型都固定为常见的组合（Rgb<u8> 和 Vec<u8>）。
     let rgb_image = RgbImage::from_raw(width as u32, height as u32, buffer)
-        .ok_or_else(|| "Failed to create RgbImage")
+        .ok_or_else(|| anyhow::anyhow!("Failed to create RgbImage"))
         .unwrap();
 
     // 第二种方式（ImageBuffer<Rgb<u8>, _>） 更加通用。你可以使用不同类型的缓冲区（如 &[u8]、Box<[u8]> 等），
@@ -83,7 +83,7 @@ pub fn avframe_rgb24_to_image_rgb(rgb_frame: &AVFrame) -> Result<RgbImage> {
 
 /// 将 AVFrame YUV420P 转换为 RgbImage
 pub fn avframe_yuv420p_to_image_rgb(frame: &AVFrame) -> Result<RgbImage> {
-    let rgb_frame = swctx::scale_frame(&frame, frame.width, frame.height, PixelFormat::RGB24)?;
+    let rgb_frame = swctx::scale_frame(frame, frame.width, frame.height, PixelFormat::RGB24)?;
     avframe_rgb24_to_image_rgb(&rgb_frame)
 }
 
@@ -137,7 +137,8 @@ mod tests {
         assert_eq!(img.width(), yuv_frame.width as u32);
         assert_eq!(img.height(), yuv_frame.height as u32);
 
-        img.save("/tmp/test_avframe_to_image.png")
+        std::fs::create_dir_all("tests/output/av_convert").unwrap();
+        img.save("tests/output/av_convert/test_avframe_to_image.png")
             .expect("avframe_to_image error");
 
         Ok(())

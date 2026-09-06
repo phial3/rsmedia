@@ -1,17 +1,16 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/decode_video.c
-use anyhow::{anyhow, Context, Result};
+mod common;
+use anyhow::{Context, Result};
 use camino::Utf8Path as Path;
+use common::test_output_path;
 use rsmpeg::{
-    avcodec::{AVCodec, AVCodecContext, AVCodecParserContext, AVPacket},
+    avcodec::{AVCodecContext, AVPacket},
+    avformat::AVFormatContextInput,
     avutil::AVFrame,
     error::RsmpegError,
     ffi,
 };
-use std::{
-    fs::{self, File},
-    io::prelude::*,
-    slice,
-};
+use std::{ffi::CString, fs, io::prelude::*, slice};
 
 /// Save a `AVFrame` as pgm file.
 fn pgm_save(frame: &AVFrame, filename: &str) -> Result<()> {
@@ -67,51 +66,35 @@ fn decode(
     Ok(())
 }
 
-/// This function extracts frames from a MPEG1 video, then save them to `out_dir` as pgm.
+/// This function extracts video frames from any container file supported by
+/// FFmpeg, then saves them to `out_dir` as pgm.
 fn decode_video(video_path: &str, out_dir: &str) -> Result<()> {
-    const INBUF_SIZE: usize = 4096;
     let video_path = Path::new(video_path);
     let out_filename = video_path.file_stem().unwrap();
     fs::create_dir_all(out_dir).unwrap();
 
-    // set end of buffer to 0 (this ensures that no overreading happens for damaged MPEG streams)
-    let mut inbuf = vec![0u8; INBUF_SIZE + ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize];
-
-    let decoder = AVCodec::find_decoder(ffi::AV_CODEC_ID_MPEG1VIDEO).context("Codec not found")?;
+    // &str ensures no internal null bytes.
+    let video_path_c = CString::new(video_path.as_str()).unwrap();
+    let mut input_format_context =
+        AVFormatContextInput::open(&video_path_c).context("Open video file failed.")?;
+    let (stream_index, decoder) = input_format_context
+        .find_best_stream(ffi::AVMEDIA_TYPE_VIDEO)
+        .context("Find best stream failed.")?
+        .context("Cannot find video stream in this file.")?;
     let mut decode_context = AVCodecContext::new(&decoder);
+    decode_context
+        .apply_codecpar(&input_format_context.streams()[stream_index].codecpar())
+        .context("Apply codecpar failed.")?;
     decode_context.open(None).context("Could not open codec")?;
+    input_format_context.dump(stream_index, &video_path_c)?;
 
-    let mut video_file =
-        File::open(video_path).with_context(|| anyhow!("Could not open {}", video_path))?;
-
-    let mut parser_context = AVCodecParserContext::init(decoder.id).context("Parser not found")?;
-    let mut packet = AVPacket::new();
-
-    loop {
-        let len = video_file
-            .read(&mut inbuf[..INBUF_SIZE])
-            .context("Read input file failed.")?;
-        if len == 0 {
-            break;
+    while let Some(packet) = input_format_context
+        .read_packet()
+        .context("Read packet failed.")?
+    {
+        if packet.stream_index == stream_index as i32 {
+            decode(&mut decode_context, Some(&packet), out_dir, out_filename)?;
         }
-        let mut parsed_offset = 0;
-        while parsed_offset < len {
-            let (get_packet, offset) = parser_context
-                .parse_packet(&mut decode_context, &mut packet, &inbuf[parsed_offset..len])
-                .context("Error while parsing")?;
-            parsed_offset += offset;
-            if get_packet {
-                decode(&mut decode_context, Some(&packet), out_dir, out_filename)?;
-            }
-        }
-    }
-
-    // Flush parser
-    let (get_packet, _) = parser_context
-        .parse_packet(&mut decode_context, &mut packet, &[])
-        .context("Error while parsing")?;
-    if get_packet {
-        decode(&mut decode_context, Some(&packet), out_dir, out_filename)?;
     }
 
     // Flush decoder
@@ -121,7 +104,7 @@ fn decode_video(video_path: &str, out_dir: &str) -> Result<()> {
 }
 
 #[test]
-#[ignore = "decode_video_test 测试运行依赖测试文件，暂时忽略"]
 fn decode_video_test() {
-    decode_video("tests/assets/vids/centaur.mpg", "tests/output/decode_video").unwrap();
+    let output_dir = test_output_path("decode_video", "");
+    decode_video("assets/mp4.mp4", output_dir.to_str().unwrap()).unwrap();
 }

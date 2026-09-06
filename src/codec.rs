@@ -1,36 +1,69 @@
 use anyhow::{Error, Result};
-use rsmpeg::avcodec::{AVCodec, AVCodecContext};
+#[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+use rsmpeg::avcodec::AVCodecContext;
+use rsmpeg::avcodec::{AVCodec, AVCodecRef};
 use rsmpeg::ffi;
 use std::ffi::CStr;
-use std::ptr::NonNull;
 
 pub struct CodecConfig {
-    codec: NonNull<ffi::AVCodec>,
+    codec: AVCodecRef<'static>,
+    #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+    context: AVCodecContext,
 }
 
-impl<'codec> CodecConfig {
-    pub fn new(id: ffi::AVCodecID) -> Self {
-        let codec = unsafe {
-            let codec = AVCodec::find_encoder(id)
-                .or_else(|| AVCodec::find_decoder(id))
-                .ok_or_else(|| Error::msg(format!("Codec not found: {id}")))
-                .unwrap();
-            NonNull::new_unchecked(codec.as_ptr() as *mut _)
-        };
-        CodecConfig { codec }
+impl CodecConfig {
+    pub fn new(id: ffi::AVCodecID) -> Result<Self> {
+        let codec = AVCodec::find_encoder(id)
+            .or_else(|| AVCodec::find_decoder(id))
+            .ok_or_else(|| Error::msg(format!("Codec id:{id} not found.")))?;
+        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        {
+            Ok(Self { codec })
+        }
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        {
+            let context = AVCodecContext::new(&codec);
+            Ok(Self { codec, context })
+        }
     }
 
     pub fn new_with_name(codec_name: &CStr) -> Result<Self> {
         let codec = AVCodec::find_encoder_by_name(codec_name)
             .or_else(|| AVCodec::find_decoder_by_name(codec_name))
-            .ok_or_else(|| Error::msg(format!("Codec not found: '{codec_name:?}'")))?;
-        Ok(Self::new(codec.id))
+            .ok_or_else(|| Error::msg(format!("Codec not found by name: '{codec_name:?}'")))?;
+        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        {
+            Ok(Self { codec })
+        }
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        {
+            let context = AVCodecContext::new(&codec);
+            Ok(Self { codec, context })
+        }
     }
 
-    pub fn new_with_ctx(ctx: &AVCodecContext) -> Self {
-        CodecConfig {
-            codec: unsafe { NonNull::new_unchecked(ctx.codec as *const _ as *mut _) },
+    pub fn from_codec(codec: AVCodecRef<'static>) -> Self {
+        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        {
+            Self { codec }
         }
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        {
+            let context = AVCodecContext::new(&codec);
+            Self { codec, context }
+        }
+    }
+
+    pub fn id(&self) -> ffi::AVCodecID {
+        self.codec.id
+    }
+
+    pub fn name(&self) -> &CStr {
+        self.codec.name()
+    }
+
+    pub fn long_name(&self) -> &CStr {
+        self.codec.long_name()
     }
 
     pub fn is_encoder(&self) -> bool {
@@ -41,189 +74,110 @@ impl<'codec> CodecConfig {
         unsafe { ffi::av_codec_is_decoder(self.codec.as_ptr()) != 0 }
     }
 
-    unsafe fn probe_len<T>(mut ptr: *const T, tail: T) -> usize {
-        for len in 0.. {
-            let left = ptr as *const u8;
-            let left = unsafe { std::slice::from_raw_parts(left, std::mem::size_of::<T>()) };
-            let right = &tail as *const _ as *const u8;
-            let right = unsafe { std::slice::from_raw_parts(right, std::mem::size_of::<T>()) };
-            if left == right {
-                return len;
-            }
-            unsafe {
-                ptr = ptr.add(1);
-            }
-        }
-        usize::MAX
-    }
-
-    unsafe fn build_array<'r, T>(ptr: *const T, tail: T) -> Option<&'r [T]> {
-        if ptr.is_null() {
-            None
-        } else {
-            let len = unsafe { Self::probe_len(ptr, tail) };
-            if len == usize::MAX {
-                None
-            } else {
-                Some(unsafe { std::slice::from_raw_parts(ptr, len) })
-            }
-        }
-    }
-
-    /// Retrieve a list of all supported values for a given configuration type.
-    ///
-    /// # Arguments
-    /// * `config_type` - The type of configuration to retrieve.
-    /// * `tail` - The value that marks the end of the list.
-    ///
-    /// See: <https://ffmpeg.org/pipermail/ffmpeg-cvslog/2024-September/145256.html>
-    /// [`avcodec_get_supported_config(avctx, codec, config, flags, out_configs, out_num_configs)`]
-    ///
-    /// * `avctx`    An optional context to use. Values such as strict_std_compliance may affect the result. If NULL, default values are used.
-    /// * `codec`    The codec to query, or NULL to use avctx->codec.
-    /// * `config`    The configuration to query.
-    /// * `flags`    Currently unused; should be set to zero.
-    /// * `out_configs`    On success, set to a list of configurations, terminated by a config-specific terminator, or NULL if all possible values are supported.
-    /// * `out_num_configs`    On success, set to the number of elements in out_configs, excluding the terminator. Optional.
-    #[cfg(feature = "ffmpeg7")]
-    unsafe fn get_supported_config<T>(
-        &self,
-        config_type: ffi::AVCodecConfig,
-        tail: T,
-    ) -> Result<Option<&'codec [T]>> {
-        let mut configs = std::ptr::null();
-        let mut num_configs = 0;
-
-        let codec_ptr = self.codec.as_ptr() as *const _;
-
-        let ret = ffi::avcodec_get_supported_config(
-            std::ptr::null(),
-            codec_ptr,
-            config_type,
-            0,
-            &mut configs,
-            &mut num_configs,
-        );
-
-        if ret < 0 {
-            return Err(Error::msg(format!(
-                "Failed to get codec supported config:{ret}"
-            )));
-        }
-
-        Ok(unsafe { Self::build_array(configs as *const T, tail) })
-    }
-
-    pub fn supported_pixel_formats(&self) -> Result<Option<&'codec [ffi::AVPixelFormat]>> {
-        #[cfg(feature = "ffmpeg7")]
-        unsafe {
-            self.get_supported_config(ffi::AV_CODEC_CONFIG_PIX_FORMAT, ffi::AV_PIX_FMT_NONE)
-        }
-        #[cfg(not(feature = "ffmpeg7"))]
-        unsafe {
-            // terminates with -1
-            Ok(Self::build_array((*self.codec.as_ptr()).pix_fmts, -1))
-        }
-    }
-
-    pub fn supported_frame_rates(&self) -> Result<Option<&'codec [ffi::AVRational]>> {
-        let tail = ffi::AVRational { num: 0, den: 0 };
-        #[cfg(feature = "ffmpeg7")]
-        unsafe {
-            self.get_supported_config(ffi::AV_CODEC_CONFIG_FRAME_RATE, tail)
-        }
-        #[cfg(not(feature = "ffmpeg7"))]
-        unsafe {
-            // terminates with AVRational{0, 0}
-            Ok(Self::build_array(
-                (*self.codec.as_ptr()).supported_framerates,
-                tail,
-            ))
-        }
-    }
-
-    pub fn supported_sample_rates(&self) -> Result<Option<&'codec [i32]>> {
-        #[cfg(feature = "ffmpeg7")]
-        unsafe {
-            self.get_supported_config(ffi::AV_CODEC_CONFIG_SAMPLE_RATE, 0)
-        }
-        #[cfg(not(feature = "ffmpeg7"))]
-        unsafe {
-            // terminates with 0
-            Ok(Self::build_array(
-                (*self.codec.as_ptr()).supported_samplerates,
-                0,
-            ))
-        }
-    }
-
-    pub fn supported_sample_formats(&self) -> Result<Option<&'codec [ffi::AVSampleFormat]>> {
-        #[cfg(feature = "ffmpeg7")]
-        unsafe {
-            self.get_supported_config(ffi::AV_CODEC_CONFIG_SAMPLE_FORMAT, ffi::AV_SAMPLE_FMT_NONE)
-        }
-        #[cfg(not(feature = "ffmpeg7"))]
-        unsafe {
-            // terminates with -1
-            Ok(Self::build_array((*self.codec.as_ptr()).sample_fmts, -1))
-        }
-    }
-
-    pub fn supported_channel_layouts(&self) -> Result<Option<&'codec [ffi::AVChannelLayout]>> {
-        let tail = unsafe {
-            ffi::AVChannelLayout {
-                order: ffi::AV_CHANNEL_ORDER_UNSPEC,
-                nb_channels: 0,
-                u: std::mem::zeroed(),
-                opaque: std::ptr::null_mut(),
-            }
-        };
-        #[cfg(feature = "ffmpeg7")]
-        unsafe {
-            self.get_supported_config(ffi::AV_CODEC_CONFIG_CHANNEL_LAYOUT, tail)
-        }
-        #[cfg(not(feature = "ffmpeg7"))]
-        unsafe {
-            // terminates with {0}
-            Ok(Self::build_array((*self.codec.as_ptr()).ch_layouts, tail))
-        }
-    }
-
-    pub fn supported_color_ranges(&self) -> Result<Option<&'codec [ffi::AVColorRange]>> {
-        #[cfg(feature = "ffmpeg7")]
-        unsafe {
-            self.get_supported_config(
-                ffi::AV_CODEC_CONFIG_COLOR_RANGE,
-                ffi::AVCOL_RANGE_UNSPECIFIED,
-            )
-        }
-        #[cfg(not(feature = "ffmpeg7"))]
-        {
-            Ok(None)
-        }
-    }
-
-    pub fn supported_color_spaces(&self) -> Result<Option<&'codec [ffi::AVColorSpace]>> {
-        #[cfg(feature = "ffmpeg7")]
-        unsafe {
-            self.get_supported_config(ffi::AV_CODEC_CONFIG_COLOR_SPACE, ffi::AVCOL_SPC_UNSPECIFIED)
-        }
-        #[cfg(not(feature = "ffmpeg7"))]
-        {
-            Ok(None)
-        }
-    }
-
     /// for audio codec, check if it supports variable frame size
-    pub fn support_variable_frame_size(&self) -> bool {
-        unsafe {
-            (*self.codec.as_ptr()).capabilities & ffi::AV_CODEC_CAP_VARIABLE_FRAME_SIZE as i32 != 0
-        }
+    pub fn is_support_variable_frame_size(&self) -> bool {
+        self.codec.capabilities & ffi::AV_CODEC_CAP_VARIABLE_FRAME_SIZE as i32 != 0
     }
 
     /// for codec, check if it supports delay
-    pub fn support_delayed_frame(&self) -> bool {
-        unsafe { (*self.codec.as_ptr()).capabilities & ffi::AV_CODEC_CAP_DELAY as i32 != 0 }
+    pub fn is_support_delayed_frame(&self) -> bool {
+        self.codec.capabilities & ffi::AV_CODEC_CAP_DELAY as i32 != 0
+    }
+}
+
+impl CodecConfig {
+    pub fn supported_pixel_formats(&self) -> Result<Option<&[ffi::AVPixelFormat]>> {
+        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        {
+            Ok(self.codec.pix_fmts())
+        }
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        {
+            let fmts = self.context.get_supported_pix_fmts(Some(&self.codec))?;
+            // FFmpeg 约定：查询结果为 NULL 表示"支持所有值"，rsmpeg 将其映射为
+            // 空切片；归一化为 None，与 FFmpeg 6 静态字段为 NULL 的语义一致。
+            Ok(if fmts.is_empty() { None } else { Some(fmts) })
+        }
+    }
+
+    pub fn supported_sample_formats(&self) -> Result<Option<&[ffi::AVSampleFormat]>> {
+        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        {
+            Ok(self.codec.sample_fmts())
+        }
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        {
+            let fmts = self.context.get_supported_sample_fmts(Some(&self.codec))?;
+            // 同上：空列表（FFmpeg NULL）表示"支持所有值"，归一化为 None。
+            Ok(if fmts.is_empty() { None } else { Some(fmts) })
+        }
+    }
+
+    pub fn supported_frame_rates(&self) -> Result<Option<&[ffi::AVRational]>> {
+        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        {
+            Ok(self.codec.supported_framerates())
+        }
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        unsafe {
+            let rates: &[ffi::AVRational] = self
+                .context
+                .get_supported_config(Some(&self.codec), ffi::AV_CODEC_CONFIG_FRAME_RATE)?;
+            // 空列表（FFmpeg NULL）表示"支持所有值"，归一化为 None。
+            Ok(if rates.is_empty() { None } else { Some(rates) })
+        }
+    }
+
+    pub fn supported_sample_rates(&self) -> Result<Option<&[i32]>> {
+        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        {
+            Ok(self.codec.supported_samplerates())
+        }
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        unsafe {
+            let rates: &[i32] = self
+                .context
+                .get_supported_config(Some(&self.codec), ffi::AV_CODEC_CONFIG_SAMPLE_RATE)?;
+            // 空列表（FFmpeg NULL）表示"支持所有值"，归一化为 None。
+            Ok(if rates.is_empty() { None } else { Some(rates) })
+        }
+    }
+
+    ///////////////
+    ///////////////
+
+    /// 查询结果为 `None`（FFmpeg 未限制，支持所有值）或查询失败（如媒体类型
+    /// 不匹配的配置项）时按"支持"处理，避免误拦合法帧。
+    pub(crate) fn is_support_pixel_format(&self, pix_fmt: i32) -> bool {
+        match self.supported_pixel_formats() {
+            Ok(None) | Err(_) => true,
+            Ok(Some(formats)) => formats.contains(&pix_fmt),
+        }
+    }
+
+    pub(crate) fn is_support_sample_format(&self, sample_fmt: i32) -> bool {
+        match self.supported_sample_formats() {
+            Ok(None) | Err(_) => true,
+            Ok(Some(formats)) => formats.contains(&sample_fmt),
+        }
+    }
+
+    /// 注意：对音频编码器查询帧率会得到 EINVAL（音频无帧率概念），
+    /// 此时按"支持"处理。
+    pub(crate) fn is_support_frame_rates(&self, frame_rate: ffi::AVRational) -> bool {
+        match self.supported_frame_rates() {
+            Ok(None) | Err(_) => true,
+            Ok(Some(rates)) => rates
+                .iter()
+                .any(|r| r.num == frame_rate.num && r.den == frame_rate.den),
+        }
+    }
+
+    pub(crate) fn is_support_sample_rate(&self, sample_rate: i32) -> bool {
+        match self.supported_sample_rates() {
+            Ok(None) | Err(_) => true,
+            Ok(Some(rates)) => rates.contains(&sample_rate),
+        }
     }
 }
 
@@ -231,163 +185,106 @@ impl<'codec> CodecConfig {
 mod tests {
     use super::*;
 
+    /// 断言视频编码/解码器支持的非空像素格式列表非空。
+    /// 若 FFmpeg 返回 `None`（表示"所有值均支持"）则视为通过。
+    fn assert_video_config(config: &CodecConfig, name: &str) {
+        let pix = config
+            .supported_pixel_formats()
+            .unwrap_or_else(|e| panic!("{name}: query pixel formats failed: {e}"));
+        assert!(
+            pix.map(|v| !v.is_empty()).unwrap_or(true),
+            "{name}: expected non-empty supported pixel formats"
+        );
+    }
+
+    /// 断言音频编码/解码器支持的采样率、采样格式列表非空。
+    fn assert_audio_config(config: &CodecConfig, name: &str) {
+        let rates = config
+            .supported_sample_rates()
+            .unwrap_or_else(|e| panic!("{name}: query sample rates failed: {e}"));
+        assert!(
+            rates.map(|v| !v.is_empty()).unwrap_or(true),
+            "{name}: sample rates should be non-empty if specified"
+        );
+
+        let fmts = config
+            .supported_sample_formats()
+            .unwrap_or_else(|e| panic!("{name}: query sample formats failed: {e}"));
+        assert!(
+            fmts.map(|v| !v.is_empty()).unwrap_or(true),
+            "{name}: expected non-empty supported sample formats"
+        );
+    }
+
     #[test]
     fn test_supported_video_codec() {
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_H264);
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
-
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_MPEG4);
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
-
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_VP8);
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
-
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_VP9);
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
-
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_HEVC);
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
-
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_AV1);
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
+        for id in [
+            ffi::AV_CODEC_ID_H264,
+            ffi::AV_CODEC_ID_MPEG4,
+            ffi::AV_CODEC_ID_VP8,
+            ffi::AV_CODEC_ID_VP9,
+            ffi::AV_CODEC_ID_HEVC,
+            ffi::AV_CODEC_ID_AV1,
+        ] {
+            let config = CodecConfig::new(id).unwrap();
+            assert_video_config(&config, &format!("video codec {id}"));
+            assert!(
+                config.is_encoder() || config.is_decoder(),
+                "video codec {id} should be encoder or decoder"
+            );
+        }
     }
 
     #[test]
     #[cfg(unix)]
-    #[ignore = "skip test_supported_video_codec_name"]
     fn test_supported_video_codec_name() {
-        let config = CodecConfig::new_with_name(c"libx264").unwrap();
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
-
-        let config = CodecConfig::new_with_name(c"libx265").unwrap();
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
-
-        let config = CodecConfig::new_with_name(c"mpeg4").unwrap();
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
-
-        let config = CodecConfig::new_with_name(c"mpeg1video").unwrap();
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
-
-        let config = CodecConfig::new_with_name(c"mpeg2video").unwrap();
-        println!("{:?}", config.supported_pixel_formats().unwrap());
-        println!("{:?}", config.supported_frame_rates().unwrap());
-        println!("{:?}", config.supported_color_ranges().unwrap());
-        println!("{:?}", config.supported_color_spaces().unwrap());
-        println!("{:?}", config.support_delayed_frame());
-        println!("=========================================");
+        for name in [
+            c"libx264",
+            c"libx265",
+            c"mpeg4",
+            c"mpeg1video",
+            c"mpeg2video",
+        ] {
+            let config = CodecConfig::new_with_name(name)
+                .unwrap_or_else(|e| panic!("could not find codec {name:?}: {e}"));
+            assert_video_config(&config, &format!("video codec {name:?}"));
+        }
     }
 
     #[test]
     fn test_supported_audio_codec() {
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_AAC);
-        println!("{:?}", config.supported_sample_rates().unwrap());
-        println!("{:?}", config.supported_sample_formats().unwrap());
-        println!("{:?}", config.supported_channel_layouts().unwrap());
-        println!("{:?}", config.support_variable_frame_size());
-        println!("=========================================");
-
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_FLAC);
-        println!("{:?}", config.supported_sample_rates().unwrap());
-        println!("{:?}", config.supported_sample_formats().unwrap());
-        println!("{:?}", config.supported_channel_layouts().unwrap());
-        println!("{:?}", config.support_variable_frame_size());
-        println!("=========================================");
-
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_MP3);
-        println!("{:?}", config.supported_sample_rates().unwrap());
-        println!("{:?}", config.supported_sample_formats().unwrap());
-        println!("{:?}", config.supported_channel_layouts().unwrap());
-        println!("{:?}", config.support_variable_frame_size());
-        println!("=========================================");
-
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_OPUS);
-        println!("{:?}", config.supported_sample_rates().unwrap());
-        println!("{:?}", config.supported_sample_formats().unwrap());
-        println!("{:?}", config.supported_channel_layouts().unwrap());
-        println!("{:?}", config.support_variable_frame_size());
-        println!("=========================================");
-
-        let config = CodecConfig::new(ffi::AV_CODEC_ID_VORBIS);
-        println!("{:?}", config.supported_sample_rates().unwrap());
-        println!("{:?}", config.supported_sample_formats().unwrap());
-        println!("{:?}", config.supported_channel_layouts().unwrap());
-        println!("{:?}", config.support_variable_frame_size());
-        println!("=========================================");
+        for id in [
+            ffi::AV_CODEC_ID_AAC,
+            ffi::AV_CODEC_ID_FLAC,
+            ffi::AV_CODEC_ID_MP3,
+            ffi::AV_CODEC_ID_OPUS,
+            ffi::AV_CODEC_ID_VORBIS,
+        ] {
+            let config = CodecConfig::new(id).unwrap();
+            assert_audio_config(&config, &format!("audio codec {id}"));
+            assert!(
+                config.is_encoder() || config.is_decoder(),
+                "audio codec {id} should be encoder or decoder"
+            );
+        }
     }
 
     #[test]
     #[cfg(unix)]
-    #[ignore = "skip test_supported_audio_codec_name"]
     fn test_supported_audio_codec_name() {
-        let config = CodecConfig::new_with_name(c"libmp3lame").unwrap();
-        println!("{:?}", config.supported_sample_rates().unwrap());
-        println!("{:?}", config.supported_sample_formats().unwrap());
-        println!("{:?}", config.supported_channel_layouts().unwrap());
-        println!("{:?}", config.support_variable_frame_size());
-        println!("=========================================");
-
-        let config = CodecConfig::new_with_name(c"libopus").unwrap();
-        println!("{:?}", config.supported_sample_rates().unwrap());
-        println!("{:?}", config.supported_sample_formats().unwrap());
-        println!("{:?}", config.supported_channel_layouts().unwrap());
-        println!("{:?}", config.support_variable_frame_size());
-        println!("=========================================");
-
-        let config = CodecConfig::new_with_name(c"libvorbis").unwrap();
-        println!("{:?}", config.supported_sample_rates().unwrap());
-        println!("{:?}", config.supported_sample_formats().unwrap());
-        println!("{:?}", config.supported_channel_layouts().unwrap());
-        println!("{:?}", config.support_variable_frame_size());
-        println!("=========================================");
+        // 外部编码器是否存在取决于 FFmpeg 编译配置（如 libvorbis 并非总是启用），
+        // 缺失时跳过该编码器；但至少要有一个可用，否则视为构建异常。
+        let mut available = 0;
+        for name in [c"libmp3lame", c"libopus", c"libvorbis"] {
+            if AVCodec::find_encoder_by_name(name).is_none() {
+                println!("skip codec {name:?}: not available in this FFmpeg build");
+                continue;
+            }
+            let config = CodecConfig::new_with_name(name)
+                .unwrap_or_else(|e| panic!("could not find codec {name:?}: {e}"));
+            assert_audio_config(&config, &format!("audio codec {name:?}"));
+            available += 1;
+        }
+        assert!(available > 0, "no external audio codecs available");
     }
 }

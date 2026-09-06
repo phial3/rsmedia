@@ -94,7 +94,7 @@ pub fn fill_plane_sizes<I: IntoIterator<Item = u32>>(
         .collect())
 }
 
-/// frame data => Vec<u8>
+/// frame data => `Vec<u8>`
 pub fn copy_frame_to_buffer(frame: &AVFrame) -> Result<Vec<u8>> {
     let frame_width: i32 = frame.width;
     let frame_height: i32 = frame.height;
@@ -143,6 +143,37 @@ pub fn copy_frame_metadata(src: &AVFrame, dst: &mut AVFrame, copy_data: bool) ->
     }
 }
 
+/// 某个帧平面的几何信息：可见宽（像素）、可见高（行）与每像素字节数。
+struct PlaneGeom {
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+}
+
+/// 依据像素格式描述符，计算指定平面相对帧全分辨率的可见宽高与像素字节数。
+///
+/// 色度子采样平面（如 YUV420P 的 U/V）宽高按 `log2_chroma_*` 右移；无该描述时退回
+/// `frame.width/height`。每像素字节数取自 `comp[plane].step`，缺失时按 1 处理。
+fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
+    let desc = PixelFormat::from(frame.format).descriptor()?;
+
+    let (shift_w, shift_h) = if plane_idx > 0 {
+        (desc.log2_chroma_w as u32, desc.log2_chroma_h as u32)
+    } else {
+        (0, 0)
+    };
+
+    Ok(PlaneGeom {
+        width: (frame.width as usize) >> shift_w,
+        height: (frame.height as usize) >> shift_h,
+        bytes_per_pixel: if desc.comp[plane_idx].step > 0 {
+            desc.comp[plane_idx].step as usize
+        } else {
+            1
+        },
+    })
+}
+
 /// 获取指定帧的指定平面的实际数据，不包含额外的填充字节
 pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     if frame.width * frame.height <= 0 {
@@ -174,41 +205,15 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     }
 
     // 获取像素格式的描述信息
-    let desc = PixelFormat::from(frame.format).descriptor();
+    let geom = plane_geom(frame, plane_idx)?;
 
-    // 计算平面的实际尺寸
-    let plane_height = if desc.log2_chroma_h > 0 && plane_idx > 0 {
-        frame.height >> desc.log2_chroma_h
-    } else {
-        frame.height
-    };
-
-    let plane_width = if desc.log2_chroma_w > 0 && plane_idx > 0 {
-        frame.width >> desc.log2_chroma_w
-    } else {
-        frame.width
-    };
-
-    // 计算每个像素的字节数
-    let bytes_per_pixel = if desc.comp[plane_idx].step > 0 {
-        desc.comp[plane_idx].step
-    } else {
-        1
-    };
-
-    // 计算平面数据的实际大小
-    // 这种计算方式假设平面数据是连续存储的，没有考虑 FFmpeg 中的 linesize （行步长）。
-    // 在 FFmpeg 中，每行数据可能会有额外的填充字节用于内存对齐，
-    // 这意味着实际的行大小（ frame.linesize[plane_idx] ）可能大于计算出的行大小（ plane_width * bytes_per_pixel ）
-    // 正确的做法是考虑 linesize 并计算实际的行大小
-    // let plane_size = plane_height as usize * plane_width as usize * bytes_per_pixel as usize;
-    //
     // 获取行步长
     let linesize = frame.linesize[plane_idx] as usize;
 
     // 创建一个新的缓冲区，只包含实际的像素数据（不包括填充）
-    let mut result =
-        Vec::with_capacity(plane_height as usize * plane_width as usize * bytes_per_pixel as usize);
+    let bytes_per_row = geom.width * geom.bytes_per_pixel;
+    let total_size = geom.height * bytes_per_row;
+    let mut result = Vec::with_capacity(total_size);
 
     unsafe {
         // 计算平面数据在缓冲区中的偏移量
@@ -224,16 +229,19 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
         let src_ptr = (*buf_ptr).data.add(data_offset);
 
         // 确保不会超出缓冲区的大小
-        let bytes_per_row = plane_width as usize * bytes_per_pixel as usize;
-        if data_offset + (plane_height as usize - 1) * linesize + bytes_per_row > (*buf_ptr).size {
+        if data_offset + (geom.height - 1) * linesize + bytes_per_row > (*buf_ptr).size {
             return Err(anyhow::anyhow!("Buffer too small for plane {}", plane_idx));
         }
 
-        // 逐行复制数据，跳过填充字节
-        for y in 0..plane_height as usize {
-            let row_ptr = src_ptr.add(y * linesize);
-            let row_data = std::slice::from_raw_parts(row_ptr, bytes_per_row);
-            result.extend_from_slice(row_data);
+        // Set the actual length
+        result.set_len(total_size);
+
+        // 使用批量复制操作逐行复制数据，跳过填充字节
+        let dst_ptr: *mut u8 = result.as_mut_ptr();
+        for y in 0..geom.height {
+            let row_src_ptr = src_ptr.add(y * linesize);
+            let row_dst_ptr = dst_ptr.add(y * bytes_per_row);
+            std::ptr::copy_nonoverlapping(row_src_ptr, row_dst_ptr, bytes_per_row);
         }
     }
 
@@ -269,8 +277,7 @@ pub fn fill_plane_from_buffer(
         return Err(Error::msg("Frame is not writable"));
     }
 
-    // 获取格式描述符
-    let desc = PixelFormat::from(frame.format).descriptor();
+    // 获取平面数量并检查平面索引
     let planes = PixelFormat::from(frame.format).count_planes()?;
 
     // 检查平面索引
@@ -287,32 +294,15 @@ pub fn fill_plane_from_buffer(
         )));
     }
 
-    // 计算平面尺寸
-    let plane_height = if desc.log2_chroma_h > 0 && plane_idx > 0 {
-        frame.height >> desc.log2_chroma_h
-    } else {
-        frame.height
-    };
-
-    let plane_width = if desc.log2_chroma_w > 0 && plane_idx > 0 {
-        frame.width >> desc.log2_chroma_w
-    } else {
-        frame.width
-    };
-
-    // 计算每个像素的字节数
-    let bytes_per_pixel = if desc.comp[plane_idx].step > 0 {
-        desc.comp[plane_idx].step
-    } else {
-        1
-    };
+    // 计算平面尺寸（宽/高按像素格式色度子采样右移，每像素字节数取 desc.comp.step）
+    let geom = plane_geom(frame, plane_idx)?;
 
     // 计算实际数据宽度（字节数）
-    let byte_width = plane_width * bytes_per_pixel;
+    let byte_width = geom.width * geom.bytes_per_pixel;
     let dst_linesize = frame.linesize[plane_idx];
 
     // 验证行大小
-    if src_linesize < byte_width as usize {
+    if src_linesize < byte_width {
         return Err(anyhow::anyhow!(
             "Source linesize {} is less than required byte width {}",
             src_linesize,
@@ -321,7 +311,7 @@ pub fn fill_plane_from_buffer(
     }
 
     // 验证 byte_width 是否满足 FFmpeg 的要求
-    if byte_width > dst_linesize.abs() || byte_width > src_linesize as i32 {
+    if byte_width > dst_linesize.unsigned_abs() as usize || byte_width > src_linesize {
         return Err(anyhow::anyhow!(
             "byte_width {} exceeds linesize limits (dst: {}, src: {})",
             byte_width,
@@ -331,7 +321,7 @@ pub fn fill_plane_from_buffer(
     }
 
     // 计算所需的最小源数据大小（考虑行填充）
-    let required_size = (plane_height as usize) * src_linesize;
+    let required_size = geom.height * src_linesize;
     if src.len() < required_size {
         return Err(anyhow::anyhow!(
             "Incorrect source data size: got {}, need {}",
@@ -347,12 +337,52 @@ pub fn fill_plane_from_buffer(
             dst_linesize,          // 目标行大小
             src.as_ptr(),          // 源数据指针
             src_linesize as i32,   // 源数据行大小
-            byte_width,            // 要复制的宽度（字节数）
-            plane_height,          // 平面高度
+            byte_width as i32,     // 要复制的宽度（字节数）
+            geom.height as i32,    // 平面高度
         );
     }
 
     Ok(())
+}
+
+/// 用计算出的值按行填充 frame 的指定平面。
+///
+/// 注意：`av_frame_get_buffer` 会按 SIMD 对齐 linesize（可能大于平面实际宽度），若按一段
+/// 连续内存写入会漏写对齐填充导致的行末尾字节未初始化（valgrind 会报
+/// "Use of uninitialised value"）。因此本函数逐行按 `data[p] + y*linesize[p]` 写入，
+/// 且只写宽度内字节，填充字节不会被触碰。
+///
+/// # Arguments
+///
+/// * `frame` - 目标 AVFrame（需已 alloc_buffer）
+/// * `plane` - 平面索引
+/// * `plane_w` - 平面实际可见宽度（像素/字节）
+/// * `plane_h` - 平面实际可见高度（像素/行）
+/// * `filler` - 计算函数，接收平面内坐标 `(x, y)`，返回该像素应写入的字节值
+///
+/// # Safety
+///
+/// 调用者需保证坐标 `(x, y)` 均满足 `x < plane_w`、`y < plane_h`，且
+/// `frame.data[plane]` 指向已分配、可写的缓冲区。
+pub unsafe fn fill_plane_with<F>(
+    frame: &AVFrame,
+    plane: usize,
+    plane_w: usize,
+    plane_h: usize,
+    filler: F,
+) where
+    F: Fn(usize, usize) -> u8,
+{
+    unsafe {
+        let linesize = frame.linesize[plane] as usize;
+        let base = frame.data[plane].cast::<u8>();
+        for y in 0..plane_h {
+            let row = base.add(y * linesize);
+            for x in 0..plane_w {
+                *row.add(x) = filler(x, y);
+            }
+        }
+    }
 }
 
 /// 将buffer数据填充到frame中
@@ -382,16 +412,9 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
     }
 
     unsafe {
-        // 4. Prepare destination pointers and linesizes (from the frame itself)
-        let mut dst_data: [*mut u8; 4] =
-            [frame.data[0], frame.data[1], frame.data[2], frame.data[3]];
-        // Note: AVFrame::linesize is [i32; AV_NUM_DATA_POINTERS], which is 8 on most platforms
-        let dst_linesizes: [i32; 4] = [
-            frame.linesize[0],
-            frame.linesize[1],
-            frame.linesize[2],
-            frame.linesize[3],
-        ];
+        // 4. 目标指针/行宽直接取自 frame 本身（data/linesize 前 4 项数组指针）
+        let dst_data = frame.data.as_ptr();
+        let dst_linesizes = frame.linesize.as_ptr();
 
         // 5. Prepare source pointers and linesizes (describing the layout within the input `buffer`)
         // We need to calculate the layout as if it were tightly packed.
@@ -422,8 +445,8 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
 
         // 6. Perform the copy
         ffi::av_image_copy(
-            dst_data.as_mut_ptr(),
-            dst_linesizes.as_ptr(),
+            dst_data,
+            dst_linesizes,
             src_data.as_ptr() as *const *const u8,
             src_linesizes.as_ptr() as *const _,
             pix_fmt,
@@ -436,6 +459,7 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
 }
 
 /// 将 AVFrame 转换为 ndarray::Array3
+#[cfg(feature = "ndarray")]
 pub fn to_ndarray(frame: &AVFrame) -> Result<ndarray::Array3<u8>> {
     let (height, width) = (frame.height as usize, frame.width as usize);
 
@@ -504,8 +528,6 @@ mod tests {
     use anyhow::Context;
     use image::{ImageBuffer, Rgb};
 
-    const OUTPUT_DIR: &str = "output";
-
     /// Create an image with the given text and a gradient color.
     fn create_image_with_text(
         width: u32,
@@ -555,8 +577,9 @@ mod tests {
 
     #[test]
     fn test_image_text() -> Result<()> {
+        let output_path = crate::test_utils::test_output_path("imgutils", "image_with_text.png");
         let rgb = create_image_with_text(640, 480, "Hello, world!");
-        rgb.save(format!("{}/image_with_text.png", OUTPUT_DIR))?;
+        rgb.save(output_path)?;
         Ok(())
     }
 
@@ -816,8 +839,8 @@ mod tests {
             for y in 0..height as usize {
                 let row_ptr = y_ptr.add(y * y_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, width as usize);
-                for x in 0..width as usize {
-                    assert_eq!(row[x], 100, "Y plane data mismatch at ({}, {})", x, y);
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 100, "Y plane data mismatch at ({}, {})", x, y);
                 }
             }
 
@@ -827,8 +850,8 @@ mod tests {
             for y in 0..uv_height as usize {
                 let row_ptr = u_ptr.add(y * u_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, uv_width as usize);
-                for x in 0..uv_width as usize {
-                    assert_eq!(row[x], 150, "U plane data mismatch at ({}, {})", x, y);
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 150, "U plane data mismatch at ({}, {})", x, y);
                 }
             }
 
@@ -838,8 +861,8 @@ mod tests {
             for y in 0..uv_height as usize {
                 let row_ptr = v_ptr.add(y * v_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, uv_width as usize);
-                for x in 0..uv_width as usize {
-                    assert_eq!(row[x], 200, "V plane data mismatch at ({}, {})", x, y);
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 200, "V plane data mismatch at ({}, {})", x, y);
                 }
             }
         }
@@ -940,6 +963,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "ndarray")]
     #[test]
     fn test_fill_frame_from_buffer() -> Result<()> {
         let mut frame = create_test_frame(320, 240, ffi::AV_PIX_FMT_RGB24)?;
@@ -958,6 +982,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "ndarray")]
     #[test]
     fn test_to_ndarray() {
         let width = 320_usize;
@@ -1018,6 +1043,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ndarray")]
     #[test]
     fn test_frame_integration() {
         // 测试完整的操作流程
@@ -1037,6 +1063,56 @@ mod tests {
         // 4. 转换为ndarray
         let array = to_ndarray(&dst_frame).unwrap();
         assert_eq!(array.shape(), &[240, 320, 3]);
+    }
+
+    #[test]
+    fn test_fill_plane_with() {
+        // YUV420P：Y 平面全分辨率，UV 平面各 1/4
+        let width = 320;
+        let height = 240;
+        let uv_w = width as usize / 2;
+        let uv_h = height as usize / 2;
+        let frame = create_test_frame(width, height, ffi::AV_PIX_FMT_YUV420P).unwrap();
+
+        unsafe {
+            fill_plane_with(&frame, 0, width as usize, height as usize, |x, y| {
+                ((y * width as usize + x) as u8) % 255
+            });
+            fill_plane_with(&frame, 1, uv_w, uv_h, |x, y| {
+                ((y * uv_w + x) as u8).wrapping_add(85) % 255
+            });
+            fill_plane_with(&frame, 2, uv_w, uv_h, |x, y| {
+                ((y * uv_w + x) as u8).wrapping_add(170) % 255
+            });
+        }
+
+        // 验证每个可见像素值；同时确保尾部填充字节未被触碰（保持未初始化也在 bounds 内，
+        // fill_plane_with 只写可见宽度，不会越界）。
+        unsafe {
+            for p in 0..3 {
+                let (pw, ph) = if p == 0 {
+                    (width as usize, height as usize)
+                } else {
+                    (uv_w, uv_h)
+                };
+                let linesize = frame.linesize[p] as usize;
+                let base = frame.data[p].cast::<u8>();
+                for y in 0..ph {
+                    let row = base.add(y * linesize);
+                    for x in 0..pw {
+                        let f = |off: u8| ((y * pw + x) as u8).wrapping_add(off) % 255;
+                        let expect = if p == 0 {
+                            f(0)
+                        } else if p == 1 {
+                            f(85)
+                        } else {
+                            f(170)
+                        };
+                        assert_eq!(*row.add(x), expect, "plane {p} at ({x},{y})");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1082,8 +1158,8 @@ mod tests {
             for y in 0..height as usize {
                 let row_ptr = y_ptr.add(y * y_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, width as usize);
-                for x in 0..width as usize {
-                    assert_eq!(row[x], 100, "Y plane data mismatch at ({}, {})", x, y);
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 100, "Y plane data mismatch at ({}, {})", x, y);
                 }
             }
 
@@ -1093,8 +1169,8 @@ mod tests {
             for y in 0..uv_height as usize {
                 let row_ptr = u_ptr.add(y * u_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, uv_width as usize);
-                for x in 0..uv_width as usize {
-                    assert_eq!(row[x], 150, "U plane data mismatch at ({}, {})", x, y);
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 150, "U plane data mismatch at ({}, {})", x, y);
                 }
             }
 
@@ -1104,8 +1180,8 @@ mod tests {
             for y in 0..uv_height as usize {
                 let row_ptr = v_ptr.add(y * v_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, uv_width as usize);
-                for x in 0..uv_width as usize {
-                    assert_eq!(row[x], 200, "V plane data mismatch at ({}, {})", x, y);
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 200, "V plane data mismatch at ({}, {})", x, y);
                 }
             }
         }
@@ -1140,12 +1216,8 @@ mod tests {
             for y in 0..height as usize {
                 let row_ptr = y_ptr.add(y * y_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, width as usize);
-                for x in 0..width as usize {
-                    assert_eq!(
-                        row[x], 100,
-                        "YUV444P Y plane data mismatch at ({}, {})",
-                        x, y
-                    );
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 100, "YUV444P Y plane data mismatch at ({}, {})", x, y);
                 }
             }
 
@@ -1155,12 +1227,8 @@ mod tests {
             for y in 0..height as usize {
                 let row_ptr = u_ptr.add(y * u_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, width as usize);
-                for x in 0..width as usize {
-                    assert_eq!(
-                        row[x], 150,
-                        "YUV444P U plane data mismatch at ({}, {})",
-                        x, y
-                    );
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 150, "YUV444P U plane data mismatch at ({}, {})", x, y);
                 }
             }
 
@@ -1170,12 +1238,8 @@ mod tests {
             for y in 0..height as usize {
                 let row_ptr = v_ptr.add(y * v_linesize);
                 let row = std::slice::from_raw_parts(row_ptr, width as usize);
-                for x in 0..width as usize {
-                    assert_eq!(
-                        row[x], 200,
-                        "YUV444P V plane data mismatch at ({}, {})",
-                        x, y
-                    );
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 200, "YUV444P V plane data mismatch at ({}, {})", x, y);
                 }
             }
         }
@@ -1200,8 +1264,8 @@ mod tests {
             for y in 0..height as usize {
                 let row_ptr = ptr.add(y * linesize);
                 let row = std::slice::from_raw_parts(row_ptr, width as usize * 4);
-                for x in 0..width as usize * 4 {
-                    assert_eq!(row[x], 128, "RGBA plane data mismatch at ({}, {})", x, y);
+                for (x, &val) in row.iter().enumerate() {
+                    assert_eq!(val, 128, "RGBA plane data mismatch at ({}, {})", x, y);
                 }
             }
         }

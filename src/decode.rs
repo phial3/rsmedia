@@ -5,8 +5,10 @@ use crate::frame::{MediaFrame, MediaFrameType};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Reader;
 use crate::options::Options;
+use crate::resize::Resize;
 use crate::stream::StreamInfo;
-use crate::{swctx, utils, Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
+use crate::swctx::ScaleAlgorithm;
+use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time, swctx, utils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
 use rsmpeg::avformat::AVStream;
@@ -26,6 +28,8 @@ pub struct DecoderBuilder {
     codec_opts: Option<Options>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
+    scale_algorithm: ScaleAlgorithm,
+    resize: Option<Resize>,
 }
 
 impl DecoderBuilder {
@@ -43,6 +47,8 @@ impl DecoderBuilder {
             hw_device_config: None,
             thread_count: num_cpus::get(),
             flags: AvCodecFlags::LOW_DELAY,
+            scale_algorithm: ScaleAlgorithm::default(),
+            resize: None,
         }
     }
 
@@ -54,14 +60,14 @@ impl DecoderBuilder {
 
     /// Set the codec name to use for decoding.
     /// If not set, the decoder will try to guess the codec based on the input.
-    pub fn with_codec_name(mut self, codec_name: Option<String>) -> Self {
-        self.codec_name = codec_name;
+    pub fn with_codec_name(mut self, codec_name: impl Into<Option<String>>) -> Self {
+        self.codec_name = codec_name.into();
         self
     }
 
     /// codec options to use for decoding.
-    pub fn with_options(mut self, options: Option<Options>) -> Self {
-        self.codec_opts = options;
+    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.codec_opts = options.into();
         self
     }
 
@@ -72,8 +78,8 @@ impl DecoderBuilder {
     }
 
     /// set the filters to apply to decoded frames.
-    pub fn with_filters(mut self, filters: Option<Vec<Filter>>) -> Self {
-        self.filters = filters;
+    pub fn with_filters(mut self, filters: impl Into<Option<Vec<Filter>>>) -> Self {
+        self.filters = filters.into();
         self
     }
 
@@ -82,6 +88,27 @@ impl DecoderBuilder {
     /// * `device_config` - Device to use for hardware acceleration.
     pub fn with_hardware_device(mut self, device_config: Option<HWDeviceConfig>) -> Self {
         self.hw_device_config = device_config;
+        self
+    }
+
+    /// Set the scaling algorithm used when converting decoded frames to a
+    /// canonical pixel format (e.g. YUV420P).
+    ///
+    /// Defaults to [`ScaleAlgorithm::Bicubic`]. Use
+    /// [`ScaleAlgorithm::Bilinear`] for output consistent with FFmpeg's command
+    /// line default, or [`ScaleAlgorithm::Area`] when downscaling.
+    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
+        self.scale_algorithm = algorithm;
+        self
+    }
+
+    /// Set the resize strategy applied to decoded video frames.
+    ///
+    /// Controls the output dimensions: [`Resize::Exact`] forces an exact size,
+    /// [`Resize::Fit`]/[`Resize::FitEven`] keep the aspect ratio while fitting
+    /// within the given bounds. When `None`, frames keep their source size.
+    pub fn with_resize(mut self, resize: Resize) -> Self {
+        self.resize = Some(resize);
         self
     }
 
@@ -109,13 +136,22 @@ impl DecoderBuilder {
         Ok(())
     }
 
-    /// Build [`Decoder`].
+    /// 构建一个**裸** [`Decoder`]（不持有 reader）。
+    ///
+    /// 适合需要精细控制 reader 生命周期的高级场景：解码时需每帧传入 reader
+    /// （`decoder.decode(&mut reader)`），且**不支持 seek**（seek 需要 reader，
+    /// 请改用 [`build_wrapped`](DecoderBuilder::build_wrapped)）。
     pub fn build(self, source: impl Into<Location>) -> Result<Decoder> {
         let reader = StreamReader::new(source)?;
         self.build_from_reader(&reader)
     }
 
-    /// 创建一个包装的解码器
+    /// 构建一个持有 reader 的 [`DecoderWrapper`]（**推荐入口**）。
+    ///
+    /// 返回的 [`DecoderWrapper`] 封装了 reader，解码无需每帧传参
+    /// （`decoder.decode()` / `decoder.decode_frame()`），并支持直接
+    /// [`seek_to_frame`](DecoderWrapper::seek_to_frame) /
+    /// [`seek_to_timestamp`](DecoderWrapper::seek_to_timestamp)。
     pub fn build_wrapped(
         self,
         source: impl Into<Location>,
@@ -124,13 +160,19 @@ impl DecoderBuilder {
         self.build_wrapped_with_reader(reader)
     }
 
-    /// a reader be required to get input stream, and build a decoder.
+    /// 用自定义 reader 构建持有 reader 的 [`DecoderWrapper`]。
+    ///
+    /// 当需要从自定义 [`Reader`]（如网络流、内存缓冲）解码时使用，行为与
+    /// [`build_wrapped`](DecoderBuilder::build_wrapped) 一致。
     pub fn build_wrapped_with_reader<R: Reader>(self, reader: R) -> Result<DecoderWrapper<R>> {
         let decoder = self.build_from_reader(&reader)?;
         Ok(DecoderWrapper::new(decoder, reader))
     }
 
-    /// a reader be required to get input stream, and build a decoder.
+    /// 用给定的 reader 构建**裸** [`Decoder`]（不持有 reader）。
+    ///
+    /// 高级/内部场景使用（如 mux 多流共享同一 reader）。解码时需每帧传入
+    /// reader，且不支持 seek。日常使用请优先 [`build_wrapped`](DecoderBuilder::build_wrapped)。
     pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
@@ -255,6 +297,8 @@ impl DecoderBuilder {
             filter_graph,
             context: decode_ctx,
             state: DecoderState::Normal,
+            scale_algorithm: self.scale_algorithm,
+            resize: self.resize,
         })
     }
 }
@@ -289,6 +333,8 @@ pub struct Decoder {
     stream_index: usize,
     media_type: MediaType,
     state: DecoderState,
+    scale_algorithm: ScaleAlgorithm,
+    resize: Option<Resize>,
 }
 
 impl Decoder {
@@ -394,6 +440,18 @@ impl Decoder {
         self.state == DecoderState::Flushed
     }
 
+    /// 解码器是否已完全结束：解码器到达 EOF，且 filter（如有）内部缓冲帧也已全部
+    /// 冲刷完毕。仅当二者都满足时，才禁止继续调用 `decode`/`decode_raw`。否则
+    /// （解码器已 Flushed 但 filter 仍有多余缓冲帧待冲刷，如延迟滤镜 `framerate`），
+    /// 仍需允许继续调用以取回剩余帧，否则会丢帧或报"cannot decode after flushed"。
+    fn is_complete(&self) -> bool {
+        self.is_flushed()
+            && match &self.filter_graph {
+                Some(graph) => graph.is_flushed(),
+                None => true,
+            }
+    }
+
     /// Decode a single frame.
     ///
     /// # Return value
@@ -404,7 +462,7 @@ impl Decoder {
     ///
     /// ```ignore
     /// loop {
-    ///     let (ts, frame) = decoder.decode()?;
+    ///     let (ts, frame) = decoder.decode::<u8>()?;
     ///     // Do something with frame...
     /// }
     /// ```
@@ -413,7 +471,7 @@ impl Decoder {
     where
         T: MediaFrameType,
     {
-        if self.is_flushed() {
+        if self.is_complete() {
             return Err(Error::msg(
                 "Decoder cannot decode after flushed. Call reset().",
             ));
@@ -449,6 +507,13 @@ impl Decoder {
                         break Some(frame);
                     }
                     Ok(None) => {
+                        // None 可能来自 Drained（EAGAIN，解码器仍有缓冲帧待产出）或
+                        // Flushed（EOF）。若是 Drained 需继续 drain，否则会丢失尾部帧
+                        // （多见于含 B 帧的码流）。
+                        if self.is_drained() {
+                            log::debug!("Decoder drained, keep draining.");
+                            continue;
+                        }
                         log::debug!("Decoder flushed. EOF reached.");
                         // self.reset();
                         // read_exhausted = false;
@@ -461,6 +526,18 @@ impl Decoder {
                 }
             }
         })
+    }
+
+    /// Decode a single frame as a `MediaFrame<u8>` (video) or `MediaFrame<f32>` (audio).
+    ///
+    /// Convenience for `decode::<u8>()` which is the common video path.
+    ///
+    /// # Return value
+    ///
+    /// The decoded frame, or [`None`] at end of stream.
+    #[cfg(feature = "ndarray")]
+    pub fn decode_frame(&mut self, reader: &mut impl Reader) -> Result<Option<MediaFrame<u8>>> {
+        self.decode::<u8>(reader)
     }
 
     /// Decode a single frame and return the raw ffmpeg `AvFrame`.
@@ -476,7 +553,7 @@ impl Decoder {
     where
         R: Reader,
     {
-        if self.is_flushed() {
+        if self.is_complete() {
             return Err(Error::msg(
                 "Decoder cannot decode after flushed. Call reset().",
             ));
@@ -512,6 +589,10 @@ impl Decoder {
                         break Some(frame);
                     }
                     Ok(None) => {
+                        if self.is_drained() {
+                            log::debug!("Decoder drained, keep draining.");
+                            continue;
+                        }
                         log::debug!("Decoder flushed. EOF reached.");
                         // self.reset();
                         // read_exhausted = false;
@@ -606,9 +687,16 @@ impl Decoder {
     /// # Return value
     ///
     /// The decoded raw frame as [`AVFrame`] if the decoder has a frame available, [`None`] if not.
+    ///
+    /// 作为低层手动解码 API 的一部分公开：配合 [`into_parts`](Self::into_parts) 与
+    /// [`decode_raw_packet`](Self::decode_raw_packet) 使用，可逐 packet 送入解码器并排空
+    /// 缓冲帧。需要 [`MediaFrame`] 的高级调用请使用 [`drain`](Self::drain)。
     pub fn drain_raw(&mut self) -> Result<Option<AVFrame>> {
-        if !self.is_drained() {
+        if self.state == DecoderState::Normal {
             self.send_packet_to_decoder(None)?;
+            // 已发送 EOS，进入 draining 模式。此后 EAGAIN 表示"仍在 drain"，
+            // 而非 read 阶段缺包，因此在此处显式置位。
+            self.state = DecoderState::Drained;
         }
         self.receive_frame_from_decoder()
     }
@@ -639,7 +727,32 @@ impl Decoder {
         // 1. 从解码器获取原始帧
         let decoded_frame = match self.decoder_receive_frame() {
             Ok(Some(f)) => f,
-            Ok(None) => return Ok(None), // Decoder drained or flushed
+            Ok(None) => {
+                // 解码器当前无帧可出。按状态区分是"仍需更多输入"还是"已到 EOF"：
+                // - Normal / Drained：读阶段或 drain 阶段的 EAGAIN，需要继续喂包，
+                //   此时绝不能刷新 filter（否则会给 buffersrc 发 EOF，后续真实帧
+                //   提交会得到 AVERROR_EOF）。
+                // - Flushed：解码器到达 EOF，此时驱动 filter graph 冲刷内部缓冲帧
+                //   （如 fps/setpts 等带延迟滤镜）。逐帧调用 `process_frame(None)`，
+                //   每帧返回一帧，直到 graph 进入 Flushed 状态。
+                match self.state {
+                    DecoderState::Normal | DecoderState::Drained => return Ok(None),
+                    DecoderState::Flushed => {
+                        if let Some(graph) = self.filter_graph.as_mut()
+                            && !graph.is_flushed()
+                        {
+                            match graph.process_frame(None)? {
+                                Some(frame) => return Ok(Some(frame)),
+                                None => {
+                                    // 已无更多缓冲帧（graph 此时已 Flushed）
+                                    debug_assert!(graph.is_flushed());
+                                }
+                            }
+                        }
+                        return Ok(None);
+                    }
+                }
+            }
             Err(e) => return Err(e),
         };
 
@@ -661,15 +774,32 @@ impl Decoder {
         // 例如：
         // 无硬件加速，默认解码格式 YUV420P
         // 存在硬件加速帧，则转换 NV12 -> YUV420P
+        // 注意：这里无论是否有 Filter，都会统一转成 YUV420P（因为
+        // `MediaFrame` 视频目前主要支持 YUV420P/RGB24）。因此即使源是
+        // yuv444p / nv12 / 10-bit，解码输出也会被转成 YUV420P，不会颜色错乱。
         let raw_frame = match self.media_type {
             MediaType::VIDEO => {
                 let target_sw_pix_fmt = PixelFormat::YUV420P;
-                if sw_frame.format != target_sw_pix_fmt.into() {
-                    swctx::scale(
+                // 计算目标尺寸：无 resize 时保持源尺寸，有 resize 时按策略计算
+                let (out_w, out_h) = match self.resize {
+                    Some(resize) => resize
+                        .compute_for((sw_frame.width as u32, sw_frame.height as u32))
+                        .ok_or_else(|| {
+                            let (w, h) = (sw_frame.width, sw_frame.height);
+                            Error::msg(format!("Cannot resize frame {w}x{h} into {resize:?}"))
+                        })?,
+                    None => (sw_frame.width as u32, sw_frame.height as u32),
+                };
+                if sw_frame.format != target_sw_pix_fmt.into()
+                    || sw_frame.width != out_w as i32
+                    || sw_frame.height != out_h as i32
+                {
+                    swctx::scale_with_flags(
                         &sw_frame,
-                        sw_frame.width,
-                        sw_frame.height,
+                        out_w as i32,
+                        out_h as i32,
                         target_sw_pix_fmt,
+                        self.scale_algorithm,
                     )?
                 } else {
                     sw_frame
@@ -712,8 +842,12 @@ impl Decoder {
         match self.context.receive_frame() {
             Ok(frame) => Ok(Some(frame)),
             Err(rsmpeg::error::RsmpegError::DecoderDrainError) => {
+                // EAGAIN：此刻无帧可出。
+                // - read 阶段：表示"该包暂未解出帧，需继续喂包"，此时不应置 Drained，
+                //   否则会使后续 drain_raw 误判已进入 draining 而跳过 EOS 发送（见 drain_raw）。
+                // - drain 阶段：Drained 已在 drain_raw 中置位，这里保持即可。
                 log::debug!("Decoder drained. try send new packet again.");
-                self.state = DecoderState::Drained;
+                // self.state = DecoderState::Drained;
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::DecoderFlushedError) => {
@@ -752,7 +886,18 @@ impl Drop for Decoder {
         // We need to drain the items still in the decoders queue.
         match self.send_packet_to_decoder(None) {
             Ok(_) => {
+                // 兜底上限：个别解码器可能持续返回 EAGAIN 而迟迟不结束，
+                // 与 encode.rs 的 1_000 保护一致，防止 Drop 排空无限循环。
+                const MAX_DRAIN_ITERATIONS: usize = 1_000;
+                let mut iterations = 0usize;
                 loop {
+                    if iterations >= MAX_DRAIN_ITERATIONS {
+                        log::warn!(
+                            "Decoder drain exceeded {MAX_DRAIN_ITERATIONS} iterations, forcing EOF."
+                        );
+                        break;
+                    }
+                    iterations += 1;
                     match self.decoder_receive_frame() {
                         Ok(Some(_frame)) => {
                             // If receive a frame, we continue to drain the queue.
@@ -827,6 +972,12 @@ impl<R: Reader> DecoderWrapper<R> {
     /// 解码下一帧（媒体帧）
     #[cfg(feature = "ndarray")]
     pub fn decode<T: MediaFrameType>(&mut self) -> Result<Option<MediaFrame<T>>> {
+        self.decoder.decode(&mut self.reader)
+    }
+
+    /// 解码下一帧（`MediaFrame<u8>` 便捷方法，等价于 `decode::<u8>()`）
+    #[cfg(feature = "ndarray")]
+    pub fn decode_frame(&mut self) -> Result<Option<MediaFrame<u8>>> {
         self.decoder.decode(&mut self.reader)
     }
 
@@ -909,20 +1060,31 @@ impl<R: Reader> DecoderWrapper<R> {
 mod tests {
     use super::*;
     use crate::filter;
+    use std::collections::HashSet;
 
     #[test]
-    #[ignore = "need a video file"]
     fn test_decode_video() -> Result<()> {
-        let video_path = std::path::Path::new("/tmp/bear.mp4");
+        let video_path = std::path::Path::new("assets/mp4.mp4");
 
-        let filters = vec![
-            filter::video::scale(1280, 720, None),
-            filter::video::drawtext("Hello", 10, 10, "", 24, "white"),
-        ];
-
-        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(Some(filters))
-            .build_wrapped(video_path)?;
+        // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用，失败时降级为仅 scale。
+        let scale = filter::video::scale(1280, 720, None);
+        let drawtext = filter::video::DrawText::new("Hello", 10, 10, 24, "white").build();
+        let build_decoder = |filters| {
+            DecoderBuilder::new(MediaType::VIDEO)
+                .with_filters(filters)
+                .build_wrapped(video_path)
+        };
+        let mut decoder = match build_decoder(vec![scale, drawtext]) {
+            Ok(d) => d,
+            Err(e)
+                if format!("{e:#}").to_lowercase().contains("no such filter")
+                    || format!("{e:#}").to_lowercase().contains("not found") =>
+            {
+                println!("SKIP drawtext (libfreetype not available): {e:#}");
+                build_decoder(vec![filter::video::scale(1280, 720, None)])?
+            }
+            Err(e) => return Err(e),
+        };
 
         loop {
             match decoder.decode_raw() {
@@ -944,9 +1106,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "need a audio file"]
     fn test_decode_audio() -> Result<()> {
-        let audio_path = std::path::Path::new("/tmp/bear.mp4");
+        let audio_path = std::path::Path::new("assets/wav.wav");
 
         let filters = vec![
             filter::audio::resample(2, 48000, SampleFormat::FLTP),
@@ -954,7 +1115,7 @@ mod tests {
         ];
 
         let mut decoder = DecoderBuilder::new(MediaType::AUDIO)
-            .with_filters(Some(filters))
+            .with_filters(filters)
             .build_wrapped(audio_path)?;
 
         loop {
@@ -973,6 +1134,157 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_video_with_resize() -> Result<()> {
+        use crate::Resize;
+
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_resize(Resize::Exact(320, 240))
+            .build_wrapped(video_path)?;
+
+        let mut frames = 0usize;
+        while let Some(frame) = decoder.decode_raw()? {
+            assert_eq!(frame.width, 320);
+            assert_eq!(frame.height, 240);
+            frames += 1;
+        }
+        assert!(frames > 0, "expected at least one decoded frame");
+
+        Ok(())
+    }
+
+    /// 验证 `with_resize` 与 `scale` filter 两种缩放方式结果一致，且同时使用时
+    /// 按「先 resize 后 filter」的顺序叠加，不冲突。
+    #[test]
+    fn test_resize_vs_filter_scale() -> Result<()> {
+        use crate::Resize;
+
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+
+        // A) 仅 with_resize
+        eprintln!("[A] with_resize only");
+        let mut dec_a = DecoderBuilder::new(MediaType::VIDEO)
+            .with_resize(Resize::Exact(320, 240))
+            .build_wrapped(video_path)?;
+        let mut a_dims = HashSet::new();
+        while let Some(f) = dec_a.decode_raw()? {
+            a_dims.insert((f.width, f.height));
+        }
+
+        // B) 仅 scale filter
+        eprintln!("[B] filter only");
+        let mut dec_b = DecoderBuilder::new(MediaType::VIDEO)
+            .with_filters(vec![filter::video::scale(320, 240, None)])
+            .build_wrapped(video_path)?;
+        let mut b_dims = HashSet::new();
+        while let Some(f) = dec_b.decode_raw()? {
+            b_dims.insert((f.width, f.height));
+        }
+
+        // A 与 B 应得到完全相同的尺寸集合
+        assert_eq!(
+            a_dims, b_dims,
+            "with_resize and filter scale produced different dimensions"
+        );
+        assert_eq!(a_dims.len(), 1, "expected a single uniform output size");
+
+        // C) 同时使用：resize(320x240) -> filter scale(640x480)，输出应为 filter 尺寸
+        eprintln!("[C] resize + filter");
+        let mut dec_c = DecoderBuilder::new(MediaType::VIDEO)
+            .with_resize(Resize::Exact(320, 240))
+            .with_filters(vec![filter::video::scale(640, 480, None)])
+            .build_wrapped(video_path)?;
+        let mut c_dims = HashSet::new();
+        while let Some(f) = dec_c.decode_raw()? {
+            c_dims.insert((f.width, f.height));
+        }
+        assert_eq!(
+            c_dims,
+            HashSet::from([(640i32, 480i32)]),
+            "resize+filter should compose to the filter size"
+        );
+
+        Ok(())
+    }
+
+    /// 生成 `n_frames` 帧、`fps` 帧率的纯色小视频（不含 B 帧），供延迟滤镜 EOF 回归测试使用。
+    #[cfg(feature = "ndarray")]
+    fn make_test_video(
+        path: &std::path::Path,
+        width: usize,
+        height: usize,
+        n_frames: usize,
+        fps: f32,
+    ) -> Result<()> {
+        use crate::{colors, encode::EncoderBuilder};
+
+        let mut encoder = EncoderBuilder::new_video(width, height)
+            .with_fps(fps)
+            .build_wrapped(path)?;
+        for i in 0..n_frames {
+            let rgb = colors::hsv_to_rgb(i as f32 / n_frames as f32 * 360.0, 100.0, 100.0);
+            let mut frame = MediaFrame::<u8>::new_video_frame(
+                width,
+                height,
+                PixelFormat::RGB24,
+                crate::time::new_rational(1, 24),
+            )?;
+            for y in 0..height {
+                for x in 0..width {
+                    frame.data[[y, x, 0]] = rgb[0];
+                    frame.data[[y, x, 1]] = rgb[1];
+                    frame.data[[y, x, 2]] = rgb[2];
+                }
+            }
+            encoder.write_frame(frame)?;
+        }
+        encoder.finish()?;
+        Ok(())
+    }
+
+    /// 自包含回归测试：验证解码器带「延迟滤镜」时，EOF 阶段的 filter flush 不会报错或丢帧。
+    /// 延迟滤镜（如 `framerate` 缓冲插值帧、`setpts` 重排帧）需在解码器 EOF 后逐帧冲刷；
+    /// 若 flush 重复向 buffersrc 发送 EOF，会得到 `AVERROR_EOF` 并中断解码（即已修复的
+    /// filter-EOF 类 BUG）。
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn test_decode_delayed_filter_eof() -> Result<()> {
+        let width = 64usize;
+        let height = 64usize;
+        // (滤镜名, 参数, 输入帧数, fps, 期望最小输出帧数)
+        let cases: &[(&str, &str, usize, f32, usize)] = &[
+            ("framerate", "framerate=fps=30", 30, 30.0, 30),
+            ("setpts", "setpts=PTS*2", 24, 24.0, 23),
+        ];
+
+        for (i, (name, spec, n_frames, fps, min_frames)) in cases.iter().enumerate() {
+            let path = crate::test_utils::test_output_path(
+                "decode",
+                &format!("rsmedia_decode_delayed_{i}.mp4"),
+            );
+            crate::test_utils::remove_test_output(&path);
+            make_test_video(&path, width, height, *n_frames, *fps)?;
+
+            let filters = vec![Filter::new(name, MediaType::VIDEO, spec.to_string())];
+            let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+                .with_filters(filters)
+                .build_wrapped(path.as_path())?;
+            let mut count = 0usize;
+            while let Some(_f) = decoder.decode_raw()? {
+                count += 1;
+            }
+            assert!(
+                count >= *min_frames,
+                "{name} delayed-filter decode dropped frames: got {count}, expected >= {min_frames}"
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
         Ok(())
     }
 }

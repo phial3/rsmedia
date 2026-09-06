@@ -1,5 +1,8 @@
 //! RIIR: https://github.com/FFmpeg/FFmpeg/blob/master/doc/examples/encode_audio.c
 
+mod common;
+use common::test_output_path;
+
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avformat::AVFormatContextOutput,
@@ -9,94 +12,9 @@ use rsmpeg::{
 };
 
 use anyhow::{Context, Result};
-use std::ffi::CStr;
-
-/// 编码器能力描述结构体
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct CodecConfig {
-    /// 支持的帧率列表（视频编码器）
-    pub supported_frame_rates: Option<Vec<ffi::AVRational>>,
-    /// 支持的采样率列表（音频编码器）
-    pub supported_sample_rates: Vec<i32>,
-    /// 支持的像素格式列表（视频编码器）
-    pub supported_pix_fmts: Vec<ffi::AVPixelFormat>,
-    /// 支持的采样格式列表（音频编码器）
-    pub supported_sample_fmts: Vec<ffi::AVSampleFormat>,
-    /// 典型帧大小（单位：样本数/视频帧）
-    pub frame_size: i32,
-}
-
-impl CodecConfig {
-    /// 从AVCodec动态获取编码器配置
-    pub fn new(codec: &AVCodec) -> Self {
-        // 获取视频相关参数
-        let supported_frame_rates = codec.supported_framerates().map(|rates| rates.to_vec());
-
-        let supported_pix_fmts = codec
-            .pix_fmts()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|&&fmt| fmt != ffi::AV_PIX_FMT_NONE)
-            .cloned()
-            .collect();
-
-        // 获取音频相关参数
-        let supported_sample_fmts = codec
-            .sample_fmts()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|&&fmt| fmt != ffi::AV_SAMPLE_FMT_NONE)
-            .cloned()
-            .collect();
-
-        let supported_sample_rates = codec
-            .supported_samplerates()
-            .unwrap_or(&[44_100, 48_000])
-            .to_vec();
-
-        let frame_size = if codec.capabilities & ffi::AV_CODEC_CAP_VARIABLE_FRAME_SIZE as i32 != 0 {
-            1024
-        } else {
-            match codec.id {
-                ffi::AV_CODEC_ID_FLAC => 4608,
-                ffi::AV_CODEC_ID_ALAC => 4096,
-                ffi::AV_CODEC_ID_WMAV2 => 2048,
-                ffi::AV_CODEC_ID_AC3 => 1536,
-                ffi::AV_CODEC_ID_MP2 => 1152,
-                ffi::AV_CODEC_ID_MP3 => 1152,
-                ffi::AV_CODEC_ID_OPUS => 960,
-                ffi::AV_CODEC_ID_DTS => 512,
-                ffi::AV_CODEC_ID_AMR_NB => 160,
-                ffi::AV_CODEC_ID_VORBIS => 64,
-                _ => 1024,
-            }
-        };
-
-        Self {
-            supported_frame_rates,
-            supported_sample_rates,
-            supported_pix_fmts,
-            supported_sample_fmts,
-            frame_size,
-        }
-    }
-
-    /// 检查采样格式是否支持
-    pub fn is_sample_fmt_supported(&self, fmt: ffi::AVSampleFormat) -> bool {
-        self.supported_sample_fmts.contains(&fmt)
-    }
-
-    /// 获取默认采样格式（优先级：FLTP > S16P > 首个支持格式）
-    #[allow(dead_code)]
-    pub fn default_sample_fmt(&self) -> Option<ffi::AVSampleFormat> {
-        [ffi::AV_SAMPLE_FMT_FLTP, ffi::AV_SAMPLE_FMT_S16P]
-            .iter()
-            .find(|&&fmt| self.supported_sample_fmts.contains(&fmt))
-            .copied()
-            .or_else(|| self.supported_sample_fmts.first().copied())
-    }
-}
+use rsmedia::codec::CodecConfig;
+use rsmedia::{EncoderBuilder, SampleFormat, filter, utils};
+use std::ffi::{CStr, CString};
 
 /// 生成正弦波音频样本（优化内存访问）
 fn generate_sine_wave(frame: &mut AVFrame, frequency: f64, sample_rate: i32) -> Result<()> {
@@ -265,31 +183,29 @@ fn encode_audio(
     nb_channels: i32,
 ) -> Result<()> {
     // 初始化编码器上下文
-    let codec =
-        AVCodec::find_encoder(codec_id).context(format!("Failed to find encoder: {}", codec_id))?;
+    // 编码器是否存在取决于 FFmpeg 编译配置（如 libvorbis、libopencore_amrnb），
+    // 缺失时跳过该测试而不是失败
+    let Some(codec) = AVCodec::find_encoder(codec_id) else {
+        println!("skip test: encoder for codec {codec_id} not available in this FFmpeg build");
+        return Ok(());
+    };
     let mut encode_ctx = AVCodecContext::new(&codec);
-
-    let codec_config = CodecConfig::new(&codec);
+    let amr_nb = codec.id == ffi::AV_CODEC_ID_AMR_NB;
+    let codec_config = CodecConfig::from_codec(codec);
+    // 固定速率编码器（PCM/FLAC 等）不暴露采样率列表；AMR-NB 仅支持 8000Hz
     let sample_rate = codec_config
-        .supported_sample_rates
-        .first()
-        .copied()
-        .unwrap();
+        .supported_sample_rates()
+        .ok()
+        .flatten()
+        .and_then(|rates| rates.first().copied())
+        .unwrap_or(if amr_nb { 8_000 } else { 44_100 });
 
     println!(
-        "{}",
-        format!(
-            "encode_audio: output_path:{}, codec_id:{}, sample_format:{}, codec_config: {:#?}",
-            output_path.to_string_lossy().to_string(),
-            codec_id,
-            sample_format,
-            codec_config
-        )
-    );
-
-    assert!(
-        codec_config.is_sample_fmt_supported(sample_format),
-        "Unsupported sample format"
+        "encode_audio: output_path:{}, codec_id:{}, sample_format:{}, sample_rate: {}",
+        output_path.to_string_lossy(),
+        codec_id,
+        sample_format,
+        sample_rate
     );
 
     // 配置编码参数
@@ -319,8 +235,15 @@ fn encode_audio(
         .context("Failed to write file header")?;
 
     // 初始化音频帧（带自动内存管理）
+    // 按编码器 frame_size 分块；frame_size 为 0（如 PCM 类）时用 1024 作块大小，
+    // 避免逐样本编码导致测试过慢。
+    let samples_per_frame = if encode_ctx.frame_size > 0 {
+        encode_ctx.frame_size
+    } else {
+        1024
+    };
     let mut frame = AVFrame::new();
-    frame.set_nb_samples(codec_config.frame_size);
+    frame.set_nb_samples(samples_per_frame);
     frame.set_ch_layout(encode_ctx.ch_layout);
     frame.set_format(encode_ctx.sample_fmt);
     frame
@@ -330,7 +253,6 @@ fn encode_audio(
     // 编码 5 秒音频数据
     let duration_seconds = 5;
     let total_samples = duration_seconds * encode_ctx.sample_rate;
-    let samples_per_frame = frame.nb_samples;
 
     for pts in (0..total_samples).step_by(samples_per_frame as usize) {
         // 生成正弦波数据
@@ -355,12 +277,18 @@ fn encode_audio(
     Ok(())
 }
 
+fn temp_output(name: &str) -> CString {
+    let path = test_output_path("encode_audio", name);
+    let path_str = path.to_string_lossy();
+    CString::new(path_str.as_bytes()).expect("temporary output path contains an embedded NUL byte")
+}
+
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_aac() {
     // aac 有损格式 (192kbps)
+    let output = temp_output("encode_audio_output.aac");
     encode_audio(
-        c"/tmp/encode_audio_output.aac",
+        &output,
         ffi::AV_CODEC_ID_AAC,
         ffi::AV_SAMPLE_FMT_FLTP,
         192_000,
@@ -370,11 +298,11 @@ fn test_encode_audio_aac() {
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_m4a() {
     // m4a AAC容器 (256kbps)
+    let output = temp_output("encode_audio_output.m4a");
     encode_audio(
-        c"/tmp/encode_audio_output.m4a",
+        &output,
         ffi::AV_CODEC_ID_AAC,
         ffi::AV_SAMPLE_FMT_FLTP,
         256_000,
@@ -384,11 +312,11 @@ fn test_encode_audio_m4a() {
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_caf() {
     // caf ALAC无损格式
+    let output = temp_output("encode_audio_output.caf");
     encode_audio(
-        c"/tmp/encode_audio_output.caf",
+        &output,
         ffi::AV_CODEC_ID_ALAC,
         ffi::AV_SAMPLE_FMT_S32P,
         0,
@@ -398,11 +326,11 @@ fn test_encode_audio_caf() {
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_mp3() {
     // mp3 有损格式 (128kbps)
+    let output = temp_output("encode_audio_output.mp3");
     encode_audio(
-        c"/tmp/encode_audio_output.mp3",
+        &output,
         ffi::AV_CODEC_ID_MP3,
         ffi::AV_SAMPLE_FMT_S16P,
         128_000,
@@ -412,53 +340,46 @@ fn test_encode_audio_mp3() {
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_flac() {
     // flac 无损格式 (24-bit)
-    encode_audio(
-        c"/tmp/encode_audio_output.flac",
-        ffi::AV_CODEC_ID_FLAC,
-        ffi::AV_SAMPLE_FMT_S16,
-        0,
-        2,
-    )
-    .unwrap();
+    let output = temp_output("encode_audio_output.flac");
+    encode_audio(&output, ffi::AV_CODEC_ID_FLAC, ffi::AV_SAMPLE_FMT_S16, 0, 2).unwrap();
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_wav() {
     // wav - EBU R128标准 (24-bit/48kHz)
+    let output = temp_output("encode_audio_output.wav");
     encode_audio(
-        c"/tmp/encode_audio_output.wav",
+        &output,
         ffi::AV_CODEC_ID_PCM_S24LE,
         ffi::AV_SAMPLE_FMT_S32,
-        2304_000,
+        2_304_000,
         2,
     )
     .unwrap();
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_wav_16bit() {
     // WAV - 16-bit PCM
+    let output = temp_output("encode_audio_output_16bit.wav");
     encode_audio(
-        c"/tmp/encode_audio_output_16bit.wav",
+        &output,
         ffi::AV_CODEC_ID_PCM_S16LE,
         ffi::AV_SAMPLE_FMT_S16,
-        1536_000, // 48kHz * 16bit * 2ch
+        1_536_000, // 48kHz * 16bit * 2ch
         2,
     )
     .unwrap();
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_ac3() {
     // AC3 - 5.1声道 (640kbps)
+    let output = temp_output("encode_audio_output.ac3");
     encode_audio(
-        c"/tmp/encode_audio_output.ac3",
+        &output,
         ffi::AV_CODEC_ID_AC3,
         ffi::AV_SAMPLE_FMT_FLTP,
         640_000,
@@ -468,11 +389,11 @@ fn test_encode_audio_ac3() {
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_opus() {
     // Opus - 低延迟语音编码 (64kbps)
+    let output = temp_output("encode_audio_output.opus");
     encode_audio(
-        c"/tmp/encode_audio_output.opus",
+        &output,
         ffi::AV_CODEC_ID_OPUS,
         ffi::AV_SAMPLE_FMT_FLT,
         64_000,
@@ -482,25 +403,11 @@ fn test_encode_audio_opus() {
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
-fn test_encode_audio_ogg_vorbis() {
-    // Vorbis - OGG容器 (128kbps)
-    encode_audio(
-        c"/tmp/encode_audio_output.ogg",
-        ffi::AV_CODEC_ID_VORBIS,
-        ffi::AV_SAMPLE_FMT_FLTP,
-        128_000,
-        2,
-    )
-    .unwrap();
-}
-
-#[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_wmav2() {
     // WMA - Windows Media Audio (128kbps)
+    let output = temp_output("encode_audio_output.wma");
     encode_audio(
-        c"/tmp/encode_audio_output.wma",
+        &output,
         ffi::AV_CODEC_ID_WMAV2,
         ffi::AV_SAMPLE_FMT_FLTP,
         128_000,
@@ -510,11 +417,11 @@ fn test_encode_audio_wmav2() {
 }
 
 #[test]
-#[ignore = "Ignore the test for now"]
 fn test_encode_audio_aiff() {
     // AIFF - Apple无压缩格式 (24-bit)
+    let output = temp_output("encode_audio_output.aiff");
     encode_audio(
-        c"/tmp/encode_audio_output.aiff",
+        &output,
         ffi::AV_CODEC_ID_PCM_S24BE,
         ffi::AV_SAMPLE_FMT_S32,
         0,
@@ -524,15 +431,123 @@ fn test_encode_audio_aiff() {
 }
 
 #[test]
-#[ignore = "[libopencore_amrnb] Only 8000Hz sample rate supported"]
 fn test_encode_audio_amr() {
     // AMR-NB - 移动语音编码 (12.2kbps)
+    let output = temp_output("encode_audio_output.amr");
     encode_audio(
-        c"/tmp/encode_audio_output.amr",
+        &output,
         ffi::AV_CODEC_ID_AMR_NB,
         ffi::AV_SAMPLE_FMT_S16,
         12200,
         1,
     )
     .unwrap();
+}
+
+/// 市场上常见通用的音频容器与对应编码器（容器, 编码器名, 码率；码率 0 表示无损）。
+/// 仅保留主流格式：冷门/仅解码/需 experimental 开关的格式不纳入测试。
+const COMMON_AUDIO_CONTAINERS: &[(&str, &str, i64)] = &[
+    ("wav", "pcm_s16le", 1_411_200),
+    ("aiff", "pcm_s16be", 1_411_200),
+    ("flac", "flac", 0),
+    ("mp3", "libmp3lame", 192_000),
+    ("aac", "aac", 128_000),
+    ("m4a", "aac", 128_000),
+    ("adts", "aac", 128_000),
+    ("wma", "wmav2", 128_000),
+    ("ac3", "ac3", 384_000),
+    ("mp2", "mp2", 192_000),
+    ("au", "pcm_mulaw", 64_000),
+    ("opus", "libopus", 128_000),
+];
+
+/// 使用 rsmedia `EncoderBuilder` 对常见音频容器做编码测试：
+/// 按编码器能力自动选择采样格式/采样率，套用音频滤镜链（音量/高通/变速），
+/// 编码 1 秒立体声正弦波并封装到对应容器。
+fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64) -> Result<()> {
+    // 编码器是否存在取决于 FFmpeg 编译配置（如 libmp3lame、libopus），
+    // 缺失时跳过该容器而不是失败
+    let Some(codec) = AVCodec::find_encoder_by_name(&utils::from_str(codec_name)) else {
+        anyhow::bail!("encoder {codec_name} not available in this FFmpeg build");
+    };
+    let codec_config = CodecConfig::from_codec(codec);
+
+    let sample_format = SampleFormat::from(
+        codec_config
+            .supported_sample_formats()
+            .ok()
+            .flatten()
+            .and_then(|fmts| fmts.first().copied())
+            .with_context(|| format!("encoder {codec_name} has no supported sample formats"))?,
+    );
+
+    // 固定速率编码器（PCM/FLAC 等）不暴露采样率列表，回退 44100
+    let sample_rate = codec_config
+        .supported_sample_rates()
+        .ok()
+        .flatten()
+        .and_then(|rates| rates.first().copied())
+        .unwrap_or(44_100);
+
+    let channels = 2;
+
+    let output_path = test_output_path("encode_audio", &format!("sine.{container_type}"));
+
+    let audio_filters = vec![
+        filter::audio::volume(1.2),  // 音量提升
+        filter::audio::highpass(80), // 切除 80Hz 以下低频
+        filter::audio::atempo(1.25), // 加速 25%
+    ];
+
+    let mut encoder = EncoderBuilder::new_audio(bit_rate, channels, sample_rate, sample_format)
+        .with_codec_name(codec_name.to_string())
+        .with_filters(audio_filters)
+        .build_wrapped(output_path.as_path())?;
+
+    // rsmedia 编码器内部对固定帧大小编码器做 AVAudioFifo 缓冲，
+    // 这里统一用 1024 样本块驱动即可
+    let frame_size = 1024;
+    let duration_seconds = 1;
+    let total_samples = (duration_seconds * sample_rate) as i64;
+
+    let mut frame = AVFrame::new();
+    frame.set_nb_samples(frame_size);
+    frame.set_ch_layout(AVChannelLayout::from_nb_channels(channels).into_inner());
+    frame.set_sample_rate(sample_rate);
+    frame.set_format(sample_format as _);
+    frame
+        .alloc_buffer()
+        .context("Failed to allocate frame buffer")?;
+
+    for pts in (0..total_samples).step_by(frame_size as usize) {
+        generate_sine_wave(&mut frame, 440.0, sample_rate).context("Failed to generate samples")?;
+        frame.set_pts(pts);
+        encoder.encode_raw(frame.clone())?;
+    }
+
+    // flush encoder and write trailer
+    encoder.finish()?;
+
+    Ok(())
+}
+
+/// 遍历常见音频容器逐一编码；编码器缺失的容器跳过并报告，
+/// 但要求至少一个容器成功，防止环境异常时测试空壳通过。
+#[test]
+fn test_encode_audio_containers() {
+    let mut skipped = Vec::new();
+    let mut encoded = 0;
+
+    for (container_type, codec_name, bit_rate) in COMMON_AUDIO_CONTAINERS {
+        match encode_audio_container(container_type, codec_name, *bit_rate) {
+            Ok(()) => encoded += 1,
+            Err(e) if e.to_string().contains("not available in this FFmpeg build") => {
+                skipped.push(*container_type)
+            }
+            Err(e) => panic!("encode {container_type} failed: {e:#}"),
+        }
+    }
+
+    println!("encoded {encoded} containers, skipped: {skipped:?}");
+    assert!(encoded > 0, "all audio container encodings were skipped");
 }

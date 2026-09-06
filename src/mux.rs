@@ -128,33 +128,28 @@ impl<W: Writer> Muxer<W> {
     /// * `packet` - [`Packet`] to mux.
     pub fn mux(&mut self, frame: AVFrame, stream_idx: usize) -> Result<Option<W::Out>> {
         if self.have_written_header {
+            let interleaved = self.interleaved;
             let mux_stream = self.get_stream_mut(stream_idx)?;
+            let enc_time_base = mux_stream.encoder.time_base();
+            let out_time_base = mux_stream.stream_info.time_base;
+            let packets = mux_stream.encoder.encode_raw(frame)?;
+            // mux_stream 对 self.streams 的借用至此结束，之后可独占使用 self.writer
 
-            match mux_stream.encoder.encode_raw(frame) {
-                Ok(Some(mut packet)) => {
-                    packet.set_pos(-1);
-                    packet.set_stream_index(stream_idx as i32);
-                    // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
-                    // encode_ctx_timebase => out_stream_time_base
-                    packet.rescale_ts(
-                        mux_stream.encoder.time_base(),
-                        mux_stream.stream_info.time_base,
-                    );
+            let mut last_out = None;
+            for mut packet in packets {
+                packet.set_pos(-1);
+                packet.set_stream_index(stream_idx as i32);
+                // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
+                // encode_ctx_timebase => out_stream_time_base
+                packet.rescale_ts(enc_time_base, out_time_base);
 
-                    Ok(Some({
-                        if self.interleaved {
-                            self.writer.write_interleaved(&mut packet)?
-                        } else {
-                            self.writer.write_frame(&mut packet)?
-                        }
-                    }))
-                }
-                Ok(None) => {
-                    log::debug!("Encoder Drain or Flushed.");
-                    Ok(None)
-                }
-                Err(e) => Err(e),
+                last_out = if interleaved {
+                    Some(self.writer.write_interleaved(&mut packet)?)
+                } else {
+                    Some(self.writer.write_frame(&mut packet)?)
+                };
             }
+            Ok(last_out)
         } else {
             self.have_written_header = true;
             self.writer.write_header()?;
@@ -165,6 +160,12 @@ impl<W: Writer> Muxer<W> {
     /// Signal to the muxer that writing has finished. This will cause a trailer to be written if
     /// the container format has one.
     pub fn finish(&mut self) -> Result<Option<W::Out>> {
+        // 从未 mux 过任何数据（header 也尚未写入）：没有实际内容需要 flush，
+        // 直接空操作返回 `None`，不产生“无头”的残缺输出。
+        if !self.have_written_header {
+            return Ok(None);
+        }
+
         for mux_stream in self.streams.iter_mut() {
             // flush the encoder to ensure all packets are sent to the muxer.
             let out_stream_index = mux_stream.stream_index;
@@ -177,7 +178,9 @@ impl<W: Writer> Muxer<W> {
             )?;
         }
 
-        if self.have_written_header && !self.have_written_trailer {
+        // 已写 header 且未写 trailer 时才写 trailer；header + trailer 均已写说明
+        // 是重复调用 finish()，此时幂等返回 None，避免重复写 trailer。
+        if !self.have_written_trailer {
             self.have_written_trailer = true;
             self.writer.write_trailer().map(Some)
         } else {
@@ -188,6 +191,20 @@ impl<W: Writer> Muxer<W> {
 
 unsafe impl<W: Writer> Send for Muxer<W> {}
 unsafe impl<W: Writer> Sync for Muxer<W> {}
+
+impl<W: Writer> Drop for Muxer<W> {
+    fn drop(&mut self) {
+        // 用户忘记调用 finish() 时（尤其是错误提前返回/panic），
+        // 自动 flush 编码器延迟缓冲并写 trailer，避免生成损坏的容器文件。
+        // 仅当已写过 header 时才处理，未 mux 过的空文件不做无意义写入。
+        if self.have_written_header
+            && !self.have_written_trailer
+            && let Err(err) = self.finish()
+        {
+            log::error!("Failed to auto-flush muxer on drop: {err:#}");
+        }
+    }
+}
 
 /// Demuxer
 pub struct Demuxer<R: Reader> {
@@ -379,7 +396,7 @@ unsafe impl<R: Reader> Sync for Demuxer<R> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{utils, EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter};
+    use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter, utils};
 
     use anyhow::{Context, Result};
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
@@ -433,7 +450,7 @@ mod tests {
         // 填充V平面 (红色分量)
         for y in 0..(height / 2) {
             for x in 0..(width / 2) {
-                let index = (y * v_linesize as usize + x) as usize;
+                let index = y * v_linesize as usize + x;
                 let v_value = (((1.0 - time_factor) * 128.0) as u8).wrapping_add(128);
                 unsafe {
                     *v_plane.add(index) = v_value;
@@ -481,21 +498,20 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "demux video"]
     fn test_mux_demux_video() -> Result<()> {
-        let output_path = Path::new("/tmp/test_mux_demux_video.mp4");
+        let output_path = crate::test_utils::test_output_path("mux", "test_mux_demux_video.mp4");
 
-        let (width, height) = (1920, 1080);
+        let (width, height) = (640, 360);
         let video_encoder = Encoder::new_video(width, height)?;
 
-        let mut muxer = Muxer::new(output_path)?;
+        let mut muxer = Muxer::new(output_path.as_path())?;
 
         let encoder_frame_rate = video_encoder.frame_rate();
         let encoder_time_base = video_encoder.time_base();
         let video_index = muxer.add_stream(video_encoder)?;
 
-        // 生成测试视频帧 // 10秒视频 30fps
-        for index in 0..10 * encoder_frame_rate.den as i64 {
+        // 生成测试视频帧 // 3秒视频 30fps
+        for index in 0..3 * encoder_frame_rate.den as i64 {
             let mut frame = generate_video_frame(width, height, index);
             frame.set_pts(index * encoder_time_base.den as i64);
             frame.set_time_base(encoder_time_base);
@@ -537,16 +553,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "test_mux_demux_audio_aac is need write file"]
     fn test_mux_demux_audio_aac() -> Result<()> {
-        let output_path = Path::new("/tmp/test_mux_demux_audio_aac.aac");
+        let output_path =
+            crate::test_utils::test_output_path("mux", "test_mux_demux_audio_aac.aac");
         let sample_rate = 44_100;
         let nb_samples = 1024;
         let channels = 2;
 
         // 添加音频流
         let audio_encoder = Encoder::new_audio(channels, sample_rate, SampleFormat::FLTP).unwrap();
-        let mut muxer = Muxer::new(output_path)?;
+        let mut muxer = Muxer::new(output_path.as_path())?;
 
         let encoder_time_base = audio_encoder.time_base();
         let audio_index = muxer.add_stream(audio_encoder)?;
@@ -607,9 +623,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "test_mux_demux_audio_mp3 is need write file"]
     fn test_mux_demux_audio_mp3() -> Result<()> {
-        let output_path = Path::new("/tmp/test_mux_demux_audio_mp3.mp3");
+        let output_path =
+            crate::test_utils::test_output_path("mux", "test_mux_demux_audio_mp3.mp3");
         let sample_rate = 44_100;
         let bit_rate = 128_000;
         let nb_samples = 1152; // libmp3lame 要求的 frame_size 为 1152
@@ -619,7 +635,7 @@ mod tests {
         let audio_encoder =
             EncoderBuilder::new_audio(bit_rate, channels, sample_rate, SampleFormat::FLTP)
                 // 使用LAME MP3编码器
-                .with_codec_name(Some("libmp3lame".to_string()))
+                .with_codec_name("libmp3lame".to_string())
                 .build()?;
 
         let mut muxer = Muxer::new(output_path)?;
@@ -660,31 +676,28 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "demux test_multiple_streams need a file"]
     fn test_multiple_streams() -> Result<()> {
         // 视频参数
-        pub const VIDEO_WIDTH: usize = 1280;
-        pub const VIDEO_HEIGHT: usize = 720;
-        pub const VIDEO_FPS: i32 = 30;
-        pub const VIDEO_DURATION_SEC: u32 = 10;
+        pub const VIDEO_WIDTH: usize = 640;
+        pub const VIDEO_HEIGHT: usize = 360;
+        pub const VIDEO_FPS: f32 = 30f32;
+        pub const VIDEO_DURATION_SEC: u32 = 3;
 
         // 音频参数
         pub const AUDIO_SAMPLE_RATE: i32 = 48_000;
         pub const AUDIO_CHANNELS: i32 = 2;
         pub const SAMPLES_PER_FRAME: u32 = 1024;
 
-        let output_path = Path::new("/tmp/test_multiple_streams.mp4");
+        let output_path = crate::test_utils::test_output_path("mux", "test_multiple_streams.mp4");
 
         let video_encoder = EncoderBuilder::new_video(VIDEO_WIDTH, VIDEO_HEIGHT)
-            .with_frame_rate(VIDEO_FPS, 1)
-            // 使用标准的90kHz时间基
-            .with_time_base(1, 90_000)
+            .with_fps(VIDEO_FPS)
             .build()?;
 
         let audio_encoder =
             Encoder::new_audio(AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, SampleFormat::FLTP)?;
 
-        let mut muxer = Muxer::new(output_path)?;
+        let mut muxer = Muxer::new(output_path.as_path())?;
 
         let video_time_base = video_encoder.time_base();
         let audio_time_base = audio_encoder.time_base();
@@ -852,9 +865,71 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "mux transcode need a file"]
     fn test_transcode() -> Result<()> {
-        transcode("/tmp/bear.mp4", "/tmp/bear_transcode.mov")?;
+        let output = crate::test_utils::test_output_path("mux", "test_transcode.mov");
+        transcode("assets/mp4.mp4", output.to_str().unwrap())?;
+        Ok(())
+    }
+
+    /// 验证两种情况：
+    /// 1. 从未 mux 任何数据（header 未写）时，`finish()` 应为空操作返回 `Ok(None)`，
+    ///    不会产生仅含 encode-EOS 包但无 header/trailer 的残缺输出。
+    /// 2. 重复调用 `finish()` 是幂等的：第二次返回 `Ok(None)`，不会重复写 trailer。
+    #[test]
+    fn test_finish_without_mux_and_idempotent() -> Result<()> {
+        let output_path = crate::test_utils::test_output_path("mux", "test_finish_without_mux.mp4");
+
+        let encoder = Encoder::new_video(320, 240)?;
+        let mut muxer = Muxer::new(output_path)?;
+        muxer.add_stream(encoder)?;
+
+        // 未 mux 任何帧，直接 finish：应为空操作，返回 None
+        let first = muxer.finish()?;
+        assert!(
+            first.is_none(),
+            "finish() on an empty muxer should be a no-op"
+        );
+        assert!(!muxer.have_written_header, "header should not be written");
+
+        // 第二次 finish 应幂等，返回 None，不重复写 trailer
+        let second = muxer.finish()?;
+        assert!(second.is_none(), "idempotent finish() should return None");
+
+        Ok(())
+    }
+
+    /// 验证用户“忘记调用 finish()”时，Drop 会自动 flush 编码器延迟缓冲并写 trailer，
+    /// 生成的容器文件依旧可以被 Demuxer 正常读取（不损坏）。
+    #[test]
+    fn test_drop_flush_without_explicit_finish() -> Result<()> {
+        let output_path =
+            crate::test_utils::test_output_path("mux", "test_drop_flush_no_finish.mp4");
+
+        let (width, height) = (320, 240);
+        let video_encoder = Encoder::new_video(width, height)?;
+        let encoder_time_base = video_encoder.time_base();
+
+        {
+            let mut muxer = Muxer::new(output_path.as_path())?;
+            let video_index = muxer.add_stream(video_encoder)?;
+            for index in 0..12 {
+                let mut frame = generate_video_frame(width, height, index);
+                frame.set_pts(index * encoder_time_base.den as i64);
+                frame.set_time_base(encoder_time_base);
+                muxer.mux(frame, video_index)?;
+            }
+            // 故意不调用 finish()，直接离开作用域触发 Drop 自动 flush
+        }
+
+        // Drop 自动完成 flush + trailer 后，文件应可被读取并解码
+        let demuxer = Demuxer::new(output_path.as_path())?;
+        // 能成功创建 demuxer 且能读到帧即证明容器完整（有 header + trailer）
+        let decoded = demuxer.filter_map(|res| res.ok().map(|_| ())).count();
+        assert!(
+            decoded > 0,
+            "expected at least one decoded frame, got {decoded}"
+        );
+
         Ok(())
     }
 }

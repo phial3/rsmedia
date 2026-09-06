@@ -11,37 +11,69 @@ on:
       - 'README.md'
 
 env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-  RUST_LOG: "debug"
-  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: "always"
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUST_LOG: "DEBUG"
   RUSTFLAGS: "-D warnings"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_NET_RETRY: "10"
 
 jobs:
+  lints:
+    name: Rust fmt / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
 
-  build-linux:
-    name: build / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rustfmt
+
+      - name: Rust fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
+    runs-on: ${{ matrix.runner }}
     container:
-      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu
+      # jrottenberg/ffmpeg 8.0 开始有 amd64 + arm64，8.0 之前只有 amd64
+      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404
+      options: --pull always
 
     env:
-      DOCKER_DEFAULT_PLATFORM: ${{ matrix.platform }}
       FFMPEG_INCLUDE_DIR: /usr/local/include
       FFMPEG_PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
 
     strategy:
       fail-fast: false
       matrix:
-        platform: ["linux/amd64"]
-        ffmpeg_version: ["6.1", "7.1", "8.0"]
         include:
-          - ffmpeg_version: "6.1"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "6.1"
             feature: "ndarray,ffmpeg6,link_system_ffmpeg"
-          - ffmpeg_version: "7.1"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "7.1"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-          - ffmpeg_version: "8.0"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "8.1"
             feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "9.0"
+            feature: "ndarray,ffmpeg9,link_system_ffmpeg"
 
     steps:
       - name: Checkout
@@ -63,6 +95,7 @@ jobs:
           autoconf \
           automake \
           binutils \
+          xz-utils \
           pkg-config \
           llvm-dev \
           libc++1 \
@@ -111,7 +144,6 @@ jobs:
           libopencore-amrnb-dev \
           libopencore-amrwb-dev \
           libva-dev \
-          libmfx-dev \
           libdrm-dev \
           libnuma-dev \
           libvdpau-dev \
@@ -122,7 +154,7 @@ jobs:
           libfreetype6-dev \
           libfontconfig1-dev \
           libssh-dev \
-          libzmq3-dev \
+          libzmq5-dev \
           libssl-dev \
           librtmp-dev \
           libiec61883-dev \
@@ -137,60 +169,60 @@ jobs:
           liblzma-dev \
           libzvbi-dev \
           libpostproc-dev \
-          librubberband-dev \
-          libfrei0r-ocaml-dev
-## ffmpeg
-## libavutil-dev \
-## libavcodec-dev \
-## libavformat-dev \
-## libavfilter-dev \
-## libavdevice-dev \
-## libswscale-dev \
-## libswresample-dev \
+          librubberband-dev
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
           components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
 
-      - name: Clippy check
-        run: cargo clippy --all --no-default-features --features ${{ matrix.feature }} -- -D warnings
+      - name: Verify FFmpeg version
+        run: |
+          ldconfig
+          ffmpeg -version
 
-      - name: Build
-        run: cargo build --no-default-features --features ${{ matrix.feature }} --verbose
+      - name: Check
+        run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
 
-      - name: Run Test
-        run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
-  build-macos:
-    name: build / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
+      - name: Doc Test
+        run: cargo test --doc --workspace --no-default-features --features ${{ matrix.feature }} --verbose
+
+  test-macos:
+    name: test / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
-        platform: ["macos/amd64"]
-        ffmpeg_version: ["6", "7", "8"]
+        platform: ["macos/arm64"]
+        ffmpeg_version: ["6", "7", "9"]
         include:
           - ffmpeg_version: "6"
             feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+            brew_formula: "ffmpeg@6"
           - ffmpeg_version: "7"
             feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-          - ffmpeg_version: "8"
-            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            brew_formula: "ffmpeg@7"
+          # homebrew 无 ffmpeg@8 / ffmpeg@9，主 formula 即 FFmpeg 9
+          - ffmpeg_version: "9"
+            feature: "ndarray,ffmpeg9,link_system_ffmpeg"
+            brew_formula: "ffmpeg"
 
     env:
-      FFMPEG_PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@${{ matrix.ffmpeg_version }}/lib/pkgconfig
-      FFMPEG_INCLUDE_DIR: /opt/homebrew/opt/ffmpeg@${{ matrix.ffmpeg_version }}/include
-      CPPFLAGS: "-I/opt/homebrew/opt/ffmpeg@${{ matrix.ffmpeg_version }}/include"
-      LDFLAGS: "-L/opt/homebrew/opt/ffmpeg@${{ matrix.ffmpeg_version }}/lib"
+      FFMPEG_PKG_CONFIG_PATH: /opt/homebrew/opt/${{ matrix.brew_formula }}/lib/pkgconfig
+      FFMPEG_INCLUDE_DIR: /opt/homebrew/opt/${{ matrix.brew_formula }}/include
+      CPPFLAGS: "-I/opt/homebrew/opt/${{ matrix.brew_formula }}/include"
+      LDFLAGS: "-L/opt/homebrew/opt/${{ matrix.brew_formula }}/lib"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
           components: rustfmt, clippy
@@ -204,209 +236,367 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install dependencies
-        run: brew install pkg-config ffmpeg@${{ matrix.ffmpeg_version }}
+        run: brew install pkg-config ${{ matrix.brew_formula }}
 
-      - name: Clippy check
-        run: cargo clippy --no-default-features --features ${{ matrix.feature }} -- -D warnings
+      - name: Check
+        run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
 
-      - name: Build
-        run: cargo build --no-default-features --features ${{ matrix.feature }} --verbose
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
       - name: Run Test
-        run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
+        run: cargo test --workspace --all-targets --no-default-features --features ${{ matrix.feature }} --verbose
 
-  build-windows:
-    name: build / windows / ffmpeg-8.1
-    runs-on: windows-latest
+  test-linux:
+    name: test / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
+    runs-on: ${{ matrix.runner }}
+
+    # https://github.com/BtbN/FFmpeg-Builds/releases provides Windows (x86_64, arm64) + Linux (x86_64, arm64)
+    # https://github.com/GyanD/codexffmpeg/releases  provides Windows x86_64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "6.1"
+            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-08-31-13-00/ffmpeg-n6.1.3-linux64-gpl-shared-6.1.tar.xz"
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            ffmpeg_version: "6.1"
+            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-08-31-13-00/ffmpeg-n6.1.3-linuxarm64-gpl-shared-6.1.tar.xz"
+
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1.tar.xz"
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linuxarm64-gpl-shared-7.1.tar.xz"
+
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linuxarm64-gpl-shared-8.1.tar.xz"
+
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "9.0"
+            feature: "ndarray,ffmpeg9,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-shared-9.0.tar.xz"
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            ffmpeg_version: "9.0"
+            feature: "ndarray,ffmpeg9,link_system_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linuxarm64-gpl-shared-9.0.tar.xz"
 
     env:
-      FFMPEG_VERSION: "8.1"
-      BUILD_FEATURES: "ndarray,ffmpeg8,link_vcpkg_ffmpeg"
-      FFMPEG_DOWNLOAD_URL: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z
+      FFMPEG_DIR: /opt/ffmpeg
+      FFMPEG_INCLUDE_DIR: /opt/ffmpeg/include
+      FFMPEG_LIBS_DIR: /opt/ffmpeg/lib
+      FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
+      PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
+      LD_LIBRARY_PATH: /opt/ffmpeg/lib
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # apt-get purge -y libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavfilter-dev libavdevice-dev
       - name: Install dependencies
         run: |
-          $VCINSTALLDIR = $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
-          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\x64\bin"
-          Invoke-WebRequest "${env:FFMPEG_DOWNLOAD_URL}" -OutFile ffmpeg-release-full-shared.7z
-          7z x ffmpeg-release-full-shared.7z
-          mkdir ffmpeg
-          mv ffmpeg-*/* ffmpeg/
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm \
+            yasm \
+            curl \
+            wget \
+            unzip \
+            gnupg \
+            clang \
+            cmake \
+            libtool \
+            autoconf \
+            automake \
+            binutils \
+            xz-utils \
+            pkg-config \
+            llvm-dev \
+            libc++1 \
+            libva2 \
+            libva-drm2 \
+            libva-x11-2 \
+            libvdpau1 \
+            libxv1 \
+            libclang-dev \
+            linux-libc-dev \
+            build-essential \
+            ca-certificates \
+            libva-dev \
+            libvpx-dev \
+            libaom-dev \
+            libass-dev \
+            libdrm-dev \
+            libv4l-dev \
+            libx264-dev \
+            libx264-164 \
+            libx265-dev \
+            libx265-199 \
+            libzimg-dev \
+            libdav1d-dev \
+            libwebp-dev \
+            libbluray-dev \
+            libtheora-dev \
+            libvidstab-dev \
+            libsvtav1-dev \
+            libxvidcore-dev \
+            libopenjp2-7-dev \
+            libgsm1-dev \
+            libsoxr-dev \
+            libopus-dev \
+            libpulse-dev \
+            libshine-dev \
+            libspeex-dev \
+            libbs2b-dev \
+            libvorbis-dev \
+            libfdk-aac-dev \
+            libasound2-dev \
+            libmp3lame-dev \
+            libmp3lame0 \
+            libtwolame-dev \
+            libjack-jackd2-dev \
+            libopencore-amrnb-dev \
+            libopencore-amrwb-dev \
+            libnuma-dev \
+            libvdpau-dev \
+            ocl-icd-opencl-dev \
+            libxml2-dev \
+            libfribidi-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libssh-dev \
+            libzmq5-dev \
+            libssl-dev \
+            librtmp-dev \
+            libiec61883-dev \
+            libgnutls28-dev \
+            libsmbclient-dev \
+            libtiff-dev \
+            libpng-dev \
+            libraw-dev \
+            libjpeg-dev \
+            zlib1g-dev \
+            libsdl2-dev \
+            liblzma-dev \
+            libzvbi-dev \
+            libpostproc-dev \
+            librubberband-dev
+
+      - name: Install BtbN FFmpeg
+        run: |
+          sudo rm -rf "${FFMPEG_DIR}"
+          sudo mkdir -p "${FFMPEG_DIR}"
+          wget --retry-connrefused --tries=5 --waitretry=3 \
+            -O ffmpeg.tar.xz \
+            "${{ matrix.download_url }}"
+          sudo tar -xJf ffmpeg.tar.xz \
+            -C "${FFMPEG_DIR}" \
+            --strip-components=1
+          sudo ldconfig
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
+
+      - name: Verify FFmpeg version
+        run: |
+          echo "FFMPEG_DIR=${FFMPEG_DIR}"
+          echo "FFMPEG_INCLUDE_DIR=${FFMPEG_INCLUDE_DIR}"
+          echo "FFMPEG_LIBS_DIR=${FFMPEG_LIBS_DIR}"
+          echo "FFMPEG_PKG_CONFIG_PATH=${FFMPEG_PKG_CONFIG_PATH}"
+          /opt/ffmpeg/bin/ffmpeg -version
+          pkg-config --modversion libavutil
+          pkg-config --modversion libavcodec
+          pkg-config --modversion libavformat
+
+      # The hosted runner image preinstalls a system FFmpeg whose shared/static libraries can be
+      # scattered under /usr in any multi-arch directory (not guaranteed to be /usr/lib/x86_64-linux-gnu).
+      # If those are linked into the test binary alongside the downloaded BtbN FFmpeg (different
+      # sonames), an AVFrame allocated by one libavutil may be freed by another, corrupting the heap
+      # (SIGABRT). Here we explicitly echo the located libs, delete all system FFmpeg library files,
+      # and purge the packages to guarantee the tests only use the single /opt/ffmpeg copy.
+      - name: Remove system FFmpeg dev libraries
+        run: |
+          set -euo pipefail
+          echo "==== Before cleanup: system-visible FFmpeg shared libs ===="
+          ldconfig -p | grep -Ei 'libav(codec|device|format|util|filter)|libsw(scale|resample)' || echo "(none)"
+
+          echo "==== Locating system FFmpeg library files (excluding /opt/ffmpeg, /proc, /sys, /dev) ===="
+          sudo find / \( -path /opt/ffmpeg -o -path /proc -o -path /sys -o -path /dev \) -prune -o \
+            -type f \( -name 'libav*.so*' -o -name 'libav*.a' \
+                       -o -name 'libsw*.so*' -o -name 'libsw*.a' \) -print 2>/dev/null \
+            | tee /tmp/sys_ffmpeg_libs.txt
+          if [ -s /tmp/sys_ffmpeg_libs.txt ]; then
+            echo "--- Deleting the listed library files ---"
+            while IFS= read -r f; do echo "rm $f"; sudo rm -f "$f"; done < /tmp/sys_ffmpeg_libs.txt
+          else
+            echo "(no system FFmpeg library files found)"
+          fi
+
+          # Purge system FFmpeg packages (dev / runtime / ffmpeg itself) to clear package-level leftovers
+          sudo apt-get purge -y \
+            libavcodec-dev \
+            libavformat-dev \
+            libavfilter-dev \
+            libavdevice-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libswresample-dev \
+            libavcodec* \
+            libavformat* \
+            libavutil* \
+            libswscale* \
+            libswresample* \
+            libavfilter* \
+            libavdevice* ffmpeg 2>/dev/null || true
+          sudo ldconfig
+
+          echo "==== Post-cleanup check: no FFmpeg should remain in the system cache ===="
+          if ldconfig -p | grep -Eiq 'libav(codec|device|format|util|filter)|libsw(scale|resample)'; then
+            echo "!! WARNING: entries still present:"
+            ldconfig -p | grep -Ei 'libav(codec|device|format|util|filter)|libsw(scale|resample)'
+            exit 1
+          else
+            echo "OK: no FFmpeg in system link/runtime cache"
+          fi
+
+      - name: Check
+        run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+
+      - name: Run Test
+        run: cargo test --workspace --all-targets --no-default-features --features ${{ matrix.feature }} --verbose
+
+  test-windows:
+    name: test / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: windows/amd64
+            runner: windows-latest
+            ffmpeg_version: "6.1"
+            feature: "ndarray,ffmpeg6,link_vcpkg_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-08-31-13-00/ffmpeg-n6.1.3-win64-gpl-shared-6.1.zip"
+          - arch: windows/arm64
+            runner: windows-11-arm
+            ffmpeg_version: "6.1"
+            feature: "ndarray,ffmpeg6,link_vcpkg_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-08-31-13-00/ffmpeg-n6.1.3-winarm64-gpl-shared-6.1.zip"
+
+          - arch: windows/amd64
+            runner: windows-latest
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_vcpkg_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-shared-7.1.zip"
+          - arch: windows/arm64
+            runner: windows-11-arm
+            ffmpeg_version: "7.1"
+            feature: "ndarray,ffmpeg7,link_vcpkg_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-winarm64-gpl-shared-7.1.zip"
+
+          - arch: windows/amd64
+            runner: windows-latest
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_vcpkg_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+          - arch: windows/arm64
+            runner: windows-11-arm
+            ffmpeg_version: "8.1"
+            feature: "ndarray,ffmpeg8,link_vcpkg_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-winarm64-gpl-shared-8.1.zip"
+
+          - arch: windows/amd64
+            runner: windows-latest
+            ffmpeg_version: "9.0"
+            feature: "ndarray,ffmpeg9,link_vcpkg_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip"
+          - arch: windows/arm64
+            runner: windows-11-arm
+            ffmpeg_version: "9.0"
+            feature: "ndarray,ffmpeg9,link_vcpkg_ffmpeg"
+            download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-winarm64-gpl-shared-9.0.zip"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install BtbN FFmpeg
+        shell: pwsh
+        run: |
+          # bindgen needs a libclang.dll whose machine type matches the host. On the
+          # x64 runner the LLVM shipped with Visual Studio's x64 Clang toolset is fine.
+          # On the ARM64 runner that x64 libclang.dll cannot be loaded by the ARM64
+          # process, so fetch the native Windows-on-ARM64 LLVM ("woa64") build instead.
+          $isArm64 = ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64')
+          if ($isArm64) {
+            Invoke-WebRequest "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-woa64.exe" -OutFile llvm-arm64.exe
+            7z x llvm-arm64.exe -y -ollvm-arm64 | Out-Null
+            $libclang = @(Get-ChildItem llvm-arm64 -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if (-not $libclang) { throw "libclang.dll not found in the ARM64 LLVM extract" }
+            Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$($libclang[0].DirectoryName)"
+          } else {
+            $VCINSTALLDIR = $(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath)
+            Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=${VCINSTALLDIR}\VC\Tools\LLVM\x64\bin"
+          }
+          Invoke-WebRequest "${{ matrix.download_url }}" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg -Force
+          # BtbN zips wrap everything in a single <package>/ dir; flatten it so
+          # bin/, lib/ and include/ sit directly under ffmpeg/.
+          Get-ChildItem ffmpeg -Directory | ForEach-Object {
+            Get-ChildItem $_.FullName -Force | Move-Item -Destination ffmpeg\ -Force
+            Remove-Item $_.FullName -Force -Recurse
+          }
           Add-Content $env:GITHUB_PATH "${pwd}\ffmpeg\bin"
           Add-Content $env:GITHUB_ENV "FFMPEG_DIR=${pwd}\ffmpeg"
           Add-Content $env:GITHUB_ENV "FFMPEG_LIBS_DIR=${pwd}\ffmpeg\lib"
           Add-Content $env:GITHUB_ENV "FFMPEG_INCLUDE_DIR=${pwd}\ffmpeg\include"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           toolchain: nightly
           components: rustfmt, clippy
 
-      - name: Clippy check
-        run: cargo clippy --no-default-features --features ${{ env.BUILD_FEATURES }} -- -D warnings
-
-      - name: Build
-        run: cargo build --no-default-features --features ${{ env.BUILD_FEATURES }} --verbose
-
-      - name: Run Test
-        run: cargo test --no-default-features --features ${{ env.BUILD_FEATURES }} --verbose -- --nocapture
-
-  test_and_clippy:
-    name: Clippy & Test / ${{ matrix.platform }} / ffmpeg-${{ matrix.ffmpeg_version }}
-    runs-on: ubuntu-latest
-    container:
-      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu
-
-    env:
-      DOCKER_DEFAULT_PLATFORM: ${{ matrix.platform }}
-      FFMPEG_INCLUDE_DIR: /usr/local/include
-      FFMPEG_PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
-
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ["linux/amd64"]
-        ffmpeg_version: ["6.1", "7.1", "8.0"]
-        include:
-          - ffmpeg_version: "6.1"
-            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
-          - ffmpeg_version: "7.1"
-            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
-          - ffmpeg_version: "8.0"
-            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install dependencies
+      - name: Verify FFmpeg version
         run: |
-          DEBIAN_FRONTEND=noninteractive apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-          jq \
-          nasm \
-          yasm \
-          curl \
-          wget \
-          unzip \
-          gnupg \
-          clang \
-          cmake \
-          libtool \
-          autoconf \
-          automake \
-          binutils \
-          pkg-config \
-          llvm-dev \
-          libclang-dev \
-          linux-libc-dev \
-          build-essential \
-          ca-certificates \
-          libva-dev \
-          libvpx-dev \
-          libaom-dev \
-          libass-dev \
-          libdrm-dev \
-          libv4l-dev \
-          libx264-dev \
-          libx265-dev \
-          libzimg-dev \
-          libdav1d-dev \
-          libwebp-dev \
-          libbluray-dev \
-          libtheora-dev \
-          libvidstab-dev \
-          libsvtav1-dev \
-          libxvidcore-dev \
-          libopenjp2-7-dev \
-          libgsm1-dev \
-          libsoxr-dev \
-          libopus-dev \
-          libpulse-dev \
-          libshine-dev \
-          libspeex-dev \
-          libbs2b-dev \
-          libvorbis-dev \
-          libfdk-aac-dev \
-          libasound2-dev \
-          libmp3lame-dev \
-          libtwolame-dev \
-          libjack-jackd2-dev \
-          libopencore-amrnb-dev \
-          libopencore-amrwb-dev \
-          libva-dev \
-          libmfx-dev \
-          libdrm-dev \
-          libnuma-dev \
-          libvdpau-dev \
-          ocl-icd-opencl-dev \
-          libass-dev \
-          libxml2-dev \
-          libfribidi-dev \
-          libfreetype6-dev \
-          libfontconfig1-dev \
-          libssh-dev \
-          libzmq3-dev \
-          libssl-dev \
-          librtmp-dev \
-          libiec61883-dev \
-          libgnutls28-dev \
-          libsmbclient-dev \
-          libtiff-dev \
-          libpng-dev \
-          libraw-dev \
-          libjpeg-dev \
-          zlib1g-dev \
-          libsdl2-dev \
-          liblzma-dev \
-          libzvbi-dev \
-          libpostproc-dev \
-          librubberband-dev \
-          libfrei0r-ocaml-dev
-## ffmpeg
-## libavutil-dev \
-## libavcodec-dev \
-## libavformat-dev \
-## libavfilter-dev \
-## libavdevice-dev \
-## libswscale-dev \
-## libswresample-dev \
+          echo "FFMPEG_DIR=${env:FFMPEG_DIR}"
+          echo "FFMPEG_INCLUDE_DIR=${env:FFMPEG_INCLUDE_DIR}"
+          echo "FFMPEG_LIBS_DIR=${env:FFMPEG_LIBS_DIR}"
+          & "${env:FFMPEG_DIR}\bin\ffmpeg.exe" -version
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: nightly
-          components: rustfmt, clippy
+      - name: Check
+        run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
 
       - name: Clippy
-        run: cargo clippy --all --no-default-features --features ${{ matrix.feature }} -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
-      - name: Test
-        run: cargo test --all --no-default-features --features ${{ matrix.feature }} --verbose -- --nocapture
-
-  lints:
-    name: Rust fmt / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: nightly
-          components: rustfmt
-
-      - name: Rust fmt
-        run: cargo fmt --all -- --check
+      - name: Run Test
+        run: cargo test --workspace --all-targets --no-default-features --features ${{ matrix.feature }} --verbose

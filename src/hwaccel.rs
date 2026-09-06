@@ -1,15 +1,17 @@
 use crate::pixel::PixelFormat;
-use crate::{imgutils, utils, Options};
+use crate::{Options, imgutils, utils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
-use rsmpeg::{ffi, UnsafeDerefMut};
+use rsmpeg::{UnsafeDerefMut, ffi};
 
 use anyhow::{Context, Error, Result};
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 /// Hardware device configuration.
 /// This struct contains all the necessary information to create a hardware device context.
@@ -157,8 +159,8 @@ impl std::fmt::Display for HWDeviceConfig {
 }
 
 /// `HWContext` cache for safe sharing of hardware device contexts.
-static HW_CTX_CACHE: Lazy<Mutex<HashMap<HWDeviceConfig, Arc<HWContext>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+/// Uses DashMap for better concurrent read/write performance.
+static HW_CTX_CACHE: Lazy<DashMap<HWDeviceConfig, Arc<HWContext>>> = Lazy::new(DashMap::new);
 
 /// `HWContext` represents a hardware context.
 ///
@@ -172,9 +174,8 @@ pub struct HWContext {
 impl HWContext {
     /// create a new HWContext with the given HWDeviceConfig
     pub fn new(config: HWDeviceConfig) -> Result<Arc<HWContext>> {
-        let mut cache = HW_CTX_CACHE.lock().unwrap();
-
-        if let Some(ctx) = cache.get(&config) {
+        // Try to get existing context from cache (lock-free read)
+        if let Some(ctx) = HW_CTX_CACHE.get(&config) {
             log::debug!("Reusing existing hardware device context. config:{config:?}");
             return Ok(ctx.clone());
         }
@@ -193,7 +194,8 @@ impl HWContext {
             config: config.clone(),
             device_ctx: UnsafeCell::new(hw_device_ctx),
         });
-        cache.insert(config, ctx.clone());
+        // Insert into cache (lock-free write)
+        HW_CTX_CACHE.insert(config, ctx.clone());
 
         Ok(ctx)
     }
@@ -278,9 +280,17 @@ impl HWContext {
                     "decoder hw_frames_ctx is null, is_hwaccel:{}",
                     decoder.is_hwaccel()
                 );
-                decoder.set_hw_frames_ctx(AVHWFramesContext::from_raw(
-                    std::ptr::NonNull::new(hw_frame.hw_frames_ctx).unwrap(),
-                ));
+                // 通过 av_buffer_ref 为解码器申请一份独立引用，
+                // 而不是把 hw_frame 自身的 hw_frames_ctx 指针直接搬走（from_raw 会转移所有权）。
+                // 否则 hw_frame 析构（unref）后 decoder->hw_frames_ctx 变成悬空指针 → double-free/UAF。
+                let ref_counter = ffi::av_buffer_ref(hw_frame.hw_frames_ctx);
+                if ref_counter.is_null() {
+                    return Err(Error::msg(
+                        "Failed to av_buffer_ref hw_frames_ctx for decoder",
+                    ));
+                }
+                let frames_ctx = AVHWFramesContext::from_raw(NonNull::new_unchecked(ref_counter));
+                decoder.set_hw_frames_ctx(frames_ctx);
             }
         }
 
@@ -357,9 +367,10 @@ impl HWContext {
         hw_frame.set_width(sw_frame.width);
         hw_frame.set_height(sw_frame.height);
         hw_frame.set_format(self.get_format(true));
-        unsafe {
-            (*hw_frame.as_mut_ptr()).hw_frames_ctx = hw_frames_ctx.as_mut_ptr();
-        }
+        // 注意：这里不要再手动把 hw_frames_ctx 赋给 hw_frame。
+        // av_hwframe_get_buffer 会在 frame->hw_frames_ctx 为 NULL 时自动 av_buffer_ref；
+        // 若预先赋成与编码器共享同一 ref，则 hw_frame.unref 会把共享 ref 减到 0，
+        // 造成编码器 hw_frames_ctx 悬空 → double-free。
 
         // 分配硬件缓冲区
         hw_frames_ctx
@@ -428,11 +439,7 @@ impl HWContext {
         }
 
         // 检查帧格式是否匹配硬件像素格式
-        if frame.format != self.get_format(true) {
-            return false;
-        }
-
-        true
+        frame.format == self.get_format(true)
     }
 
     /// Check if a frame is in software memory format
@@ -630,18 +637,20 @@ impl From<HWDeviceType> for ffi::AVHWDeviceType {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn hwaccel_get_format(
     ctx: *mut ffi::AVCodecContext,
     pix_fmts: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
-    let mut p = pix_fmts;
-    let hw_format = (*ctx).opaque as ffi::AVPixelFormat;
-    while *p != ffi::AV_PIX_FMT_NONE {
-        if *p == hw_format {
-            return *p;
+    unsafe {
+        let mut p = pix_fmts;
+        let hw_format = (*ctx).opaque as ffi::AVPixelFormat;
+        while *p != ffi::AV_PIX_FMT_NONE {
+            if *p == hw_format {
+                return *p;
+            }
+            p = p.add(1);
         }
-        p = p.add(1);
+        ffi::AV_PIX_FMT_NONE
     }
-    ffi::AV_PIX_FMT_NONE
 }

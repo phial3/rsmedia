@@ -1,4 +1,5 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use rsmedia::codec::CodecConfig;
 use rsmpeg::ffi;
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
@@ -57,22 +58,34 @@ fn thumbnail(
     let mut encode_context = {
         let encoder = AVCodec::find_encoder(ffi::AV_CODEC_ID_MJPEG).context("Encoder not found")?;
         let mut encode_context = AVCodecContext::new(&encoder);
+        let codec_config = CodecConfig::from_codec(encoder);
 
         encode_context.set_bit_rate(decode_context.bit_rate);
         encode_context.set_width(width.unwrap_or(decode_context.width));
         encode_context.set_height(height.unwrap_or(decode_context.height));
-        encode_context.set_time_base(avutil::av_inv_q(decode_context.framerate));
-        encode_context.set_pix_fmt(if let Some(pix_fmts) = encoder.pix_fmts() {
-            pix_fmts[0]
+        // 图片输入（如 mjpeg）的 framerate 可能为 0/0，此时回退 25fps 保证 time_base 有效
+        let frame_rate = if decode_context.framerate.num > 0 {
+            decode_context.framerate
         } else {
-            decode_context.pix_fmt
-        });
+            avutil::ra(1, 25)
+        };
+        encode_context.set_time_base(avutil::av_inv_q(frame_rate));
+        encode_context.set_pix_fmt(
+            if let Some(pix_fmts) = codec_config.supported_pixel_formats()? {
+                pix_fmts[0]
+            } else {
+                decode_context.pix_fmt
+            },
+        );
         encode_context.open(None)?;
 
         encode_context
     };
 
     let scaled_cover_packet = {
+        // 不同 FFmpeg 版本/平台下 `ffi::SWS_*` 类型不同（macOS 为 `u32`，Windows ffmpeg8 为 `i32`），
+        // 而 `get_context` 统一要求 `u32`，故统一转换并允许跨平台 lint。
+        #[allow(clippy::unnecessary_cast)]
         let mut sws_context = SwsContext::get_context(
             decode_context.width,
             decode_context.height,
@@ -80,7 +93,7 @@ fn thumbnail(
             encode_context.width,
             encode_context.height,
             encode_context.pix_fmt,
-            ffi::SWS_FAST_BILINEAR | ffi::SWS_PRINT_INFO,
+            (ffi::SWS_FAST_BILINEAR | ffi::SWS_PRINT_INFO) as u32,
             None,
             None,
             None,
@@ -124,13 +137,12 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "thumbnail_test0 测试运行依赖测试文件，暂时忽略"]
     fn thumbnail_test0() {
         std::fs::create_dir_all("tests/output/thumbnail").unwrap();
 
         thumbnail(
-            c"tests/assets/vids/bear.mp4",
-            c"tests/output/thumbnail/bear.jpg",
+            c"assets/mp4.mp4",
+            c"tests/output/thumbnail/mp4.jpg",
             Some(192),
             Some(108),
         )
@@ -138,13 +150,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "thumbnail_test1 测试运行依赖测试文件，暂时忽略"]
     fn thumbnail_test1() {
         std::fs::create_dir_all("tests/output/thumbnail").unwrap();
 
         thumbnail(
-            c"tests/assets/vids/video.mp4",
-            c"tests/output/thumbnail/test1_video.jpg",
+            c"assets/cat.jpg",
+            c"tests/output/thumbnail/cat.jpg",
             Some(280),
             Some(240),
         )
@@ -152,12 +163,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "thumbnail_test2 测试运行依赖测试文件，暂时忽略"]
+    #[ignore = "depends on an unreachable internal network stream (127.0.0.1)"]
     fn thumbnail_test2() {
         std::fs::create_dir_all("tests/output/thumbnail").unwrap();
 
         thumbnail(
-            c"http://172.24.82.2/video/final_134_raw.mp4",
+            c"http://127.0.0.1:8080/video/final_134_raw.mp4",
             c"tests/output/thumbnail/test2_video.jpg",
             Some(900),
             Some(600),

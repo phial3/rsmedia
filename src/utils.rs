@@ -19,7 +19,7 @@ pub fn from_path<P: AsRef<Path> + ?Sized>(path: &P) -> CString {
     }
 }
 
-/// Option<&Path> -> Option<CString>
+/// Option<&Path> -> `Option<CString>`
 pub fn from_path_opt<P: AsRef<Path> + ?Sized>(path: Option<&P>) -> Option<CString> {
     path.map(from_path)
 }
@@ -53,7 +53,7 @@ pub fn from_str<S: AsRef<str> + ?Sized>(s: &S) -> CString {
     CString::new(s.as_ref()).unwrap()
 }
 
-/// Option<&str> -> Option<CString>
+/// Option<&str> -> `Option<CString>`
 pub fn from_str_opt<S: AsRef<str> + ?Sized>(s: Option<&S>) -> Option<CString> {
     s.map(from_str)
 }
@@ -99,7 +99,7 @@ pub unsafe fn from_c_char(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    let cstr = CStr::from_ptr(ptr);
+    let cstr = unsafe { CStr::from_ptr(ptr) };
     match cstr.to_str() {
         Ok(s) => s.to_owned(),
         Err(_) => {
@@ -107,16 +107,6 @@ pub unsafe fn from_c_char(ptr: *const c_char) -> String {
             cstr.to_string_lossy().into_owned()
         }
     }
-}
-
-/// 将 Rust 字符串转换为 C 字符串指针
-///
-/// # Safety
-///
-/// 返回的指针需要手动释放，否则会造成内存泄漏
-/// 使用 `free_cstr` 函数释放内存
-pub unsafe fn to_c_char(s: &str) -> *mut c_char {
-    CString::new(s).unwrap().into_raw()
 }
 
 #[cfg(test)]

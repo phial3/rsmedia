@@ -1,7 +1,7 @@
 use super::avio;
 /// Simplified transcoding test, select the first video stream in given video file
 /// and transcode it. Store the output in memory.
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rsmpeg::ffi;
 use rsmpeg::{
     avcodec::AVCodecContext, avformat::AVFormatContextOutput, avutil::AVFrame, error::RsmpegError,
@@ -221,77 +221,16 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "avio_writing_test0 测试运行依赖测试文件，暂时忽略"]
-    fn avio_writing_test0() {
+    fn avio_writing_test() {
         std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
-        transcoding(
-            c"tests/assets/vids/mov_sample.mov",
-            c"tests/output/avio_writing/mov_sample.mp4",
-        )
-        .unwrap();
+        transcoding(c"assets/mp4.mp4", c"tests/output/avio_writing/mp4.mp4").unwrap();
     }
 
     #[test]
-    #[ignore = "avio_writing_test1 测试运行依赖测试文件，暂时忽略"]
-    fn avio_writing_test1() {
-        std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
-        transcoding(
-            c"tests/assets/vids/centaur.mpg",
-            c"tests/output/avio_writing/centaur.mp4",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "avio_writing_test2 测试运行依赖测试文件，暂时忽略"]
-    fn avio_writing_test2() {
-        std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
-        transcoding(
-            c"tests/assets/vids/bear.mp4",
-            c"tests/output/avio_writing/bear.mp4",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "avio_writing_test3 测试运行依赖测试文件，暂时忽略"]
-    fn avio_writing_test3() {
-        std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
-        transcoding(
-            c"tests/assets/vids/vp8.mp4",
-            c"tests/output/avio_writing/vp8.mp4",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "avio_writing_test4 测试运行依赖测试文件，暂时忽略"]
-    fn avio_writing_test4() {
-        std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
-        transcoding(
-            c"tests/assets/vids/big_buck_bunny.mp4",
-            c"tests/output/avio_writing/big_buck_bunny.mp4",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "avio_writing_test5 测试运行依赖测试文件，暂时忽略"]
-    fn avio_writing_test5() {
-        std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
-        transcoding(
-            c"tests/assets/vids/with_pic.mp4",
-            c"tests/output/avio_writing/with_pic.mp4",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    #[ignore = "avio_writing_test6 测试运行依赖测试文件，暂时忽略"]
-    fn avio_writing_test6() {
+    fn avio_clip_video_test() {
         std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
         clip_video(
-            c"http://172.24.82.2/video/final_134_raw.mp4",
+            c"assets/mp4.mp4",
             c"tests/output/avio_writing/clip_video.mp4",
             0.0,
             1.0,

@@ -1,9 +1,8 @@
 [package]
 name = "rsmedia"
-version = "0.1.0"
-edition = "2021"
-build = "build.rs"
-readme = "README.md"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89.0"
 license = "MIT OR Apache-2.0"
 description = "High-level video toolkit based on ffmpeg."
 keywords = ["video", "ffmpeg", "encoding", "decoding", "muxing"]
@@ -13,63 +12,61 @@ repository = "https://github.com/dromara/rsmedia.git"
 exclude = [".github/*", "assets/*", "data/*", "examples/*", "tests/*", "benches/*", "docs/*", ]
 
 [features]
-default = ["ndarray", "ffmpeg8", "link_system_ffmpeg"]
-ffmpeg6 = ["rsmpeg/ffmpeg6"]
+default = ["ndarray", "ffmpeg9", "link_system_ffmpeg"]
+ffmpeg6 = ["rsmpeg/ffmpeg6_1"]
 ffmpeg7 = ["rsmpeg/ffmpeg7_1"]
-ffmpeg8 = ["rsmpeg/ffmpeg8"]
+ffmpeg8 = ["rsmpeg/ffmpeg8_1"]
+ffmpeg9 = ["rsmpeg/ffmpeg9"]
 ## unxi linking ffmpeg with pkg-config.
-link_system_ffmpeg = ["rsmpeg/link_system_ffmpeg", "pkg-config"]
+link_system_ffmpeg = ["rsmpeg/link_system_ffmpeg"]
 ## windows linking ffmpeg with vcpkg.
-link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg", "vcpkg"]
+link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg"]
 
 [dependencies]
-pix = "0.14"
-rgb = "0.8"
-yuv = { version = "0.8", features = ["rayon", "professional_mode"] }
-color = "0.3"
-colorous = "1.0"
-colorutils-rs = "0.7"
+#pix = "1.0"
+#rgb = "0.8"
+#color = "0.3"
 palette = "0.7"
+yuv = { version = "0.8", features = ["rayon", "professional_mode"] }
+colorous = "1.0"
+colorutils-rs = "0.8"
 image = "0.25"
-imageproc = "0.26"
+imageproc = "0.27"
 num-traits = "0.2"
 anyhow = "1.0"
 log = "0.4"
 tracing = "0.1"
 url = "2.5"
 rand = "0.10"
-rayon = "1.11"
 dashmap = "6.1"
 once_cell = "1.21"
 num_cpus = "1.17"
 ndarray = { version = "0.17", optional = true }
-rsmpeg = { git = "https://github.com/larksuite/rsmpeg", default-features = false }
+# use custom rsmpeg
+rsmpeg = { git = "https://github.com/phial3/rsmpeg", branch = "ffmpeg9", default-features = false }
 
 [dev-dependencies]
 libc = "0.2"
 camino = "1.2"
 chrono = "0.4"
-ringbuf = "0.4"
-ctor = "0.6"
+#ringbuf = "0.5"
+#ctor = "1.0"
+#dtor = "1.0"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
 ab_glyph = "0.2"
-libblur = "0.23"
-pic-scale = "0.7"
-fast_image_resize = "6.0"
-histogram_equalization = "0.2"
+#libblur = "0.24"
+#pic-scale = "0.7"
+#fast_image_resize = "6.0"
+#histogram_equalization = "0.2"
 ## security & async
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 ## sound & audio
-cpal = "0.17"
+cpal = "0.18"
 wavers = "1.5"
-rubato = "1.0"
-dasp = { version = "0.11", features = ["all"] }
+#rubato = "5.0"
+#dasp = { version = "0.11", features = ["all"] }
 rodio = { version = "0.22", features = ["symphonia-all", "tracing"] }
-
-[build-dependencies]
-vcpkg = { version = "0.2", optional = true }
-pkg-config = { version = "0.3", optional = true }
 
 [package.metadata.docs.rs]
 all-features = true
@@ -78,8 +75,63 @@ all-features = true
 name = "decoding"
 path = "examples/decoding.rs"
 required-features = ["ndarray"]
+test = false
 
 [[example]]
 name = "encoding"
 path = "examples/encoding.rs"
 required-features = ["ndarray"]
+test = false
+
+[[example]]
+name = "decode_raw"
+path = "examples/decode_raw.rs"
+test = false
+
+[[example]]
+name = "audio_encoding"
+path = "examples/audio_encoding.rs"
+required-features = ["ndarray"]
+test = false
+
+[[example]]
+name = "decode_streams"
+path = "examples/decode_streams.rs"
+required-features = ["ndarray"]
+test = false
+
+[[example]]
+name = "seek"
+path = "examples/seek.rs"
+required-features = ["ndarray"]
+test = false
+
+[[example]]
+name = "metadata"
+path = "examples/metadata.rs"
+required-features = ["ndarray"]
+test = false
+
+[[example]]
+name = "filter_demo"
+path = "examples/filter_demo.rs"
+required-features = ["ndarray"]
+test = false
+
+[[example]]
+name = "color_professional"
+path = "examples/color_professional.rs"
+required-features = ["ndarray"]
+test = false
+
+[[example]]
+name = "quick_write"
+path = "examples/quick_write.rs"
+required-features = ["ndarray"]
+test = false
+
+[[example]]
+name = "hw_vt_check"
+path = "examples/hw_vt_check.rs"
+required-features = ["ndarray"]
+test = false

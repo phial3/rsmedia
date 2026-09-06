@@ -1,5 +1,3 @@
-use crate::utils;
-
 use rsmpeg::avutil::AVPixFmtDescriptorRef;
 use rsmpeg::ffi;
 
@@ -1248,16 +1246,25 @@ impl From<PixelFormat> for ffi::AVPixelFormat {
 //////////////////////////////////////////////////////////
 
 impl PixelFormat {
-    /// 获取像素格式描述符
-    pub fn descriptor(&self) -> AVPixFmtDescriptorRef {
-        AVPixFmtDescriptorRef::get((*self).into()).unwrap()
+    /// 获取像素格式描述符；未知/无效格式返回错误而非 panic。
+    pub fn descriptor(&self) -> Result<AVPixFmtDescriptorRef> {
+        AVPixFmtDescriptorRef::get((*self).into()).ok_or_else(|| {
+            Error::msg(format!(
+                "No pix_fmt descriptor for {}",
+                self.get_pix_fmt_name()
+            ))
+        })
     }
 
-    /// 获取像素格式名称
-    pub fn get_pix_fmt_name(&self) -> String {
+    /// 获取像素格式名称（FFmpeg 返回静态字符串，借用即可，避免每次分配 String）
+    pub fn get_pix_fmt_name(&self) -> &'static str {
         unsafe {
             let name = ffi::av_get_pix_fmt_name((*self).into());
-            utils::from_c_char(name)
+            if name.is_null() {
+                "unknown"
+            } else {
+                std::ffi::CStr::from_ptr(name).to_str().unwrap_or("unknown")
+            }
         }
     }
 
@@ -1363,12 +1370,23 @@ mod tests {
             PixelFormat::YUV420P,
             false,
         )?;
-        println!("Best pixel format: {:?}", best_fmt);
         assert_ne!(best_fmt, PixelFormat::NONE);
+        // 在候选集中选出最佳格式，其结果一定属于候选集
+        assert!(
+            matches!(
+                best_fmt,
+                PixelFormat::RGB24 | PixelFormat::BGR24 | PixelFormat::YUV420P
+            ),
+            "best pixel format should be one of the candidates, got {best_fmt:?}"
+        );
 
         // 10. 测试像素格式损失计算
         let loss = get_pix_fmt_loss(PixelFormat::RGB24, PixelFormat::YUV420P, false)?;
-        println!("Pixel format loss: {}", loss);
+        assert!(loss >= 0, "pixel format loss should be non-negative");
+
+        // 相同的格式转换应无损失
+        let same_loss = get_pix_fmt_loss(PixelFormat::RGB24, PixelFormat::RGB24, false)?;
+        assert_eq!(same_loss, 0, "same format conversion should have zero loss");
 
         Ok(())
     }
@@ -1387,7 +1405,14 @@ mod tests {
             for &dst_fmt in &formats {
                 if src_fmt != dst_fmt {
                     let loss = get_pix_fmt_loss(dst_fmt, src_fmt, true)?;
-                    println!("Convert {:?} to {:?}, loss: {}", src_fmt, dst_fmt, loss);
+                    assert!(
+                        loss >= 0,
+                        "loss for {src_fmt:?}->{dst_fmt:?} should be non-negative"
+                    );
+                } else {
+                    // 不同格式但相等的情况不存在；此处保证自身转换无损失
+                    let loss = get_pix_fmt_loss(dst_fmt, src_fmt, true)?;
+                    assert_eq!(loss, 0, "self conversion should have zero loss");
                 }
             }
         }

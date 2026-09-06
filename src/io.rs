@@ -102,16 +102,18 @@ impl<'a> StreamReaderBuilder<'a> {
     /// # Arguments
     ///
     /// * `options` - Options to pass on to input.
-    pub fn with_options(mut self, options: Option<Options>) -> Self {
-        self.options = options;
+    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.options = options.into();
         self
     }
 
     /// Build [`StreamReader`].
     pub fn build(self) -> Result<StreamReader> {
         let src_path = self.source.as_path().to_str().unwrap();
-        let protocol =
-            unsafe { ffi::avio_find_protocol_name(utils::to_c_char(src_path) as *const _) };
+        // RAII CString，FFI 使用后由析构自动释放
+        let src_cstr = std::ffi::CString::new(src_path)
+            .map_err(|e| Error::msg(format!("Invalid source path '{src_path}': {e}")))?;
+        let protocol = unsafe { ffi::avio_find_protocol_name(src_cstr.as_ptr()) };
         if protocol.is_null() {
             return Err(Error::msg(format!(
                 "Unsupported input source protocol: {src_path}"
@@ -130,7 +132,7 @@ impl<'a> StreamReaderBuilder<'a> {
         let mut dict = self.options.map(|opts| opts.into_dict());
         let mut ctx_input = AVFormatContextInput::builder()
             .url(&filename)
-            .format(fmt_opt.unwrap().deref())
+            .maybe_format(fmt_opt.as_deref())
             .options(&mut dict)
             .open()
             .context("Create input format context failed.")?;
@@ -262,7 +264,20 @@ unsafe impl Send for StreamReader {}
 unsafe impl Sync for StreamReader {}
 
 /// Any type that implements this can write video packets.
-pub trait Writer: private::Write + private::Output {}
+pub trait Writer: private::Write + private::Output {
+    /// 获取输出流当前的时间基。
+    ///
+    /// 注意：`write_header` 之后 muxer 可能调整 stream 的时间基（例如 MP4 的
+    /// movenc 会重设 timescale）。因此写包时应**实时获取**，不要缓存 write 前
+    /// 的值，否则 packet 的 pts/duration 会按错误的 time_base 解析。
+    fn stream_time_base(&self, stream_index: usize) -> ffi::AVRational {
+        self.output()
+            .streams()
+            .get(stream_index)
+            .map(|s| s.time_base)
+            .unwrap_or(crate::time::TIME_BASE)
+    }
+}
 
 /// Build a [`StreamWriter`].
 pub struct StreamWriterBuilder<'a> {
@@ -315,8 +330,8 @@ impl<'a> StreamWriterBuilder<'a> {
     /// # Arguments
     ///
     /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: Option<Options>) -> Self {
-        self.options = options;
+    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.options = options.into();
         self
     }
 
@@ -327,7 +342,7 @@ impl<'a> StreamWriterBuilder<'a> {
         let mut dict = self.options.map(|opts| opts.into_dict());
         let output_ctx = AVFormatContextOutput::builder()
             .filename(&filename)
-            .format_name(format.unwrap().as_ref())
+            .maybe_format_name(format.as_deref())
             .options(&mut dict)
             .build()
             .context("Create output format context failed.")?;
@@ -408,8 +423,8 @@ impl<'a> BufferWriterBuilder<'a> {
     /// # Arguments
     ///
     /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: Option<Options>) -> Self {
-        self.options = options;
+    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.options = options.into();
         self
     }
 
@@ -445,8 +460,8 @@ impl BufferWriter {
         BufferWriterBuilder::new(format).build()
     }
 
-    fn begin_write(&mut self) {
-        output_raw_buf_start(&mut self.output);
+    fn begin_write(&mut self) -> Result<()> {
+        output_raw_buf_start(&mut self.output)
     }
 
     fn end_write(&mut self) -> Vec<u8> {
@@ -491,8 +506,8 @@ impl<'a> PacketizedBufWriterBuilder<'a> {
     /// # Arguments
     ///
     /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: Option<Options>) -> Self {
-        self.options = options;
+    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.options = options.into();
         self
     }
 
@@ -535,7 +550,7 @@ impl PacketizedBufWriter {
         PacketizedBufWriterBuilder::new(format).build()
     }
 
-    fn begin_write(&mut self) {
+    fn begin_write(&mut self) -> Result<()> {
         output_raw_packetized_buf_start(
             &mut self.output,
             // Note: `ffi::output_raw_packetized_bug_start` requires that this value lives until
@@ -544,7 +559,7 @@ impl PacketizedBufWriter {
             // (see the implementation) of `Write` for `PacketizedBufWriter`.
             &mut self.buffers,
             Self::PACKET_SIZE,
-        );
+        )
     }
 
     fn end_write(&mut self) {
@@ -622,27 +637,27 @@ pub(crate) mod private {
         type Out = Buf;
 
         fn write_header(&mut self) -> Result<Buf> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_header(&mut None)?;
             Ok(self.end_write())
         }
 
         fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Buf> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_frame(packet)?;
             flush_output(&mut self.output)?;
             Ok(self.end_write())
         }
 
         fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Buf> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.interleaved_write_frame(packet)?;
             flush_output(&mut self.output)?;
             Ok(self.end_write())
         }
 
         fn write_trailer(&mut self) -> Result<Buf> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_trailer()?;
             Ok(self.end_write())
         }
@@ -652,14 +667,14 @@ pub(crate) mod private {
         type Out = Bufs;
 
         fn write_header(&mut self) -> Result<Bufs> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_header(&mut None)?;
             self.end_write();
             Ok(self.take_buffers())
         }
 
         fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Bufs> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_frame(packet)?;
             flush_output(&mut self.output)?;
             self.end_write();
@@ -667,7 +682,7 @@ pub(crate) mod private {
         }
 
         fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Bufs> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.interleaved_write_frame(packet)?;
             flush_output(&mut self.output)?;
             self.end_write();
@@ -675,7 +690,7 @@ pub(crate) mod private {
         }
 
         fn write_trailer(&mut self) -> Result<Bufs> {
-            self.begin_write();
+            self.begin_write()?;
             self.output.write_trailer()?;
             self.end_write();
             Ok(self.take_buffers())
@@ -778,7 +793,7 @@ pub(crate) fn output_raw(format: &str) -> Result<AVFormatContextOutput> {
 /// # Arguments
 ///
 /// * `output` - Output context to start write on.
-pub(crate) fn output_raw_buf_start(output: &mut AVFormatContextOutput) {
+pub(crate) fn output_raw_buf_start(output: &mut AVFormatContextOutput) -> Result<()> {
     unsafe {
         // Here we initialize a raw pointer (mutable) as nullptr initially. We then call the
         // `avio_open_dyn_buf` which expects a ptr ptr, and place the result in p. In case of
@@ -787,10 +802,11 @@ pub(crate) fn output_raw_buf_start(output: &mut AVFormatContextOutput) {
         match ffi::avio_open_dyn_buf((&mut p) as *mut *mut ffi::AVIOContext) {
             0 => {
                 (*output.as_mut_ptr()).pb = p;
+                Ok(())
             }
-            _ => {
-                panic!("Failed to open dynamic buffer for output context.");
-            }
+            _ => Err(Error::msg(
+                "Failed to open dynamic buffer for output context.",
+            )),
         }
     }
 }
@@ -848,7 +864,7 @@ pub fn output_raw_packetized_buf_start(
     output: &mut AVFormatContextOutput,
     packet_buffer: &mut Vec<Vec<u8>>,
     max_packet_size: usize,
-) {
+) -> Result<()> {
     unsafe {
         let buffer = ffi::av_malloc(max_packet_size) as *mut u8;
 
@@ -876,12 +892,23 @@ pub fn output_raw_packetized_buf_start(
             None,
         );
 
+        // `avio_alloc_context` 可能因 OOM 等等返回 NULL，必须先判空，
+        // 否则下方解引用 (*io) 即空指针解引用（UB）。
+        if io.is_null() {
+            // 释放刚才 av_malloc 的 buffer，避免泄漏
+            if !buffer.is_null() {
+                ffi::av_free(buffer as *mut std::ffi::c_void);
+            }
+            return Err(Error::msg("Failed to allocate AVIOContext"));
+        }
+
         // Setting `max_packet_size` will let the underlying IO stream know that this buffer must be
         // treated as packetized.
         (*io).max_packet_size = max_packet_size.try_into().unwrap();
 
         // Assign IO to output context.
         (*output.as_mut_ptr()).pb = io;
+        Ok(())
     }
 }
 
@@ -952,6 +979,8 @@ pub(crate) fn flush_output(output: &mut AVFormatContextOutput) -> Result<()> {
 pub fn init_logging() {
     unsafe {
         ffi::av_log_set_callback(Some(log_callback));
+        ffi::av_log_set_level(ffi::AV_LOG_TRACE as _);
+        // ffi::av_log_set_flags()
     }
 }
 
@@ -993,35 +1022,37 @@ unsafe extern "C" fn log_callback(
         let mut line = [0; 1024];
         let mut print_prefix: std::ffi::c_int = 1;
         // Use the ffmpeg default formatting.
-        let ret = ffi::av_log_format_line2(
-            avcl,
-            level_no,
-            fmt,
-            vl,
-            line.as_mut_ptr(),
-            (line.len()) as std::ffi::c_int,
-            (&mut print_prefix) as *mut std::ffi::c_int,
-        );
+        let ret = unsafe {
+            ffi::av_log_format_line2(
+                avcl,
+                level_no,
+                fmt,
+                vl,
+                line.as_mut_ptr(),
+                (line.len()) as std::ffi::c_int,
+                (&mut print_prefix) as *mut std::ffi::c_int,
+            )
+        };
         // Simply discard the log message if formatting fails.
-        if ret > 0 {
-            if let Ok(line) = std::ffi::CStr::from_ptr(line.as_mut_ptr()).to_str() {
-                let line = line.trim();
-                if log_filter_hacks(line) {
-                    match level_no as u32 {
-                        // These are all error states.
-                        ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
-                            tracing::error!(target: "rsmedia", "{}", line)
-                        }
-                        ffi::AV_LOG_WARNING => tracing::warn!(target: "rsmedia", "{}", line),
-                        ffi::AV_LOG_INFO => tracing::info!(target: "rsmedia", "{}", line),
-                        // There is no "verbose" in `log`, so we just put it in the "debug" category.
-                        ffi::AV_LOG_VERBOSE | ffi::AV_LOG_DEBUG => {
-                            tracing::debug!(target: "rsmedia", "{}", line)
-                        }
-                        ffi::AV_LOG_TRACE => tracing::trace!(target: "rsmedia", "{}", line),
-                        _ => {}
-                    };
-                }
+        if ret > 0
+            && let Ok(line) = unsafe { std::ffi::CStr::from_ptr(line.as_mut_ptr()) }.to_str()
+        {
+            let line = line.trim();
+            if log_filter_hacks(line) {
+                match level_no as u32 {
+                    // These are all error states.
+                    ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
+                        tracing::error!(target: "rsmedia", "{}", line)
+                    }
+                    ffi::AV_LOG_WARNING => tracing::warn!(target: "rsmedia", "{}", line),
+                    ffi::AV_LOG_INFO => tracing::info!(target: "rsmedia", "{}", line),
+                    // There is no "verbose" in `log`, so we just put it in the "debug" category.
+                    ffi::AV_LOG_VERBOSE | ffi::AV_LOG_DEBUG => {
+                        tracing::debug!(target: "rsmedia", "{}", line)
+                    }
+                    ffi::AV_LOG_TRACE => tracing::trace!(target: "rsmedia", "{}", line),
+                    _ => {}
+                };
             }
         }
     }
@@ -1037,11 +1068,7 @@ fn log_filter_hacks(line: &str) -> bool {
     /* Hack 1 */
     const HACK_1_PELCO_NEEDLE_1: &str = "SEI type 5 size";
     const HACK_1_PELCO_NEEDLE_2: &str = "truncated at";
-    if line.contains(HACK_1_PELCO_NEEDLE_1) && line.contains(HACK_1_PELCO_NEEDLE_2) {
-        return false;
-    }
-
-    true
+    !(line.contains(HACK_1_PELCO_NEEDLE_1) && line.contains(HACK_1_PELCO_NEEDLE_2))
 }
 
 /// Create SDP file contents for the given output. Useful for RTP muxers.
