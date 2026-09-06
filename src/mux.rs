@@ -400,7 +400,7 @@ mod tests {
 
     use anyhow::{Context, Result};
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     /// 生成YUV420P格式的视频帧,彩色渐变测试图
     fn generate_video_frame(width: usize, height: usize, frame_index: i64) -> AVFrame {
@@ -499,12 +499,12 @@ mod tests {
 
     #[test]
     fn test_mux_demux_video() -> Result<()> {
-        let output_path = Path::new("/tmp/test_mux_demux_video.mp4");
+        let output_path = std::env::temp_dir().join("test_mux_demux_video.mp4");
 
         let (width, height) = (640, 360);
         let video_encoder = Encoder::new_video(width, height)?;
 
-        let mut muxer = Muxer::new(output_path)?;
+        let mut muxer = Muxer::new(output_path.as_path())?;
 
         let encoder_frame_rate = video_encoder.frame_rate();
         let encoder_time_base = video_encoder.time_base();
@@ -554,14 +554,14 @@ mod tests {
 
     #[test]
     fn test_mux_demux_audio_aac() -> Result<()> {
-        let output_path = Path::new("/tmp/test_mux_demux_audio_aac.aac");
+        let output_path = std::env::temp_dir().join("test_mux_demux_audio_aac.aac");
         let sample_rate = 44_100;
         let nb_samples = 1024;
         let channels = 2;
 
         // 添加音频流
         let audio_encoder = Encoder::new_audio(channels, sample_rate, SampleFormat::FLTP).unwrap();
-        let mut muxer = Muxer::new(output_path)?;
+        let mut muxer = Muxer::new(output_path.as_path())?;
 
         let encoder_time_base = audio_encoder.time_base();
         let audio_index = muxer.add_stream(audio_encoder)?;
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_mux_demux_audio_mp3() -> Result<()> {
-        let output_path = Path::new("/tmp/test_mux_demux_audio_mp3.mp3");
+        let output_path = std::env::temp_dir().join("test_mux_demux_audio_mp3.mp3");
         let sample_rate = 44_100;
         let bit_rate = 128_000;
         let nb_samples = 1152; // libmp3lame 要求的 frame_size 为 1152
@@ -686,7 +686,7 @@ mod tests {
         pub const AUDIO_CHANNELS: i32 = 2;
         pub const SAMPLES_PER_FRAME: u32 = 1024;
 
-        let output_path = Path::new("/tmp/test_multiple_streams.mp4");
+        let output_path = std::env::temp_dir().join("test_multiple_streams.mp4");
 
         let video_encoder = EncoderBuilder::new_video(VIDEO_WIDTH, VIDEO_HEIGHT)
             .with_fps(VIDEO_FPS)
@@ -695,7 +695,7 @@ mod tests {
         let audio_encoder =
             Encoder::new_audio(AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, SampleFormat::FLTP)?;
 
-        let mut muxer = Muxer::new(output_path)?;
+        let mut muxer = Muxer::new(output_path.as_path())?;
 
         let video_time_base = video_encoder.time_base();
         let audio_time_base = audio_encoder.time_base();
@@ -864,7 +864,8 @@ mod tests {
 
     #[test]
     fn test_transcode() -> Result<()> {
-        transcode("assets/mp4.mp4", "/tmp/test_transcode.mov")?;
+        let output = std::env::temp_dir().join("test_transcode.mov");
+        transcode("assets/mp4.mp4", output.to_str().unwrap())?;
         Ok(())
     }
 
@@ -874,7 +875,7 @@ mod tests {
     /// 2. 重复调用 `finish()` 是幂等的：第二次返回 `Ok(None)`，不会重复写 trailer。
     #[test]
     fn test_finish_without_mux_and_idempotent() -> Result<()> {
-        let output_path = Path::new("/tmp/test_finish_without_mux.mp4");
+        let output_path = std::env::temp_dir().join("test_finish_without_mux.mp4");
 
         let encoder = Encoder::new_video(320, 240)?;
         let mut muxer = Muxer::new(output_path)?;
@@ -899,7 +900,7 @@ mod tests {
     /// 生成的容器文件依旧可以被 Demuxer 正常读取（不损坏）。
     #[test]
     fn test_drop_flush_without_explicit_finish() -> Result<()> {
-        let output_path = PathBuf::from("/tmp/test_drop_flush_no_finish.mp4");
+        let output_path = std::env::temp_dir().join("test_drop_flush_no_finish.mp4");
 
         let (width, height) = (320, 240);
         let video_encoder = Encoder::new_video(width, height)?;

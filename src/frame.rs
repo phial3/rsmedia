@@ -1467,33 +1467,27 @@ mod tests {
         // Y 平面使用全分辨率 (width × height)
         // U 平面使用 1/4 分辨率 ((width/2) × (height/2))
         // V 平面使用 1/4 分辨率 ((width/2) × (height/2))
+        //
+        // 使用 imgutils::fill_plane_with 逐行按 data[p]+y*linesize[p] 写入，
+        // 避免漏写 av_frame_get_buffer 对齐 linesize 后行末尾的填充字节（valgrind uninit）。
         unsafe {
-            // Y 平面 (全分辨率)
-            let y_data = std::slice::from_raw_parts_mut(
-                frame.data[0].cast::<u8>(),
-                height as usize * width as usize,
+            imgutils::fill_plane_with(&frame, 0, width as usize, height as usize, |x, y| {
+                ((y * width as usize + x) as u8) % 255
+            });
+            imgutils::fill_plane_with(
+                &frame,
+                1,
+                width as usize / 2,
+                height as usize / 2,
+                |x, y| ((y * (width as usize / 2) + x) as u8).wrapping_add(85) % 255,
             );
-            for (i, byte) in y_data.iter_mut().enumerate() {
-                *byte = (i % 255) as u8;
-            }
-
-            // U 平面 (1/4分辨率)
-            let u_data = std::slice::from_raw_parts_mut(
-                frame.data[1].cast::<u8>(),
-                (height as usize / 2) * (width as usize / 2),
+            imgutils::fill_plane_with(
+                &frame,
+                2,
+                width as usize / 2,
+                height as usize / 2,
+                |x, y| ((y * (width as usize / 2) + x) as u8).wrapping_add(170) % 255,
             );
-            for (i, byte) in u_data.iter_mut().enumerate() {
-                *byte = ((i + 85) % 255) as u8;
-            }
-
-            // V 平面 (1/4分辨率)
-            let v_data = std::slice::from_raw_parts_mut(
-                frame.data[2].cast::<u8>(),
-                (height as usize / 2) * (width as usize / 2),
-            );
-            for (i, byte) in v_data.iter_mut().enumerate() {
-                *byte = ((i + 170) % 255) as u8;
-            }
         }
 
         // 转换为 MediaFrame

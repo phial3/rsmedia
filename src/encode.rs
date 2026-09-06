@@ -1969,10 +1969,15 @@ mod tests {
                                     "COMB codec={codec} src={w}x{h} fps={fps} resize={resize:?} algo={algo:?}"
                                 );
                                 let n_frames = 6usize;
+                                // Windows 文件名校验：避免把 Debug 形式（含引号/括号/逗号/空格）放进文件名
+                                let resize_token = match resize {
+                                    Some(Resize::Exact(w, h)) => format!("exact_{w}x{h}"),
+                                    Some(Resize::Fit(w, h)) => format!("fit_{w}x{h}"),
+                                    Some(Resize::FitEven(w, h)) => format!("fiteven_{w}x{h}"),
+                                    None => "orig".to_string(),
+                                };
                                 let path = temp_path(format!(
-                                    "rsmedia_param_{codec}_{w}x{h}_{fps}_{:?}_{:?}.mp4",
-                                    resize.map(|r| format!("{r:?}")),
-                                    algo
+                                    "rsmedia_param_{codec}_{w}x{h}_{fps}_{resize_token}_{algo:?}.mp4"
                                 ));
                                 remove_temp(&path);
 
