@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_mux_demux_video() -> Result<()> {
-        let output_path = crate::test_utils::test_output_path("mux", "test_mux_demux_video.mp4");
+        let output_path = crate::test_support::test_output_path("mux", "test_mux_demux_video.mp4");
 
         let (width, height) = (640, 360);
         let video_encoder = Encoder::new_video(width, height)?;
@@ -956,7 +956,7 @@ mod tests {
     #[test]
     fn test_mux_demux_audio_aac() -> Result<()> {
         let output_path =
-            crate::test_utils::test_output_path("mux", "test_mux_demux_audio_aac.aac");
+            crate::test_support::test_output_path("mux", "test_mux_demux_audio_aac.aac");
         let sample_rate = 44_100;
         let nb_samples = 1024;
         let channels = 2;
@@ -1029,7 +1029,7 @@ mod tests {
         use std::ffi::CStr;
         use std::ptr;
 
-        let output_path = crate::test_utils::test_output_path("mux", "test_mux_metadata.mp4");
+        let output_path = crate::test_support::test_output_path("mux", "test_mux_metadata.mp4");
 
         let (width, height) = (320, 240);
         let sample_rate = 44_100;
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn test_mux_demux_audio_mp3() -> Result<()> {
         let output_path =
-            crate::test_utils::test_output_path("mux", "test_mux_demux_audio_mp3.mp3");
+            crate::test_support::test_output_path("mux", "test_mux_demux_audio_mp3.mp3");
         let sample_rate = 44_100;
         let bit_rate = 128_000;
         let nb_samples = 1152; // libmp3lame 要求的 frame_size 为 1152
@@ -1189,7 +1189,7 @@ mod tests {
         pub const AUDIO_CHANNELS: i32 = 2;
         pub const SAMPLES_PER_FRAME: u32 = 1024;
 
-        let output_path = crate::test_utils::test_output_path("mux", "test_multiple_streams.mp4");
+        let output_path = crate::test_support::test_output_path("mux", "test_multiple_streams.mp4");
 
         let video_encoder = EncoderBuilder::new_video(VIDEO_WIDTH, VIDEO_HEIGHT)
             .with_fps(VIDEO_FPS)
@@ -1367,7 +1367,7 @@ mod tests {
 
     #[test]
     fn test_transcode() -> Result<()> {
-        let output = crate::test_utils::test_output_path("mux", "test_transcode.mov");
+        let output = crate::test_support::test_output_path("mux", "test_transcode.mov");
         transcode("assets/mp4.mp4", output.to_str().unwrap())?;
         Ok(())
     }
@@ -1378,7 +1378,8 @@ mod tests {
     /// 2. 重复调用 `finish()` 是幂等的：第二次返回 `Ok(None)`，不会重复写 trailer。
     #[test]
     fn test_finish_without_mux_and_idempotent() -> Result<()> {
-        let output_path = crate::test_utils::test_output_path("mux", "test_finish_without_mux.mp4");
+        let output_path =
+            crate::test_support::test_output_path("mux", "test_finish_without_mux.mp4");
 
         let encoder = Encoder::new_video(320, 240)?;
         let mut muxer = Muxer::new(output_path)?;
@@ -1404,7 +1405,7 @@ mod tests {
     #[test]
     fn test_drop_flush_without_explicit_finish() -> Result<()> {
         let output_path =
-            crate::test_utils::test_output_path("mux", "test_drop_flush_no_finish.mp4");
+            crate::test_support::test_output_path("mux", "test_drop_flush_no_finish.mp4");
 
         let (width, height) = (320, 240);
         let video_encoder = Encoder::new_video(width, height)?;
@@ -1438,7 +1439,7 @@ mod tests {
     /// 应还原标题与秒级起止时间；参数校验（start<0、end<=start、内嵌 NUL）须报错。
     #[test]
     fn test_mux_chapters() -> Result<()> {
-        let output_path = crate::test_utils::test_output_path("mux", "test_mux_chapters.mp4");
+        let output_path = crate::test_support::test_output_path("mux", "test_mux_chapters.mp4");
 
         let (width, height) = (320, 240);
         let video_encoder = Encoder::new_video(width, height)?;
@@ -1480,7 +1481,7 @@ mod tests {
         assert!((chapters[1].end - 2.0).abs() < 1e-6);
 
         // MKV 使用原生 chapter atom（非 MP4 文本轨），同样必须完整回传
-        let mkv_path = crate::test_utils::test_output_path("mux", "test_mux_chapters.mkv");
+        let mkv_path = crate::test_support::test_output_path("mux", "test_mux_chapters.mkv");
         let video_encoder = Encoder::new_video(width, height)?;
         let encoder_time_base = video_encoder.time_base();
         let mut muxer = Muxer::new(mkv_path.as_path())?;
@@ -1514,8 +1515,8 @@ mod tests {
     fn test_encode_gif_palette_pipeline() -> Result<()> {
         use crate::filter::video;
 
-        let output_path = crate::test_utils::test_output_path("mux", "test_gif_palette.gif");
-        crate::test_utils::remove_test_output(&output_path);
+        let output_path = crate::test_support::test_output_path("mux", "test_gif_palette.gif");
+        crate::test_support::remove_test_output(&output_path);
 
         let (width, height) = (96usize, 64usize);
         let in_fps = 30.0f32;
@@ -1585,7 +1586,7 @@ mod tests {
     fn test_mux_cover_art() -> Result<()> {
         use crate::pixel::PixelFormat;
 
-        let output_path = crate::test_utils::test_output_path("mux", "test_mux_cover_art.mp4");
+        let output_path = crate::test_support::test_output_path("mux", "test_mux_cover_art.mp4");
 
         let (width, height) = (320, 240);
         let video_encoder = Encoder::new_video(width, height)?;

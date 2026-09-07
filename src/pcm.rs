@@ -336,7 +336,7 @@ mod tests {
     use crate::encode::Encoder;
     use crate::io::Reader;
     use crate::mux::Demuxer;
-    use crate::{SampleFormat, test_utils};
+    use crate::{SampleFormat, test_support};
 
     /// 生成交错 f32 正弦 PCM（amplitude 0.3，单声道/多声道相同相位）。
     fn sine_samples(
@@ -392,8 +392,8 @@ mod tests {
     /// 采样率/声道数保持、codec 为 aac。
     #[test]
     fn test_pcm_sink_f32_to_aac() -> Result<()> {
-        let output_path = test_utils::test_output_path("pcm", "test_pcm_f32.m4a");
-        test_utils::remove_test_output(&output_path);
+        let output_path = test_support::test_output_path("pcm", "test_pcm_f32.m4a");
+        test_support::remove_test_output(&output_path);
 
         let (in_rate, channels) = (44_100u32, 2u16);
         let total_in = 44_100usize; // 1 秒
@@ -434,8 +434,8 @@ mod tests {
     /// 解码后应为 44.1kHz、时长接近 1 秒。
     #[test]
     fn test_pcm_sink_resample() -> Result<()> {
-        let output_path = test_utils::test_output_path("pcm", "test_pcm_resample.m4a");
-        test_utils::remove_test_output(&output_path);
+        let output_path = test_support::test_output_path("pcm", "test_pcm_resample.m4a");
+        test_support::remove_test_output(&output_path);
 
         let (in_rate, out_rate) = (48_000u32, 44_100u32);
         let (in_channels, out_channels) = (1u16, 2u16);
@@ -471,8 +471,8 @@ mod tests {
     /// i16 写入路径：交错 S16 → AAC，解码样本数与输入一致（±1 帧）。
     #[test]
     fn test_pcm_sink_i16_to_aac() -> Result<()> {
-        let output_path = test_utils::test_output_path("pcm", "test_pcm_i16.m4a");
-        test_utils::remove_test_output(&output_path);
+        let output_path = test_support::test_output_path("pcm", "test_pcm_i16.m4a");
+        test_support::remove_test_output(&output_path);
 
         let (in_rate, channels) = (44_100u32, 2u16);
         let total_in = 22_050usize; // 0.5 秒
@@ -512,8 +512,8 @@ mod tests {
     /// u8 写入路径：交错 U8（128 为静音中点）→ AAC，解码样本数与输入一致（±1 帧）。
     #[test]
     fn test_pcm_sink_u8_to_aac() -> Result<()> {
-        let output_path = test_utils::test_output_path("pcm", "test_pcm_u8.m4a");
-        test_utils::remove_test_output(&output_path);
+        let output_path = test_support::test_output_path("pcm", "test_pcm_u8.m4a");
+        test_support::remove_test_output(&output_path);
 
         let (in_rate, channels) = (44_100u32, 1u16);
         let total_in = 22_050usize; // 0.5 秒
@@ -553,8 +553,8 @@ mod tests {
     /// 三段协同，解码样本数与输入一致（±1 帧）。
     #[test]
     fn test_pcm_sink_filter_input_sample_format() -> Result<()> {
-        let output_path = test_utils::test_output_path("pcm", "test_pcm_filter_input.m4a");
-        test_utils::remove_test_output(&output_path);
+        let output_path = test_support::test_output_path("pcm", "test_pcm_filter_input.m4a");
+        test_support::remove_test_output(&output_path);
 
         let (in_rate, channels) = (44_100u32, 2u16);
         let total_in = 22_050usize; // 0.5 秒
@@ -597,8 +597,8 @@ mod tests {
     fn test_pcm_sink_validation() -> Result<()> {
         // 非法规格：new() 出错时 muxer 被丢弃（未写 header，无副作用）
         let assert_invalid_spec = |spec: PcmSpec| -> Result<()> {
-            let output_path = test_utils::test_output_path("pcm", "test_pcm_invalid.m4a");
-            test_utils::remove_test_output(&output_path);
+            let output_path = test_support::test_output_path("pcm", "test_pcm_invalid.m4a");
+            test_support::remove_test_output(&output_path);
             let encoder = Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?;
             let mut muxer = Muxer::new(output_path.as_path())?;
             let audio_index = muxer.add_stream(encoder)?;
@@ -609,15 +609,15 @@ mod tests {
         assert_invalid_spec(PcmSpec::new(44_100, 0))?;
 
         // 非音频流拒绝
-        let output_path = test_utils::test_output_path("pcm", "test_pcm_invalid.m4a");
-        test_utils::remove_test_output(&output_path);
+        let output_path = test_support::test_output_path("pcm", "test_pcm_invalid.m4a");
+        test_support::remove_test_output(&output_path);
         let video_encoder = EncoderBuilder::new_video(64, 64).build()?;
         let mut muxer = Muxer::new(output_path.as_path())?;
         let video_index = muxer.add_stream(video_encoder)?;
         assert!(PcmSink::new(muxer, video_index, PcmSpec::new(44_100, 2)).is_err());
 
         // 声道不对齐的交错块拒绝；空块为 no-op
-        let output_path = test_utils::test_output_path("pcm", "test_pcm_invalid.m4a");
+        let output_path = test_support::test_output_path("pcm", "test_pcm_invalid.m4a");
         let encoder = Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?;
         let mut muxer = Muxer::new(output_path.as_path())?;
         let audio_index = muxer.add_stream(encoder)?;

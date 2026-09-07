@@ -99,7 +99,7 @@ mod tests {
     use crate::error::RsmediaError;
     use crate::io::StreamReader;
     use crate::io::private::{Output, Write};
-    use crate::test_utils;
+    use crate::test_support;
     use crate::time::Rescale;
 
     /// 测试用完整 ASS 脚本头：字幕编码器（ass/subrip/mov_text）open 时以此
@@ -138,8 +138,8 @@ mod tests {
     fn test_mov_text_encode_and_readback() -> Result<()> {
         use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 
-        let path = test_utils::test_output_path("subtitle", "rsmedia_mov_text.mp4");
-        test_utils::remove_test_output(&path);
+        let path = test_support::test_output_path("subtitle", "rsmedia_mov_text.mp4");
+        test_support::remove_test_output(&path);
 
         // 1) Write: create an MP4 with a mov_text subtitle stream
         let segments = sample_segments();
@@ -200,7 +200,7 @@ mod tests {
         assert!(all.contains("Second subtitle"), "decoded text: {all:?}");
         assert!(all.contains("Third subtitle"), "decoded text: {all:?}");
 
-        test_utils::remove_test_output(&path);
+        test_support::remove_test_output(&path);
         Ok(())
     }
 
@@ -210,8 +210,8 @@ mod tests {
     /// from packet pts/duration) and payload text.
     #[test]
     fn test_subrip_encode() -> Result<()> {
-        let path = test_utils::test_output_path("subtitle", "rsmedia_subrip.srt");
-        test_utils::remove_test_output(&path);
+        let path = test_support::test_output_path("subtitle", "rsmedia_subrip.srt");
+        test_support::remove_test_output(&path);
 
         let segments = sample_segments();
         let mut encoder = EncoderBuilder::new_subtitle()
@@ -246,7 +246,7 @@ mod tests {
             );
         }
 
-        test_utils::remove_test_output(&path);
+        test_support::remove_test_output(&path);
         Ok(())
     }
 
@@ -255,8 +255,8 @@ mod tests {
     #[test]
     fn test_subtitle_passthrough() -> Result<()> {
         // 1) Create an MKV with subrip subtitles
-        let input_path = test_utils::test_output_path("subtitle", "rsmedia_passthrough_in.mkv");
-        test_utils::remove_test_output(&input_path);
+        let input_path = test_support::test_output_path("subtitle", "rsmedia_passthrough_in.mkv");
+        test_support::remove_test_output(&input_path);
 
         let segments = sample_segments();
         let mut encoder = EncoderBuilder::new_subtitle()
@@ -266,8 +266,8 @@ mod tests {
         encoder.finish()?;
 
         // 2) Read the MKV and copy the subtitle stream to another MKV
-        let output_path = test_utils::test_output_path("subtitle", "rsmedia_passthrough_out.mkv");
-        test_utils::remove_test_output(&output_path);
+        let output_path = test_support::test_output_path("subtitle", "rsmedia_passthrough_out.mkv");
+        test_support::remove_test_output(&output_path);
 
         let mut reader = StreamReader::new(input_path.as_path())?;
         let mut out_writer = crate::io::StreamWriter::new(output_path.as_path())?;
@@ -303,8 +303,8 @@ mod tests {
             "output should have subtitle stream"
         );
 
-        test_utils::remove_test_output(&input_path);
-        test_utils::remove_test_output(&output_path);
+        test_support::remove_test_output(&input_path);
+        test_support::remove_test_output(&output_path);
         Ok(())
     }
 
@@ -315,8 +315,8 @@ mod tests {
     fn test_ass_encode_and_readback() -> Result<()> {
         use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 
-        let path = test_utils::test_output_path("subtitle", "rsmedia_ass.mkv");
-        test_utils::remove_test_output(&path);
+        let path = test_support::test_output_path("subtitle", "rsmedia_ass.mkv");
+        test_support::remove_test_output(&path);
 
         // 1) Write: create an MKV with an ASS subtitle stream
         let segments = sample_segments();
@@ -377,7 +377,7 @@ mod tests {
         assert!(all.contains("Second subtitle"), "decoded text: {all:?}");
         assert!(all.contains("Third subtitle"), "decoded text: {all:?}");
 
-        test_utils::remove_test_output(&path);
+        test_support::remove_test_output(&path);
         Ok(())
     }
 

@@ -1173,7 +1173,7 @@ mod tests {
     /// N 个按 `%03d` 模式编号的 PNG 文件。
     #[test]
     fn test_write_image_sequence() -> Result<()> {
-        let pattern = crate::test_utils::test_output_path("images", "img_%03d.png");
+        let pattern = crate::test_support::test_output_path("images", "img_%03d.png");
         let n_frames = 8;
 
         let writer = StreamWriterBuilder::new(pattern.as_path())
@@ -1212,7 +1212,7 @@ mod tests {
     #[test]
     fn test_read_image_sequence() -> Result<()> {
         // 复用写入测试生成的序列；若不存在则现场生成
-        let pattern = crate::test_utils::test_output_path("images", "img_%03d.png");
+        let pattern = crate::test_support::test_output_path("images", "img_%03d.png");
         if !pattern.with_file_name("img_001.png").exists() {
             let writer = StreamWriterBuilder::new(pattern.as_path())
                 .with_format("image2")

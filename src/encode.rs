@@ -2042,11 +2042,11 @@ mod tests {
             // 视频编码参数
             let width = 640;
             let height = 360;
-            let output_path = crate::test_utils::test_output_path(
+            let output_path = crate::test_support::test_output_path(
                 "encode",
                 &format!("test_encode_video.{}", spec.container),
             );
-            crate::test_utils::remove_test_output(&output_path);
+            crate::test_support::remove_test_output(&output_path);
 
             // 按容器规格创建编码器（fps 必须传入编码器，保证 time_base = 1/fps，
             // 否则编码器运行在默认 30fps，与帧 pts 的 25fps 语义不一致，
@@ -2150,8 +2150,8 @@ mod tests {
             let n_frames = 10;
             let fps = 25.0;
 
-            let path = crate::test_utils::test_output_path("encode", "rsmedia_roundtrip.mp4");
-            crate::test_utils::remove_test_output(&path);
+            let path = crate::test_support::test_output_path("encode", "rsmedia_roundtrip.mp4");
+            crate::test_support::remove_test_output(&path);
 
             // 1) 编码：用 write_frame 自动维护 pts
             let mut encoder = EncoderBuilder::new_video(width, height)
@@ -2177,7 +2177,7 @@ mod tests {
                 "decoded frame count mismatch: got {decoded}, expected {n_frames}"
             );
 
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
             Ok(())
         }
 
@@ -2191,8 +2191,8 @@ mod tests {
             let n_frames = 10;
             let fps = 25.0;
 
-            let path = crate::test_utils::test_output_path("encode", "rsmedia_crf_roundtrip.mp4");
-            crate::test_utils::remove_test_output(&path);
+            let path = crate::test_support::test_output_path("encode", "rsmedia_crf_roundtrip.mp4");
+            crate::test_support::remove_test_output(&path);
 
             let mut encoder = EncoderBuilder::new_video(width, height)
                 .with_fps(fps)
@@ -2212,7 +2212,7 @@ mod tests {
             }
             assert_eq!(decoded, n_frames, "CRF roundtrip frame count mismatch");
 
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
             Ok(())
         }
 
@@ -2228,8 +2228,8 @@ mod tests {
             let n_frames = 5;
 
             // 未显式指定 pix_fmt：协商为 mjpeg 支持列表中的格式
-            let path = crate::test_utils::test_output_path("encode", "rsmedia_mjpeg.avi");
-            crate::test_utils::remove_test_output(&path);
+            let path = crate::test_support::test_output_path("encode", "rsmedia_mjpeg.avi");
+            crate::test_support::remove_test_output(&path);
             let mut encoder = EncoderBuilder::new_video(width, height)
                 .with_codec_name("mjpeg".to_string())
                 .build_wrapped(path.as_path())?;
@@ -2247,7 +2247,7 @@ mod tests {
             }
             assert_eq!(decoded, n_frames, "mjpeg roundtrip frame count mismatch");
             drop(decoder);
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
 
             // 显式指定编码器不支持的像素格式：build() 应 fail fast
             let result = EncoderBuilder::new_video(width, height)
@@ -2273,8 +2273,8 @@ mod tests {
             let samples_per_frame = 1024u32;
             let frames_to_write = 10u32;
 
-            let path = crate::test_utils::test_output_path("encode", "rsmedia_pcm_s16le.wav");
-            crate::test_utils::remove_test_output(&path);
+            let path = crate::test_support::test_output_path("encode", "rsmedia_pcm_s16le.wav");
+            crate::test_support::remove_test_output(&path);
 
             // 不经 new_audio，保持 sample_format 未显式指定
             let mut encoder = EncoderBuilder::default()
@@ -2304,7 +2304,7 @@ mod tests {
                 "decoded {total_samples} samples, expected >= {expected}"
             );
             drop(decoder);
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
 
             // 显式指定编码器不支持的采样格式：build() 应 fail fast
             let result = EncoderBuilder::default()
@@ -2343,8 +2343,8 @@ mod tests {
             let height = 64usize;
             let fps = 25.0;
 
-            let path = crate::test_utils::test_output_path("encode", "rsmedia_profile.mp4");
-            crate::test_utils::remove_test_output(&path);
+            let path = crate::test_support::test_output_path("encode", "rsmedia_profile.mp4");
+            crate::test_support::remove_test_output(&path);
 
             let mut encoder = EncoderBuilder::new_video(width, height)
                 .with_fps(fps)
@@ -2363,7 +2363,7 @@ mod tests {
             assert_eq!(info.level, 41);
 
             drop(decoder);
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
             Ok(())
         }
 
@@ -2401,8 +2401,9 @@ mod tests {
             let n_frames = 30;
             let fps = 30.0;
 
-            let path = crate::test_utils::test_output_path("encode", "rsmedia_delayed_filter.mp4");
-            crate::test_utils::remove_test_output(&path);
+            let path =
+                crate::test_support::test_output_path("encode", "rsmedia_delayed_filter.mp4");
+            crate::test_support::remove_test_output(&path);
 
             // framerate 滤镜内部缓冲运动插值帧，输入 30 帧@30fps=1s，输出仍约 30 帧，
             // 其中尾部的插值帧要等 flush(EOF) 才输出。若 flush 缓冲帧被丢弃会偏少。
@@ -2431,7 +2432,7 @@ mod tests {
                 "delayed filter roundtrip lost frames: got {decoded}, expected >= {n_frames}"
             );
 
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
             Ok(())
         }
 
@@ -2446,8 +2447,8 @@ mod tests {
             let n_frames = 8;
             let fps: f64 = 30.0;
 
-            let path = crate::test_utils::test_output_path("encode", "rsmedia_auto_pts.mp4");
-            crate::test_utils::remove_test_output(&path);
+            let path = crate::test_support::test_output_path("encode", "rsmedia_auto_pts.mp4");
+            crate::test_support::remove_test_output(&path);
 
             let mut encoder = EncoderBuilder::new_video(width, height)
                 .with_fps(fps as f32)
@@ -2488,7 +2489,7 @@ mod tests {
                 .unwrap_or(expected_delta);
             assert_eq!(delta, expected_delta, "pts delta mismatch vs 1/fps");
 
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
             Ok(())
         }
 
@@ -2500,11 +2501,11 @@ mod tests {
             use crate::{DecoderBuilder, MediaType};
 
             for fps in [24.0f32, 25.0, 30.0, 60.0, 29.97] {
-                let path = crate::test_utils::test_output_path(
+                let path = crate::test_support::test_output_path(
                     "encode",
                     &format!("rsmedia_fps_{fps}.mp4"),
                 );
-                crate::test_utils::remove_test_output(&path);
+                crate::test_support::remove_test_output(&path);
 
                 let n_frames = 12;
                 let mut encoder = EncoderBuilder::new_video(64, 64)
@@ -2543,7 +2544,7 @@ mod tests {
                     "fps={fps}: decoded {decoded} frames, expected {n_frames}"
                 );
 
-                crate::test_utils::remove_test_output(&path);
+                crate::test_support::remove_test_output(&path);
             }
             Ok(())
         }
@@ -2599,13 +2600,13 @@ mod tests {
                                     Some(Resize::FitEven(w, h)) => format!("fiteven_{w}x{h}"),
                                     None => "orig".to_string(),
                                 };
-                                let path = crate::test_utils::test_output_path(
+                                let path = crate::test_support::test_output_path(
                                     "encode",
                                     &format!(
                                         "rsmedia_param_{codec}_{w}x{h}_{fps}_{resize_token}_{algo:?}.mp4"
                                     ),
                                 );
-                                crate::test_utils::remove_test_output(&path);
+                                crate::test_support::remove_test_output(&path);
 
                                 // 编码
                                 let mut enc = EncoderBuilder::new_video(w, h)
@@ -2656,7 +2657,7 @@ mod tests {
                                     "{codec} {w}x{h} fps={fps} resize={resize:?} {algo:?}: decoded {decoded}, expected >= {n_frames}"
                                 );
 
-                                crate::test_utils::remove_test_output(&path);
+                                crate::test_support::remove_test_output(&path);
                             }
                         }
                     }
@@ -2778,11 +2779,11 @@ mod tests {
 
             for (name, filter, min_frames, dims) in cases {
                 println!("VIDFILT {name}");
-                let path = crate::test_utils::test_output_path(
+                let path = crate::test_support::test_output_path(
                     "encode",
                     &format!("rsmedia_vfilt_{name}.mp4"),
                 );
-                crate::test_utils::remove_test_output(&path);
+                crate::test_support::remove_test_output(&path);
 
                 // 编码（应用该滤镜）；滤镜缺失时优雅跳过
                 let mut enc = match EncoderBuilder::new_video(width, height)
@@ -2793,7 +2794,7 @@ mod tests {
                     Ok(enc) => enc,
                     Err(e) if is_filter_unavailable(&e) => {
                         println!("SKIP {name}: not available ({e:#})");
-                        crate::test_utils::remove_test_output(&path);
+                        crate::test_support::remove_test_output(&path);
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -2831,7 +2832,7 @@ mod tests {
                     "{name}: decoded {decoded}, expected >= {min_frames}"
                 );
 
-                crate::test_utils::remove_test_output(&path);
+                crate::test_support::remove_test_output(&path);
             }
             Ok(())
         }
@@ -2943,11 +2944,11 @@ mod tests {
                 _ => spec.sample_rate, // 固定速率编码器（PCM 等）无列表，直接用表值
             };
 
-            let path = crate::test_utils::test_output_path(
+            let path = crate::test_support::test_output_path(
                 "encode",
                 &format!("rsmedia_audio_container.{}", spec.container),
             );
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
 
             // 按容器规格创建编码器
             let mut encoder = EncoderBuilder::new_audio(
@@ -3072,7 +3073,7 @@ mod tests {
                 input_samples.saturating_sub(MAX_ENCODER_DELAY)
             );
 
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
             Ok(())
         }
 
@@ -3122,8 +3123,8 @@ mod tests {
 
             // 1) flac → .flac：STREAMINFO 必须作为 extradata 存在
             let flac_path =
-                crate::test_utils::test_output_path("encode", "rsmedia_global_header.flac");
-            crate::test_utils::remove_test_output(&flac_path);
+                crate::test_support::test_output_path("encode", "rsmedia_global_header.flac");
+            crate::test_support::remove_test_output(&flac_path);
             let mut encoder = EncoderBuilder::new_audio(0, 2, 44_100, SampleFormat::S16)
                 .with_codec_name("flac".to_string())
                 .build_wrapped(flac_path.as_path())?;
@@ -3140,12 +3141,12 @@ mod tests {
                 "flac STREAMINFO must be carried as extradata in the output stream"
             );
             drop(reader);
-            crate::test_utils::remove_test_output(&flac_path);
+            crate::test_support::remove_test_output(&flac_path);
 
             // 2) aac → .m4a（MP4 全局头容器）：AudioSpecificConfig 必须存在
             let m4a_path =
-                crate::test_utils::test_output_path("encode", "rsmedia_global_header.m4a");
-            crate::test_utils::remove_test_output(&m4a_path);
+                crate::test_support::test_output_path("encode", "rsmedia_global_header.m4a");
+            crate::test_support::remove_test_output(&m4a_path);
             let mut encoder = EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP)
                 .with_codec_name("aac".to_string())
                 .build_wrapped(m4a_path.as_path())?;
@@ -3162,7 +3163,7 @@ mod tests {
                 "AAC AudioSpecificConfig must be carried as extradata in the output stream"
             );
             drop(reader);
-            crate::test_utils::remove_test_output(&m4a_path);
+            crate::test_support::remove_test_output(&m4a_path);
             Ok(())
         }
 
@@ -3179,8 +3180,9 @@ mod tests {
             let samples_per_frame = 1024u32;
             let frames_to_write = 10u32;
 
-            let path = crate::test_utils::test_output_path("encode", "rsmedia_audio_roundtrip.m4a");
-            crate::test_utils::remove_test_output(&path);
+            let path =
+                crate::test_support::test_output_path("encode", "rsmedia_audio_roundtrip.m4a");
+            crate::test_support::remove_test_output(&path);
 
             let mut encoder =
                 EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
@@ -3233,7 +3235,7 @@ mod tests {
             );
             assert!(decoded_frames > 0, "no audio frames decoded");
 
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
             Ok(())
         }
 
@@ -3251,8 +3253,8 @@ mod tests {
             let samples_per_frame = 1000u32;
             let frames_to_write = 3u32;
 
-            let path = crate::test_utils::test_output_path("encode", "rsmedia_audio_partial.m4a");
-            crate::test_utils::remove_test_output(&path);
+            let path = crate::test_support::test_output_path("encode", "rsmedia_audio_partial.m4a");
+            crate::test_support::remove_test_output(&path);
 
             let mut encoder =
                 EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
@@ -3282,7 +3284,7 @@ mod tests {
                 "decoded {total_samples} samples, expected >= {expected}"
             );
 
-            crate::test_utils::remove_test_output(&path);
+            crate::test_support::remove_test_output(&path);
             Ok(())
         }
 
@@ -3301,11 +3303,11 @@ mod tests {
             let frames_to_write = 10u32;
 
             let src =
-                crate::test_utils::test_output_path("encode", "rsmedia_audio_transcode_src.m4a");
+                crate::test_support::test_output_path("encode", "rsmedia_audio_transcode_src.m4a");
             let dst =
-                crate::test_utils::test_output_path("encode", "rsmedia_audio_transcode_dst.m4a");
-            crate::test_utils::remove_test_output(&src);
-            crate::test_utils::remove_test_output(&dst);
+                crate::test_support::test_output_path("encode", "rsmedia_audio_transcode_dst.m4a");
+            crate::test_support::remove_test_output(&src);
+            crate::test_support::remove_test_output(&dst);
 
             // 1) 生成源音频文件
             let mut enc =
@@ -3358,8 +3360,8 @@ mod tests {
                 "transcoded decoded {total} samples, expected >= {src_samples}"
             );
 
-            crate::test_utils::remove_test_output(&src);
-            crate::test_utils::remove_test_output(&dst);
+            crate::test_support::remove_test_output(&src);
+            crate::test_support::remove_test_output(&dst);
             Ok(())
         }
 
@@ -3431,11 +3433,11 @@ mod tests {
 
             for (name, audio_filter, duration_preserving) in cases {
                 println!("AUDFILT {name}");
-                let path = crate::test_utils::test_output_path(
+                let path = crate::test_support::test_output_path(
                     "encode",
                     &format!("rsmedia_afilter_{name}.m4a"),
                 );
-                crate::test_utils::remove_test_output(&path);
+                crate::test_support::remove_test_output(&path);
 
                 let mut enc = match EncoderBuilder::new_audio(
                     128_000,
@@ -3451,7 +3453,7 @@ mod tests {
                     // 未编译时初始化失败，这里优雅跳过，避免环境差异导致测试失败。
                     Err(e) if is_filter_unavailable(&e) => {
                         println!("SKIP {name}: not available ({e:#})");
-                        crate::test_utils::remove_test_output(&path);
+                        crate::test_support::remove_test_output(&path);
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -3499,7 +3501,7 @@ mod tests {
                     );
                 }
 
-                crate::test_utils::remove_test_output(&path);
+                crate::test_support::remove_test_output(&path);
             }
             Ok(())
         }

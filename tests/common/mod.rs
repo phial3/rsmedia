@@ -1,12 +1,9 @@
-// Shared helpers for integration tests (`tests/*.rs`).
+// Shared helpers for *integration* tests (`tests/*.rs`). This module is
+// intentionally independent of the library crate (`src/`): integration tests
+// `mod common;` and use `common::test_output_path(...)` / the frame generators.
 //
-// This file is included from two places so the logic has a single definition:
-// - Integration tests: `mod common;` then `common::test_output_path(...)`.
-// - Library unit tests: `include!("../tests/common/mod.rs")` inside the
-//   `#[cfg(test)]` `test_utils` module in `src/lib.rs`.
-//
-// `tests/common/mod.rs` is never compiled as its own test target, so nothing
-// here ends up in the shipped library binary.
+// Note: library unit tests (`src/`) keep their own `test_support` module and do
+// not include this file, so there is no dependency between the two test suites.
 
 /// Returns a standardized test output path under `tests/output/{category}/`,
 /// creating the directory if needed. The path is relative to the package root,
