@@ -5,6 +5,7 @@ pub mod frame;
 #[cfg(feature = "ndarray")]
 pub use frame::{MediaFrame, MediaFrameFormat, MediaFrameType};
 pub mod codec;
+pub use codec::{CodecConfig, CodecInfo, FormatInfo, Profile};
 pub mod colors;
 pub mod error;
 pub mod filter;
@@ -21,7 +22,7 @@ pub mod resize;
 pub mod stream;
 pub mod swctx;
 pub mod time;
-pub mod utils;
+pub mod strutils;
 
 pub use swctx::ScaleAlgorithm;
 

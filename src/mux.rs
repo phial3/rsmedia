@@ -396,7 +396,7 @@ unsafe impl<R: Reader> Sync for Demuxer<R> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter, utils};
+    use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter, strutils};
 
     use crate::error::{Context, Result};
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
@@ -838,7 +838,7 @@ mod tests {
         };
 
         output
-            .dump(0, utils::from_str(output_path).as_c_str())
+            .dump(0, strutils::str_to_cstring(output_path).as_c_str())
             .context("Dump output format context failed.")?;
 
         output

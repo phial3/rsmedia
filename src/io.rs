@@ -2,7 +2,7 @@ use crate::flags::MediaType;
 use crate::location::Location;
 use crate::options::Options;
 use crate::stream::Stream;
-use crate::utils;
+use crate::strutils;
 
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
 use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput, AVInputFormat};
@@ -44,7 +44,7 @@ pub trait Reader {
     fn find_best_stream(&self, media_type: MediaType) -> Result<(usize, String)> {
         self.input()
             .find_best_stream(media_type as _)?
-            .map(|(index, codec)| (index, utils::to_string(codec.name()).unwrap()))
+            .map(|(index, codec)| (index, strutils::cstr_to_string(codec.name()).unwrap()))
             .ok_or(RsmediaError::custom(format!(
                 "No stream found for MediaType:{media_type:?}"
             )))
@@ -121,14 +121,14 @@ impl<'a> StreamReaderBuilder<'a> {
         }
         log::debug!(
             "Using input protocol: [{}], source: {}",
-            unsafe { utils::from_c_char(protocol) },
+            unsafe { strutils::c_char_to_str(protocol) },
             src_path
         );
 
-        let filename = utils::from_path(&self.source.as_path());
+        let filename = strutils::path_to_cstring(&self.source.as_path());
         let fmt_opt = self
             .format
-            .and_then(|str| AVInputFormat::find(&utils::from_str(str)));
+            .and_then(|str| AVInputFormat::find(&strutils::str_to_cstring(str)));
         let mut dict = self.options.map(|opts| opts.into_dict());
         let mut ctx_input = AVFormatContextInput::builder()
             .url(&filename)
@@ -337,8 +337,8 @@ impl<'a> StreamWriterBuilder<'a> {
 
     /// Build [`StreamWriter`].
     pub fn build(self) -> Result<StreamWriter> {
-        let filename = utils::from_path(&self.destination.as_path());
-        let format = self.format.map(utils::from_str);
+        let filename = strutils::path_to_cstring(&self.destination.as_path());
+        let format = self.format.map(strutils::str_to_cstring);
         let mut dict = self.options.map(|opts| opts.into_dict());
         let output_ctx = AVFormatContextOutput::builder()
             .filename(&filename)
@@ -1094,7 +1094,7 @@ pub fn sdp(output_fmt_ctx: &AVFormatContextOutput) -> Result<String> {
         let output_fmt_ctx_ptr = output_fmt_ctx_ptr as *mut *mut ffi::AVFormatContext;
         let ret = ffi::av_sdp_create(output_fmt_ctx_ptr, 1, buf_ptr, BUF_SIZE);
         if ret == 0 {
-            Ok(utils::from_c_char(buf_ptr))
+            Ok(strutils::c_char_to_str(buf_ptr))
         } else {
             Err(RsmpegError::AVError(ret).into())
         }

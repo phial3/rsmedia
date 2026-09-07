@@ -8,7 +8,7 @@ use crate::options::Options;
 use crate::resize::Resize;
 use crate::stream::StreamInfo;
 use crate::swctx::ScaleAlgorithm;
-use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time, swctx, utils};
+use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time, swctx, strutils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
 use rsmpeg::avformat::AVStream;
@@ -188,7 +188,7 @@ impl DecoderBuilder {
             } else {
                 codec_name.as_str()
             };
-            AVCodec::find_decoder_by_name(&utils::from_str(codec_name))
+            AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name))
                 .context(format!("Failed to find decoder by name: '{codec_name}'"))?
         };
 
@@ -218,7 +218,7 @@ impl DecoderBuilder {
                     .device_type
                     .find_hw_pixel_format_with_codec(&codec)
                     .ok_or_else(|| {
-                        let codec_name = utils::to_string(codec.name()).unwrap();
+                        let codec_name = strutils::cstr_to_string(codec.name()).unwrap();
                         RsmediaError::custom(format!(
                             "Decoder with HW acceleration is not supported for codec: {codec_name}"
                         ))

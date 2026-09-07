@@ -1,4 +1,4 @@
-use crate::utils;
+use crate::strutils;
 
 use rsmpeg::avutil::AVDictionary;
 
@@ -256,7 +256,7 @@ impl From<HashMap<String, String>> for Options {
     fn from(item: HashMap<String, String>) -> Self {
         let mut dict = AVDictionary::new(c"", c"", 0);
         for (k, v) in item {
-            dict = dict.set(&utils::from_str(&k), &utils::from_str(&v), 0);
+            dict = dict.set(&strutils::str_to_cstring(&k), &strutils::str_to_cstring(&v), 0);
         }
         Self(dict)
     }
@@ -269,8 +269,8 @@ impl From<&Options> for HashMap<String, String> {
             .into_iter()
             .map(|entry| {
                 (
-                    utils::to_string(entry.key()).unwrap(),
-                    utils::to_string(entry.value()).unwrap(),
+                    strutils::cstr_to_string(entry.key()).unwrap(),
+                    strutils::cstr_to_string(entry.value()).unwrap(),
                 )
             })
             .collect()

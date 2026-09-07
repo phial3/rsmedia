@@ -1,6 +1,6 @@
 use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
-use crate::{MediaType, Options, PixelFormat, SampleFormat, utils};
+use crate::{MediaType, Options, PixelFormat, SampleFormat, strutils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecParametersRef, AVPacket};
 use rsmpeg::avformat::{AVInputFormatRef, AVStream};
@@ -294,7 +294,7 @@ impl StreamInfo {
     /// if not, will use current stream codec name
     pub fn find_decoder_name(&self, hw_device_type: Option<HWDeviceType>) -> Option<String> {
         let codec_id = self.codec_id as ffi::AVCodecID;
-        let codec_name = utils::to_string(AVCodec::find_decoder(codec_id)?.name()).unwrap();
+        let codec_name = strutils::cstr_to_string(AVCodec::find_decoder(codec_id)?.name()).unwrap();
 
         let hw_codec_name = if let Some(hw_type) = hw_device_type {
             match hw_type {
@@ -362,7 +362,7 @@ impl StreamInfo {
         hw_device_type: Option<HWDeviceType>,
     ) -> Option<String> {
         let codec_id = stream_info.codec_id as ffi::AVCodecID;
-        let codec_name = utils::to_string(AVCodec::find_encoder(codec_id)?.name()).unwrap();
+        let codec_name = strutils::cstr_to_string(AVCodec::find_encoder(codec_id)?.name()).unwrap();
 
         let hw_codec_name = if let Some(hw_type) = hw_device_type {
             match hw_type {
@@ -420,7 +420,7 @@ impl std::fmt::Debug for StreamInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let codec_name = unsafe {
             let codec_id = self.codec_id as ffi::AVCodecID;
-            utils::from_c_char(ffi::avcodec_get_name(codec_id))
+            strutils::c_char_to_str(ffi::avcodec_get_name(codec_id))
         };
         let format = {
             if self.media_type == MediaType::VIDEO {

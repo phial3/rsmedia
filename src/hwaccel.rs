@@ -1,5 +1,5 @@
 use crate::pixel::PixelFormat;
-use crate::{Options, imgutils, utils};
+use crate::{Options, imgutils, strutils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
@@ -182,7 +182,7 @@ impl HWContext {
 
         // create a new hardware device context
         let hw_device_ctx = {
-            let device = utils::from_str_opt(config.device_id.as_ref());
+            let device = strutils::str_to_cstring_opt(config.device_id.as_ref());
             let opts = config.options.as_ref().map(|opts| opts.as_dict());
             AVHWDeviceContext::create(config.device_type.into(), device.as_deref(), opts, 0)
                 .context("Failed to create hardware device context")?

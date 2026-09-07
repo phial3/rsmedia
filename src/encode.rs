@@ -10,7 +10,7 @@ use crate::pixel::PixelFormat;
 use crate::stream::StreamInfo;
 use crate::swctx::ScaleAlgorithm;
 use crate::time::Rescale;
-use crate::{Location, MediaType, SampleFormat, StreamWriter, swctx, time, utils};
+use crate::{Location, MediaType, SampleFormat, StreamWriter, swctx, time, strutils};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket};
 use rsmpeg::avutil::{self, AVAudioFifo, AVChannelLayout, AVChannelLayoutRef, AVFrame};
@@ -374,7 +374,7 @@ impl EncoderBuilder {
                     }
                 }
             };
-            AVCodec::find_encoder_by_name(&utils::from_str(codec_name))
+            AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name))
                 .context(format!("Failed to find encoder by name: '{codec_name}'"))?
         };
 
@@ -1598,12 +1598,12 @@ mod tests {
 
             let codec_name = spec.codec.unwrap_or("libx264");
             // 编码器存在性取决于 FFmpeg 构建配置（如 libtheora/libx265），缺失时跳过
-            if AVCodec::find_encoder_by_name(&utils::from_str(codec_name)).is_none() {
+            if AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)).is_none() {
                 return Err(RsmediaError::codec_not_found(format!(
                     "encoder {codec_name} not available in this FFmpeg build"
                 )));
             }
-            let codec_name = utils::from_str(codec_name);
+            let codec_name = strutils::str_to_cstring(codec_name);
             let codec_config = CodecConfig::new_with_name(&codec_name)?;
             assert!(
                 codec_config.is_encoder(),
@@ -2287,7 +2287,7 @@ mod tests {
 
             let codec_name = spec.codec.unwrap_or("aac");
             // 编码器存在性取决于 FFmpeg 构建配置（如 libmp3lame/libopus），缺失时跳过
-            let Some(codec) = AVCodec::find_encoder_by_name(&utils::from_str(codec_name)) else {
+            let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)) else {
                 return Err(RsmediaError::codec_not_found(format!(
                     "encoder {codec_name} not available in this FFmpeg build"
                 )));
