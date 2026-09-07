@@ -3,7 +3,7 @@ use std::os::raw::c_char;
 use std::path::Path;
 
 /// &Path -> &Cstr
-pub fn from_path<P: AsRef<Path> + ?Sized>(path: &P) -> CString {
+pub fn path_to_cstring<P: AsRef<Path> + ?Sized>(path: &P) -> CString {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -20,14 +20,14 @@ pub fn from_path<P: AsRef<Path> + ?Sized>(path: &P) -> CString {
 }
 
 /// Option<&Path> -> `Option<CString>`
-pub fn from_path_opt<P: AsRef<Path> + ?Sized>(path: Option<&P>) -> Option<CString> {
-    path.map(from_path)
+pub fn path_to_cstring_opt<P: AsRef<Path> + ?Sized>(path: Option<&P>) -> Option<CString> {
+    path.map(path_to_cstring)
 }
 
 /// &Cstr -> &Path
 /// - Unix: 使用原始字节直接构造路径（允许任意字节）
 /// - Windows: 假设输入为 UTF-16 LE 编码的字节序列
-pub fn to_path<C: AsRef<CStr> + ?Sized>(cstr: &C) -> &Path {
+pub fn cstr_to_path<C: AsRef<CStr> + ?Sized>(cstr: &C) -> &Path {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -49,22 +49,22 @@ pub fn to_path<C: AsRef<CStr> + ?Sized>(cstr: &C) -> &Path {
 }
 
 /// &str -> CString
-pub fn from_str<S: AsRef<str> + ?Sized>(s: &S) -> CString {
+pub fn str_to_cstring<S: AsRef<str> + ?Sized>(s: &S) -> CString {
     CString::new(s.as_ref()).unwrap()
 }
 
 /// Option<&str> -> `Option<CString>`
-pub fn from_str_opt<S: AsRef<str> + ?Sized>(s: Option<&S>) -> Option<CString> {
-    s.map(from_str)
+pub fn str_to_cstring_opt<S: AsRef<str> + ?Sized>(s: Option<&S>) -> Option<CString> {
+    s.map(str_to_cstring)
 }
 
 /// &Cstr -> String
-pub fn to_string<C: AsRef<CStr> + ?Sized>(cstr: &C) -> Result<String, std::str::Utf8Error> {
+pub fn cstr_to_string<C: AsRef<CStr> + ?Sized>(cstr: &C) -> Result<String, std::str::Utf8Error> {
     cstr.as_ref().to_str().map(String::from)
 }
 
 /// OsStr -> CString
-pub fn from_os_str(path_or_url: impl AsRef<OsStr>) -> CString {
+pub fn os_str_to_cstring(path_or_url: impl AsRef<OsStr>) -> CString {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -77,7 +77,7 @@ pub fn from_os_str(path_or_url: impl AsRef<OsStr>) -> CString {
 }
 
 /// CStr -> OsString
-pub fn to_os_string(cstr: impl AsRef<CStr>) -> OsString {
+pub fn cstr_to_os_string(cstr: impl AsRef<CStr>) -> OsString {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
@@ -95,7 +95,7 @@ pub fn to_os_string(cstr: impl AsRef<CStr>) -> OsString {
 ///
 /// - 指针必须指向一个有效的以 null 结尾的 C 字符串
 /// - 字符串内容必须是有效的 UTF-8
-pub unsafe fn from_c_char(ptr: *const c_char) -> String {
+pub unsafe fn c_char_to_str(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
@@ -107,6 +107,27 @@ pub unsafe fn from_c_char(ptr: *const c_char) -> String {
             cstr.to_string_lossy().into_owned()
         }
     }
+}
+
+/// 将逗号分隔的 C 字符串指针转换为 `Vec<String>`，空指针返回空 Vec。
+///
+/// FFmpeg 格式结构体（如 `AVOutputFormat.extensions`）常用逗号分隔
+/// 多个别名或扩展名（如 `"mkv,mka,mks"`）。
+///
+/// # Safety
+///
+/// - 指针为 NULL 或指向一个有效的以 null 结尾的 C 字符串
+/// - 字符串在调用期间保持有效（FFmpeg 静态结构体始终满足）
+pub unsafe fn c_char_to_str_list(ptr: *const c_char) -> Vec<String> {
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    let cstr = unsafe { CStr::from_ptr(ptr) };
+    cstr.to_string_lossy()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -125,12 +146,12 @@ mod tests {
         };
 
         // 从 &str 路径
-        let cstring = from_path(Path::new(path_str));
+        let cstring = path_to_cstring(Path::new(path_str));
         assert_eq!(cstring.to_str().unwrap(), path_str);
 
         // 从 PathBuf
         let path_buf = PathBuf::from(path_str);
-        let cstring = from_path(&path_buf);
+        let cstring = path_to_cstring(&path_buf);
         assert_eq!(cstring.to_str().unwrap(), path_str);
 
         // UTF-8 中文路径 (使用平台特定分隔符)
@@ -140,7 +161,7 @@ mod tests {
             r"测试\文件.txt"
         };
         let chinese = CString::new(chinese_path).unwrap();
-        let utf8_path = to_path(&chinese);
+        let utf8_path = cstr_to_path(&chinese);
         assert_eq!(utf8_path.to_str().unwrap(), chinese_path);
 
         #[cfg(unix)]
@@ -148,7 +169,7 @@ mod tests {
             // NOT UTF-8
             use std::os::unix::ffi::OsStrExt;
             let gbk = CString::new(vec![0xB2, 0xE2, 0xCA, 0xD4, 0x2E, 0x74, 0x78, 0x74]).unwrap();
-            let gbk_path = to_path(&gbk);
+            let gbk_path = cstr_to_path(&gbk);
             assert_eq!(
                 gbk_path.as_os_str().as_bytes(),
                 &[0xB2, 0xE2, 0xCA, 0xD4, 0x2E, 0x74, 0x78, 0x74]
@@ -164,8 +185,8 @@ mod tests {
             let os_str = path.as_os_str();
             let wide_chars: Vec<u16> = os_str.encode_wide().collect();
             let os_string = OsString::from_wide(&wide_chars);
-            let cstring = from_path(&os_string);
-            let result_path = to_path(&cstring);
+            let cstring = path_to_cstring(&os_string);
+            let result_path = cstr_to_path(&cstring);
             assert_eq!(result_path.to_str().unwrap(), test_str);
         }
     }
@@ -174,23 +195,48 @@ mod tests {
     fn test_str_conversion() {
         // 从 &str
         let s = "hello world";
-        let cstring = from_str(s);
+        let cstring = str_to_cstring(s);
         assert_eq!(cstring.to_str().unwrap(), s);
 
         // 从 String
         let string = String::from("hello world");
-        let cstring = from_str(&string);
+        let cstring = str_to_cstring(&string);
         assert_eq!(cstring.to_str().unwrap(), string);
 
         // 从 &OsStr
         let os_str = "/usr/local/bin";
-        let cstring = from_os_str(os_str);
+        let cstring = os_str_to_cstring(os_str);
         assert_eq!(cstring.to_str().unwrap(), os_str);
 
         // to OsString
         let cstring = CString::new(os_str).unwrap();
-        let os_string = to_os_string(cstring);
+        let os_string = cstr_to_os_string(cstring);
         assert_eq!(os_string.to_str().unwrap(), os_str);
+    }
+
+    #[test]
+    fn test_c_char_to_str() {
+        let c = CString::new("hello").unwrap();
+        assert_eq!(unsafe { c_char_to_str(c.as_ptr()) }, "hello");
+        // null pointer
+        assert_eq!(unsafe { c_char_to_str(std::ptr::null()) }, "");
+    }
+
+    #[test]
+    fn test_c_char_to_str_list() {
+        let c = CString::new("mkv,mka,mks").unwrap();
+        assert_eq!(
+            unsafe { c_char_to_str_list(c.as_ptr()) },
+            vec!["mkv".to_string(), "mka".to_string(), "mks".to_string()]
+        );
+        // null pointer
+        assert!(unsafe { c_char_to_str_list(std::ptr::null()) }.is_empty());
+        // single value
+        let c = CString::new("mp4").unwrap();
+        assert_eq!(
+            unsafe { c_char_to_str_list(c.as_ptr()) },
+            vec!["mp4".to_string()]
+        );
     }
 
     #[test]
@@ -204,21 +250,21 @@ mod tests {
 
         // Optional Path
         let path: Option<&Path> = Some(Path::new(test_path));
-        let cstring = from_path_opt(path);
+        let cstring = path_to_cstring_opt(path);
         assert!(cstring.is_some());
         assert_eq!(cstring.unwrap().to_str().unwrap(), test_path);
 
         // Optional str
         let s: Option<&str> = Some("hello");
-        let cstring = from_str_opt(s);
+        let cstring = str_to_cstring_opt(s);
         assert!(cstring.is_some());
         assert_eq!(cstring.unwrap().to_str().unwrap(), "hello");
 
         // None cases
         let none_path: Option<&Path> = None;
-        assert!(from_path_opt(none_path).is_none());
+        assert!(path_to_cstring_opt(none_path).is_none());
 
         let none_str: Option<&str> = None;
-        assert!(from_str_opt(none_str).is_none());
+        assert!(str_to_cstring_opt(none_str).is_none());
     }
 }

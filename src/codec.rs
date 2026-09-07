@@ -1,9 +1,39 @@
-use anyhow::{Error, Result};
+use crate::error::{Result, RsmediaError};
+use crate::stream::MediaType;
+use crate::strutils;
+
 #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
 use rsmpeg::avcodec::AVCodecContext;
 use rsmpeg::avcodec::{AVCodec, AVCodecRef};
+use rsmpeg::avformat::{AVInputFormatRef, AVOutputFormatRef};
 use rsmpeg::ffi;
+
 use std::ffi::CStr;
+use std::fmt;
+
+/// 解码器旗标（对应 FFmpeg `AV_CODEC_FLAG_*`）。
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AvCodecFlags {
+    UNALIGNED = ffi::AV_CODEC_FLAG_UNALIGNED,
+    QSCALE = ffi::AV_CODEC_FLAG_QSCALE,
+    _4MV = ffi::AV_CODEC_FLAG_4MV,
+    OUTPUT_CORRUPT = ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT,
+    QPEL = ffi::AV_CODEC_FLAG_QPEL,
+    PASS1 = ffi::AV_CODEC_FLAG_PASS1,
+    PASS2 = ffi::AV_CODEC_FLAG_PASS2,
+    GRAY = ffi::AV_CODEC_FLAG_GRAY,
+    PSNR = ffi::AV_CODEC_FLAG_PSNR,
+    INTERLACED_DCT = ffi::AV_CODEC_FLAG_INTERLACED_DCT,
+    LOW_DELAY = ffi::AV_CODEC_FLAG_LOW_DELAY,
+    GLOBAL_HEADER = ffi::AV_CODEC_FLAG_GLOBAL_HEADER,
+    BITEXACT = ffi::AV_CODEC_FLAG_BITEXACT,
+    AC_PRED = ffi::AV_CODEC_FLAG_AC_PRED,
+    LOOP_FILTER = ffi::AV_CODEC_FLAG_LOOP_FILTER,
+    INTERLACED_ME = ffi::AV_CODEC_FLAG_INTERLACED_ME,
+    CLOSED_GOP = ffi::AV_CODEC_FLAG_CLOSED_GOP,
+}
 
 pub struct CodecConfig {
     codec: AVCodecRef<'static>,
@@ -15,7 +45,7 @@ impl CodecConfig {
     pub fn new(id: ffi::AVCodecID) -> Result<Self> {
         let codec = AVCodec::find_encoder(id)
             .or_else(|| AVCodec::find_decoder(id))
-            .ok_or_else(|| Error::msg(format!("Codec id:{id} not found.")))?;
+            .ok_or_else(|| RsmediaError::custom(format!("Codec id:{id} not found.")))?;
         #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
         {
             Ok(Self { codec })
@@ -30,7 +60,9 @@ impl CodecConfig {
     pub fn new_with_name(codec_name: &CStr) -> Result<Self> {
         let codec = AVCodec::find_encoder_by_name(codec_name)
             .or_else(|| AVCodec::find_decoder_by_name(codec_name))
-            .ok_or_else(|| Error::msg(format!("Codec not found by name: '{codec_name:?}'")))?;
+            .ok_or_else(|| {
+                RsmediaError::custom(format!("Codec not found by name: '{codec_name:?}'"))
+            })?;
         #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
         {
             Ok(Self { codec })
@@ -181,6 +213,176 @@ impl CodecConfig {
     }
 }
 
+impl CodecConfig {
+    /// Media type (video/audio/subtitle/...) this codec handles.
+    pub fn media_type(&self) -> MediaType {
+        MediaType::from(self.codec.type_)
+    }
+
+    /// Whether this is a hardware-accelerated implementation
+    /// (e.g. `h264_nvenc`, `h264_vaapi`, `h264_videotoolbox`).
+    pub fn is_hardware(&self) -> bool {
+        self.codec.capabilities & ffi::AV_CODEC_CAP_HARDWARE as i32 != 0
+    }
+
+    /// Profiles the codec supports (e.g. High/Main/Baseline for H.264).
+    /// Empty when the codec does not declare a profile list.
+    ///
+    /// Note: FFmpeg 9 leaves `AVCodec.profiles` NULL for FFCodec-based
+    /// codecs (most encoders), so this may be empty there — use
+    /// [`CodecConfig::profile_name`] to resolve a known profile id instead.
+    pub fn profiles(&self) -> Vec<Profile> {
+        let mut out = Vec::new();
+        unsafe {
+            let mut p = self.codec.profiles;
+            if p.is_null() {
+                return out;
+            }
+            while (*p).profile != ffi::AV_PROFILE_UNKNOWN {
+                let name = strutils::c_char_to_str((*p).name);
+                out.push(Profile {
+                    id: (*p).profile,
+                    name,
+                });
+                p = p.add(1);
+            }
+        }
+        out
+    }
+
+    /// Resolve the human readable name of a profile id via
+    /// `avcodec_profile_name`, e.g. `FF_PROFILE_H264_HIGH` -> "High".
+    /// Works on all supported FFmpeg versions, even when [`CodecConfig::profiles`]
+    /// returns an empty list.
+    pub fn profile_name(&self, profile_id: i32) -> Option<String> {
+        let p = unsafe { ffi::avcodec_profile_name(self.codec.id, profile_id) };
+        if p.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        }
+    }
+
+    /// All codecs registered in this FFmpeg build (encoders and decoders).
+    pub fn all() -> Vec<Self> {
+        AVCodec::iterate().map(Self::from_codec).collect()
+    }
+
+    /// All registered encoder implementations.
+    pub fn encoders() -> Vec<Self> {
+        Self::all().into_iter().filter(|c| c.is_encoder()).collect()
+    }
+
+    /// All registered decoder implementations.
+    pub fn decoders() -> Vec<Self> {
+        Self::all().into_iter().filter(|c| c.is_decoder()).collect()
+    }
+
+    /// All encoder implementations for one codec id — e.g. for
+    /// `AV_CODEC_ID_H264` this typically lists `libx264`, `h264_nvenc`,
+    /// `h264_videotoolbox`, ... depending on the FFmpeg build and platform.
+    pub fn encoders_for(id: ffi::AVCodecID) -> Vec<Self> {
+        Self::encoders()
+            .into_iter()
+            .filter(|c| c.id() == id)
+            .collect()
+    }
+
+    /// All decoder implementations for one codec id.
+    pub fn decoders_for(id: ffi::AVCodecID) -> Vec<Self> {
+        Self::decoders()
+            .into_iter()
+            .filter(|c| c.id() == id)
+            .collect()
+    }
+}
+
+/// One entry of a codec's profile list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// FFmpeg profile constant (e.g. `FF_PROFILE_H264_HIGH`).
+    pub id: i32,
+    /// Human readable profile name (e.g. "High").
+    pub name: String,
+}
+
+impl fmt::Display for Profile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.name.is_empty() {
+            write!(f, "{}", self.id)
+        } else {
+            write!(f, "{}", self.name)
+        }
+    }
+}
+
+/// Owned summary of a muxer/demuxer container format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatInfo {
+    /// Short name list (comma-separated aliases), e.g. "matroska,webm".
+    pub name: String,
+    /// Human readable description, e.g. "Matroska".
+    pub long_name: String,
+    /// Typical file extensions, e.g. ["mkv"].
+    pub extensions: Vec<String>,
+}
+
+impl FormatInfo {
+    /// Primary short name (the first alias of [`FormatInfo::name`]),
+    /// e.g. "matroska" for the Matroska demuxer whose name list is
+    /// "matroska,webm".
+    pub fn short_name(&self) -> &str {
+        self.name.split(',').next().unwrap_or(&self.name)
+    }
+
+    fn from_output(fmt: AVOutputFormatRef<'static>) -> Self {
+        let extensions = unsafe { strutils::c_char_to_str_list(fmt.extensions) };
+        Self {
+            name: fmt.name().to_string_lossy().into_owned(),
+            long_name: fmt.long_name().to_string_lossy().into_owned(),
+            extensions,
+        }
+    }
+
+    fn from_input(fmt: AVInputFormatRef<'static>) -> Self {
+        let extensions = unsafe { strutils::c_char_to_str_list(fmt.extensions) };
+        Self {
+            name: fmt.name().to_string_lossy().into_owned(),
+            long_name: fmt.long_name().to_string_lossy().into_owned(),
+            extensions,
+        }
+    }
+
+    /// All muxers (output container formats) in this FFmpeg build.
+    pub fn muxers() -> Vec<Self> {
+        rsmpeg::avformat::AVOutputFormat::iterate()
+            .map(Self::from_output)
+            .collect()
+    }
+
+    /// All demuxers (input container formats) in this FFmpeg build.
+    pub fn demuxers() -> Vec<Self> {
+        rsmpeg::avformat::AVInputFormat::iterate()
+            .map(Self::from_input)
+            .collect()
+    }
+
+    /// Look up a muxer by its short name (or one of its aliases),
+    /// e.g. "mp4", "mkv", "matroska".
+    pub fn find_muxer(short_name: &str) -> Option<Self> {
+        Self::muxers().into_iter().find(|f| {
+            f.name == short_name || f.name.split(',').any(|alias| alias.trim() == short_name)
+        })
+    }
+
+    /// Look up a demuxer by its short name (or one of its aliases).
+    pub fn find_demuxer(short_name: &str) -> Option<Self> {
+        Self::demuxers().into_iter().find(|f| {
+            f.name == short_name || f.name.split(',').any(|alias| alias.trim() == short_name)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +488,94 @@ mod tests {
             available += 1;
         }
         assert!(available > 0, "no external audio codecs available");
+    }
+
+    #[test]
+    fn test_codec_discovery() {
+        let all = CodecConfig::all();
+        assert!(!all.is_empty(), "no codecs registered");
+
+        let encoders = CodecConfig::encoders();
+        let decoders = CodecConfig::decoders();
+        assert!(!encoders.is_empty() && !decoders.is_empty());
+        assert!(encoders.iter().all(|c| c.is_encoder()));
+        assert!(decoders.iter().all(|c| c.is_decoder()));
+
+        // h264 decoder is available in every FFmpeg build.
+        let h264 = CodecConfig::decoders_for(ffi::AV_CODEC_ID_H264);
+        assert!(!h264.is_empty(), "h264 decoder missing");
+        assert_eq!(h264[0].media_type(), MediaType::VIDEO);
+    }
+
+    #[test]
+    fn test_encoders_for_h264() {
+        let encoders = CodecConfig::encoders_for(ffi::AV_CODEC_ID_H264);
+        assert!(!encoders.is_empty(), "no h264 encoder in this FFmpeg build");
+        // Software implementations are not flagged as hardware.
+        if let Some(sw) = encoders.iter().find(|c| c.name() == c"libx264") {
+            assert!(!sw.is_hardware(), "libx264 must not be hardware");
+        }
+        let names: Vec<_> = encoders
+            .iter()
+            .map(|c| c.name().to_string_lossy().into_owned())
+            .collect();
+        println!("h264 encoders: {names:?}");
+    }
+
+    #[test]
+    fn test_format_discovery() {
+        let muxers = FormatInfo::muxers();
+        let demuxers = FormatInfo::demuxers();
+        assert!(!muxers.is_empty() && !demuxers.is_empty());
+
+        assert!(
+            muxers.iter().any(|f| f.name == "matroska"),
+            "matroska muxer missing"
+        );
+        assert!(muxers.iter().any(|f| f.name == "mp4"), "mp4 muxer missing");
+        // The mov demuxer's short-name field is the full alias list
+        // ("mov,mp4,m4a,3gp,3g2,mj2"), so look it up by alias.
+        assert!(
+            FormatInfo::find_demuxer("mov").is_some(),
+            "mov demuxer missing"
+        );
+        assert!(
+            FormatInfo::find_demuxer("matroska").is_some(),
+            "matroska demuxer missing"
+        );
+
+        let mp4 = FormatInfo::find_muxer("mp4").expect("mp4 muxer lookup failed");
+        assert_eq!(mp4.name, "mp4");
+        assert!(mp4.extensions.contains(&"mp4".to_string()));
+
+        // "mkv" is only an output alias; the demuxer is registered as
+        // "matroska" (with the alias list "matroska,webm").
+        let mkv = FormatInfo::find_demuxer("matroska").expect("matroska demuxer lookup failed");
+        assert_eq!(mkv.short_name(), "matroska");
+        assert!(mkv.extensions.contains(&"mkv".to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_libx264_profiles() {
+        let config = CodecConfig::new_with_name(c"libx264").expect("libx264 missing");
+        let profiles = config.profiles();
+        let names: Vec<_> = profiles.iter().map(|p| p.name.to_lowercase()).collect();
+        if profiles.is_empty() {
+            // FFmpeg 9: AVCodec.profiles is NULL for FFCodec-based encoders;
+            // fall back to the profile-id lookup which works everywhere.
+            let high = config
+                .profile_name(ffi::AV_PROFILE_H264_HIGH as i32)
+                .expect("h264 High profile name lookup failed");
+            assert_eq!(high, "High");
+        } else {
+            assert!(names.contains(&"high".to_string()), "profiles: {names:?}");
+            assert!(
+                names.contains(&"baseline".to_string()),
+                "profiles: {names:?}"
+            );
+        }
+        assert_eq!(config.media_type(), MediaType::VIDEO);
+        assert!(!config.is_hardware());
     }
 }

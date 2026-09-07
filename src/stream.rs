@@ -1,17 +1,54 @@
+use crate::error::{Result, RsmediaError};
 use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
-use crate::{MediaType, Options, PixelFormat, SampleFormat, utils};
+use crate::strutils;
+use crate::{Options, PixelFormat, SampleFormat};
 
-use rsmpeg::avcodec::{AVCodec, AVCodecParametersRef, AVPacket};
-use rsmpeg::avformat::{AVInputFormatRef, AVStream};
-use rsmpeg::avutil::AVDictionaryRef;
+use rsmpeg::avcodec::AVCodec;
+use rsmpeg::avformat::AVStream;
+use rsmpeg::avutil;
 use rsmpeg::ffi;
 
-use anyhow::{Error, Result};
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
+
+/// 媒体类型（对应 FFmpeg `AVMEDIA_TYPE_*`）：流的分类属性。
+///
+/// 放在 stream 模块 —— 它是 [`StreamInfo::media_type`] 等流描述的核心维度。
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MediaType {
+    UNKNOWN = ffi::AVMEDIA_TYPE_UNKNOWN,
+    VIDEO = ffi::AVMEDIA_TYPE_VIDEO,
+    AUDIO = ffi::AVMEDIA_TYPE_AUDIO,
+    DATA = ffi::AVMEDIA_TYPE_DATA,
+    SUBTITLE = ffi::AVMEDIA_TYPE_SUBTITLE,
+    ATTACHMENT = ffi::AVMEDIA_TYPE_ATTACHMENT,
+}
+
+impl MediaType {
+    pub fn get_media_type_string(&self) -> String {
+        avutil::get_media_type_string(*self as _).map_or("Unknown".to_string(), |s| {
+            strutils::cstr_to_string(s).unwrap()
+        })
+    }
+}
+
+impl From<ffi::AVMediaType> for MediaType {
+    fn from(item: ffi::AVMediaType) -> Self {
+        match item {
+            ffi::AVMEDIA_TYPE_UNKNOWN => MediaType::UNKNOWN,
+            ffi::AVMEDIA_TYPE_VIDEO => MediaType::VIDEO,
+            ffi::AVMEDIA_TYPE_AUDIO => MediaType::AUDIO,
+            ffi::AVMEDIA_TYPE_DATA => MediaType::DATA,
+            ffi::AVMEDIA_TYPE_SUBTITLE => MediaType::SUBTITLE,
+            ffi::AVMEDIA_TYPE_ATTACHMENT => MediaType::ATTACHMENT,
+            // 遇到未知/版本差异的类型时回退为 UNKNOWN 而非 panic，避免库内部直接崩溃
+            _ => MediaType::UNKNOWN,
+        }
+    }
+}
 
 /// Holds transferable stream information. This can be used to duplicate stream settings for the
 /// purpose of transmuxing or transcoding.
@@ -133,7 +170,7 @@ impl StreamInfo {
             .input()
             .streams()
             .get(stream_index)
-            .ok_or(Error::msg(format!(
+            .ok_or(RsmediaError::custom(format!(
                 "reader stream: {stream_index} not found!"
             )))?;
 
@@ -145,7 +182,7 @@ impl StreamInfo {
             .output()
             .streams()
             .get(stream_index)
-            .ok_or(Error::msg(format!(
+            .ok_or(RsmediaError::custom(format!(
                 "writer stream: {stream_index} not found!"
             )))?;
 
@@ -157,7 +194,7 @@ impl StreamInfo {
         let codec_type = codecpar.codec_type();
         let metadata = stream
             .metadata()
-            .map_or(HashMap::new(), |d| Options::new(d.to_owned()).into());
+            .map_or(HashMap::new(), |d| Options::from_dict(&d).into());
         let bytes_per_sample = if codec_type.is_audio() {
             SampleFormat::from(codecpar.format).get_bytes_per_sample()
         } else {
@@ -294,7 +331,7 @@ impl StreamInfo {
     /// if not, will use current stream codec name
     pub fn find_decoder_name(&self, hw_device_type: Option<HWDeviceType>) -> Option<String> {
         let codec_id = self.codec_id as ffi::AVCodecID;
-        let codec_name = utils::to_string(AVCodec::find_decoder(codec_id)?.name()).unwrap();
+        let codec_name = strutils::cstr_to_string(AVCodec::find_decoder(codec_id)?.name()).unwrap();
 
         let hw_codec_name = if let Some(hw_type) = hw_device_type {
             match hw_type {
@@ -362,7 +399,7 @@ impl StreamInfo {
         hw_device_type: Option<HWDeviceType>,
     ) -> Option<String> {
         let codec_id = stream_info.codec_id as ffi::AVCodecID;
-        let codec_name = utils::to_string(AVCodec::find_encoder(codec_id)?.name()).unwrap();
+        let codec_name = strutils::cstr_to_string(AVCodec::find_encoder(codec_id)?.name()).unwrap();
 
         let hw_codec_name = if let Some(hw_type) = hw_device_type {
             match hw_type {
@@ -402,6 +439,14 @@ impl StreamInfo {
                     ffi::AV_CODEC_ID_HEVC => Some("hevc_vulkan".to_string()),
                     _ => None,
                 },
+                // Windows：D3D11VA 设备类型承载 AMD AMF 编码器
+                //（AMF 无独立 hwcontext，挂在 d3d11va 下）。
+                HWDeviceType::D3D11VA => match codec_id {
+                    ffi::AV_CODEC_ID_H264 => Some("h264_amf".to_string()),
+                    ffi::AV_CODEC_ID_HEVC => Some("hevc_amf".to_string()),
+                    ffi::AV_CODEC_ID_AV1 => Some("av1_amf".to_string()),
+                    _ => None,
+                },
                 _ => None,
             }
         } else {
@@ -420,7 +465,7 @@ impl std::fmt::Debug for StreamInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let codec_name = unsafe {
             let codec_id = self.codec_id as ffi::AVCodecID;
-            utils::from_c_char(ffi::avcodec_get_name(codec_id))
+            strutils::c_char_to_str(ffi::avcodec_get_name(codec_id))
         };
         let format = {
             if self.media_type == MediaType::VIDEO {
@@ -458,125 +503,3 @@ impl std::fmt::Display for StreamInfo {
 
 unsafe impl Send for StreamInfo {}
 unsafe impl Sync for StreamInfo {}
-
-//////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////
-
-pub struct Stream<'a> {
-    av_stream: &'a AVStream,
-    iformat: AVInputFormatRef<'a>,
-    metadata: Option<AVDictionaryRef<'a>>,
-}
-
-impl<'a> Stream<'a> {
-    pub fn wrap(
-        av_stream: &'a AVStream,
-        iformat: AVInputFormatRef<'a>,
-        metadata: Option<AVDictionaryRef<'a>>,
-    ) -> Stream<'a> {
-        Stream {
-            av_stream,
-            iformat,
-            metadata,
-        }
-    }
-
-    pub fn iformat(&self) -> &AVInputFormatRef<'a> {
-        &self.iformat
-    }
-
-    pub fn ctx_metadata(&self) -> &Option<AVDictionaryRef<'a>> {
-        &self.metadata
-    }
-}
-
-impl Stream<'_> {
-    pub fn id(&self) -> i32 {
-        self.av_stream.id
-    }
-
-    pub fn index(&self) -> usize {
-        self.av_stream.index as usize
-    }
-
-    pub fn time_base(&self) -> ffi::AVRational {
-        self.av_stream.time_base
-    }
-
-    pub fn start_time(&self) -> i64 {
-        self.av_stream.start_time
-    }
-
-    pub fn duration(&self) -> i64 {
-        self.av_stream.duration
-    }
-
-    pub fn nb_frames(&self) -> i64 {
-        self.av_stream.nb_frames
-    }
-
-    pub fn disposition(&self) -> i32 {
-        self.av_stream.disposition
-    }
-
-    pub fn discard(&self) -> ffi::AVDiscard {
-        self.av_stream.discard
-    }
-
-    pub fn r_frame_rate(&self) -> ffi::AVRational {
-        self.av_stream.r_frame_rate
-    }
-
-    pub fn avg_frame_rate(&self) -> ffi::AVRational {
-        self.av_stream.avg_frame_rate
-    }
-
-    pub fn parameters(&self) -> AVCodecParametersRef<'_> {
-        self.av_stream.codecpar()
-    }
-
-    pub fn metadata(&self) -> Option<AVDictionaryRef<'_>> {
-        self.av_stream.metadata()
-    }
-}
-
-impl PartialEq for Stream<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.av_stream.id == other.av_stream.id
-    }
-}
-
-impl Eq for Stream<'_> {}
-
-/////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////
-
-pub struct PacketSideData<'a> {
-    ptr: *mut ffi::AVPacketSideData,
-    _marker: PhantomData<&'a AVPacket>,
-}
-
-impl PacketSideData<'_> {
-    pub fn wrap(ptr: *mut ffi::AVPacketSideData) -> Self {
-        PacketSideData {
-            ptr,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn as_ptr(&self) -> *const ffi::AVPacketSideData {
-        self.ptr as *const _
-    }
-
-    pub fn kind(&self) -> ffi::AVPacketSideDataType {
-        unsafe { ffi::AVPacketSideDataType::from((*self.as_ptr()).type_) }
-    }
-
-    pub fn size(&self) -> usize {
-        unsafe { (*self.as_ptr()).size }
-    }
-
-    pub fn data(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts((*self.as_ptr()).data, (*self.as_ptr()).size) }
-    }
-}

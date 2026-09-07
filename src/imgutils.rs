@@ -1,6 +1,6 @@
 use crate::PixelFormat;
+use crate::error::{Result, RsmediaError, format_err};
 
-use anyhow::{Error, Result};
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 
@@ -19,7 +19,9 @@ pub fn fill_linesizes(pix_fmt: PixelFormat, width: i32) -> Result<[i32; 4]> {
 
     // >= 0 in case of success, a negative error code otherwise
     if ret < 0 {
-        return Err(Error::msg(format!("Failed to fill linesizes: {ret}")));
+        return Err(RsmediaError::custom(format!(
+            "Failed to fill linesizes: {ret}"
+        )));
     }
 
     Ok(linesizes)
@@ -39,7 +41,9 @@ pub fn get_linesize(pix_fmt: PixelFormat, width: u32, plane: usize) -> Result<us
 
     // returns the computed size in bytes
     if ret <= 0 {
-        return Err(Error::msg(format!("Failed to get line size, ret: {ret}")));
+        return Err(RsmediaError::custom(format!(
+            "Failed to get line size, ret: {ret}"
+        )));
     }
 
     Ok(ret as usize)
@@ -82,7 +86,7 @@ pub fn fill_plane_sizes<I: IntoIterator<Item = u32>>(
 
     // >= 0 in case of success, a negative error code otherwise
     if ret < 0 {
-        return Err(Error::msg(format!(
+        return Err(RsmediaError::custom(format!(
             "Failed to fill plane sizes, ret: {ret}"
         )));
     }
@@ -99,7 +103,7 @@ pub fn copy_frame_to_buffer(frame: &AVFrame) -> Result<Vec<u8>> {
     let frame_width: i32 = frame.width;
     let frame_height: i32 = frame.height;
     if frame_width * frame_height <= 0 {
-        return Err(anyhow::anyhow!("Invalid frame dimensions"));
+        return Err(format_err!("Invalid frame dimensions"));
     }
 
     let buf_size = frame.image_get_buffer_size(1)?;
@@ -109,7 +113,9 @@ pub fn copy_frame_to_buffer(frame: &AVFrame) -> Result<Vec<u8>> {
         buffer.truncate(bytes);
         Ok(buffer)
     } else {
-        Err(Error::msg(format!("Failed to copy image:{bytes}")))
+        Err(RsmediaError::custom(format!(
+            "Failed to copy image:{bytes}"
+        )))
     }
 }
 
@@ -129,14 +135,14 @@ pub fn copy_frame_metadata(src: &AVFrame, dst: &mut AVFrame, copy_data: bool) ->
             // 复制数据
             let ret = ffi::av_frame_copy(dst.as_mut_ptr(), src.as_ptr());
             if ret < 0 {
-                return Err(anyhow::anyhow!("Failed to copy frame data: {}", ret));
+                return Err(format_err!("Failed to copy frame data: {}", ret));
             }
         }
 
         // 复制属性：仅包含 metadata 和 side_data
         let ret = ffi::av_frame_copy_props(dst.as_mut_ptr(), src.as_ptr());
         if ret < 0 {
-            return Err(anyhow::anyhow!("Failed to copy frame properties: {}", ret));
+            return Err(format_err!("Failed to copy frame properties: {}", ret));
         }
 
         Ok(())
@@ -177,20 +183,20 @@ fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
 /// 获取指定帧的指定平面的实际数据，不包含额外的填充字节
 pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     if frame.width * frame.height <= 0 {
-        return Err(anyhow::anyhow!("Invalid frame dimensions"));
+        return Err(format_err!("Invalid frame dimensions"));
     }
 
     // count planes of format
     let planes = PixelFormat::from(frame.format).count_planes()?;
     if plane_idx >= planes as usize {
-        return Err(anyhow::anyhow!(
+        return Err(format_err!(
             "Invalid plane index: {}, max planes: {}",
             plane_idx,
             planes
         ));
     }
     if frame.data[plane_idx].is_null() {
-        return Err(anyhow::anyhow!(
+        return Err(format_err!(
             "Null plane data pointer for plane {}",
             plane_idx
         ));
@@ -198,7 +204,7 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
 
     let buf_ptr = unsafe { ffi::av_frame_get_plane_buffer(frame.as_ptr(), plane_idx as i32) };
     if buf_ptr.is_null() {
-        return Err(anyhow::anyhow!(
+        return Err(format_err!(
             "Null plane buffer pointer for plane {}",
             plane_idx
         ));
@@ -219,10 +225,7 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
         // 计算平面数据在缓冲区中的偏移量
         let data_offset = frame.data[plane_idx].offset_from((*buf_ptr).data) as usize;
         if data_offset >= (*buf_ptr).size {
-            return Err(anyhow::anyhow!(
-                "Invalid data offset for plane {}",
-                plane_idx
-            ));
+            return Err(format_err!("Invalid data offset for plane {}", plane_idx));
         }
 
         // 计算平面数据地址加上偏移量
@@ -230,7 +233,7 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
 
         // 确保不会超出缓冲区的大小
         if data_offset + (geom.height - 1) * linesize + bytes_per_row > (*buf_ptr).size {
-            return Err(anyhow::anyhow!("Buffer too small for plane {}", plane_idx));
+            return Err(format_err!("Buffer too small for plane {}", plane_idx));
         }
 
         // Set the actual length
@@ -271,10 +274,10 @@ pub fn fill_plane_from_buffer(
 ) -> Result<()> {
     // 基本参数检查
     if frame.width * frame.height <= 0 {
-        return Err(Error::msg("Invalid frame dimensions"));
+        return Err(RsmediaError::custom("Invalid frame dimensions"));
     }
     if !frame.is_writable()? {
-        return Err(Error::msg("Frame is not writable"));
+        return Err(RsmediaError::custom("Frame is not writable"));
     }
 
     // 获取平面数量并检查平面索引
@@ -282,14 +285,14 @@ pub fn fill_plane_from_buffer(
 
     // 检查平面索引
     if plane_idx >= planes as usize {
-        return Err(Error::msg(format!(
+        return Err(RsmediaError::custom(format!(
             "Invalid plane index: {plane_idx}, max planes: {planes}"
         )));
     }
 
     // 检查目标平面指针是否有效
     if frame.data[plane_idx].is_null() {
-        return Err(Error::msg(format!(
+        return Err(RsmediaError::custom(format!(
             "Null plane data pointer for plane {plane_idx}"
         )));
     }
@@ -303,7 +306,7 @@ pub fn fill_plane_from_buffer(
 
     // 验证行大小
     if src_linesize < byte_width {
-        return Err(anyhow::anyhow!(
+        return Err(format_err!(
             "Source linesize {} is less than required byte width {}",
             src_linesize,
             byte_width
@@ -312,7 +315,7 @@ pub fn fill_plane_from_buffer(
 
     // 验证 byte_width 是否满足 FFmpeg 的要求
     if byte_width > dst_linesize.unsigned_abs() as usize || byte_width > src_linesize {
-        return Err(anyhow::anyhow!(
+        return Err(format_err!(
             "byte_width {} exceeds linesize limits (dst: {}, src: {})",
             byte_width,
             dst_linesize,
@@ -323,7 +326,7 @@ pub fn fill_plane_from_buffer(
     // 计算所需的最小源数据大小（考虑行填充）
     let required_size = geom.height * src_linesize;
     if src.len() < required_size {
-        return Err(anyhow::anyhow!(
+        return Err(format_err!(
             "Incorrect source data size: got {}, need {}",
             src.len(),
             required_size
@@ -389,12 +392,12 @@ pub unsafe fn fill_plane_with<F>(
 pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()> {
     // 1. Basic validation
     if !frame.is_writable()? {
-        return Err(Error::msg("Frame is not writable"));
+        return Err(RsmediaError::custom("Frame is not writable"));
     }
     if frame.data[0].is_null() {
         // This check implies the frame buffer hasn't been allocated properly
         // alloc_buffer should have been called before passing the frame here.
-        return Err(Error::msg(
+        return Err(RsmediaError::custom(
             "Frame buffer is not allocated (frame.data is null)",
         ));
     }
@@ -404,7 +407,7 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
 
     // 3. Validate input buffer size
     if buffer.len() < expected_size {
-        return Err(Error::msg(format!(
+        return Err(RsmediaError::custom(format!(
             "Input buffer size mismatch. Expected at least {} bytes, got {}",
             expected_size,
             buffer.len()
@@ -438,7 +441,7 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
         );
 
         if ret_fill < 0 {
-            return Err(Error::msg(format!(
+            return Err(RsmediaError::custom(format!(
                 "Failed to calculate source layout using av_image_fill_arrays: {ret_fill}"
             )));
         }
@@ -468,7 +471,7 @@ pub fn to_ndarray(frame: &AVFrame) -> Result<ndarray::Array3<u8>> {
         f if f == ffi::AV_PIX_FMT_RGB24 => {
             let buffer = copy_frame_to_buffer(frame)?;
             ndarray::Array3::from_shape_vec((height, width, 3), buffer)
-                .map_err(|e| anyhow::anyhow!("Failed to convert RGB ndarray: {}", e))
+                .map_err(|e| format_err!("Failed to convert RGB ndarray: {}", e))
         }
         // YUV 格式：平面存储，需要分别处理每个平面并上采样
         f if f == ffi::AV_PIX_FMT_YUV420P => {
@@ -514,7 +517,7 @@ pub fn to_ndarray(frame: &AVFrame) -> Result<ndarray::Array3<u8>> {
 
             Ok(array)
         }
-        _ => Err(anyhow::anyhow!(
+        _ => Err(format_err!(
             "Unsupported pixel format to ndarray: {}",
             frame.format
         )),
@@ -524,8 +527,8 @@ pub fn to_ndarray(frame: &AVFrame) -> Result<ndarray::Array3<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Context;
     use ab_glyph::PxScale;
-    use anyhow::Context;
     use image::{ImageBuffer, Rgb};
 
     /// Create an image with the given text and a gradient color.

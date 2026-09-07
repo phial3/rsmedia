@@ -33,7 +33,6 @@ colorutils-rs = "0.8"
 image = "0.25"
 imageproc = "0.27"
 num-traits = "0.2"
-anyhow = "1.0"
 log = "0.4"
 tracing = "0.1"
 url = "2.5"
@@ -46,6 +45,7 @@ ndarray = { version = "0.17", optional = true }
 rsmpeg = { git = "https://github.com/phial3/rsmpeg", branch = "ffmpeg9", default-features = false }
 
 [dev-dependencies]
+anyhow = "1.0"
 libc = "0.2"
 camino = "1.2"
 chrono = "0.4"

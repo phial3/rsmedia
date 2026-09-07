@@ -2,7 +2,7 @@
 mod common;
 use anyhow::{Context, Result, anyhow};
 use common::test_output_path;
-use rsmedia::{EncoderBuilder, utils};
+use rsmedia::{EncoderBuilder, strutils};
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext},
     avutil::{AVFrame, opt_set, ra},
@@ -134,7 +134,7 @@ const COMMON_VIDEO_CONTAINERS: &[(&str, &str)] = &[
 fn encode_video_container(container_type: &str, codec_name: &str) -> Result<()> {
     // 编码器是否存在取决于 FFmpeg 编译配置（如 libx264、libtheora），
     // 缺失时跳过该容器而不是失败
-    if AVCodec::find_encoder_by_name(&utils::from_str(codec_name)).is_none() {
+    if AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)).is_none() {
         anyhow::bail!("encoder {codec_name} not available in this FFmpeg build");
     }
 

@@ -1,11 +1,10 @@
+use crate::error::{Context, Result, RsmediaError};
 use crate::{PixelFormat, SampleFormat, imgutils, time};
 
 use rsmpeg::avutil::{AVFrame, AVSamples};
 use rsmpeg::ffi;
 use rsmpeg::swresample::SwrContext;
 use rsmpeg::swscale::SwsContext;
-
-use anyhow::{Context, Error, Result};
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////// Video Scaler SwsContext ////////////////////////////////////////////
@@ -143,7 +142,9 @@ pub fn scale_with_flags(
     scaler_algo: ScaleAlgorithm,
 ) -> Result<AVFrame> {
     if !src_frame.hw_frames_ctx.is_null() {
-        anyhow::bail!("Hardware frames are not supported in this software scalar");
+        return Err(RsmediaError::unsupported(
+            "Hardware frames are not supported in this software scalar",
+        ));
     }
 
     let mut dst_frame = AVFrame::new();
@@ -170,7 +171,9 @@ pub fn scale_with_flags(
         ffi::sws_scale_frame(sws_ctx.as_mut_ptr(), dst_frame_ptr, src_frame.as_ptr())
     };
     if ret < 0 {
-        return Err(Error::msg(format!("Failed to scale frame, ret: {ret}")));
+        return Err(RsmediaError::custom(format!(
+            "Failed to scale frame, ret: {ret}"
+        )));
     }
 
     log::debug!(
@@ -221,14 +224,16 @@ pub fn convert(
     out_sample_rate: i32,
 ) -> Result<AVSamples> {
     if !src_frame.hw_frames_ctx.is_null() {
-        anyhow::bail!("Hardware frames are not supported in this software re-sampler");
+        return Err(RsmediaError::unsupported(
+            "Hardware frames are not supported in this software re-sampler",
+        ));
     }
 
     if src_frame.sample_rate < 1 || src_frame.nb_samples < 1 {
-        return Err(Error::msg("Invalid input frame."));
+        return Err(RsmediaError::custom("Invalid input frame."));
     }
 
-    let mut swr_ctx = setup_resampler(
+    let mut resampler = Resampler::new(
         src_frame.ch_layout,
         src_frame.format,
         src_frame.sample_rate,
@@ -238,29 +243,7 @@ pub fn convert(
     )
     .context("Failed to create resample context.")?;
 
-    let mut output_samples = AVSamples::new(
-        out_ch_layout.nb_channels,
-        src_frame.nb_samples,
-        out_sample_fmt,
-        0,
-    )
-    .context("Create samples buffer failed.")?;
-
-    let ret = unsafe {
-        swr_ctx
-            .convert(
-                output_samples.audio_data.as_mut_ptr(),
-                output_samples.nb_samples,
-                src_frame.extended_data as *const _,
-                src_frame.nb_samples,
-            )
-            .context("Could not convert input samples")?
-    };
-    if ret < 0 {
-        return Err(Error::msg(format!(
-            "Failed to convert input samples, ret: {ret}"
-        )));
-    }
+    let samples = resampler.convert(src_frame, out_ch_layout, out_sample_fmt)?;
 
     log::debug!(
         "Swr convert from src:[{}, {:?}, {}] to dst:[{}, {:?}, {}]",
@@ -272,7 +255,7 @@ pub fn convert(
         out_sample_rate
     );
 
-    Ok(output_samples)
+    Ok(samples)
 }
 
 /// Audio resampling frame
@@ -287,22 +270,23 @@ pub fn convert_frame(
     out_sample_rate: i32,
 ) -> Result<AVFrame> {
     if !src_frame.hw_frames_ctx.is_null() {
-        anyhow::bail!("Hardware frames are not supported in this software re-sampler");
+        return Err(RsmediaError::unsupported(
+            "Hardware frames are not supported in this software re-sampler",
+        ));
     }
 
     if src_frame.sample_rate < 1 || src_frame.nb_samples < 1 {
-        return Err(Error::msg("Invalid input frame."));
+        return Err(RsmediaError::custom("Invalid input frame."));
     }
 
-    let swr_ctx = setup_resampler(
+    let mut resampler = Resampler::new(
         src_frame.ch_layout,
         src_frame.format,
         src_frame.sample_rate,
         out_ch_layout,
         out_sample_fmt,
         out_sample_rate,
-    )
-    .context("Failed to create resample context.")?;
+    )?;
 
     let mut dst_frame = AVFrame::new();
     // copy props
@@ -314,7 +298,7 @@ pub fn convert_frame(
     // 但 FFmpeg 不会自动扩大已分配的输出缓冲（只把放不下的部分存入内部 FIFO），
     // 若这里 mb_samples 设得过小，将导致 swr_convert 越界写。
     // 用 swr_get_out_samples() 得到所需输出样本数的上界来分配缓冲。
-    let out_samples = swr_ctx.get_out_samples(src_frame.nb_samples).max(1);
+    let out_samples = resampler.get_out_samples(src_frame.nb_samples).max(1);
     dst_frame.set_nb_samples(out_samples);
     dst_frame.set_sample_rate(out_sample_rate);
     dst_frame.set_time_base(time::new_rational(1, out_sample_rate));
@@ -327,8 +311,8 @@ pub fn convert_frame(
     // 如果输出 AVFrame 没有分配数据指针，则将在调用 av_frame_get_buffer() 分配帧时设置 nb_samples 字段。
     // 输出的 AVFrame 可以是 NULL，或者分配的样本少于所需的数量。在这种情况下，未写入输出的剩余样本将被添加到内部 FIFO 缓冲区，在下次调用此函数或 swr_convert() 时返回。
     // 如果转换采样率，内部重采样延迟缓冲区中可能会有剩余数据。要以输出方式获取这些数据，请调用此函数或 swr_convert()，并输入 NULL。
-    swr_ctx
-        .convert_frame(Some(src_frame), &mut dst_frame)
+    resampler
+        .convert_frame(src_frame, &mut dst_frame)
         .context("Failed to convert frame.")?;
 
     log::debug!(
@@ -344,11 +328,120 @@ pub fn convert_frame(
     Ok(dst_frame)
 }
 
+/// Persistent streaming resampler.
+///
+/// Unlike [`convert_frame`] (which creates a temporary context on each call),
+/// `Resampler` holds a reusable `SwrContext` for continuous streaming input:
+/// when resampling (different input/output sample rates), the internal filter
+/// delay buffers samples between calls and outputs them with subsequent data;
+/// at the end, [`Resampler::flush`] must be called to drain the tail, otherwise
+/// the last few milliseconds of samples will be lost.
+pub struct Resampler {
+    swr: SwrContext,
+}
+
+impl Resampler {
+    pub fn new(
+        in_ch_layout: ffi::AVChannelLayout,
+        in_sample_fmt: ffi::AVSampleFormat,
+        in_sample_rate: i32,
+        out_ch_layout: ffi::AVChannelLayout,
+        out_sample_fmt: ffi::AVSampleFormat,
+        out_sample_rate: i32,
+    ) -> Result<Self> {
+        Ok(Self {
+            swr: setup_resampler(
+                in_ch_layout,
+                in_sample_fmt,
+                in_sample_rate,
+                out_ch_layout,
+                out_sample_fmt,
+                out_sample_rate,
+            )?,
+        })
+    }
+
+    /// Upper bound estimate of the number of output samples for the given number of input samples.
+    pub fn get_out_samples(&self, in_samples: i32) -> i32 {
+        self.swr.get_out_samples(in_samples).max(1)
+    }
+
+    /// Convert an input frame into an output frame with allocated buffer
+    /// (persistent context: samples that cannot be written due to insufficient
+    /// output capacity remain internally buffered and are returned with subsequent calls).
+    ///
+    /// The caller must set format/layout/sample_rate/nb_samples on `dst` and
+    /// call `alloc_buffer`; after conversion, `dst.nb_samples` is the actual
+    /// number of output samples.
+    pub fn convert_frame(&mut self, src: &AVFrame, dst: &mut AVFrame) -> Result<()> {
+        self.swr
+            .convert_frame(Some(src), dst)
+            .context("Failed to convert frame with streaming resampler")
+    }
+
+    /// Raw sample conversion (direct `swr_convert` wrapper), for caller-managed
+    /// sample buffers such as [`AVSamples`].
+    ///
+    /// Returns the number of samples output per channel; a negative value has
+    /// been mapped to an error. Returns 0 when the input sample count is > 0,
+    /// indicating that the conversion result is temporarily buffered inside swr
+    /// (possible during resampling) and will be output along with subsequent inputs.
+    ///
+    /// # Safety
+    ///
+    /// The buffers pointed to by `out`/`in_` and their sample counts must satisfy
+    /// the validity requirements of `swr_convert`.
+    pub fn convert(
+        &mut self,
+        src_frame: &AVFrame,
+        out_ch_layout: ffi::AVChannelLayout,
+        out_sample_fmt: ffi::AVSampleFormat,
+    ) -> Result<AVSamples> {
+        let mut out_samples = AVSamples::new(
+            out_ch_layout.nb_channels,
+            src_frame.nb_samples,
+            out_sample_fmt,
+            0,
+        )
+        .context("Create samples buffer failed.")?;
+
+        let ret = unsafe {
+            self.swr
+                .convert(
+                    out_samples.audio_data.as_mut_ptr(),
+                    out_samples.nb_samples,
+                    src_frame.extended_data as *const _,
+                    src_frame.nb_samples,
+                )
+                .context("Could not convert input samples")?
+        };
+
+        if ret < 0 {
+            return Err(RsmediaError::custom(format!(
+                "Failed to convert input samples, ret: {ret}"
+            )));
+        }
+
+        Ok(out_samples)
+    }
+
+    /// Drain the remaining samples from the resampler (EOF flush).
+    ///
+    /// `dst` must already have an allocated buffer; after conversion,
+    /// `dst.nb_samples` is the actual number of samples obtained (possibly 0).
+    /// Repeat the call until 0 is returned to fully drain.
+    pub fn flush(&mut self, dst: &mut AVFrame) -> Result<()> {
+        self.swr
+            .convert_frame(None, dst)
+            .context("Failed to flush streaming resampler")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{Context, Result};
     use crate::{SampleFormat, time};
-    use anyhow::{Context, Result};
     use rsmpeg::avutil::AVChannelLayout;
     use rsmpeg::ffi;
 
@@ -483,7 +576,7 @@ mod tests {
             ffi::AV_SAMPLE_FMT_S64 | ffi::AV_SAMPLE_FMT_S64P => {
                 fill_samples!(i64, i64::MAX)
             }
-            _ => return Err(Error::msg("Unsupported sample format")),
+            _ => return Err(RsmediaError::custom("Unsupported sample format")),
         }
         Ok(())
     }

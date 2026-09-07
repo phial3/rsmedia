@@ -1,7 +1,7 @@
+use crate::error::{Result, RsmediaError};
+
 use rsmpeg::avutil::AVPixFmtDescriptorRef;
 use rsmpeg::ffi;
-
-use anyhow::{Error, Result};
 
 /// Number of pixel formats
 /// DO NOT USE THIS if you want to link with shared libav* because the number of formats might differ between versions
@@ -1249,7 +1249,7 @@ impl PixelFormat {
     /// 获取像素格式描述符；未知/无效格式返回错误而非 panic。
     pub fn descriptor(&self) -> Result<AVPixFmtDescriptorRef> {
         AVPixFmtDescriptorRef::get((*self).into()).ok_or_else(|| {
-            Error::msg(format!(
+            RsmediaError::custom(format!(
                 "No pix_fmt descriptor for {}",
                 self.get_pix_fmt_name()
             ))
@@ -1272,7 +1272,9 @@ impl PixelFormat {
     pub fn count_planes(&self) -> Result<i32> {
         let cnt = unsafe { ffi::av_pix_fmt_count_planes((*self).into()) };
         if cnt < 0 {
-            return Err(Error::msg(format!("Failed to get plane count:{cnt}")));
+            return Err(RsmediaError::custom(format!(
+                "Failed to get plane count:{cnt}"
+            )));
         }
         Ok(cnt)
     }
@@ -1299,7 +1301,9 @@ pub fn find_best_pix_fmt(
     };
 
     match PixelFormat::from(flags) {
-        PixelFormat::NONE => Err(Error::msg(format!("Failed to find best pix fmt:{flags}"))),
+        PixelFormat::NONE => Err(RsmediaError::custom(format!(
+            "Failed to find best pix fmt:{flags}"
+        ))),
         fmt => Ok(fmt),
     }
 }
@@ -1323,7 +1327,7 @@ pub fn find_codec_best_pix_fmt(
         )
     };
     if ret < 0 {
-        return Err(Error::msg(format!(
+        return Err(RsmediaError::custom(format!(
             "Failed to find codec best pix fmt, ret: {ret}"
         )));
     }
@@ -1349,7 +1353,7 @@ pub fn get_pix_fmt_loss(
     };
 
     if loss < 0 {
-        return Err(Error::msg(format!(
+        return Err(RsmediaError::custom(format!(
             "Failed to get pix fmt loss, ret: {loss}"
         )));
     }

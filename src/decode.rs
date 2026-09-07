@@ -1,5 +1,6 @@
+use crate::codec::AvCodecFlags;
+use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
-use crate::flags::AvCodecFlags;
 #[cfg(feature = "ndarray")]
 use crate::frame::{MediaFrame, MediaFrameType};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
@@ -7,15 +8,15 @@ use crate::io::Reader;
 use crate::options::Options;
 use crate::resize::Resize;
 use crate::stream::StreamInfo;
-use crate::swctx::ScaleAlgorithm;
-use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time, swctx, utils};
+use crate::strutils;
+use crate::swctx::{self, ScaleAlgorithm};
+use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
 use rsmpeg::avformat::AVStream;
 use rsmpeg::avutil::{self, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
 
-use anyhow::{Context, Error, Result};
 use std::sync::Arc;
 
 /// Builds a [`Decoder`].
@@ -115,7 +116,7 @@ impl DecoderBuilder {
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
-            return Err(Error::msg(format!(
+            return Err(RsmediaError::custom(format!(
                 "Decoder codec type not supported: {:?} vs. {:?}",
                 media_type, decoder.codec_type
             )));
@@ -176,11 +177,14 @@ impl DecoderBuilder {
     pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
-        let input_stream = reader
-            .input()
-            .streams()
-            .get(stream_index)
-            .ok_or(Error::msg(format!("stream: {stream_index} not found!")))?;
+        let input_stream =
+            reader
+                .input()
+                .streams()
+                .get(stream_index)
+                .ok_or(RsmediaError::custom(format!(
+                    "stream: {stream_index} not found!"
+                )))?;
 
         let codec = {
             let codec_name = if let Some(ref codec_name) = self.codec_name {
@@ -188,7 +192,7 @@ impl DecoderBuilder {
             } else {
                 codec_name.as_str()
             };
-            AVCodec::find_decoder_by_name(&utils::from_str(codec_name))
+            AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name))
                 .context(format!("Failed to find decoder by name: '{codec_name}'"))?
         };
 
@@ -218,8 +222,8 @@ impl DecoderBuilder {
                     .device_type
                     .find_hw_pixel_format_with_codec(&codec)
                     .ok_or_else(|| {
-                        let codec_name = utils::to_string(codec.name()).unwrap();
-                        Error::msg(format!(
+                        let codec_name = strutils::cstr_to_string(codec.name()).unwrap();
+                        RsmediaError::custom(format!(
                             "Decoder with HW acceleration is not supported for codec: {codec_name}"
                         ))
                     })?;
@@ -242,7 +246,7 @@ impl DecoderBuilder {
             })
             .transpose()?;
 
-        let dict = self.codec_opts.map(|opts| opts.into_dict());
+        let dict = self.codec_opts.and_then(|opts| opts.into_dict());
         decode_ctx
             .open(dict)
             .context("Failed to open decoder for stream")?;
@@ -256,6 +260,8 @@ impl DecoderBuilder {
                     FilterParams::Video(VideoParams {
                         width: init_width,
                         height: init_height,
+                        // 解码器输出已统一为 YUV420P，滤镜图 src/sink 同格式
+                        src_format: PixelFormat::YUV420P,
                         format: PixelFormat::YUV420P, // 确保视频帧 filter 的输入格式是 YUV420P
                         time_base: decode_ctx.time_base,
                         frame_rate: decode_ctx.framerate,
@@ -266,6 +272,7 @@ impl DecoderBuilder {
                     nb_channels: decode_ctx.ch_layout.nb_channels,
                     sample_rate: decode_ctx.sample_rate,
                     format: SampleFormat::from(decode_ctx.sample_fmt),
+                    src_format: SampleFormat::from(decode_ctx.sample_fmt),
                     time_base: decode_ctx.time_base,
                 }),
                 _ => panic!("Unsupported filter for media type: {media_type:?}"),
@@ -274,7 +281,7 @@ impl DecoderBuilder {
             let mut graph = FilterGraph::new();
             // 验证 Filter 链的媒体类型是否与当前流匹配
             if !filters.iter().all(|f| f.media_type() == media_type) {
-                return Err(Error::msg(format!(
+                return Err(RsmediaError::custom(format!(
                     "Filter media type mismatch for stream type {media_type:?}"
                 )));
             }
@@ -472,7 +479,7 @@ impl Decoder {
         T: MediaFrameType,
     {
         if self.is_complete() {
-            return Err(Error::msg(
+            return Err(RsmediaError::custom(
                 "Decoder cannot decode after flushed. Call reset().",
             ));
         }
@@ -481,10 +488,10 @@ impl Decoder {
         Ok(loop {
             if !read_exhausted {
                 match reader.read_packet() {
-                    Ok(Some((stream, packet))) => {
-                        if stream.index() != self.stream_index() {
+                    Ok(Some((stream_index, packet))) => {
+                        if stream_index != self.stream_index() {
                             // skip other streams
-                            log::trace!("skip stream index: {}, {:?}", stream.index(), packet);
+                            log::trace!("skip stream index: {}, {:?}", stream_index, packet);
                             continue;
                         }
                         if let Some(frame) = self.decode_packet(&packet)? {
@@ -528,9 +535,13 @@ impl Decoder {
         })
     }
 
-    /// Decode a single frame as a `MediaFrame<u8>` (video) or `MediaFrame<f32>` (audio).
+    /// Decode a single frame as a `MediaFrame<u8>`.
     ///
-    /// Convenience for `decode::<u8>()` which is the common video path.
+    /// Convenience for `decode::<u8>()` which is the common video path
+    /// (8-bit formats such as YUV420P/RGB24). For audio the sample type must
+    /// match the codec's native sample format size — use `decode::<f32>()`
+    /// for FLTP/FLT output or [`decode_raw`](Self::decode_raw) to avoid the
+    /// typed conversion entirely.
     ///
     /// # Return value
     ///
@@ -554,7 +565,7 @@ impl Decoder {
         R: Reader,
     {
         if self.is_complete() {
-            return Err(Error::msg(
+            return Err(RsmediaError::custom(
                 "Decoder cannot decode after flushed. Call reset().",
             ));
         }
@@ -563,10 +574,10 @@ impl Decoder {
         Ok(loop {
             if !read_exhausted {
                 match reader.read_packet() {
-                    Ok(Some((stream, packet))) => {
-                        if stream.index() != self.stream_index() {
+                    Ok(Some((stream_index, packet))) => {
+                        if stream_index != self.stream_index() {
                             // skip other streams
-                            log::trace!("skip stream index: {}, {:?}", stream.index(), packet);
+                            log::trace!("skip stream index: {}, {:?}", stream_index, packet);
                             continue;
                         }
                         if let Some(frame) = self.decode_raw_packet(&packet)? {
@@ -786,7 +797,9 @@ impl Decoder {
                         .compute_for((sw_frame.width as u32, sw_frame.height as u32))
                         .ok_or_else(|| {
                             let (w, h) = (sw_frame.width, sw_frame.height);
-                            Error::msg(format!("Cannot resize frame {w}x{h} into {resize:?}"))
+                            RsmediaError::custom(format!(
+                                "Cannot resize frame {w}x{h} into {resize:?}"
+                            ))
                         })?,
                     None => (sw_frame.width as u32, sw_frame.height as u32),
                 };
@@ -857,7 +870,7 @@ impl Decoder {
             }
             Err(e) => {
                 log::warn!("Failed to receive frame from decoder: {e}");
-                Err(Error::new(e))
+                Err(RsmediaError::from(e))
             }
         }
     }
@@ -1015,7 +1028,9 @@ impl<R: Reader> DecoderWrapper<R> {
                 .seek_to_timestamp(timestamp_milliseconds)
                 .inspect(|_| self.decoder.flush())
         } else {
-            Err(Error::msg("Seek is only supported for StreamReader"))
+            Err(RsmediaError::custom(
+                "Seek is only supported for StreamReader",
+            ))
         }
     }
 
@@ -1033,7 +1048,7 @@ impl<R: Reader> DecoderWrapper<R> {
                 )
                 .inspect(|_| self.decoder.flush())
         } else {
-            Err(Error::msg(
+            Err(RsmediaError::custom(
                 "Seek to frame is only supported for StreamReader",
             ))
         }
@@ -1049,7 +1064,7 @@ impl<R: Reader> DecoderWrapper<R> {
                 .seek_to_start()
                 .inspect(|_| self.decoder.flush())
         } else {
-            Err(Error::msg(
+            Err(RsmediaError::custom(
                 "Seek to start is only supported for StreamReader",
             ))
         }

@@ -1,16 +1,55 @@
+use crate::error::{Context, Result, RsmediaError};
 use crate::filter::Filter;
-use crate::flags::MediaType;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, Writer};
+use crate::stream::MediaType;
 use crate::stream::StreamInfo;
-use crate::{Decoder, DecoderBuilder, Encoder, Location, StreamReader, StreamWriter};
+use crate::{
+    Decoder, DecoderBuilder, Encoder, EncoderBuilder, Location, StreamReader, StreamWriter,
+};
 
-use rsmpeg::avutil::AVFrame;
-
-use anyhow::{Context, Error, Result};
 use dashmap::DashMap;
+use rsmpeg::avutil::AVFrame;
+use rsmpeg::ffi;
+
 use std::collections::HashMap;
+use std::ffi::CStr;
+use std::ptr;
 use std::sync::Arc;
+
+/// A container chapter mark (MP4/MKV chapters), with times in seconds.
+///
+/// Chapter times are stored internally on a millisecond time base (1/1000),
+/// matching what `ffmetadata` and most container tooling use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chapter {
+    /// Unique chapter id; `0` means auto-assign sequential ids (0, 1, 2, ...)
+    /// when the header is written.
+    pub id: i64,
+    /// Human-readable chapter title, stored as the chapter's `title` metadata.
+    pub title: String,
+    /// Chapter start time in seconds.
+    pub start: f64,
+    /// Chapter end time in seconds (exclusive).
+    pub end: f64,
+}
+
+impl Chapter {
+    /// Creates a chapter with an auto-assigned id.
+    pub fn new(title: impl Into<String>, start: f64, end: f64) -> Self {
+        Self {
+            id: 0,
+            title: title.into(),
+            start,
+            end,
+        }
+    }
+
+    /// Returns the chapter duration in seconds.
+    pub fn duration(&self) -> f64 {
+        (self.end - self.start).max(0.0)
+    }
+}
 
 /// Represents a muxer. A muxer allows muxing media packets into a new container format. Muxing does
 /// not require encoding and/or decoding.
@@ -52,6 +91,15 @@ pub struct Muxer<W: Writer> {
     interleaved: bool,
     have_written_header: bool,
     have_written_trailer: bool,
+    /// Container-level metadata (e.g. "title", "artist"), applied to the
+    /// format context right before the header is written.
+    metadata: HashMap<String, String>,
+    /// Per-stream metadata (e.g. "language"), keyed by the output stream
+    /// index returned from [`Muxer::add_stream`], applied right before the
+    /// header is written.
+    stream_metadata: HashMap<usize, HashMap<String, String>>,
+    /// Container chapters, applied right before the header is written.
+    chapters: Vec<Chapter>,
 }
 
 pub struct MuxerStream {
@@ -89,6 +137,9 @@ impl<W: Writer> Muxer<W> {
             interleaved: false,
             have_written_header: false,
             have_written_trailer: false,
+            metadata: HashMap::new(),
+            stream_metadata: HashMap::new(),
+            chapters: Vec::new(),
         }
     }
 
@@ -111,14 +162,292 @@ impl<W: Writer> Muxer<W> {
         self.streams
             .iter()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| Error::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut MuxerStream> {
         self.streams
             .iter_mut()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| Error::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
+    }
+
+    /// Sets a container-level metadata entry, e.g. `title`, `artist`,
+    /// `comment`. Applied when the container header is written, i.e. before
+    /// the first [`Self::mux`] call; entries set after the header is written
+    /// are ignored (with a warning).
+    ///
+    /// Keys and values must not contain interior NUL bytes.
+    pub fn set_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<&mut Self> {
+        let (key, value) = validate_metadata_pair(key, value)?;
+        if self.have_written_header {
+            log::warn!("set_metadata({key:?}) after header write has no effect");
+        }
+        self.metadata.insert(key, value);
+        Ok(self)
+    }
+
+    /// Sets a per-stream metadata entry for the stream with index returned
+    /// from [`Self::add_stream`]. The common case is `language` with an
+    /// ISO 639-2 code ("chi", "eng", "und", ...), which players use to pick
+    /// audio/subtitle tracks.
+    ///
+    /// Applied when the container header is written; keys and values must not
+    /// contain interior NUL bytes.
+    pub fn set_stream_metadata(
+        &mut self,
+        stream_index: usize,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<&mut Self> {
+        let (key, value) = validate_metadata_pair(key, value)?;
+        let nb_streams = self.writer.output().nb_streams as usize;
+        if stream_index >= nb_streams {
+            return Err(RsmediaError::invalid_config(format!(
+                "stream index {stream_index} out of range (nb_streams={nb_streams})"
+            )));
+        }
+        if self.have_written_header {
+            log::warn!(
+                "set_stream_metadata({stream_index}, {key:?}) after header write has no effect"
+            );
+        }
+        self.stream_metadata
+            .entry(stream_index)
+            .or_default()
+            .insert(key, value);
+        Ok(self)
+    }
+
+    /// Applies container-level and per-stream metadata to the raw format
+    /// context.
+    ///
+    /// Must be called exactly once, immediately before `write_header`, as
+    /// FFmpeg only reads metadata during `avformat_write_header`. rsmpeg
+    /// exposes output streams only immutably (`AVStreamRef`), so the raw
+    /// stream array is accessed here instead; this is sound because the
+    /// writer exclusively owns the context and no streams are added after
+    /// this point.
+    fn apply_metadata(&mut self) {
+        if self.metadata.is_empty() && self.stream_metadata.is_empty() {
+            return;
+        }
+        let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
+
+        for (key, value) in &self.metadata {
+            let (k, v) = (
+                crate::strutils::str_to_cstring(key),
+                crate::strutils::str_to_cstring(value),
+            );
+            let ret = unsafe { ffi::av_dict_set(&mut ctx.metadata, k.as_ptr(), v.as_ptr(), 0) };
+            if ret < 0 {
+                log::warn!("av_dict_set({key:?}) failed: {ret}");
+            }
+        }
+
+        let streams =
+            unsafe { std::slice::from_raw_parts_mut(ctx.streams, ctx.nb_streams as usize) };
+        for (idx, entries) in &self.stream_metadata {
+            let Some(stream) = streams.get_mut(*idx) else {
+                log::warn!(
+                    "stream metadata: index {idx} out of range (nb_streams={})",
+                    ctx.nb_streams
+                );
+                continue;
+            };
+            for (key, value) in entries {
+                let (k, v) = (
+                    crate::strutils::str_to_cstring(key),
+                    crate::strutils::str_to_cstring(value),
+                );
+                let ret = unsafe {
+                    ffi::av_dict_set(&mut (**stream).metadata, k.as_ptr(), v.as_ptr(), 0)
+                };
+                if ret < 0 {
+                    log::warn!("av_dict_set(stream {idx}, {key:?}) failed: {ret}");
+                }
+            }
+        }
+    }
+
+    /// Adds a container chapter. Chapters are written when the container
+    /// header is written, i.e. before the first [`Self::mux`] call; chapters
+    /// added after the header is written are ignored (with a warning).
+    ///
+    /// Times are in seconds; internally stored on a millisecond time base.
+    /// Requires a container with chapter support (MP4, MKV, ...).
+    pub fn add_chapter(&mut self, chapter: Chapter) -> Result<&mut Self> {
+        if self.have_written_header {
+            log::warn!(
+                "add_chapter({:?}) after header write has no effect",
+                chapter.title
+            );
+        }
+        if chapter.start < 0.0 {
+            return Err(RsmediaError::invalid_config(format!(
+                "chapter start must be >= 0, got {}",
+                chapter.start
+            )));
+        }
+        if chapter.end <= chapter.start {
+            return Err(RsmediaError::invalid_config(format!(
+                "chapter end ({}) must be greater than start ({})",
+                chapter.end, chapter.start
+            )));
+        }
+        let (_, title) = validate_metadata_pair("title", chapter.title.clone())?;
+        self.chapters.push(Chapter {
+            id: chapter.id,
+            title,
+            start: chapter.start,
+            end: chapter.end,
+        });
+        Ok(self)
+    }
+
+    /// Adds a cover-art (attached picture) stream using the MP4/MKV default
+    /// `mjpeg` codec. See [`Self::add_cover_art_with`] for details; use that
+    /// method instead when a custom cover codec (e.g. `png`) is needed.
+    ///
+    /// Returns the output stream index of the cover stream.
+    pub fn add_cover_art(&mut self, cover_frame: AVFrame) -> Result<usize> {
+        let width = cover_frame.width as usize;
+        let height = cover_frame.height as usize;
+        let encoder = EncoderBuilder::new_video(width, height)
+            .with_codec_name("mjpeg".to_string())
+            .build()?;
+        self.add_cover_art_with(encoder, cover_frame)
+    }
+
+    /// Adds a cover-art (attached picture) stream: `cover_frame` is encoded
+    /// with `encoder` (typically `mjpeg` or `png`) into a dedicated video
+    /// stream marked with `AV_DISPOSITION_ATTACHED_PIC`, which MP4 writes as
+    /// the `covr` atom and MKV as an attachment.
+    ///
+    /// The stream is marked and the frame muxed immediately, so this must be
+    /// called after all primary streams are added (the header is written on
+    /// the first mux) and before any regular [`Self::mux`] call. Returns the
+    /// output stream index of the cover stream.
+    pub fn add_cover_art_with(&mut self, encoder: Encoder, cover_frame: AVFrame) -> Result<usize> {
+        if self.have_written_header {
+            return Err(RsmediaError::invalid_config(
+                "add_cover_art after header write is not supported",
+            ));
+        }
+        let stream_idx = self.add_stream(encoder)?;
+
+        // Mark the stream as an attached picture. rsmpeg only exposes the
+        // output stream array immutably, so the raw stream array is accessed
+        // here instead; sound because the writer exclusively owns the context
+        // and the disposition must be set before `write_header`.
+        let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
+        let streams =
+            unsafe { std::slice::from_raw_parts_mut(ctx.streams, ctx.nb_streams as usize) };
+        let Some(stream) = streams.get_mut(stream_idx) else {
+            return Err(RsmediaError::custom(format!(
+                "cover art stream index {stream_idx} out of range (nb_streams={})",
+                ctx.nb_streams
+            )));
+        };
+        unsafe {
+            (**stream).disposition |= ffi::AV_DISPOSITION_ATTACHED_PIC as i32;
+        }
+
+        // The cover must have a valid pts so the muxer timestamps it correctly.
+        let mut cover_frame = cover_frame;
+        if cover_frame.pts == ffi::AV_NOPTS_VALUE {
+            cover_frame.set_pts(0);
+        }
+        self.mux(cover_frame, stream_idx)?;
+        Ok(stream_idx)
+    }
+
+    /// Writes the pending [`Chapter`] list into the raw format context.
+    ///
+    /// Must be called exactly once, immediately before `write_header`, as
+    /// FFmpeg requires `nb_chapters` to be initialized before the header is
+    /// written. Chapters are allocated with `av_mallocz` and ownership is
+    /// transferred to the format context, which frees them in
+    /// `avformat_free_context`.
+    fn apply_chapters(&mut self) {
+        if self.chapters.is_empty() {
+            return;
+        }
+        let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
+
+        let count = self.chapters.len();
+        let chapters_ptr = unsafe {
+            ffi::av_calloc(count, std::mem::size_of::<*mut ffi::AVChapter>())
+                as *mut *mut ffi::AVChapter
+        };
+        if chapters_ptr.is_null() {
+            log::error!("av_calloc for {count} chapters failed; chapters are dropped");
+            return;
+        }
+
+        for (i, chapter) in self.chapters.iter().enumerate() {
+            // Millisecond time base: times are stored as whole milliseconds.
+            let start_ms = (chapter.start * 1000.0).round() as i64;
+            let end_ms = (chapter.end * 1000.0).round() as i64;
+            let chapter_ptr = unsafe {
+                ffi::av_mallocz(std::mem::size_of::<ffi::AVChapter>()) as *mut ffi::AVChapter
+            };
+            if chapter_ptr.is_null() {
+                log::error!("av_mallocz for chapter {i} failed; chapter is dropped");
+                continue;
+            }
+            unsafe {
+                (*chapter_ptr).id = if chapter.id != 0 {
+                    chapter.id
+                } else {
+                    i as i64
+                };
+                (*chapter_ptr).time_base = ffi::AVRational { num: 1, den: 1000 };
+                (*chapter_ptr).start = start_ms;
+                (*chapter_ptr).end = end_ms;
+                let title = crate::strutils::str_to_cstring(&chapter.title);
+                ffi::av_dict_set(
+                    &mut (*chapter_ptr).metadata,
+                    c"title".as_ptr(),
+                    title.as_ptr(),
+                    0,
+                );
+                *chapters_ptr.add(i) = chapter_ptr;
+            }
+        }
+
+        ctx.chapters = chapters_ptr;
+        ctx.nb_chapters = count as u32;
+    }
+
+    /// Refreshes cached [`StreamInfo`] for every stream after the header is
+    /// written.
+    ///
+    /// Muxers may adjust stream parameters inside `avformat_write_header` —
+    /// most notably the time base (e.g. the GIF muxer forces `1/100`,
+    /// MP4 applies its movie timescale). Packet timestamps must be rescaled to
+    /// the *post-header* stream time base, so the cached pre-header value
+    /// cannot be used for `rescale_ts`.
+    fn refresh_stream_info(&mut self) -> Result<()> {
+        for mux_stream in self.streams.iter_mut() {
+            let stream_info = StreamInfo::from_writer(&self.writer, mux_stream.stream_index)?;
+            let tb_changed = stream_info.time_base.num != mux_stream.stream_info.time_base.num
+                || stream_info.time_base.den != mux_stream.stream_info.time_base.den;
+            if tb_changed {
+                log::debug!(
+                    "Muxer changed stream {} time_base: {:?} -> {:?}",
+                    mux_stream.stream_index,
+                    mux_stream.stream_info.time_base,
+                    stream_info.time_base
+                );
+                mux_stream.stream_info = stream_info;
+            }
+        }
+        Ok(())
     }
 
     /// Mux a single packet. This will mux a single packet.
@@ -152,7 +481,10 @@ impl<W: Writer> Muxer<W> {
             Ok(last_out)
         } else {
             self.have_written_header = true;
+            self.apply_metadata();
+            self.apply_chapters();
             self.writer.write_header()?;
+            self.refresh_stream_info()?;
             self.mux(frame, stream_idx)
         }
     }
@@ -191,6 +523,23 @@ impl<W: Writer> Muxer<W> {
 
 unsafe impl<W: Writer> Send for Muxer<W> {}
 unsafe impl<W: Writer> Sync for Muxer<W> {}
+
+/// Validates a metadata key/value pair: rejects interior NUL bytes, which
+/// cannot be represented in the C strings handed to `av_dict_set`.
+fn validate_metadata_pair(
+    key: impl Into<String>,
+    value: impl Into<String>,
+) -> Result<(String, String)> {
+    let (key, value) = (key.into(), value.into());
+    for (what, s) in [("key", &key), ("value", &value)] {
+        if s.contains('\0') {
+            return Err(RsmediaError::invalid_config(format!(
+                "metadata {what} contains interior NUL byte: {s:?}"
+            )));
+        }
+    }
+    Ok((key, value))
+}
 
 impl<W: Writer> Drop for Muxer<W> {
     fn drop(&mut self) {
@@ -262,7 +611,16 @@ impl<R: Reader> Demuxer<R> {
             let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
             let media_type = stream_info.media_type;
             // auto detect hardware acceleration decoder codec
-            let codec_name = stream_info.find_decoder_name(device_type);
+            let Some(codec_name) = stream_info.find_decoder_name(device_type) else {
+                // Streams without a registered decoder (chapter tracks,
+                // attached pictures, binary data, ...) are skipped instead of
+                // failing the whole demuxer.
+                log::debug!(
+                    "Skipping stream {stream_idx}: no decoder for codec_id {:#x}",
+                    stream_info.codec_id
+                );
+                continue;
+            };
             let decoder = DecoderBuilder::new(media_type)
                 .with_codec_name(codec_name)
                 .with_hardware_device(device_config.clone())
@@ -284,18 +642,55 @@ impl<R: Reader> Demuxer<R> {
         &self.streams
     }
 
+    /// Reads back the container chapters (title/start/end in seconds).
+    ///
+    /// Returns an empty list for containers without chapter support.
+    pub fn chapters(&self) -> Vec<Chapter> {
+        let input = self.reader.input();
+        let nb = input.nb_chapters as usize;
+        if nb == 0 || input.chapters.is_null() {
+            return Vec::new();
+        }
+        let mut chapters = Vec::with_capacity(nb);
+        let raw = unsafe { std::slice::from_raw_parts(input.chapters, nb) };
+        for &c in raw {
+            if c.is_null() {
+                continue;
+            }
+            unsafe {
+                let title_entry =
+                    ffi::av_dict_get((*c).metadata, c"title".as_ptr(), ptr::null(), 0);
+                let title = if title_entry.is_null() {
+                    String::new()
+                } else {
+                    crate::strutils::cstr_to_string(CStr::from_ptr((*title_entry).value))
+                        .unwrap_or_default()
+                };
+                let tb = (*c).time_base;
+                let tb_secs = tb.num as f64 / tb.den as f64;
+                chapters.push(Chapter {
+                    id: (*c).id,
+                    title,
+                    start: (*c).start as f64 * tb_secs,
+                    end: (*c).end as f64 * tb_secs,
+                });
+            }
+        }
+        chapters
+    }
+
     pub fn get_stream(&self, index: usize) -> Result<&DemuxerStream> {
         self.streams
             .iter()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| Error::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut DemuxerStream> {
         self.streams
             .iter_mut()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| Error::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
     fn set_flushed(&self, stream_index: usize) {
@@ -314,13 +709,17 @@ impl<R: Reader> Demuxer<R> {
         loop {
             if !read_exhausted {
                 match self.reader.read_packet() {
-                    Ok(Some((stream, packet))) => {
-                        let stream_idx = stream.index();
-                        let demux_stream = self
+                    Ok(Some((stream_idx, packet))) => {
+                        let Some(demux_stream) = self
                             .streams
                             .iter_mut()
                             .find(|s| s.stream_index == stream_idx)
-                            .unwrap();
+                        else {
+                            // Packets of skipped streams (chapter tracks, ...)
+                            // are dropped.
+                            log::debug!("Dropping packet of undecodable stream {stream_idx}");
+                            continue;
+                        };
                         if let Some(frame) = demux_stream.decoder.decode_raw_packet(&packet)? {
                             return Ok(Some((stream_idx, frame)));
                         }
@@ -396,9 +795,9 @@ unsafe impl<R: Reader> Sync for Demuxer<R> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter, utils};
+    use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter, strutils};
 
-    use anyhow::{Context, Result};
+    use crate::error::{Context, Result};
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
     use std::path::Path;
 
@@ -483,7 +882,9 @@ mod tests {
         for ch in 0..channels {
             let data_ptr = unsafe {
                 let ptr = (*frame.as_mut_ptr()).data[ch] as *mut f32;
-                anyhow::ensure!(!ptr.is_null(), "Audio data pointer is null");
+                if ptr.is_null() {
+                    return Err(RsmediaError::custom("Audio data pointer is null"));
+                }
                 std::slice::from_raw_parts_mut(ptr, nb_samples)
             };
 
@@ -618,6 +1019,106 @@ mod tests {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// 容器级 metadata 与流级 language 标签的写入与回读验证（多轨场景）。
+    #[test]
+    fn test_mux_metadata_and_language() -> Result<()> {
+        use std::ffi::CStr;
+        use std::ptr;
+
+        let output_path = crate::test_utils::test_output_path("mux", "test_mux_metadata.mp4");
+
+        let (width, height) = (320, 240);
+        let sample_rate = 44_100;
+        let nb_samples = 1024;
+
+        let video_encoder = Encoder::new_video(width, height)?;
+        let video_time_base = video_encoder.time_base();
+        let video_frame_rate = video_encoder.frame_rate();
+        let audio_encoder = Encoder::new_audio(2, sample_rate, SampleFormat::FLTP).unwrap();
+        let audio_time_base = audio_encoder.time_base();
+
+        let mut muxer = Muxer::new(output_path.as_path())?;
+        let video_index = muxer.add_stream(video_encoder)?;
+        let audio_index = muxer.add_stream(audio_encoder)?;
+
+        // 参数校验：内嵌 NUL 与越界索引必须 fail fast
+        assert!(muxer.set_metadata("bad\0key", "v").is_err());
+        assert!(muxer.set_metadata("title", "bad\0value").is_err());
+        assert!(muxer.set_stream_metadata(99, "language", "eng").is_err());
+
+        muxer.set_metadata("title", "rsmedia metadata test")?;
+        muxer.set_metadata("artist", "rsmedia")?;
+        muxer.set_stream_metadata(video_index, "language", "und")?;
+        muxer.set_stream_metadata(audio_index, "language", "chi")?;
+
+        // 1 秒视频 + 1 秒音频（header 在首个 mux 调用时写入，metadata 届时生效）
+        for index in 0..video_frame_rate.den as i64 {
+            let mut frame = generate_video_frame(width, height, index);
+            frame.set_pts(index * video_time_base.den as i64);
+            frame.set_time_base(video_time_base);
+            muxer.mux(frame, video_index)?;
+        }
+        let mut total_samples = 0i64;
+        for _ in 0..(sample_rate / nb_samples) {
+            let mut frame =
+                generate_audio_sine_wave_frame(440.0, 2, nb_samples as usize, sample_rate)?;
+            frame.set_pts(total_samples);
+            frame.set_time_base(audio_time_base);
+            muxer.mux(frame, audio_index)?;
+            total_samples += nb_samples as i64;
+        }
+        muxer.finish()?;
+
+        // 回读验证：容器级 title/artist 与各流 language 标签
+        let reader = StreamReader::new(output_path.as_path())?;
+        let input = reader.input();
+
+        let get_str = |dict: *mut ffi::AVDictionary, key: &CStr| -> Option<String> {
+            unsafe {
+                let entry = ffi::av_dict_get(dict, key.as_ptr(), ptr::null(), 0);
+                if entry.is_null() {
+                    None
+                } else {
+                    Some(
+                        crate::strutils::cstr_to_string(CStr::from_ptr((*entry).value))
+                            .expect("metadata value is UTF8"),
+                    )
+                }
+            }
+        };
+
+        let title = get_str(input.metadata, c"title");
+        assert_eq!(
+            title.as_deref(),
+            Some("rsmedia metadata test"),
+            "container title metadata mismatch"
+        );
+
+        let artist = get_str(input.metadata, c"artist");
+        assert_eq!(artist.as_deref(), Some("rsmedia"));
+
+        let streams = input.streams();
+        let video_lang = get_str(
+            streams[video_index]
+                .metadata()
+                .map(|d| d.as_ptr() as *mut _)
+                .unwrap_or(ptr::null_mut()),
+            c"language",
+        );
+        assert_eq!(video_lang.as_deref(), Some("und"));
+
+        let audio_lang = get_str(
+            streams[audio_index]
+                .metadata()
+                .map(|d| d.as_ptr() as *mut _)
+                .unwrap_or(ptr::null_mut()),
+            c"language",
+        );
+        assert_eq!(audio_lang.as_deref(), Some("chi"));
 
         Ok(())
     }
@@ -836,23 +1337,23 @@ mod tests {
         };
 
         output
-            .dump(0, utils::from_str(output_path).as_c_str())
+            .dump(0, strutils::str_to_cstring(output_path).as_c_str())
             .context("Dump output format context failed.")?;
 
         output
             .write_header(&mut None)
             .context("Writer header failed.")?;
 
-        while let Some((in_stream, mut packet)) =
+        while let Some((input_stream_index, mut packet)) =
             input_reader.read_packet().context("Read packet failed.")?
         {
-            let input_stream_index = in_stream.index();
             let Some(output_stream_index) = stream_mapping[input_stream_index] else {
                 continue;
             };
             {
+                let in_stream = &input_reader.input().streams()[input_stream_index];
                 let output_stream = &output.streams()[output_stream_index];
-                packet.rescale_ts(in_stream.time_base(), output_stream.time_base);
+                packet.rescale_ts(in_stream.time_base, output_stream.time_base);
                 packet.set_stream_index(output_stream_index as i32);
                 packet.set_pos(-1);
             }
@@ -928,6 +1429,218 @@ mod tests {
         assert!(
             decoded > 0,
             "expected at least one decoded frame, got {decoded}"
+        );
+
+        Ok(())
+    }
+
+    /// 章节写入与回读：2 个章节按毫秒时间基写入 MP4，重开后 `Demuxer::chapters()`
+    /// 应还原标题与秒级起止时间；参数校验（start<0、end<=start、内嵌 NUL）须报错。
+    #[test]
+    fn test_mux_chapters() -> Result<()> {
+        let output_path = crate::test_utils::test_output_path("mux", "test_mux_chapters.mp4");
+
+        let (width, height) = (320, 240);
+        let video_encoder = Encoder::new_video(width, height)?;
+        let encoder_time_base = video_encoder.time_base();
+
+        let mut muxer = Muxer::new(output_path.as_path())?;
+        let video_index = muxer.add_stream(video_encoder)?;
+
+        // 参数校验 fail fast
+        assert!(muxer.add_chapter(Chapter::new("bad", -1.0, 1.0)).is_err());
+        assert!(muxer.add_chapter(Chapter::new("bad", 2.0, 1.0)).is_err());
+        assert!(
+            muxer
+                .add_chapter(Chapter::new("bad\0title", 0.0, 1.0))
+                .is_err()
+        );
+
+        muxer.add_chapter(Chapter::new("Intro", 0.0, 1.0))?;
+        muxer.add_chapter(Chapter::new("Part Two", 1.0, 2.0))?;
+
+        // 1 秒视频（30fps）
+        for index in 0..encoder_time_base.den as i64 {
+            let mut frame = generate_video_frame(width, height, index);
+            frame.set_pts(index * encoder_time_base.den as i64);
+            frame.set_time_base(encoder_time_base);
+            muxer.mux(frame, video_index)?;
+        }
+        muxer.finish()?;
+
+        // 回读：标题 + 秒级起止
+        let demuxer = Demuxer::new(output_path.as_path())?;
+        let chapters = demuxer.chapters();
+        assert_eq!(chapters.len(), 2, "expected 2 chapters, got {chapters:?}");
+        assert_eq!(chapters[0].title, "Intro");
+        assert!((chapters[0].start - 0.0).abs() < 1e-6);
+        assert!((chapters[0].end - 1.0).abs() < 1e-6);
+        assert_eq!(chapters[1].title, "Part Two");
+        assert!((chapters[1].start - 1.0).abs() < 1e-6);
+        assert!((chapters[1].end - 2.0).abs() < 1e-6);
+
+        // MKV 使用原生 chapter atom（非 MP4 文本轨），同样必须完整回传
+        let mkv_path = crate::test_utils::test_output_path("mux", "test_mux_chapters.mkv");
+        let video_encoder = Encoder::new_video(width, height)?;
+        let encoder_time_base = video_encoder.time_base();
+        let mut muxer = Muxer::new(mkv_path.as_path())?;
+        let video_index = muxer.add_stream(video_encoder)?;
+        muxer.add_chapter(Chapter::new("MKV Intro", 0.0, 1.0))?;
+        for index in 0..encoder_time_base.den as i64 {
+            let mut frame = generate_video_frame(width, height, index);
+            frame.set_pts(index * encoder_time_base.den as i64);
+            frame.set_time_base(encoder_time_base);
+            muxer.mux(frame, video_index)?;
+        }
+        muxer.finish()?;
+
+        let demuxer = Demuxer::new(mkv_path.as_path())?;
+        let chapters = demuxer.chapters();
+        assert_eq!(
+            chapters.len(),
+            1,
+            "expected 1 mkv chapter, got {chapters:?}"
+        );
+        assert_eq!(chapters[0].title, "MKV Intro");
+        assert!((chapters[0].end - 1.0).abs() < 1e-6);
+
+        Ok(())
+    }
+
+    /// GIF 调色板管线（palettegen/paletteuse 单遍滤镜图）编码：
+    /// 60 帧 @30fps 输入 → fps=10 抽帧 + 调色板量化 → gif 编码器（pal8），
+    /// 回读应得到 ~20 帧 GIF（fps 滤镜丢帧），解码器为 gif。
+    #[test]
+    fn test_encode_gif_palette_pipeline() -> Result<()> {
+        use crate::filter::video;
+
+        let output_path = crate::test_utils::test_output_path("mux", "test_gif_palette.gif");
+        crate::test_utils::remove_test_output(&output_path);
+
+        let (width, height) = (96usize, 64usize);
+        let in_fps = 30.0f32;
+        let out_fps = 10.0f32;
+
+        // 编码器按**输入**帧率（30fps）构建，滤镜图内 fps=10 完成抽帧
+        let encoder = crate::EncoderBuilder::new_video(width, height)
+            .with_codec_name("gif".to_string())
+            .with_fps(in_fps)
+            .with_filters(vec![video::gif_palette(out_fps, None)])
+            .build()?;
+
+        let mut muxer = Muxer::new(output_path.as_path())?;
+        let video_index = muxer.add_stream(encoder)?;
+
+        // 2 秒 @30fps 输入（编码器 time_base = 1/30，帧间隔 1 tick）
+        let encoder_time_base = ffi::AVRational { num: 1, den: 30 };
+        for index in 0..60i64 {
+            let mut frame = generate_video_frame(width, height, index);
+            frame.set_pts(index);
+            frame.set_time_base(encoder_time_base);
+            muxer.mux(frame, video_index)?;
+        }
+        muxer.finish()?;
+
+        // 回读验证：帧数 ~20（fps=10 x 2s），codec 为 GIF，尺寸不变
+        let demuxer = Demuxer::new(output_path.as_path())?;
+        let frames: Vec<_> = demuxer.filter_map(|res| res.ok()).collect();
+        assert_eq!(
+            frames.len(),
+            20,
+            "expected 20 gif frames (60 in @30fps -> 10fps), got {}",
+            frames.len()
+        );
+        let (_, frame) = &frames[0];
+        assert_eq!(frame.width as usize, width);
+        assert_eq!(frame.height as usize, height);
+
+        let frame_count = frames.len() as f64;
+
+        // 容器流信息校验
+        let reader = StreamReader::new(output_path.as_path())?;
+        let stream = &reader.input().streams()[0];
+        assert_eq!(stream.codecpar().codec_id, ffi::AV_CODEC_ID_GIF);
+
+        // 时间戳校验：20 帧 @10fps 时长应为 ~2.0s，容器帧率 10fps。
+        // 回归保护：muxer 在 write_header 内强制 GIF 流 time_base=1/100，
+        // 若 pts 未按最终流时间基重缩放，时长会缩短 10 倍（0.2s）。
+        let tb = stream.time_base;
+        let duration_secs = stream.duration as f64 * tb.num as f64 / tb.den as f64;
+        assert!(
+            (duration_secs - frame_count / out_fps as f64).abs() < 0.1,
+            "stream duration should be ~{frame_count} / {out_fps}s, got {duration_secs}s"
+        );
+        assert_eq!(
+            (stream.avg_frame_rate.num, stream.avg_frame_rate.den),
+            (out_fps as i32, 1),
+            "container frame rate should be {out_fps}"
+        );
+
+        Ok(())
+    }
+
+    /// 封面图（attached_pic）写入：主视频流 + mjpeg 封面流（RGB24 帧自动转
+    /// 编码器协商格式），输出中封面流应带 AV_DISPOSITION_ATTACHED_PIC 标记。
+    #[test]
+    fn test_mux_cover_art() -> Result<()> {
+        use crate::pixel::PixelFormat;
+
+        let output_path = crate::test_utils::test_output_path("mux", "test_mux_cover_art.mp4");
+
+        let (width, height) = (320, 240);
+        let video_encoder = Encoder::new_video(width, height)?;
+        let encoder_time_base = video_encoder.time_base();
+
+        let mut muxer = Muxer::new(output_path.as_path())?;
+        let video_index = muxer.add_stream(video_encoder)?;
+
+        // 生成一张 RGB24 渐变封面帧（编码器自动协商并转换为 mjpeg 支持的格式）
+        let mut cover = AVFrame::new();
+        cover.set_width(width as i32);
+        cover.set_height(height as i32);
+        cover.set_format(PixelFormat::RGB24.into());
+        cover.alloc_buffer().context("alloc cover frame")?;
+        let rgb = cover.data_mut()[0];
+        let linesize = cover.linesize[0];
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * linesize as usize + x * 3;
+                unsafe {
+                    *rgb.add(index) = (x * 255 / width) as u8;
+                    *rgb.add(index + 1) = (y * 255 / height) as u8;
+                    *rgb.add(index + 2) = 128;
+                }
+            }
+        }
+        let cover_index = muxer.add_cover_art(cover)?;
+
+        // 1 秒主视频
+        for index in 0..encoder_time_base.den as i64 {
+            let mut frame = generate_video_frame(width, height, index);
+            frame.set_pts(index * encoder_time_base.den as i64);
+            frame.set_time_base(encoder_time_base);
+            muxer.mux(frame, video_index)?;
+        }
+        muxer.finish()?;
+
+        // 回读验证：封面流存在且带 attached_pic 标记，编码为 mjpeg
+        let reader = StreamReader::new(output_path.as_path())?;
+        let streams = reader.input().streams();
+        assert_eq!(
+            streams.len(),
+            2,
+            "expected 2 streams (video + cover), got {}",
+            streams.len()
+        );
+        let cover_stream = &streams[cover_index];
+        assert!(
+            cover_stream.disposition & ffi::AV_DISPOSITION_ATTACHED_PIC as i32 != 0,
+            "cover stream must be marked with AV_DISPOSITION_ATTACHED_PIC"
+        );
+        assert_eq!(
+            cover_stream.codecpar().codec_id,
+            ffi::AV_CODEC_ID_MJPEG,
+            "cover stream must be mjpeg-encoded"
         );
 
         Ok(())

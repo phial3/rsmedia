@@ -1,15 +1,14 @@
-use crate::flags::MediaType;
+use crate::error::{Context, Result, RsmediaError};
 use crate::location::Location;
 use crate::options::Options;
-use crate::stream::Stream;
-use crate::utils;
+use crate::stream::MediaType;
+use crate::strutils;
 
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
 use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput, AVInputFormat};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
-use anyhow::{Context, Error, Result};
 use std::ops::{Bound, Deref};
 
 pub trait Reader {
@@ -19,20 +18,16 @@ pub trait Reader {
     fn input(&self) -> &AVFormatContextInput;
     fn input_mut(&mut self) -> &mut AVFormatContextInput;
 
-    fn read_packet(&mut self) -> Result<Option<(Stream<'_>, AVPacket)>> {
+    /// Read the next packet. Returns `None` on EOF.
+    ///
+    /// 成功时返回 `(packet 所属流的 index, packet)`；调用方如需更多流信息
+    /// （time_base、metadata 等），可通过 `self.input().streams().get(index)`
+    /// 直接使用 rsmpeg 的 [`AVStream`]。
+    fn read_packet(&mut self) -> Result<Option<(usize, AVPacket)>> {
         match self.input_mut().read_packet() {
-            Ok(Some(pkt)) => {
-                let av_stream = self
-                    .input()
-                    .streams()
-                    .get(pkt.stream_index as usize)
-                    .unwrap();
-                let iformat = self.input().iformat();
-                let metadata = self.input().metadata();
-                Ok(Some((Stream::wrap(av_stream, iformat, metadata), pkt)))
-            }
+            Ok(Some(pkt)) => Ok(Some((pkt.stream_index as usize, pkt))),
             Ok(None) => Ok(None),
-            Err(e) => Err(Error::new(e)),
+            Err(e) => Err(RsmediaError::from(e)),
         }
     }
 
@@ -44,8 +39,8 @@ pub trait Reader {
     fn find_best_stream(&self, media_type: MediaType) -> Result<(usize, String)> {
         self.input()
             .find_best_stream(media_type as _)?
-            .map(|(index, codec)| (index, utils::to_string(codec.name()).unwrap()))
-            .ok_or(Error::msg(format!(
+            .map(|(index, codec)| (index, strutils::cstr_to_string(codec.name()).unwrap()))
+            .ok_or(RsmediaError::custom(format!(
                 "No stream found for MediaType:{media_type:?}"
             )))
     }
@@ -112,24 +107,24 @@ impl<'a> StreamReaderBuilder<'a> {
         let src_path = self.source.as_path().to_str().unwrap();
         // RAII CString，FFI 使用后由析构自动释放
         let src_cstr = std::ffi::CString::new(src_path)
-            .map_err(|e| Error::msg(format!("Invalid source path '{src_path}': {e}")))?;
+            .map_err(|e| RsmediaError::custom(format!("Invalid source path '{src_path}': {e}")))?;
         let protocol = unsafe { ffi::avio_find_protocol_name(src_cstr.as_ptr()) };
         if protocol.is_null() {
-            return Err(Error::msg(format!(
+            return Err(RsmediaError::custom(format!(
                 "Unsupported input source protocol: {src_path}"
             )));
         }
         log::debug!(
             "Using input protocol: [{}], source: {}",
-            unsafe { utils::from_c_char(protocol) },
+            unsafe { strutils::c_char_to_str(protocol) },
             src_path
         );
 
-        let filename = utils::from_path(&self.source.as_path());
+        let filename = strutils::path_to_cstring(&self.source.as_path());
         let fmt_opt = self
             .format
-            .and_then(|str| AVInputFormat::find(&utils::from_str(str)));
-        let mut dict = self.options.map(|opts| opts.into_dict());
+            .and_then(|str| AVInputFormat::find(&strutils::str_to_cstring(str)));
+        let mut dict = self.options.and_then(|opts| opts.into_dict());
         let mut ctx_input = AVFormatContextInput::builder()
             .url(&filename)
             .maybe_format(fmt_opt.as_deref())
@@ -213,7 +208,7 @@ impl StreamReader {
                 flags,
             );
             if res < 0 {
-                return Err(Error::msg(format!("Seek to frame failed: {res}")));
+                return Err(RsmediaError::custom(format!("Seek to frame failed: {res}")));
             }
             Ok(())
         }
@@ -236,7 +231,7 @@ impl StreamReader {
             let res = ffi::avformat_seek_file(self.input.as_mut_ptr(), -1, start, ts, end, 0);
             if res < 0 {
                 // >=0 on success, error code otherwise
-                return Err(Error::msg(format!("Seek file failed: {res}")));
+                return Err(RsmediaError::custom(format!("Seek file failed: {res}")));
             }
             Ok(())
         }
@@ -337,9 +332,9 @@ impl<'a> StreamWriterBuilder<'a> {
 
     /// Build [`StreamWriter`].
     pub fn build(self) -> Result<StreamWriter> {
-        let filename = utils::from_path(&self.destination.as_path());
-        let format = self.format.map(utils::from_str);
-        let mut dict = self.options.map(|opts| opts.into_dict());
+        let filename = strutils::path_to_cstring(&self.destination.as_path());
+        let format = self.format.map(strutils::str_to_cstring);
+        let mut dict = self.options.and_then(|opts| opts.into_dict());
         let output_ctx = AVFormatContextOutput::builder()
             .filename(&filename)
             .maybe_format_name(format.as_deref())
@@ -430,7 +425,7 @@ impl<'a> BufferWriterBuilder<'a> {
 
     /// Build [`BufferWriter`].
     pub fn build(self) -> Result<BufferWriter> {
-        let _dict = self.options.map(|opts| opts.into_dict());
+        let _dict = self.options.and_then(|opts| opts.into_dict());
         Ok(BufferWriter {
             output: output_raw(self.format)?,
         })
@@ -513,7 +508,7 @@ impl<'a> PacketizedBufWriterBuilder<'a> {
 
     /// Build [`PacketizedBufWriter`].
     pub fn build(self) -> Result<PacketizedBufWriter> {
-        let _dict = self.options.map(|opts| opts.into_dict());
+        let _dict = self.options.and_then(|opts| opts.into_dict());
         Ok(PacketizedBufWriter {
             output: output_raw(self.format)?,
             buffers: Vec::new(),
@@ -781,7 +776,7 @@ pub(crate) fn output_raw(format: &str) -> Result<AVFormatContextOutput> {
             0 => Ok(AVFormatContextOutput::from_raw(
                 std::ptr::NonNull::new(output_ptr).unwrap(),
             )),
-            e => Err(Error::new(RsmpegError::from(e))),
+            e => Err(RsmpegError::AVError(e).into()),
         }
     }
 }
@@ -804,7 +799,7 @@ pub(crate) fn output_raw_buf_start(output: &mut AVFormatContextOutput) -> Result
                 (*output.as_mut_ptr()).pb = p;
                 Ok(())
             }
-            _ => Err(Error::msg(
+            _ => Err(RsmediaError::custom(
                 "Failed to open dynamic buffer for output context.",
             )),
         }
@@ -899,7 +894,7 @@ pub fn output_raw_packetized_buf_start(
             if !buffer.is_null() {
                 ffi::av_free(buffer as *mut std::ffi::c_void);
             }
-            return Err(Error::msg("Failed to allocate AVIOContext"));
+            return Err(RsmediaError::custom("Failed to allocate AVIOContext"));
         }
 
         // Setting `max_packet_size` will let the underlying IO stream know that this buffer must be
@@ -969,7 +964,7 @@ pub(crate) fn flush_output(output: &mut AVFormatContextOutput) -> Result<()> {
     unsafe {
         match ffi::av_write_frame(output.as_mut_ptr(), std::ptr::null_mut()) {
             0 | 1 => Ok(()),
-            e => Err(Error::new(RsmpegError::from(e))),
+            e => Err(RsmpegError::AVError(e).into()),
         }
     }
 }
@@ -1094,9 +1089,9 @@ pub fn sdp(output_fmt_ctx: &AVFormatContextOutput) -> Result<String> {
         let output_fmt_ctx_ptr = output_fmt_ctx_ptr as *mut *mut ffi::AVFormatContext;
         let ret = ffi::av_sdp_create(output_fmt_ctx_ptr, 1, buf_ptr, BUF_SIZE);
         if ret == 0 {
-            Ok(utils::from_c_char(buf_ptr))
+            Ok(strutils::c_char_to_str(buf_ptr))
         } else {
-            Err(Error::new(RsmpegError::from(ret)))
+            Err(RsmpegError::AVError(ret).into())
         }
     }
 }
@@ -1140,4 +1135,137 @@ struct RTPMuxContext {
     pub base_timestamp: u32,
     pub cur_timestamp: u32,
     pub max_payload_size: std::ffi::c_int,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EncoderBuilder;
+    use crate::mux::{Demuxer, Muxer};
+    use crate::options::Options;
+    use crate::pixel::PixelFormat;
+    use rsmpeg::avutil::AVFrame;
+
+    /// 生成 RGB24 渐变测试帧（image2 序列写入用）。
+    fn generate_rgb_frame(width: usize, height: usize, index: i64) -> AVFrame {
+        let mut frame = AVFrame::new();
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
+        frame.set_format(PixelFormat::RGB24.into());
+        frame.alloc_buffer().expect("alloc rgb frame buffer");
+
+        let plane = frame.data_mut()[0];
+        let linesize = frame.linesize[0];
+        for y in 0..height {
+            for x in 0..width {
+                let i = y * linesize as usize + x * 3;
+                unsafe {
+                    *plane.add(i) = (x * 255 / width) as u8;
+                    *plane.add(i + 1) = (y * 255 / height) as u8;
+                    *plane.add(i + 2) = ((index * 25) % 256) as u8;
+                }
+            }
+        }
+        frame
+    }
+
+    /// 图片序列写入（image2 muxer + png 编码器）：写入 N 帧 => 磁盘上生成
+    /// N 个按 `%03d` 模式编号的 PNG 文件。
+    #[test]
+    fn test_write_image_sequence() -> Result<()> {
+        let pattern = crate::test_utils::test_output_path("images", "img_%03d.png");
+        let n_frames = 8;
+
+        let writer = StreamWriterBuilder::new(pattern.as_path())
+            .with_format("image2")
+            .build()?;
+        let mut muxer = Muxer::new_from_writer(writer);
+
+        let encoder = EncoderBuilder::new_video(64, 48)
+            .with_codec_name("png".to_string())
+            .build()?;
+        let video_index = muxer.add_stream(encoder)?;
+
+        for i in 0..n_frames {
+            let mut frame = generate_rgb_frame(64, 48, i);
+            frame.set_pts(i);
+            muxer.mux(frame, video_index)?;
+        }
+        muxer.finish()?;
+
+        // 校验每个编号文件都存在且非空（image2 从 start_number=1 开始编号）
+        let dir = pattern.parent().unwrap();
+        for i in 1..=n_frames {
+            let file = dir.join(format!("img_{i:03}.png"));
+            let meta = std::fs::metadata(&file)
+                .unwrap_or_else(|e| panic!("expected sequence file {}: {e}", file.display()));
+            assert!(meta.len() > 0, "sequence file {} is empty", file.display());
+        }
+        // 未写入的下一个编号不应存在
+        assert!(!dir.join(format!("img_{:03}.png", n_frames + 1)).exists());
+
+        Ok(())
+    }
+
+    /// 图片序列读取（image2 demuxer）：按 `%03d` 模式打开序列，解码帧数应与
+    /// 写入帧数一致，且尺寸正确。
+    #[test]
+    fn test_read_image_sequence() -> Result<()> {
+        // 复用写入测试生成的序列；若不存在则现场生成
+        let pattern = crate::test_utils::test_output_path("images", "img_%03d.png");
+        if !pattern.with_file_name("img_001.png").exists() {
+            let writer = StreamWriterBuilder::new(pattern.as_path())
+                .with_format("image2")
+                .build()?;
+            let mut muxer = Muxer::new_from_writer(writer);
+            let encoder = EncoderBuilder::new_video(64, 48)
+                .with_codec_name("png".to_string())
+                .build()?;
+            let video_index = muxer.add_stream(encoder)?;
+            for i in 0..8 {
+                let mut frame = generate_rgb_frame(64, 48, i);
+                frame.set_pts(i);
+                muxer.mux(frame, video_index)?;
+            }
+            muxer.finish()?;
+        }
+
+        let reader = StreamReaderBuilder::new(pattern.as_path())
+            .with_format("image2")
+            .with_options(Options::from_iter([(
+                "framerate".to_string(),
+                "5".to_string(),
+            )]))
+            .build()?;
+
+        let demuxer = Demuxer::new_from_reader(reader, None, None)?;
+        let decoded: Vec<_> = demuxer.filter_map(|res| res.ok()).collect();
+        assert_eq!(
+            decoded.len(),
+            8,
+            "expected 8 decoded frames from image sequence"
+        );
+        for (_, frame) in &decoded {
+            assert_eq!(frame.width, 64);
+            assert_eq!(frame.height, 48);
+        }
+
+        Ok(())
+    }
+
+    /// 单张图片读取：jpg 由 FFmpeg 自动探测（image2/mjpeg demuxer），应能
+    /// 解码出至少一帧且尺寸与源图一致。
+    #[test]
+    fn test_read_single_image() -> Result<()> {
+        let demuxer = Demuxer::new(std::path::Path::new("assets/cat.jpg"))?;
+        let decoded: Vec<_> = demuxer.filter_map(|res| res.ok()).collect();
+        assert!(
+            !decoded.is_empty(),
+            "expected at least one decoded frame from a single image"
+        );
+        let (_, frame) = &decoded[0];
+        assert!(frame.width > 0 && frame.height > 0);
+
+        Ok(())
+    }
 }
