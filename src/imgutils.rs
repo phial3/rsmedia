@@ -1,5 +1,6 @@
 use crate::PixelFormat;
 use crate::error::{Result, RsmediaError, format_err};
+
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 

@@ -1,6 +1,7 @@
-use crate::flags::MediaType;
+use crate::error::{Context, Result, RsmediaError};
 use crate::location::Location;
 use crate::options::Options;
+use crate::stream::MediaType;
 use crate::strutils;
 
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
@@ -8,7 +9,6 @@ use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput, AVInputForma
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
-use crate::error::{Context, Result, RsmediaError};
 use std::ops::{Bound, Deref};
 
 pub trait Reader {

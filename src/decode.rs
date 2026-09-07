@@ -1,5 +1,6 @@
+use crate::codec::AvCodecFlags;
+use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
-use crate::flags::AvCodecFlags;
 #[cfg(feature = "ndarray")]
 use crate::frame::{MediaFrame, MediaFrameType};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
@@ -7,15 +8,15 @@ use crate::io::Reader;
 use crate::options::Options;
 use crate::resize::Resize;
 use crate::stream::StreamInfo;
-use crate::swctx::ScaleAlgorithm;
-use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time, strutils, swctx};
+use crate::strutils;
+use crate::swctx::{self, ScaleAlgorithm};
+use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
 use rsmpeg::avformat::AVStream;
 use rsmpeg::avutil::{self, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
 
-use crate::error::{Context, Result, RsmediaError};
 use std::sync::Arc;
 
 /// Builds a [`Decoder`].

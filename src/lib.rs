@@ -3,12 +3,12 @@ pub mod encode;
 #[cfg(feature = "ndarray")]
 pub mod frame;
 #[cfg(feature = "ndarray")]
-pub use frame::{MediaFrame, MediaFrameFormat, MediaFrameType};
+pub use frame::{MediaFrame, MediaFrameType};
 pub mod codec;
 pub mod colors;
 pub mod error;
+pub mod fmt;
 pub mod filter;
-pub mod flags;
 pub mod hwaccel;
 pub mod imgutils;
 pub mod init;
@@ -28,7 +28,7 @@ pub use codec::{CodecConfig, FormatInfo, Profile};
 pub use decode::{Decoder, DecoderBuilder};
 pub use encode::{Encoder, EncoderBuilder};
 pub use error::{Error, Result, RsmediaError};
-pub use flags::{MediaType, SampleFormat};
+pub use fmt::{FrameFormat, SampleFormat};
 pub use init::init;
 pub use io::{Reader, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
@@ -36,7 +36,8 @@ pub use location::{Location, Url};
 pub use options::{Options, Quality, VideoProfile};
 pub use pixel::PixelFormat;
 pub use resize::Resize;
-pub use subtitle::{SubtitleSegment, copy_subtitle_stream};
+pub use stream::MediaType;
+pub use subtitle::SubtitleSegment;
 pub use swctx::ScaleAlgorithm;
 pub use time::Time;
 

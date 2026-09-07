@@ -1,13 +1,39 @@
 use crate::error::{Result, RsmediaError};
-use crate::flags::MediaType;
+use crate::stream::MediaType;
 use crate::strutils;
+
 #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
 use rsmpeg::avcodec::AVCodecContext;
 use rsmpeg::avcodec::{AVCodec, AVCodecRef};
 use rsmpeg::avformat::{AVInputFormatRef, AVOutputFormatRef};
 use rsmpeg::ffi;
+
 use std::ffi::CStr;
 use std::fmt;
+
+/// 解码器旗标（对应 FFmpeg `AV_CODEC_FLAG_*`）。
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AvCodecFlags {
+    UNALIGNED = ffi::AV_CODEC_FLAG_UNALIGNED,
+    QSCALE = ffi::AV_CODEC_FLAG_QSCALE,
+    _4MV = ffi::AV_CODEC_FLAG_4MV,
+    OUTPUT_CORRUPT = ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT,
+    QPEL = ffi::AV_CODEC_FLAG_QPEL,
+    PASS1 = ffi::AV_CODEC_FLAG_PASS1,
+    PASS2 = ffi::AV_CODEC_FLAG_PASS2,
+    GRAY = ffi::AV_CODEC_FLAG_GRAY,
+    PSNR = ffi::AV_CODEC_FLAG_PSNR,
+    INTERLACED_DCT = ffi::AV_CODEC_FLAG_INTERLACED_DCT,
+    LOW_DELAY = ffi::AV_CODEC_FLAG_LOW_DELAY,
+    GLOBAL_HEADER = ffi::AV_CODEC_FLAG_GLOBAL_HEADER,
+    BITEXACT = ffi::AV_CODEC_FLAG_BITEXACT,
+    AC_PRED = ffi::AV_CODEC_FLAG_AC_PRED,
+    LOOP_FILTER = ffi::AV_CODEC_FLAG_LOOP_FILTER,
+    INTERLACED_ME = ffi::AV_CODEC_FLAG_INTERLACED_ME,
+    CLOSED_GOP = ffi::AV_CODEC_FLAG_CLOSED_GOP,
+}
 
 pub struct CodecConfig {
     codec: AVCodecRef<'static>,

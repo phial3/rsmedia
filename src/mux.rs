@@ -1,14 +1,14 @@
+use crate::error::{Context, Result, RsmediaError};
 use crate::filter::Filter;
-use crate::flags::MediaType;
+use crate::stream::MediaType;
+use crate::stream::StreamInfo;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, Writer};
-use crate::stream::StreamInfo;
 use crate::{Decoder, DecoderBuilder, Encoder, Location, StreamReader, StreamWriter};
 
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 
-use crate::error::{Context, Result, RsmediaError};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;

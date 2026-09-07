@@ -1,7 +1,7 @@
+use crate::error::{Result, RsmediaError};
+
 use rsmpeg::avutil::AVPixFmtDescriptorRef;
 use rsmpeg::ffi;
-
-use crate::error::{Result, RsmediaError};
 
 /// Number of pixel formats
 /// DO NOT USE THIS if you want to link with shared libav* because the number of formats might differ between versions

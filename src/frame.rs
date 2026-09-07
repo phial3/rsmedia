@@ -1,10 +1,11 @@
+use crate::error::{Context, Result, RsmediaError};
+use crate::fmt::FrameFormat;
 use crate::pixel::PixelFormat;
 use crate::{MediaType, SampleFormat, imgutils, time};
 
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
 
-use crate::error::{Context, Result, RsmediaError};
 use yuv::{
     BufferStoreMut, YuvConversionMode, YuvPlanarImage, YuvPlanarImageMut, YuvRange,
     YuvStandardMatrix,
@@ -35,26 +36,6 @@ impl MediaFrameType for u64 {}
 impl MediaFrameType for f32 {}
 impl MediaFrameType for f64 {}
 
-/// 帧格式的统一表示：视频帧为像素格式，音频帧为采样格式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MediaFrameFormat {
-    /// 视频帧的像素格式（如 [`PixelFormat::RGB24`]、[`PixelFormat::YUV420P`]）。
-    Pixel(PixelFormat),
-    /// 音频帧的采样格式（如 [`SampleFormat::FLTP`]）。
-    Sample(SampleFormat),
-}
-
-impl MediaFrameFormat {
-    /// 取回 FFmpeg 原生格式值（`AV_PIX_FMT_*` 或 `AV_SAMPLE_FMT_*` 的数字表示）。
-    #[inline]
-    pub fn as_raw(&self) -> i32 {
-        match self {
-            MediaFrameFormat::Pixel(p) => (*p).into(),
-            MediaFrameFormat::Sample(s) => *s as i32,
-        }
-    }
-}
-
 /// A frame array is the `ndarray` version of `AVFrame`
 /// It is 3-dimensional array with dims `(H, W, C)` and type byte.
 ///
@@ -78,9 +59,9 @@ pub struct MediaFrame<T> {
     /// 帧理论持续时间，同 `time_base` 单位；0 表示未知或未设置。
     pub duration: i64,
     /// 像素/采样格式（统一表示）。
-    /// Video: [`MediaFrameFormat::Pixel`]（含 [`PixelFormat`]）
-    /// Audio: [`MediaFrameFormat::Sample`]（含 [`SampleFormat`]）
-    pub format: MediaFrameFormat,
+    /// Video: [`FrameFormat::Pixel`]（含 [`PixelFormat`]）
+    /// Audio: [`FrameFormat::Sample`]（含 [`SampleFormat`]）
+    pub format: FrameFormat,
     /// 通用音频/视频数据（ndarray 存储，C 连续布局）。
     /// Video: `[height, width, channels]`
     /// Audio: `[frames, nb_samples, nb_channels]`
@@ -154,7 +135,7 @@ where
             height,
             time_base,
             data,
-            format: MediaFrameFormat::Pixel(format),
+            format: FrameFormat::Pixel(format),
             pts: 0,
             dts: 0,
             duration: 0,
@@ -209,7 +190,7 @@ where
         }
 
         Ok(Self {
-            format: MediaFrameFormat::Sample(format),
+            format: FrameFormat::Sample(format),
             data,
             time_base,
             sample_rate,
@@ -261,10 +242,10 @@ where
         self.pts = pts;
     }
 
-    /// Returns the frame's unified format: [`MediaFrameFormat::Pixel`] for video,
-    /// [`MediaFrameFormat::Sample`] for audio; `None` for other media types.
+    /// Returns the frame's unified format: [`FrameFormat::Pixel`] for video,
+    /// [`FrameFormat::Sample`] for audio; `None` for other media types.
     #[inline]
-    pub fn format(&self) -> Option<MediaFrameFormat> {
+    pub fn format(&self) -> Option<FrameFormat> {
         (self.media_type == MediaType::VIDEO || self.media_type == MediaType::AUDIO)
             .then_some(self.format)
     }
@@ -315,7 +296,7 @@ where
             Ok(Self {
                 pts,
                 dts,
-                format: MediaFrameFormat::Sample(SampleFormat::from(format)),
+                format: FrameFormat::Sample(SampleFormat::from(format)),
                 duration,
                 pkt_duration: 0,
                 width: 0,
@@ -345,7 +326,7 @@ where
                 height,
                 pts,
                 dts,
-                format: MediaFrameFormat::Pixel(PixelFormat::from(format)),
+                format: FrameFormat::Pixel(PixelFormat::from(format)),
                 duration,
                 time_base,
                 data: video_data(frame)?,
@@ -421,14 +402,14 @@ where
     ////////////////////////////////////////////////////////////////////////////////////
 
     /// 校验当前帧为视频帧，且像素格式为 `expected`；否则返回可读的错误信息。
-    fn check_video_format(&self, expected: MediaFrameFormat, expected_desc: &str) -> Result<()> {
+    fn check_video_format(&self, expected: FrameFormat, expected_desc: &str) -> Result<()> {
         if self.media_type != MediaType::VIDEO {
             return Err(RsmediaError::custom("Only video frames are supported"));
         }
         if self.format != expected {
             let got = match self.format {
-                MediaFrameFormat::Pixel(p) => p.get_pix_fmt_name(),
-                MediaFrameFormat::Sample(_) => "<audio format>",
+                FrameFormat::Pixel(p) => p.get_pix_fmt_name(),
+                FrameFormat::Sample(_) => "<audio format>",
             };
             return Err(RsmediaError::custom(format!(
                 "Expected {expected_desc} format, got {got}"
@@ -439,7 +420,7 @@ where
 
     /// 校验当前帧是否为可转换的 RGB24 视频帧。
     fn check_rgb24_supported(&self) -> Result<()> {
-        self.check_video_format(MediaFrameFormat::Pixel(PixelFormat::RGB24), "RGB24")
+        self.check_video_format(FrameFormat::Pixel(PixelFormat::RGB24), "RGB24")
     }
 
     /// 根据分辨率自动选择标准色彩矩阵：
@@ -576,13 +557,13 @@ where
         }
 
         let mut res = self.clone();
-        res.format = MediaFrameFormat::Pixel(PixelFormat::YUV420P);
+        res.format = FrameFormat::Pixel(PixelFormat::YUV420P);
         res.data = yuv_data;
         Ok(res)
     }
 
     pub fn convert_yuv_to_rgb(&self) -> Result<Self> {
-        self.check_video_format(MediaFrameFormat::Pixel(PixelFormat::YUV420P), "YUV420P")?;
+        self.check_video_format(FrameFormat::Pixel(PixelFormat::YUV420P), "YUV420P")?;
 
         let height = self.height;
         let width = self.width;
@@ -650,7 +631,7 @@ where
         }
 
         let mut res = self.clone();
-        res.format = MediaFrameFormat::Pixel(PixelFormat::RGB24);
+        res.format = FrameFormat::Pixel(PixelFormat::RGB24);
         res.data = rgb_data;
         Ok(res)
     }
@@ -1181,9 +1162,9 @@ mod tests {
 
         // 单次往返：RGB -> YUV -> RGB
         let yuv = rgb.convert_rgb_to_yuv()?;
-        assert_eq!(yuv.format, MediaFrameFormat::Pixel(PixelFormat::YUV420P));
+        assert_eq!(yuv.format, FrameFormat::Pixel(PixelFormat::YUV420P));
         let back = yuv.convert_yuv_to_rgb()?;
-        assert_eq!(back.format, MediaFrameFormat::Pixel(PixelFormat::RGB24));
+        assert_eq!(back.format, FrameFormat::Pixel(PixelFormat::RGB24));
         assert_pixel_close(&back, &rgb, 3);
 
         // 多次链式转换（容差放宽）
@@ -1209,13 +1190,10 @@ mod tests {
 
         // 显式指定不同色彩矩阵，均应输出 YUV420P
         let yuv709 = rgb_frame.convert_rgb_to_yuv_with_matrix(YuvStandardMatrix::Bt709)?;
-        assert_eq!(yuv709.format, MediaFrameFormat::Pixel(PixelFormat::YUV420P));
+        assert_eq!(yuv709.format, FrameFormat::Pixel(PixelFormat::YUV420P));
 
         let yuv2020 = rgb_frame.convert_rgb_to_yuv_with_matrix(YuvStandardMatrix::Bt2020)?;
-        assert_eq!(
-            yuv2020.format,
-            MediaFrameFormat::Pixel(PixelFormat::YUV420P)
-        );
+        assert_eq!(yuv2020.format, FrameFormat::Pixel(PixelFormat::YUV420P));
 
         // 不同色彩矩阵导致不同的 YUV 转换结果
         assert_ne!(yuv709.data, yuv2020.data);
@@ -1327,7 +1305,7 @@ mod tests {
         assert_eq!(frame.data.shape(), &[height, width, 3]);
         assert_eq!(frame.width, width);
         assert_eq!(frame.height, height);
-        assert_eq!(frame.format, MediaFrameFormat::Pixel(PixelFormat::RGB24));
+        assert_eq!(frame.format, FrameFormat::Pixel(PixelFormat::RGB24));
         assert!(frame.data.is_standard_layout(), "RGB24 应为行主序连续布局");
 
         // 填充并读回验证
@@ -1373,7 +1351,7 @@ mod tests {
         // 验证
         assert_eq!(frame.width, width);
         assert_eq!(frame.height, height);
-        assert_eq!(frame.format, MediaFrameFormat::Pixel(PixelFormat::YUV420P));
+        assert_eq!(frame.format, FrameFormat::Pixel(PixelFormat::YUV420P));
 
         Ok(())
     }
@@ -1416,7 +1394,7 @@ mod tests {
         assert_eq!(frame.nb_samples, samples);
         assert_eq!(frame.nb_channels, channels);
         assert_eq!(frame.sample_rate, sample_rate);
-        assert_eq!(frame.format, MediaFrameFormat::Sample(SampleFormat::FLTP));
+        assert_eq!(frame.format, FrameFormat::Sample(SampleFormat::FLTP));
 
         Ok(())
     }
@@ -1833,7 +1811,7 @@ mod tests {
 
         // DynamicImage -> MediaFrame
         let back = MediaFrame::<u8>::from_dynamic_image(&img, TIME_BASE)?;
-        assert_eq!(back.format, MediaFrameFormat::Pixel(PixelFormat::RGB24));
+        assert_eq!(back.format, FrameFormat::Pixel(PixelFormat::RGB24));
         assert_eq!(back.data.dim(), (TEST_HEIGHT, TEST_WIDTH, 3));
         assert_eq!(back.data, frame.data);
 
@@ -1993,7 +1971,7 @@ mod tests {
             TIME_BASE,
         )?;
         match video.format() {
-            Some(MediaFrameFormat::Pixel(PixelFormat::RGB24)) => {}
+            Some(FrameFormat::Pixel(PixelFormat::RGB24)) => {}
             other => panic!("video format = {other:?}"),
         }
 
@@ -2001,7 +1979,7 @@ mod tests {
         let audio =
             MediaFrame::<f32>::new_audio_frame(SampleFormat::FLTP, 2, 16, 48000, TIME_BASE)?;
         match audio.format() {
-            Some(MediaFrameFormat::Sample(SampleFormat::FLTP)) => {}
+            Some(FrameFormat::Sample(SampleFormat::FLTP)) => {}
             other => panic!("audio format = {other:?}"),
         }
 
@@ -2035,7 +2013,7 @@ mod tests {
         // 元数据
         assert_eq!(back.media_type, MediaType::VIDEO);
         assert_eq!(back.pts, 12345);
-        assert_eq!(back.format, MediaFrameFormat::Pixel(PixelFormat::RGB24));
+        assert_eq!(back.format, FrameFormat::Pixel(PixelFormat::RGB24));
         assert!(
             back.sample_aspect_ratio.num == 0 && back.sample_aspect_ratio.den == 0
                 || back.sample_aspect_ratio.num == 0 && back.sample_aspect_ratio.den == 1,

@@ -14,13 +14,15 @@
 //!     fade_out(270, 30),
 //! ];
 //! ```
-use crate::{MediaType, PixelFormat, SampleFormat};
+use crate::MediaType;
+use crate::error::{Context, Result, RsmediaError};
+use crate::fmt::{FrameFormat, SampleFormat};
+use crate::pixel::PixelFormat;
 
 use rsmpeg::avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut};
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
 
-use crate::error::{Context, Result, RsmediaError};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 

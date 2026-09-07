@@ -21,6 +21,7 @@
 
 use crate::error::Result;
 use crate::io::{Reader, Writer};
+
 use rsmpeg::ffi;
 
 /// Copy subtitle packets from a reader stream to a writer stream (passthrough).

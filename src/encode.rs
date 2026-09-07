@@ -1,6 +1,7 @@
 use crate::codec::CodecConfig;
+use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
-use crate::flags::AvFormatFlags;
+use crate::fmt::{AvFormatFlags, FrameFormat};
 #[cfg(feature = "ndarray")]
 use crate::frame::{MediaFrame, MediaFrameType};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
@@ -8,16 +9,16 @@ use crate::io::Writer;
 use crate::options::{Options, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
 use crate::stream::StreamInfo;
+use crate::strutils;
 use crate::subtitle::SubtitleSegment;
-use crate::swctx::ScaleAlgorithm;
-use crate::time::Rescale;
-use crate::{Location, MediaType, SampleFormat, StreamWriter, strutils, swctx, time};
+use crate::swctx::{self, ScaleAlgorithm};
+use crate::time::{self, Rescale};
+use crate::{Location, MediaType, SampleFormat, StreamWriter};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket, AVSubtitle};
 use rsmpeg::avutil::{self, AVAudioFifo, AVChannelLayout, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
 
-use crate::error::{Context, Result, RsmediaError};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -2813,7 +2814,7 @@ mod tests {
     #[cfg(feature = "ndarray")]
     mod audio_tests {
         use super::*;
-        use crate::frame::MediaFrameFormat;
+        use crate::fmt::FrameFormat;
         use rsmpeg::avcodec::AVCodec;
 
         /// 音频容器规格：一个容器对应一条完整的编码配置。
@@ -3188,7 +3189,7 @@ mod tests {
             while let Some(frame) = decoder.decode::<f32>()? {
                 assert_eq!(
                     frame.format(),
-                    Some(MediaFrameFormat::Sample(format)),
+                    Some(FrameFormat::Sample(format)),
                     "sample format mismatch"
                 );
                 assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
@@ -3316,7 +3317,7 @@ mod tests {
             while let Some(frame) = out.decode::<f32>()? {
                 assert_eq!(
                     frame.format(),
-                    Some(MediaFrameFormat::Sample(format)),
+                    Some(FrameFormat::Sample(format)),
                     "sample format mismatch"
                 );
                 assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
@@ -3448,7 +3449,7 @@ mod tests {
                     );
                     assert_eq!(
                         frame.format(),
-                        Some(MediaFrameFormat::Sample(format)),
+                        Some(FrameFormat::Sample(format)),
                         "{name}: sample format mismatch"
                     );
                     assert_eq!(

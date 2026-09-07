@@ -8,12 +8,11 @@
 //! - `DecoderWrapper::decode::<f32>` —— 解码为音频 [`MediaFrame`]
 //! - `MediaFrame::format` —— 读取音频帧的采样格式（`MediaFrameFormat::Sample` 变体）
 
-use rsmedia::{
-    DecoderBuilder, EncoderBuilder, MediaFrame, MediaFrameFormat, MediaType, SampleFormat,
-};
+use rsmedia::time;
+use rsmedia::{DecoderBuilder, EncoderBuilder};
+use rsmedia::{FrameFormat, MediaFrame, MediaType, SampleFormat};
 
 use anyhow::Result;
-use rsmedia::time;
 use std::path::Path;
 
 const SAMPLE_RATE: u32 = 44_100;
@@ -74,7 +73,7 @@ fn decode_audio(source: &Path) -> Result<()> {
         let fmt = frame
             .format()
             .map(|f| match f {
-                MediaFrameFormat::Sample(s) => s.get_sample_fmt_name().to_string(),
+                FrameFormat::Sample(s) => s.get_sample_fmt_name().to_string(),
                 _ => "N/A".to_string(),
             })
             .unwrap_or_else(|| "N/A".to_string());

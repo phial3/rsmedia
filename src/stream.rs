@@ -1,15 +1,54 @@
+use crate::error::{Result, RsmediaError};
 use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
-use crate::{MediaType, Options, PixelFormat, SampleFormat, strutils};
+use crate::strutils;
+use crate::{Options, PixelFormat, SampleFormat};
 
 use rsmpeg::avcodec::AVCodec;
 use rsmpeg::avformat::AVStream;
+use rsmpeg::avutil;
 use rsmpeg::ffi;
 
-use crate::error::{Result, RsmediaError};
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::ptr::NonNull;
+
+/// 媒体类型（对应 FFmpeg `AVMEDIA_TYPE_*`）：流的分类属性。
+///
+/// 放在 stream 模块 —— 它是 [`StreamInfo::media_type`] 等流描述的核心维度。
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MediaType {
+    UNKNOWN = ffi::AVMEDIA_TYPE_UNKNOWN,
+    VIDEO = ffi::AVMEDIA_TYPE_VIDEO,
+    AUDIO = ffi::AVMEDIA_TYPE_AUDIO,
+    DATA = ffi::AVMEDIA_TYPE_DATA,
+    SUBTITLE = ffi::AVMEDIA_TYPE_SUBTITLE,
+    ATTACHMENT = ffi::AVMEDIA_TYPE_ATTACHMENT,
+}
+
+impl MediaType {
+    pub fn get_media_type_string(&self) -> String {
+        avutil::get_media_type_string(*self as _).map_or("Unknown".to_string(), |s| {
+            strutils::cstr_to_string(s).unwrap()
+        })
+    }
+}
+
+impl From<ffi::AVMediaType> for MediaType {
+    fn from(item: ffi::AVMediaType) -> Self {
+        match item {
+            ffi::AVMEDIA_TYPE_UNKNOWN => MediaType::UNKNOWN,
+            ffi::AVMEDIA_TYPE_VIDEO => MediaType::VIDEO,
+            ffi::AVMEDIA_TYPE_AUDIO => MediaType::AUDIO,
+            ffi::AVMEDIA_TYPE_DATA => MediaType::DATA,
+            ffi::AVMEDIA_TYPE_SUBTITLE => MediaType::SUBTITLE,
+            ffi::AVMEDIA_TYPE_ATTACHMENT => MediaType::ATTACHMENT,
+            // 遇到未知/版本差异的类型时回退为 UNKNOWN 而非 panic，避免库内部直接崩溃
+            _ => MediaType::UNKNOWN,
+        }
+    }
+}
 
 /// Holds transferable stream information. This can be used to duplicate stream settings for the
 /// purpose of transmuxing or transcoding.

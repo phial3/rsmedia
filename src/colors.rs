@@ -395,6 +395,7 @@ pub fn colormap_lookup(
 /// `gray` values in `[min, max]` are mapped to colors; the result is an
 /// `Array3` of shape `(height, width, 3)` suitable for constructing a
 /// `MediaFrame` (RGB24) or saving as an image.
+#[cfg(feature = "ndarray")]
 pub fn grayscale_to_colormap<T>(
     gradient: &colorous::Gradient,
     gray: &ndarray::Array2<T>,
