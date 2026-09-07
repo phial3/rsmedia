@@ -27,11 +27,13 @@ pub struct EncoderBuilder {
     fps: f32,
     width: usize,
     height: usize,
-    pixel_format: PixelFormat,
+    /// `None` = 未显式指定，`build()` 时按编码器支持列表自动协商。
+    pixel_format: Option<PixelFormat>,
     /// Audio
     nb_channels: i32,
     sample_rate: i32,
-    sample_format: SampleFormat,
+    /// `None` = 未显式指定，`build()` 时按编码器支持列表自动协商。
+    sample_format: Option<SampleFormat>,
     /// Common
     bit_rate: i64,
     gop_size: i32,
@@ -248,8 +250,11 @@ impl EncoderBuilder {
     }
 
     /// Set the pixel format.
+    ///
+    /// When not set, [`Self::build`] negotiates one from the encoder's
+    /// supported list (preferring [`PixelFormat::YUV420P`]).
     pub fn with_pixel_format(mut self, pixel_format: PixelFormat) -> Self {
-        self.pixel_format = pixel_format;
+        self.pixel_format = Some(pixel_format);
         self
     }
 
@@ -302,8 +307,12 @@ impl EncoderBuilder {
         self
     }
 
+    /// Set the sample format.
+    ///
+    /// When not set, [`Self::build`] negotiates one from the encoder's
+    /// supported list (preferring [`SampleFormat::FLTP`]).
     pub fn with_sample_format(mut self, sample_format: SampleFormat) -> Self {
-        self.sample_format = sample_format;
+        self.sample_format = Some(sample_format);
         self
     }
 
@@ -345,7 +354,13 @@ impl EncoderBuilder {
     /// # Return value
     ///
     /// New encoder with settings applied.
-    fn setup_codec_context(&self, encoder: &mut AVCodecContext, use_crf: bool) -> Result<()> {
+    fn setup_codec_context(
+        &self,
+        encoder: &mut AVCodecContext,
+        use_crf: bool,
+        pixel_format: PixelFormat,
+        sample_format: SampleFormat,
+    ) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != encoder.codec_type {
             return Err(RsmediaError::custom(format!(
@@ -367,13 +382,13 @@ impl EncoderBuilder {
             encoder.set_framerate(self.frame_rate);
             encoder.set_time_base(self.effective_time_base());
             encoder.set_pkt_timebase(self.pkt_time_base);
-            encoder.set_pix_fmt(self.pixel_format.into());
+            encoder.set_pix_fmt(pixel_format.into());
             encoder.set_sample_aspect_ratio(time::new_rational(1, 1));
         } else if media_type == MediaType::AUDIO {
             encoder.set_ch_layout(AVChannelLayout::from_nb_channels(self.nb_channels).into_inner());
             encoder.set_bit_rate(self.effective_bit_rate());
             encoder.set_sample_rate(self.sample_rate);
-            encoder.set_sample_fmt(self.sample_format as _);
+            encoder.set_sample_fmt(sample_format as _);
             encoder.set_time_base(self.effective_time_base());
         } else {
             return Err(RsmediaError::custom(format!(
@@ -390,6 +405,73 @@ impl EncoderBuilder {
         }
 
         Ok(())
+    }
+
+    /// 解析编码目标像素格式（P0-2 自动格式协商）。
+    ///
+    /// * 显式指定（[`Self::with_pixel_format`]]）：软件路径立即校验编码器
+    ///   是否支持，不支持时 `build()` 报错（fail fast）；硬件路径跳过校验
+    ///   （`setup_hw_frames` 会按 HW 要求重设 pix_fmt，HW 私有格式不在
+    ///   软件支持列表内）。
+    /// * 未指定：优先 [`PixelFormat::YUV420P`]（兼容性最好）；编码器不支持
+    ///   时（如 mjpeg 仅接受 YUVJ 系）取支持列表首个格式；列表为 `None`
+    ///   （FFmpeg 未限制）或查询失败时仍回退 YUV420P。
+    fn resolve_pixel_format(&self, config: &CodecConfig, codec_name: &str) -> Result<PixelFormat> {
+        match self.pixel_format {
+            Some(fmt) => {
+                if self.hw_device_config.is_none() && !config.is_support_pixel_format(fmt as i32) {
+                    return Err(RsmediaError::InvalidConfig(format!(
+                        "encoder '{codec_name}' does not support pixel format {fmt:?}"
+                    )));
+                }
+                Ok(fmt)
+            }
+            None => {
+                let negotiated = match config.supported_pixel_formats() {
+                    Ok(Some(list)) if !list.is_empty() => {
+                        if list.contains(&(PixelFormat::YUV420P as i32)) {
+                            PixelFormat::YUV420P
+                        } else {
+                            PixelFormat::from(list[0])
+                        }
+                    }
+                    _ => PixelFormat::YUV420P,
+                };
+                log::debug!("negotiated pixel format {negotiated:?} for encoder '{codec_name}'");
+                Ok(negotiated)
+            }
+        }
+    }
+
+    /// 解析编码目标采样格式（P0-2 自动格式协商），策略同
+    /// [`Self::resolve_pixel_format`]：显式指定则校验（fail fast），
+    /// 未指定优先 [`SampleFormat::FLTP`]（aac/mp3 等原生平面浮点格式），
+    /// 不支持时取支持列表首个（如 `pcm_s16le` 为 S16）。
+    fn resolve_sample_format(&self, config: &CodecConfig, codec_name: &str) -> Result<SampleFormat> {
+        match self.sample_format {
+            Some(fmt) => {
+                if !config.is_support_sample_format(fmt as i32) {
+                    return Err(RsmediaError::InvalidConfig(format!(
+                        "encoder '{codec_name}' does not support sample format {fmt:?}"
+                    )));
+                }
+                Ok(fmt)
+            }
+            None => {
+                let negotiated = match config.supported_sample_formats() {
+                    Ok(Some(list)) if !list.is_empty() => {
+                        if list.contains(&(SampleFormat::FLTP as i32)) {
+                            SampleFormat::FLTP
+                        } else {
+                            SampleFormat::from(list[0])
+                        }
+                    }
+                    _ => SampleFormat::FLTP,
+                };
+                log::debug!("negotiated sample format {negotiated:?} for encoder '{codec_name}'");
+                Ok(negotiated)
+            }
+        }
     }
 
     /// Build an [`EncoderWrapper`] with a [`StreamWriter`].
@@ -455,8 +537,14 @@ impl EncoderBuilder {
             };
 
         let mut encode_ctx = AVCodecContext::new(&codec);
-        self.setup_codec_context(&mut encode_ctx, use_crf)?;
         let config = CodecConfig::from_codec(codec);
+        // P0-2 自动格式协商：显式指定的格式立即校验（fail fast），未指定的
+        // 从编码器支持列表中挑选，避免把帧转进一个编码器不支持的格式后才
+        // 在写入阶段报错。
+        let pixel_format = self.resolve_pixel_format(&config, &codec_name)?;
+        let sample_format = self.resolve_sample_format(&config, &codec_name)?;
+
+        self.setup_codec_context(&mut encode_ctx, use_crf, pixel_format, sample_format)?;
 
         // 在 hw_device_config / codec_opts 被 move 之前构造 filter graph：
         // 此位置 self 尚未被部分 move，可直接借用 self 计算 time_base。
@@ -466,7 +554,7 @@ impl EncoderBuilder {
                     FilterParams::Video(VideoParams {
                         width: self.width as i32,
                         height: self.height as i32,
-                        format: self.pixel_format,
+                        format: pixel_format,
                         time_base: self.effective_time_base(),
                         frame_rate: self.frame_rate,
                         pixel_aspect: encode_ctx.sample_aspect_ratio, // sample aspect ratio (0 if unknown)
@@ -476,7 +564,7 @@ impl EncoderBuilder {
                     FilterParams::Audio(AudioParams {
                         nb_channels: self.nb_channels,
                         sample_rate: self.sample_rate,
-                        format: self.sample_format,
+                        format: sample_format,
                         time_base: self.effective_time_base(), // time_base = 1 / sample_rate
                     })
                 }
@@ -615,7 +703,7 @@ impl Default for EncoderBuilder {
             // video
             width: 0,
             height: 0,
-            pixel_format: PixelFormat::YUV420P,
+            pixel_format: None,
             time_base: time::TIME_BASE,
             pkt_time_base: time::TIME_BASE,
             bit_rate: Self::VIDEO_BIT_RATE,
@@ -627,7 +715,7 @@ impl Default for EncoderBuilder {
             // audio
             nb_channels: 2,
             sample_rate: 44100,
-            sample_format: SampleFormat::FLTP,
+            sample_format: None,
             // common
             media_type: MediaType::VIDEO,
             thread_count: num_cpus::get(),
@@ -1221,13 +1309,14 @@ impl Encoder {
         index: usize,
         out_stream_time_base: ffi::AVRational,
     ) -> Result<()> {
-        // 确定编码器是否支持延迟（delay）
-        // 如果编码器不支持延迟，那么就没有必要进行 flush 操作，因为在这种情况下，编码器不会保留任何未处理的数据。
-        // 如果编码器支持延迟（delay），则在结束编码之前发送 EOS 包是有必要的，
-        // 因为编码器可能还在缓冲一些数据，直到接收到 EOS 信号才会处理完这些数据并输出剩余的包。
-        if !self.config.is_support_delayed_frame() {
-            return Ok(());
-        }
+        // 始终发送 EOS 并排空编码器。
+        //
+        // 旧实现在此对无 `AV_CODEC_CAP_DELAY` 的编码器提前返回，假设"无延迟 =
+        // 编码器不缓冲数据"。这是错误的：开启帧线程（thread_count > 1，默认
+        // 即为 CPU 核数）的编码器即使没有 DELAY 能力标志，也会在内部线程队列
+        // 缓冲若干帧，提前返回会丢失末尾帧（实测 mjpeg 5 帧丢 1 帧）。对真正
+        // 无缓冲的编码器，发送 EOS 后立即返回 Flushed，代价可忽略。此外提前
+        // 返回还会跳过下方滤镜缓冲帧与音频 FIFO 末帧的冲刷，同为隐患。
 
         if let Some(filter) = self.filter_graph.as_mut() {
             let frames = filter.flush()?;
@@ -1893,6 +1982,116 @@ mod tests {
             assert_eq!(decoded, n_frames, "CRF roundtrip frame count mismatch");
 
             crate::test_utils::remove_test_output(&path);
+            Ok(())
+        }
+
+        /// P0-2 自动像素格式协商：mjpeg 仅接受 YUVJ 系像素格式，未显式指定
+        /// pix_fmt 时应从支持列表协商（YUV420P 输入帧由 rescale 自动转换），
+        /// 编码往返成功；显式指定不支持的格式时 `build()` 立即报错。
+        #[test]
+        fn test_negotiate_pixel_format_mjpeg() -> Result<()> {
+            use crate::DecoderBuilder;
+
+            let width = 64usize;
+            let height = 64usize;
+            let n_frames = 5;
+
+            // 未显式指定 pix_fmt：协商为 mjpeg 支持列表中的格式
+            let path = crate::test_utils::test_output_path("encode", "rsmedia_mjpeg.avi");
+            crate::test_utils::remove_test_output(&path);
+            let mut encoder = EncoderBuilder::new_video(width, height)
+                .with_codec_name("mjpeg".to_string())
+                .build_wrapped(path.as_path())?;
+            for i in 0..n_frames {
+                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                encoder.write_frame(frame)?;
+            }
+            encoder.finish()?;
+
+            let mut decoder =
+                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let mut decoded = 0usize;
+            while decoder.decode_frame()?.is_some() {
+                decoded += 1;
+            }
+            assert_eq!(decoded, n_frames, "mjpeg roundtrip frame count mismatch");
+            drop(decoder);
+            crate::test_utils::remove_test_output(&path);
+
+            // 显式指定编码器不支持的像素格式：build() 应 fail fast
+            let result = EncoderBuilder::new_video(width, height)
+                .with_codec_name("mjpeg".to_string())
+                .with_pixel_format(PixelFormat::RGB24)
+                .build();
+            assert!(
+                result.is_err(),
+                "explicit unsupported pix_fmt should fail at build()"
+            );
+            Ok(())
+        }
+
+        /// P0-2 自动采样格式协商：pcm_s16le 仅接受 S16，未显式指定
+        /// sample_format 时应协商为 S16（FLTP 输入帧由 rescale 自动转换）；
+        /// 显式指定不支持的格式时 `build()` 立即报错。
+        #[test]
+        fn test_negotiate_sample_format_pcm() -> Result<()> {
+            use crate::frame::MediaFrame;
+            use crate::{DecoderBuilder, MediaType};
+
+            let sample_rate = 44_100u32;
+            let channels = 2u32;
+            let samples_per_frame = 1024u32;
+            let frames_to_write = 10u32;
+
+            let path = crate::test_utils::test_output_path("encode", "rsmedia_pcm_s16le.wav");
+            crate::test_utils::remove_test_output(&path);
+
+            // 不经 new_audio，保持 sample_format 未显式指定
+            let mut encoder = EncoderBuilder::default()
+                .with_media_type(MediaType::AUDIO)
+                .with_nb_channels(channels as i32)
+                .with_sample_rate(sample_rate as i32)
+                .with_codec_name("pcm_s16le".to_string())
+                .build_wrapped(path.as_path())?;
+            for _ in 0..frames_to_write {
+                let frame = sine_audio_frame::<f32>(
+                    440.0,
+                    channels,
+                    samples_per_frame,
+                    sample_rate,
+                );
+                encoder.write_frame(frame)?;
+            }
+            encoder.finish()?;
+
+            let mut decoder =
+                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+            let mut total_samples = 0u64;
+            while let Some(frame) = decoder.decode::<i16>()? {
+                assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
+                assert_eq!(frame.nb_channels, channels, "channel count mismatch");
+                total_samples += frame.nb_samples as u64;
+            }
+            let expected = frames_to_write as u64 * samples_per_frame as u64;
+            assert!(
+                total_samples >= expected,
+                "decoded {total_samples} samples, expected >= {expected}"
+            );
+            drop(decoder);
+            crate::test_utils::remove_test_output(&path);
+
+            // 显式指定编码器不支持的采样格式：build() 应 fail fast
+            let result = EncoderBuilder::default()
+                .with_media_type(MediaType::AUDIO)
+                .with_nb_channels(channels as i32)
+                .with_sample_rate(sample_rate as i32)
+                .with_codec_name("pcm_s16le".to_string())
+                .with_sample_format(SampleFormat::FLTP)
+                .build();
+            assert!(
+                result.is_err(),
+                "explicit unsupported sample format should fail at build()"
+            );
             Ok(())
         }
 
