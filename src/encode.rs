@@ -5,12 +5,12 @@ use crate::flags::AvFormatFlags;
 use crate::frame::{MediaFrame, MediaFrameType};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
-use crate::options::Options;
+use crate::options::{Options, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
 use crate::stream::StreamInfo;
 use crate::swctx::ScaleAlgorithm;
 use crate::time::Rescale;
-use crate::{Location, MediaType, SampleFormat, StreamWriter, swctx, time, strutils};
+use crate::{Location, MediaType, SampleFormat, StreamWriter, strutils, swctx, time};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket};
 use rsmpeg::avutil::{self, AVAudioFifo, AVChannelLayout, AVChannelLayoutRef, AVFrame};
@@ -45,6 +45,9 @@ pub struct EncoderBuilder {
     media_type: MediaType,
     codec_name: Option<String>,
     codec_opts: Option<Options>,
+    level: Option<String>,
+    quality: Option<Quality>,
+    profile: Option<VideoProfile>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
     scale_algorithm: ScaleAlgorithm,
@@ -71,6 +74,18 @@ impl EncoderBuilder {
     /// default codec
     const VIDEO_CODEC_NAME: &'static str = "libx264";
     const AUDIO_CODEC_NAME: &'static str = "aac";
+
+    /// Codecs whose FFmpeg wrapper exposes the `crf` private option
+    /// (checked when [`Quality::Crf`] is requested).
+    const CRF_CAPABLE_CODECS: &'static [&'static str] = &[
+        "libx264",
+        "libx265",
+        "libvpx",
+        "libvpx-vp9",
+        "libaom-av1",
+        "libsvtav1",
+        "libopenh264",
+    ];
 
     /// Create a video encoder with the specified destination
     ///
@@ -137,6 +152,40 @@ impl EncoderBuilder {
     /// Set the bit rate.
     pub fn with_bit_rate(mut self, bit_rate: i64) -> Self {
         self.bit_rate = bit_rate;
+        self
+    }
+
+    /// Set the rate control strategy (video encoders only; ignored for audio).
+    ///
+    /// * [`Quality::Crf`] — quality-targeted encoding. Applied via the codec's
+    ///   `crf` private option when supported (`libx264`, `libx265`, `libvpx`,
+    ///   `libvpx-vp9`, `libaom-av1`, `libsvtav1`, `libopenh264`); other codecs
+    ///   fall back to [`Self::with_bit_rate`] with a warning and the stream
+    ///   bit rate is left untouched.
+    /// * [`Quality::Bitrate`] — explicit target bit rate, overriding
+    ///   [`Self::with_bit_rate`].
+    pub fn with_quality(mut self, quality: Quality) -> Self {
+        self.quality = Some(quality);
+        self
+    }
+
+    /// Set the H.264-style profile (`baseline`, `main`, `high`, `high10`,
+    /// `high422`, `high444`) via the codec's `profile` private option.
+    ///
+    /// Works out of the box for `libx264`; other encoders map what they
+    /// support and silently ignore unknown profile names (check the encoder
+    /// documentation, or pass a codec-specific option via
+    /// [`Self::with_options`]). Video only.
+    pub fn with_profile(mut self, profile: VideoProfile) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Set the codec level, e.g. `"4.1"` for H.264 ( Annex A level) — passed
+    /// through to the codec's `level` private option when available
+    /// (`libx264` accepts Annex A strings like `"4.1"`). Video only.
+    pub fn with_level(mut self, level: impl ToString) -> Self {
+        self.level = Some(level.to_string());
         self
     }
 
@@ -277,16 +326,26 @@ impl EncoderBuilder {
         }
     }
 
+    /// The bit rate actually applied to the codec context: an explicit
+    /// [`Quality::Bitrate`] overrides [`Self::bit_rate`].
+    fn effective_bit_rate(&self) -> i64 {
+        match self.quality {
+            Some(Quality::Bitrate(bit_rate)) if bit_rate > 0 => bit_rate,
+            _ => self.bit_rate,
+        }
+    }
+
     /// Apply the settings to an encoder.
     ///
     /// # Arguments
     ///
     /// * `encoder` - Encoder to apply settings to.
+    /// * `use_crf` - Whether CRF rate control is active (skip bit rate).
     ///
     /// # Return value
     ///
     /// New encoder with settings applied.
-    fn setup_codec_context(&self, encoder: &mut AVCodecContext) -> Result<()> {
+    fn setup_codec_context(&self, encoder: &mut AVCodecContext, use_crf: bool) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != encoder.codec_type {
             return Err(RsmediaError::custom(format!(
@@ -298,7 +357,11 @@ impl EncoderBuilder {
         if media_type == MediaType::VIDEO {
             encoder.set_width(self.width as i32);
             encoder.set_height(self.height as i32);
-            encoder.set_bit_rate(self.bit_rate);
+            // CRF 模式下不设置 bit_rate（CRF 以质量为目标，码率由编码器自行
+            // 决定；写默认 1Mbps 会让 muxer 元数据与实际输出不符）。
+            if !use_crf {
+                encoder.set_bit_rate(self.effective_bit_rate());
+            }
             encoder.set_gop_size(self.gop_size);
             encoder.set_max_b_frames(self.max_b_frames);
             encoder.set_framerate(self.frame_rate);
@@ -308,7 +371,7 @@ impl EncoderBuilder {
             encoder.set_sample_aspect_ratio(time::new_rational(1, 1));
         } else if media_type == MediaType::AUDIO {
             encoder.set_ch_layout(AVChannelLayout::from_nb_channels(self.nb_channels).into_inner());
-            encoder.set_bit_rate(self.bit_rate);
+            encoder.set_bit_rate(self.effective_bit_rate());
             encoder.set_sample_rate(self.sample_rate);
             encoder.set_sample_fmt(self.sample_format as _);
             encoder.set_time_base(self.effective_time_base());
@@ -360,26 +423,39 @@ impl EncoderBuilder {
     /// * `settings` - Encoder settings to use.
     pub fn build(self) -> Result<Encoder> {
         let media_type = self.media_type;
-        let codec = {
-            let codec_name = if let Some(codec_name) = &self.codec_name {
-                codec_name.as_ref()
-            } else {
-                match media_type {
-                    MediaType::VIDEO => Self::VIDEO_CODEC_NAME,
-                    MediaType::AUDIO => Self::AUDIO_CODEC_NAME,
-                    _ => {
-                        return Err(RsmediaError::custom(
-                            format!("Unsupported media type:{media_type:?}",),
-                        ));
-                    }
+        let codec_name: String = match &self.codec_name {
+            Some(codec_name) => codec_name.clone(),
+            None => match media_type {
+                MediaType::VIDEO => Self::VIDEO_CODEC_NAME.to_string(),
+                MediaType::AUDIO => Self::AUDIO_CODEC_NAME.to_string(),
+                _ => {
+                    return Err(RsmediaError::custom(format!(
+                        "Unsupported media type:{media_type:?}",
+                    )));
                 }
-            };
-            AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name))
-                .context(format!("Failed to find encoder by name: '{codec_name}'"))?
+            },
         };
+        let codec = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(&codec_name))
+            .context(format!("Failed to find encoder by name: '{codec_name}'"))?;
+
+        // CRF 速率控制：仅对支持 crf 私有选项的视频编码器生效，其余编码器
+        // 回退到 bit_rate 控制（与 ffmpeg CLI 行为一致，只是多一个警告）。
+        let use_crf = media_type == MediaType::VIDEO
+            && match self.quality {
+                Some(Quality::Crf(_)) => {
+                    let capable = Self::CRF_CAPABLE_CODECS.contains(&codec_name.as_str());
+                    if !capable {
+                        log::warn!(
+                            "codec '{codec_name}' has no CRF support, falling back to bit rate control"
+                        );
+                    }
+                    capable
+                }
+                _ => false,
+            };
 
         let mut encode_ctx = AVCodecContext::new(&codec);
-        self.setup_codec_context(&mut encode_ctx)?;
+        self.setup_codec_context(&mut encode_ctx, use_crf)?;
         let config = CodecConfig::from_codec(codec);
 
         // 在 hw_device_config / codec_opts 被 move 之前构造 filter graph：
@@ -496,9 +572,26 @@ impl EncoderBuilder {
             })
             .transpose()?;
 
-        let dict = self.codec_opts.map(|opts| opts.into_dict());
+        // 打开编码器前的私有选项：quality/profile/level 先写入，用户
+        // codec_opts 后合并覆盖（显式指定的用户选项优先）。
+        let mut opts = Options::new();
+        if use_crf && let Some(Quality::Crf(crf)) = self.quality {
+            opts.insert("crf", crf.to_string());
+        }
+        if media_type == MediaType::VIDEO {
+            if let Some(profile) = self.profile {
+                opts.insert("profile", profile.as_option_str());
+            }
+            if let Some(level) = &self.level {
+                opts.insert("level", level);
+            }
+        }
+        if let Some(user_opts) = self.codec_opts {
+            // 用户显式选项覆盖 quality 默认值
+            opts.merge(user_opts);
+        }
         encode_ctx
-            .open(dict)
+            .open(opts.into_dict())
             .context("Failed to open encode context")?;
 
         Ok(Encoder {
@@ -540,6 +633,9 @@ impl Default for EncoderBuilder {
             thread_count: num_cpus::get(),
             codec_name: None,
             codec_opts: None,
+            quality: None,
+            profile: None,
+            level: None,
             filters: None,
             hw_device_config: None,
             scale_algorithm: ScaleAlgorithm::default(),
@@ -1765,6 +1861,109 @@ mod tests {
             Ok(())
         }
 
+        /// Quality::Crf 编码往返：文件正常产出、帧数一致。
+        #[test]
+        fn test_quality_crf_roundtrip() -> Result<()> {
+            use crate::DecoderBuilder;
+
+            let width = 64usize;
+            let height = 64usize;
+            let n_frames = 10;
+            let fps = 25.0;
+
+            let path = crate::test_utils::test_output_path("encode", "rsmedia_crf_roundtrip.mp4");
+            crate::test_utils::remove_test_output(&path);
+
+            let mut encoder = EncoderBuilder::new_video(width, height)
+                .with_fps(fps)
+                .with_quality(Quality::Crf(23))
+                .build_wrapped(path.as_path())?;
+            for i in 0..n_frames {
+                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                encoder.write_frame(frame)?;
+            }
+            encoder.finish()?;
+
+            let mut decoder =
+                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let mut decoded = 0usize;
+            while decoder.decode_frame()?.is_some() {
+                decoded += 1;
+            }
+            assert_eq!(decoded, n_frames, "CRF roundtrip frame count mismatch");
+
+            crate::test_utils::remove_test_output(&path);
+            Ok(())
+        }
+
+        /// Quality::Bitrate 覆盖 with_bit_rate，并反映到 codecpar。
+        #[test]
+        fn test_quality_bitrate_applied() -> Result<()> {
+            let encoder = EncoderBuilder::new_video(64, 64)
+                .with_bit_rate(500_000)
+                .with_quality(Quality::Bitrate(2_000_000))
+                .build()?;
+            assert_eq!(encoder.codecpar().bit_rate, 2_000_000);
+            Ok(())
+        }
+
+        /// profile/level 通过私有选项传给 libx264：编码到 MP4 后重新打开，
+        /// 容器元数据（avcC/SPS）应回报 profile=High(100)、level=4.1(41)。
+        #[test]
+        #[cfg(unix)]
+        fn test_profile_level_applied() -> Result<()> {
+            use crate::DecoderBuilder;
+
+            let width = 64usize;
+            let height = 64usize;
+            let fps = 25.0;
+
+            let path = crate::test_utils::test_output_path("encode", "rsmedia_profile.mp4");
+            crate::test_utils::remove_test_output(&path);
+
+            let mut encoder = EncoderBuilder::new_video(width, height)
+                .with_fps(fps)
+                .with_profile(VideoProfile::High)
+                .with_level("4.1")
+                .build_wrapped(path.as_path())?;
+            for i in 0..5 {
+                let frame = rainbow_video_frame(width, height, i as f32 / 5.0);
+                encoder.write_frame(frame)?;
+            }
+            encoder.finish()?;
+
+            let decoder = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let info = decoder.stream_info();
+            assert_eq!(info.profile, ffi::AV_PROFILE_H264_HIGH as i32);
+            assert_eq!(info.level, 41);
+
+            drop(decoder);
+            crate::test_utils::remove_test_output(&path);
+            Ok(())
+        }
+
+        /// Crf 请求在不支持的编码器上回退为 bit_rate 控制（默认 1Mbps）。
+        #[test]
+        fn test_crf_fallback_bitrate() -> Result<()> {
+            let encoder = EncoderBuilder::new_video(64, 64)
+                .with_fps(25.0)
+                .with_codec_name("mpeg4".to_string())
+                .with_quality(Quality::Crf(20))
+                .build()?;
+            assert_eq!(encoder.codecpar().bit_rate, EncoderBuilder::VIDEO_BIT_RATE);
+            Ok(())
+        }
+
+        /// 音频编码器忽略 Crf（视频概念），正常按 bit_rate 打开。
+        #[test]
+        fn test_audio_ignores_crf() -> Result<()> {
+            let encoder = EncoderBuilder::new_audio(128_000, 2, 44100, SampleFormat::FLTP)
+                .with_quality(Quality::Crf(20))
+                .build()?;
+            assert_eq!(encoder.codecpar().bit_rate, 128_000);
+            Ok(())
+        }
+
         /// 回归测试：带延迟滤镜（framerate，内部缓冲运动插值帧、flush 时才输出剩余帧）
         /// 编码时，flush() 阶段取出的缓冲帧必须全部写盘，不能因再次送入已 flushed 的
         /// filter 而被丢弃。
@@ -2287,7 +2486,8 @@ mod tests {
 
             let codec_name = spec.codec.unwrap_or("aac");
             // 编码器存在性取决于 FFmpeg 构建配置（如 libmp3lame/libopus），缺失时跳过
-            let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)) else {
+            let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name))
+            else {
                 return Err(RsmediaError::codec_not_found(format!(
                     "encoder {codec_name} not available in this FFmpeg build"
                 )));
@@ -2386,8 +2586,8 @@ mod tests {
                 other => {
                     return Err(RsmediaError::unsupported(format!(
                         "test sample format: {other:?}"
-                    )))
-                },
+                    )));
+                }
             }
             encoder.finish()?;
             println!(
@@ -2428,8 +2628,8 @@ mod tests {
                 other => {
                     return Err(RsmediaError::unsupported(format!(
                         "decoded sample format: {other:?}"
-                    )))
-                },
+                    )));
+                }
             }
             assert!(
                 decoded_frames > 0,

@@ -129,7 +129,7 @@ impl<'a> StreamReaderBuilder<'a> {
         let fmt_opt = self
             .format
             .and_then(|str| AVInputFormat::find(&strutils::str_to_cstring(str)));
-        let mut dict = self.options.map(|opts| opts.into_dict());
+        let mut dict = self.options.and_then(|opts| opts.into_dict());
         let mut ctx_input = AVFormatContextInput::builder()
             .url(&filename)
             .maybe_format(fmt_opt.as_deref())
@@ -339,7 +339,7 @@ impl<'a> StreamWriterBuilder<'a> {
     pub fn build(self) -> Result<StreamWriter> {
         let filename = strutils::path_to_cstring(&self.destination.as_path());
         let format = self.format.map(strutils::str_to_cstring);
-        let mut dict = self.options.map(|opts| opts.into_dict());
+        let mut dict = self.options.and_then(|opts| opts.into_dict());
         let output_ctx = AVFormatContextOutput::builder()
             .filename(&filename)
             .maybe_format_name(format.as_deref())
@@ -430,7 +430,7 @@ impl<'a> BufferWriterBuilder<'a> {
 
     /// Build [`BufferWriter`].
     pub fn build(self) -> Result<BufferWriter> {
-        let _dict = self.options.map(|opts| opts.into_dict());
+        let _dict = self.options.and_then(|opts| opts.into_dict());
         Ok(BufferWriter {
             output: output_raw(self.format)?,
         })
@@ -513,7 +513,7 @@ impl<'a> PacketizedBufWriterBuilder<'a> {
 
     /// Build [`PacketizedBufWriter`].
     pub fn build(self) -> Result<PacketizedBufWriter> {
-        let _dict = self.options.map(|opts| opts.into_dict());
+        let _dict = self.options.and_then(|opts| opts.into_dict());
         Ok(PacketizedBufWriter {
             output: output_raw(self.format)?,
             buffers: Vec::new(),

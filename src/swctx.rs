@@ -172,7 +172,9 @@ pub fn scale_with_flags(
         ffi::sws_scale_frame(sws_ctx.as_mut_ptr(), dst_frame_ptr, src_frame.as_ptr())
     };
     if ret < 0 {
-        return Err(RsmediaError::custom(format!("Failed to scale frame, ret: {ret}")));
+        return Err(RsmediaError::custom(format!(
+            "Failed to scale frame, ret: {ret}"
+        )));
     }
 
     log::debug!(
@@ -353,8 +355,8 @@ pub fn convert_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SampleFormat, time};
     use crate::error::{Context, Result};
+    use crate::{SampleFormat, time};
     use rsmpeg::avutil::AVChannelLayout;
     use rsmpeg::ffi;
 

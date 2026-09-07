@@ -4,36 +4,125 @@ use rsmpeg::avutil::AVDictionary;
 
 use std::collections::HashMap;
 
-/// A macro to create a HashMap with key-value pairs.
-macro_rules! map {
-    // empty
-    () => {
-        ::std::collections::HashMap::new()
-    };
-    // key-value pairs
-    ($($key:expr => $value:expr),+ $(,)?) => {
-        {
-            let mut map = ::std::collections::HashMap::new();
-            $(
-                map.insert($key.into(), $value.into());
-            )+
-            map
-        }
-    };
-}
-
 /// A wrapper type for ffmpeg options.
+///
+/// Internally backed by a [`HashMap<String, String>`] and lazily materialized
+/// into an [`AVDictionary`] at the FFI boundary
+/// ([`Options::into_dict`]/[`Options::to_dict`]).
+///
+/// This avoids a subtle defect of building AVDictionary directly: rsmpeg
+/// cannot represent an *empty* dictionary (FFmpeg uses a NULL pointer), so
+/// previous eager construction always carried a junk `key=""` entry that made
+/// libav log `Option '' not found` on every `open()`. With lazy
+/// materialization an empty `Options` converts to `None`.
 ///
 /// FFmpeg Documentation: <https://ffmpeg.org/doxygen/trunk/>
 ///
 /// `libavformat/options_table.h`: <https://www.ffmpeg.org/doxygen/trunk/libavformat_2options__table_8h-source.html>
-/// `libavcodec/options_table.h`: <https://www.ffmpeg.org/doxygen/trunk/libavcodec_2options__table_8h_source.html>
-#[derive(Clone)]
-pub struct Options(AVDictionary);
+/// `libavcodec/options_table.h`: <https://www.ffmpeg.org/doxygen/trunk/libavcodec_2options_table_8h_source.html>
+///
+/// # Example
+///
+/// ```ignore
+/// let mut opts = Options::new();
+/// opts.insert("threads", "4");
+/// opts.merge(Options::preset_h264()); // preset keys win
+/// ```
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Options(HashMap<String, String>);
 
 impl Options {
-    pub fn new(dict: AVDictionary) -> Self {
-        Self(dict)
+    /// Creates an empty options set.
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    /// Inserts a key-value pair, replacing any existing entry (same
+    /// overwrite semantics as `av_dict_set` with flags 0).
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
+        self.0.insert(key.into(), value.into());
+        self
+    }
+
+    /// Looks up a value by key.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    /// Removes a key, returning its previous value.
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        self.0.remove(key)
+    }
+
+    /// Returns true if the key is present.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns true if there are no entries.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterates over key-value pairs (unordered, like the underlying
+    /// AVDictionary).
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter()
+    }
+
+    /// Merges `other` into `self`; entries from `other` win on conflicts
+    /// (same overwrite semantics as `av_dict_copy` with flags 0).
+    pub fn merge(&mut self, other: Options) {
+        self.0.extend(other.0);
+    }
+
+    /// Materializes into an [`AVDictionary`], or `None` when empty so that
+    /// `open(None)` is called instead of feeding libav a junk dictionary.
+    ///
+    /// Keys/values containing interior NUL bytes are skipped with a warning
+    /// (they cannot be represented in a C string).
+    pub fn to_dict(&self) -> Option<AVDictionary> {
+        self.clone().into_dict()
+    }
+
+    /// Consuming variant of [`Options::to_dict`].
+    pub fn into_dict(self) -> Option<AVDictionary> {
+        let mut dict: Option<AVDictionary> = None;
+        for (k, v) in self.0 {
+            if k.contains('\0') || v.contains('\0') {
+                log::warn!("Skip option with interior NUL: {k:?}={v:?}");
+                continue;
+            }
+            let (key, value) = (strutils::str_to_cstring(&k), strutils::str_to_cstring(&v));
+            dict = match dict {
+                Some(dict) => Some(dict.set(&key, &value, 0)),
+                None => Some(AVDictionary::new(&key, &value, 0)),
+            };
+        }
+        dict
+    }
+
+    /// Reads entries back from an [`AVDictionary`].
+    pub fn from_dict(dict: &AVDictionary) -> Self {
+        dict.into_iter()
+            .filter_map(|entry| {
+                match (
+                    strutils::cstr_to_string(entry.key()),
+                    strutils::cstr_to_string(entry.value()),
+                ) {
+                    (Ok(key), Ok(value)) => Some((key, value)),
+                    (bad_key, bad_value) => {
+                        log::warn!("Skip non-UTF8 option: {bad_key:?}={bad_value:?}");
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Creates options such that ffmpeg will prefer TCP transport when reading RTSP stream (over
@@ -43,15 +132,13 @@ impl Options {
     /// This sets the `rtsp_transport` to `tcp` in ffmpeg options,
     /// it also sets `rw_timeout` and `stimeout` to lower (more sane) values.
     pub fn preset_avformat_rtsp_transport_tcp() -> Self {
-        let opts = map! {
-            "rtsp_transport" => "tcp",
+        let mut opts = Self::new();
+        opts
             // These can't be too low because ffmpeg takes its sweet time
-            "rw_timeout" => "16000000",
-            "stimeout" => "16000000",
-        };
-
-        // HashMap<String, String> -> Options
-        opts.into()
+            .insert("rtsp_transport", "tcp")
+            .insert("rw_timeout", "16000000")
+            .insert("stimeout", "16000000");
+        opts
     }
 
     /// Creates options such that ffmpeg is instructed to fragment output and mux to fragmented mp4
@@ -61,105 +148,93 @@ impl Options {
     /// have a header and each packet contains enough metadata to be streamed without the header.
     /// Muxer output should be compatiable with MSE.
     pub fn preset_avformat_fragmented_mov() -> Self {
-        let opts = map! {
-            "movflags" => "faststart+frag_keyframe+frag_custom+empty_moov+omit_tfhd_offset",
-        };
-
-        // HashMap<String, String> -> Options
-        opts.into()
+        let mut opts = Self::new();
+        opts.insert(
+            "movflags",
+            "faststart+frag_keyframe+frag_custom+empty_moov+omit_tfhd_offset",
+        );
+        opts
     }
 
     /// Creates options for a FLV muxer.
     pub fn preset_avformat_flv() -> Self {
-        let opts = map! {
-            "flvflags" => "no_duration_filesize",
-            "fflags" => "nobuffer+flush_packets",
-             // 添加实时流标志
-            "live" => "1",
-             // 完全禁用元数据更新
-            "write_metaf" => "0",
-             // 设置较小的chunk大小以减少延迟
-            "chunk_size" => "4096",
-        };
-
-        // HashMap<String, String> -> Options
-        opts.into()
+        let mut opts = Self::new();
+        opts.insert("flvflags", "no_duration_filesize")
+            .insert("fflags", "nobuffer+flush_packets")
+            // 添加实时流标志
+            .insert("live", "1")
+            // 完全禁用元数据更新
+            .insert("write_metaf", "0")
+            // 设置较小的chunk大小以减少延迟
+            .insert("chunk_size", "4096");
+        opts
     }
 
     /// Default avcodec options for a libx264 encoder.
     pub fn preset_h264() -> Self {
-        let opts = map! {
-             // ultrafast,superfast,veryfast,faster,fast,medium,slow,slower,veryslow,placebo
-            "preset" => "medium",
-             // baseline,main,high
-            "profile:v" => "high",
+        let mut opts = Self::new();
+        opts
+            // ultrafast,superfast,veryfast,faster,fast,medium,slow,slower,veryslow,placebo
+            .insert("preset", "medium")
+            // baseline,main,high
+            .insert("profile", "high")
             // 场景切换敏感度
-            "scenecut" => "0",
-        };
-
-        // HashMap<String, String> -> Options
-        opts.into()
+            .insert("scenecut", "0");
+        opts
     }
 
     /// Options for a libx264 encoder that are tuned for low-latency encoding such as for real-time streaming.
     pub fn preset_h264_realtime() -> Self {
-        let opts = map! {
+        let mut opts = Self::new();
+        opts
             // ultrafast,superfast,veryfast,faster,fast,medium,slow,slower,veryslow,placebo
-            "preset" => "medium",
+            .insert("preset", "medium")
             // baseline,main,high
-            "profile:v" => "main",
-             // film,animation,grain,stillimage,psnr,ssim,fastdecode,zerolatency
-            "tune" => "zerolatency",
-            // rc 参数在 libx264 中不是直接支持的，应该使用 rate_control 或相关参数如 crf, qp 或 bitrate
-            // crf, vbr, cbr, abr
-            // "rc" => "cbr",
+            .insert("profile", "main")
+            // film,animation,grain,stillimage,psnr,ssim,fastdecode,zerolatency
+            .insert("tune", "zerolatency")
             // 设置比特率控制,视频比特率
-            "b:v" => "3000k",
+            .insert("b", "3000k")
             // 最大比特率
-            "maxrate" => "3500k",
+            .insert("maxrate", "3500k")
             // 缓冲区大小
-            "bufsize" => "3000k",
+            .insert("bufsize", "3000k")
             // 恒定质量因子
-            "crf" => "23",
+            .insert("crf", "23")
             // 场景切换敏感度
-            "scenecut" => "0",
+            .insert("scenecut", "0")
             // 周期内部刷新替代关键帧
-            "intra-refresh" => "1",
+            .insert("intra-refresh", "1")
             // 参考帧数量
-            "refs" => "3",
+            .insert("refs", "3")
             // GOP=60（2秒@30fps）
-            "g" => "60",
+            .insert("g", "60")
             // 禁用 B 帧
-            "bf" => "0",
+            .insert("bf", "0")
             // 最小量化参数
-            "qmin" => "4",
+            .insert("qmin", "4")
             // 最大量化参数
-            "qmax" => "51",
+            .insert("qmax", "51")
             // 启用中等强度去块滤波
-            "deblock" => "1:1",
+            .insert("deblock", "1:1")
             // 自适应量化模式
-            "aq-mode" => "2",
+            .insert("aq-mode", "2")
             // 量化优化, 0: 禁用, 1: 仅用于最终编码, 2: 用于所有模式决策
-            "trellis" => "1",
-            "threads" => "auto",
+            .insert("trellis", "1")
+            .insert("threads", "auto")
             // 使用所有可用的分区模式
-            "partitions" => "all",
+            .insert("partitions", "all")
             // 最小关键帧间隔
-            "keyint_min" => "30",
+            .insert("keyint_min", "30")
             // 强制恒定帧率
-            "force-cfr" => "1",
+            .insert("force-cfr", "1")
             // 启用切片线程
-            "sliced_threads" => "1",
+            .insert("sliced_threads", "1")
             // 禁用前瞻同步
-            "sync-lookahead" => "0",
+            .insert("sync-lookahead", "0")
             // 减少前瞻帧数
-            "rc-lookahead" => "10",
-            // 使用x264opts组合参数进行更精细的控制
-            "x264opts" => "no-mbtree:no-weightb:nal-hrd=cbr",
-        };
-
-        // HashMap<String, String> -> Options
-        opts.into()
+            .insert("rc-lookahead", "10");
+        opts
     }
 
     /// h264_nvenc options only
@@ -171,128 +246,78 @@ impl Options {
     /// <https://docs.nvidia.com/video-technologies/video-codec-sdk/12.1/nvenc-preset-migration-guide/index.html>
     ///
     pub fn preset_h264_nvenc() -> Self {
-        let opts = map! {
-             // p1-p7, default(p4), slow, medium, fast, hp, hq, bd, ll, llhq, llhp, lossless
-            "preset" => "p5",
+        let mut opts = Self::new();
+        opts
+            // p1-p7, default(p4), slow, medium, fast, hp, hq, bd, ll, llhq, llhp, lossless
+            .insert("preset", "p5")
             // baseline, main, high, high444p, high10, high422
-            "profile" => "high",
+            .insert("profile", "high")
             // ll, ull, lossless, film, animation, grain, fastdecode, zerolatency, hq
-            "tune" => "ll",
+            .insert("tune", "ll")
             // 设置比特率 4Mbps
-            "b:v" => "4000k",
-            "maxrate" => "5000k",
-            "bufsize" => "8000k",
+            .insert("b", "4000k")
+            .insert("maxrate", "5000k")
+            .insert("bufsize", "8000k")
             // constqp, ll_2pass_size, ll_2pass_quality
             // vbr, vbr_hq, vbr_minqp, vbr_2pass
             // cbr, cbr_hq, cbr_ld_hq
-            "rc" => "cbr",
-            // 添加锐度增强，低延迟不需要，增强画质可以启用
-            // "rc-lookahead" => "20",
+            .insert("rc", "cbr")
             // 量化参数
-            "qmin" => "10",
-            "qmax" => "18",
+            .insert("qmin", "10")
+            .insert("qmax", "18")
             // 启用自适应量化
-            "spatial-aq" => "1",
-            "temporal-aq" => "1",
-            "aq-strength" => "8",
-            // 启用2pass编码,注意与 zerolatency 可能冲突
-            // "2pass" => "1",
+            .insert("spatial-aq", "1")
+            .insert("temporal-aq", "1")
+            .insert("aq-strength", "8")
             // GOP设置，较小的GOP有利于快速恢复和低延迟
-            "g" => "30",
+            .insert("g", "30")
             // 禁用B帧以，避免出现画面闪烁
-            "bf" => "0",
-            "b_ref_mode" => "middle",
+            .insert("bf", "0")
+            .insert("b_ref_mode", "middle")
             // 启用场景切换检测，允许在场景变化时插入I帧
-            "no-scenecut" => "0",
+            .insert("no-scenecut", "0")
             // 低延时
-            "delay" => "0",
-            "zerolatency" => "1",
+            .insert("delay", "0")
+            .insert("zerolatency", "1")
             // NVENC特有的参数
             // 增加表面缓冲区数量
-            "surfaces" => "32",
+            .insert("surfaces", "32")
             // 加权预测，改善低光照
-            "weighted_pred" => "1",
-        };
-
-        // HashMap<String, String> -> Options
-        opts.into()
-    }
-
-    /// 转换为 AVDictionary 但不转移所有权
-    pub fn as_dict(&self) -> &AVDictionary {
-        &self.0
-    }
-
-    /// 转换为 AVDictionary 并转移所有权
-    pub fn into_dict(self) -> AVDictionary {
-        self.0
-    }
-
-    /// 创建一个 AVDictionary 的副本
-    pub fn to_dict(&self) -> AVDictionary {
-        self.0.clone()
+            .insert("weighted_pred", "1");
+        opts
     }
 }
 
-/// HashMap<String, String> -> Options
+/// `HashMap<String, String>` -> `Options`
 impl From<HashMap<String, String>> for Options {
-    /// Converts from `HashMap` to `Options`.
-    ///
-    /// # Arguments
-    ///
-    /// * `item` - Item to convert from.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let my_opts = HashMap::new();
-    /// options.insert(
-    ///     "my_option".to_string(),
-    ///     "my_value".to_string(),
-    /// );
-    ///
-    /// let opts: Options = my_opts.into();
-    /// ```
     fn from(item: HashMap<String, String>) -> Self {
-        let mut dict = AVDictionary::new(c"", c"", 0);
-        for (k, v) in item {
-            dict = dict.set(&strutils::str_to_cstring(&k), &strutils::str_to_cstring(&v), 0);
-        }
-        Self(dict)
-    }
-}
-
-/// Converts from `&Options` to `HashMap<String, String>`.
-impl From<&Options> for HashMap<String, String> {
-    fn from(item: &Options) -> Self {
-        item.0
-            .into_iter()
-            .map(|entry| {
-                (
-                    strutils::cstr_to_string(entry.key()).unwrap(),
-                    strutils::cstr_to_string(entry.value()).unwrap(),
-                )
-            })
-            .collect()
+        Self(item)
     }
 }
 
 /// `Options` -> `HashMap<String, String>`
 impl From<Options> for HashMap<String, String> {
-    /// Converts from `Options` to `HashMap`.
-    ///
-    /// # Arguments
-    ///
-    /// * `item` - Item to convert from.
     fn from(item: Options) -> Self {
-        (&item).into()
+        item.0
+    }
+}
+
+/// Borrowing conversion (clones the entries).
+impl From<&Options> for HashMap<String, String> {
+    fn from(item: &Options) -> Self {
+        item.0.clone()
+    }
+}
+
+impl FromIterator<(String, String)> for Options {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
     }
 }
 
 impl std::fmt::Debug for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let dict: HashMap<String, String> = self.into();
-        write!(f, "{dict:?}")
+        std::fmt::Debug::fmt(&self.0, f)
     }
 }
 
@@ -302,8 +327,50 @@ impl std::fmt::Display for Options {
     }
 }
 
-unsafe impl Send for Options {}
-unsafe impl Sync for Options {}
+/// Rate control strategy for video encoders, set via
+/// [`crate::EncoderBuilder::with_quality`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quality {
+    /// Constant Rate Factor — quality-targeted, file size varies.
+    /// Lower value = higher quality (x264 scale, sane range 0..=51,
+    /// defaults around 18-28). Supported by `libx264`, `libx265`,
+    /// `libvpx`, `libvpx-vp9`, `libaom-av1`, `libsvtav1` and
+    /// `libopenh264`; other encoders fall back to [`Quality::Bitrate`]
+    /// with a warning.
+    Crf(u8),
+    /// Explicit target bit rate in bits per second.
+    Bitrate(i64),
+}
+
+/// H.264-style encoding profile, set via [`crate::EncoderBuilder::with_profile`].
+///
+/// The variant name is passed as the codec's `profile` private option
+/// string (`"baseline"`, `"main"`, `"high"`, ...). `libx264` supports all
+/// variants directly; other encoders map what they support and ignore
+/// unknown names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoProfile {
+    Baseline,
+    Main,
+    High,
+    High10,
+    High422,
+    High444,
+}
+
+impl VideoProfile {
+    /// FFmpeg private-option string for this profile (x264 naming).
+    pub fn as_option_str(&self) -> &'static str {
+        match self {
+            VideoProfile::Baseline => "baseline",
+            VideoProfile::Main => "main",
+            VideoProfile::High => "high",
+            VideoProfile::High10 => "high10",
+            VideoProfile::High422 => "high422",
+            VideoProfile::High444 => "high444",
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -313,5 +380,87 @@ mod tests {
     fn test_options_debug() {
         let opts = Options::preset_h264_realtime();
         println!("{:?}", opts);
+    }
+
+    #[test]
+    fn test_options_basic_ops() {
+        let mut opts = Options::new();
+        assert!(opts.is_empty());
+
+        opts.insert("threads", "4").insert("preset", "fast");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts.get("threads"), Some("4"));
+        assert_eq!(opts.get("missing"), None);
+        assert!(opts.contains_key("preset"));
+
+        // overwrite semantics
+        opts.insert("threads", "8");
+        assert_eq!(opts.get("threads"), Some("8"));
+
+        assert_eq!(opts.remove("preset"), Some("fast".to_string()));
+        assert_eq!(opts.remove("preset"), None);
+        assert_eq!(opts.len(), 1);
+    }
+
+    #[test]
+    fn test_options_merge_other_wins() {
+        let mut base = Options::new();
+        base.insert("preset", "medium").insert("crf", "23");
+
+        let mut overlay = Options::new();
+        overlay.insert("crf", "18").insert("tune", "film");
+
+        base.merge(overlay);
+        assert_eq!(base.get("preset"), Some("medium"));
+        assert_eq!(base.get("crf"), Some("18"));
+        assert_eq!(base.get("tune"), Some("film"));
+    }
+
+    #[test]
+    fn test_options_empty_to_dict_is_none() {
+        // 根治旧实现：空 Options 物化为 None，不再携带 key="" 的脏条目。
+        let opts = Options::new();
+        assert!(opts.into_dict().is_none());
+    }
+
+    #[test]
+    fn test_options_dict_roundtrip() {
+        let mut opts = Options::new();
+        opts.insert("crf", "23").insert("profile", "high");
+
+        let dict = opts.to_dict().expect("non-empty must materialize");
+        let back = Options::from_dict(&dict);
+        assert_eq!(back.get("crf"), Some("23"));
+        assert_eq!(back.get("profile"), Some("high"));
+        assert_eq!(back.len(), 2);
+    }
+
+    #[test]
+    fn test_options_hashmap_roundtrip() {
+        let mut map = HashMap::new();
+        map.insert("a".to_string(), "1".to_string());
+
+        let opts: Options = map.clone().into();
+        assert_eq!(opts.get("a"), Some("1"));
+
+        let back: HashMap<String, String> = opts.into();
+        assert_eq!(back, map);
+    }
+
+    #[test]
+    fn test_options_presets_fixed_keys() {
+        // "profile:v"/"b:v" 是 ffmpeg CLI 语法，AVOption 查找不到会被静默
+        // 忽略；preset 必须使用真正的 AVOption 名。
+        assert_eq!(Options::preset_h264().get("profile"), Some("high"));
+        assert_eq!(Options::preset_h264().get("profile:v"), None);
+
+        let rt = Options::preset_h264_realtime();
+        assert_eq!(rt.get("profile"), Some("main"));
+        assert_eq!(rt.get("b"), Some("3000k"));
+        assert_eq!(rt.get("b:v"), None);
+        // x264opts 是 CLI 组合器，AVOption 中不存在
+        assert_eq!(rt.get("x264opts"), None);
+
+        assert_eq!(Options::preset_h264_nvenc().get("b"), Some("4000k"));
     }
 }

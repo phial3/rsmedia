@@ -1,5 +1,5 @@
-use crate::io::init_logging;
 use crate::error::{Error, Result};
+use crate::io::init_logging;
 use once_cell::sync::OnceCell;
 
 static INIT: OnceCell<()> = OnceCell::new();

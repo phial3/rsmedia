@@ -8,7 +8,7 @@ use crate::options::Options;
 use crate::resize::Resize;
 use crate::stream::StreamInfo;
 use crate::swctx::ScaleAlgorithm;
-use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time, swctx, strutils};
+use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time, strutils, swctx};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
 use rsmpeg::avformat::AVStream;
@@ -176,11 +176,14 @@ impl DecoderBuilder {
     pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
-        let input_stream = reader
-            .input()
-            .streams()
-            .get(stream_index)
-            .ok_or(RsmediaError::custom(format!("stream: {stream_index} not found!")))?;
+        let input_stream =
+            reader
+                .input()
+                .streams()
+                .get(stream_index)
+                .ok_or(RsmediaError::custom(format!(
+                    "stream: {stream_index} not found!"
+                )))?;
 
         let codec = {
             let codec_name = if let Some(ref codec_name) = self.codec_name {
@@ -242,7 +245,7 @@ impl DecoderBuilder {
             })
             .transpose()?;
 
-        let dict = self.codec_opts.map(|opts| opts.into_dict());
+        let dict = self.codec_opts.and_then(|opts| opts.into_dict());
         decode_ctx
             .open(dict)
             .context("Failed to open decoder for stream")?;
@@ -786,7 +789,9 @@ impl Decoder {
                         .compute_for((sw_frame.width as u32, sw_frame.height as u32))
                         .ok_or_else(|| {
                             let (w, h) = (sw_frame.width, sw_frame.height);
-                            RsmediaError::custom(format!("Cannot resize frame {w}x{h} into {resize:?}"))
+                            RsmediaError::custom(format!(
+                                "Cannot resize frame {w}x{h} into {resize:?}"
+                            ))
                         })?,
                     None => (sw_frame.width as u32, sw_frame.height as u32),
                 };
@@ -1015,7 +1020,9 @@ impl<R: Reader> DecoderWrapper<R> {
                 .seek_to_timestamp(timestamp_milliseconds)
                 .inspect(|_| self.decoder.flush())
         } else {
-            Err(RsmediaError::custom("Seek is only supported for StreamReader"))
+            Err(RsmediaError::custom(
+                "Seek is only supported for StreamReader",
+            ))
         }
     }
 

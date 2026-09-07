@@ -1163,7 +1163,9 @@ impl FilterGraph {
                 self.state = FilterGraphState::Flushed;
                 Ok(None)
             }
-            Err(e) => Err(RsmediaError::custom(format!("Get frame from buffer sink Error: {e}"))),
+            Err(e) => Err(RsmediaError::custom(format!(
+                "Get frame from buffer sink Error: {e}"
+            ))),
         }
     }
 

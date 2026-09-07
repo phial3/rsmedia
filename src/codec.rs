@@ -34,7 +34,9 @@ impl CodecConfig {
     pub fn new_with_name(codec_name: &CStr) -> Result<Self> {
         let codec = AVCodec::find_encoder_by_name(codec_name)
             .or_else(|| AVCodec::find_decoder_by_name(codec_name))
-            .ok_or_else(|| RsmediaError::custom(format!("Codec not found by name: '{codec_name:?}'")))?;
+            .ok_or_else(|| {
+                RsmediaError::custom(format!("Codec not found by name: '{codec_name:?}'"))
+            })?;
         #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
         {
             Ok(Self { codec })
@@ -212,7 +214,10 @@ impl CodecConfig {
             }
             while (*p).profile != ffi::AV_PROFILE_UNKNOWN {
                 let name = strutils::c_char_to_str((*p).name);
-                out.push(Profile { id: (*p).profile, name });
+                out.push(Profile {
+                    id: (*p).profile,
+                    name,
+                });
                 p = p.add(1);
             }
         }
@@ -230,6 +235,39 @@ impl CodecConfig {
         } else {
             Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
         }
+    }
+
+    /// All codecs registered in this FFmpeg build (encoders and decoders).
+    pub fn all() -> Vec<Self> {
+        AVCodec::iterate().map(Self::from_codec).collect()
+    }
+
+    /// All registered encoder implementations.
+    pub fn encoders() -> Vec<Self> {
+        Self::all().into_iter().filter(|c| c.is_encoder()).collect()
+    }
+
+    /// All registered decoder implementations.
+    pub fn decoders() -> Vec<Self> {
+        Self::all().into_iter().filter(|c| c.is_decoder()).collect()
+    }
+
+    /// All encoder implementations for one codec id — e.g. for
+    /// `AV_CODEC_ID_H264` this typically lists `libx264`, `h264_nvenc`,
+    /// `h264_videotoolbox`, ... depending on the FFmpeg build and platform.
+    pub fn encoders_for(id: ffi::AVCodecID) -> Vec<Self> {
+        Self::encoders()
+            .into_iter()
+            .filter(|c| c.id() == id)
+            .collect()
+    }
+
+    /// All decoder implementations for one codec id.
+    pub fn decoders_for(id: ffi::AVCodecID) -> Vec<Self> {
+        Self::decoders()
+            .into_iter()
+            .filter(|c| c.id() == id)
+            .collect()
     }
 }
 
@@ -249,65 +287,6 @@ impl fmt::Display for Profile {
         } else {
             write!(f, "{}", self.name)
         }
-    }
-}
-
-/// Lightweight, owned summary of a codec discovered via `av_codec_iterate`.
-///
-/// Unlike [`CodecConfig`], building a `CodecInfo` never allocates an
-/// `AVCodecContext`, so it is cheap enough to enumerate every registered
-/// codec (used for capability queries and the codec matrix tests).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodecInfo {
-    pub id: ffi::AVCodecID,
-    pub name: String,
-    pub long_name: String,
-    pub media_type: MediaType,
-    pub is_encoder: bool,
-    pub is_decoder: bool,
-    pub is_hardware: bool,
-}
-
-impl CodecInfo {
-    fn from_ref(codec: AVCodecRef<'static>) -> Self {
-        let is_encoder = unsafe { ffi::av_codec_is_encoder(codec.as_ptr()) != 0 };
-        let is_decoder = unsafe { ffi::av_codec_is_decoder(codec.as_ptr()) != 0 };
-        Self {
-            id: codec.id,
-            name: unsafe { strutils::c_char_to_str(codec.name().as_ptr()) },
-            long_name: unsafe { strutils::c_char_to_str(codec.long_name().as_ptr()) },
-            media_type: MediaType::from(codec.type_),
-            is_encoder,
-            is_decoder,
-            is_hardware: codec.capabilities & ffi::AV_CODEC_CAP_HARDWARE as i32 != 0,
-        }
-    }
-
-    /// All codecs registered in this FFmpeg build (encoders and decoders).
-    pub fn all() -> Vec<Self> {
-        AVCodec::iterate().map(Self::from_ref).collect()
-    }
-
-    /// All registered encoder implementations.
-    pub fn encoders() -> Vec<Self> {
-        Self::all().into_iter().filter(|c| c.is_encoder).collect()
-    }
-
-    /// All registered decoder implementations.
-    pub fn decoders() -> Vec<Self> {
-        Self::all().into_iter().filter(|c| c.is_decoder).collect()
-    }
-
-    /// All encoder implementations for one codec id — e.g. for
-    /// `AV_CODEC_ID_H264` this typically lists `libx264`, `h264_nvenc`,
-    /// `h264_videotoolbox`, ... depending on the FFmpeg build and platform.
-    pub fn encoders_for(id: ffi::AVCodecID) -> Vec<Self> {
-        Self::encoders().into_iter().filter(|c| c.id == id).collect()
-    }
-
-    /// All decoder implementations for one codec id.
-    pub fn decoders_for(id: ffi::AVCodecID) -> Vec<Self> {
-        Self::decoders().into_iter().filter(|c| c.id == id).collect()
     }
 }
 
@@ -331,7 +310,7 @@ impl FormatInfo {
     }
 
     fn from_output(fmt: AVOutputFormatRef<'static>) -> Self {
-        let extensions = unsafe { strutils::c_char_to_str_list((*fmt).extensions) };
+        let extensions = unsafe { strutils::c_char_to_str_list(fmt.extensions) };
         Self {
             name: fmt.name().to_string_lossy().into_owned(),
             long_name: fmt.long_name().to_string_lossy().into_owned(),
@@ -340,7 +319,7 @@ impl FormatInfo {
     }
 
     fn from_input(fmt: AVInputFormatRef<'static>) -> Self {
-        let extensions = unsafe { strutils::c_char_to_str_list((*fmt).extensions) };
+        let extensions = unsafe { strutils::c_char_to_str_list(fmt.extensions) };
         Self {
             name: fmt.name().to_string_lossy().into_owned(),
             long_name: fmt.long_name().to_string_lossy().into_owned(),
@@ -350,28 +329,30 @@ impl FormatInfo {
 
     /// All muxers (output container formats) in this FFmpeg build.
     pub fn muxers() -> Vec<Self> {
-        rsmpeg::avformat::AVOutputFormat::iterate().map(Self::from_output).collect()
+        rsmpeg::avformat::AVOutputFormat::iterate()
+            .map(Self::from_output)
+            .collect()
     }
 
     /// All demuxers (input container formats) in this FFmpeg build.
     pub fn demuxers() -> Vec<Self> {
-        rsmpeg::avformat::AVInputFormat::iterate().map(Self::from_input).collect()
+        rsmpeg::avformat::AVInputFormat::iterate()
+            .map(Self::from_input)
+            .collect()
     }
 
     /// Look up a muxer by its short name (or one of its aliases),
     /// e.g. "mp4", "mkv", "matroska".
     pub fn find_muxer(short_name: &str) -> Option<Self> {
         Self::muxers().into_iter().find(|f| {
-            f.name == short_name
-                || f.name.split(',').any(|alias| alias.trim() == short_name)
+            f.name == short_name || f.name.split(',').any(|alias| alias.trim() == short_name)
         })
     }
 
     /// Look up a demuxer by its short name (or one of its aliases).
     pub fn find_demuxer(short_name: &str) -> Option<Self> {
         Self::demuxers().into_iter().find(|f| {
-            f.name == short_name
-                || f.name.split(',').any(|alias| alias.trim() == short_name)
+            f.name == short_name || f.name.split(',').any(|alias| alias.trim() == short_name)
         })
     }
 }
@@ -485,30 +466,33 @@ mod tests {
 
     #[test]
     fn test_codec_discovery() {
-        let all = CodecInfo::all();
+        let all = CodecConfig::all();
         assert!(!all.is_empty(), "no codecs registered");
 
-        let encoders = CodecInfo::encoders();
-        let decoders = CodecInfo::decoders();
+        let encoders = CodecConfig::encoders();
+        let decoders = CodecConfig::decoders();
         assert!(!encoders.is_empty() && !decoders.is_empty());
-        assert!(encoders.iter().all(|c| c.is_encoder));
-        assert!(decoders.iter().all(|c| c.is_decoder));
+        assert!(encoders.iter().all(|c| c.is_encoder()));
+        assert!(decoders.iter().all(|c| c.is_decoder()));
 
         // h264 decoder is available in every FFmpeg build.
-        let h264 = CodecInfo::decoders_for(ffi::AV_CODEC_ID_H264);
+        let h264 = CodecConfig::decoders_for(ffi::AV_CODEC_ID_H264);
         assert!(!h264.is_empty(), "h264 decoder missing");
-        assert_eq!(h264[0].media_type, MediaType::VIDEO);
+        assert_eq!(h264[0].media_type(), MediaType::VIDEO);
     }
 
     #[test]
     fn test_encoders_for_h264() {
-        let encoders = CodecInfo::encoders_for(ffi::AV_CODEC_ID_H264);
+        let encoders = CodecConfig::encoders_for(ffi::AV_CODEC_ID_H264);
         assert!(!encoders.is_empty(), "no h264 encoder in this FFmpeg build");
         // Software implementations are not flagged as hardware.
-        if let Some(sw) = encoders.iter().find(|c| c.name == "libx264") {
-            assert!(!sw.is_hardware, "libx264 must not be hardware");
+        if let Some(sw) = encoders.iter().find(|c| c.name() == c"libx264") {
+            assert!(!sw.is_hardware(), "libx264 must not be hardware");
         }
-        let names: Vec<_> = encoders.iter().map(|c| c.name.clone()).collect();
+        let names: Vec<_> = encoders
+            .iter()
+            .map(|c| c.name().to_string_lossy().into_owned())
+            .collect();
         println!("h264 encoders: {names:?}");
     }
 
@@ -518,12 +502,21 @@ mod tests {
         let demuxers = FormatInfo::demuxers();
         assert!(!muxers.is_empty() && !demuxers.is_empty());
 
-        assert!(muxers.iter().any(|f| f.name == "matroska"), "matroska muxer missing");
+        assert!(
+            muxers.iter().any(|f| f.name == "matroska"),
+            "matroska muxer missing"
+        );
         assert!(muxers.iter().any(|f| f.name == "mp4"), "mp4 muxer missing");
         // The mov demuxer's short-name field is the full alias list
         // ("mov,mp4,m4a,3gp,3g2,mj2"), so look it up by alias.
-        assert!(FormatInfo::find_demuxer("mov").is_some(), "mov demuxer missing");
-        assert!(FormatInfo::find_demuxer("matroska").is_some(), "matroska demuxer missing");
+        assert!(
+            FormatInfo::find_demuxer("mov").is_some(),
+            "mov demuxer missing"
+        );
+        assert!(
+            FormatInfo::find_demuxer("matroska").is_some(),
+            "matroska demuxer missing"
+        );
 
         let mp4 = FormatInfo::find_muxer("mp4").expect("mp4 muxer lookup failed");
         assert_eq!(mp4.name, "mp4");
@@ -551,7 +544,10 @@ mod tests {
             assert_eq!(high, "High");
         } else {
             assert!(names.contains(&"high".to_string()), "profiles: {names:?}");
-            assert!(names.contains(&"baseline".to_string()), "profiles: {names:?}");
+            assert!(
+                names.contains(&"baseline".to_string()),
+                "profiles: {names:?}"
+            );
         }
         assert_eq!(config.media_type(), MediaType::VIDEO);
         assert!(!config.is_hardware());

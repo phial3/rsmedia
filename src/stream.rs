@@ -157,7 +157,7 @@ impl StreamInfo {
         let codec_type = codecpar.codec_type();
         let metadata = stream
             .metadata()
-            .map_or(HashMap::new(), |d| Options::new(d.to_owned()).into());
+            .map_or(HashMap::new(), |d| Options::from_dict(&d).into());
         let bytes_per_sample = if codec_type.is_audio() {
             SampleFormat::from(codecpar.format).get_bytes_per_sample()
         } else {

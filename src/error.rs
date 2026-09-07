@@ -39,7 +39,10 @@ pub enum RsmediaError {
     /// Any other error with a human readable message.
     Other(String),
     /// An error with additional context attached (produced by [`Context`]).
-    Context { context: String, source: Box<RsmediaError> },
+    Context {
+        context: String,
+        source: Box<RsmediaError>,
+    },
 }
 
 impl RsmediaError {
@@ -47,11 +50,18 @@ impl RsmediaError {
     pub fn with_context(mut self, context: impl Into<String>) -> Self {
         // Nested contexts collapse into a single message chain: keep the
         // innermost error and join the context strings outermost-first.
-        if let RsmediaError::Context { context: inner, source } = self {
+        if let RsmediaError::Context {
+            context: inner,
+            source,
+        } = self
+        {
             self = *source;
             self.with_context(format!("{}: {inner}", context.into()))
         } else {
-            RsmediaError::Context { context: context.into(), source: Box::new(self) }
+            RsmediaError::Context {
+                context: context.into(),
+                source: Box::new(self),
+            }
         }
     }
 
@@ -88,10 +98,10 @@ impl fmt::Display for RsmediaError {
             RsmediaError::Io(e) => write!(f, "I/O error: {e}"),
             RsmediaError::CodecNotFound(name) => {
                 write!(f, "codec not found in this FFmpeg build: '{name}'")
-            },
+            }
             RsmediaError::FormatNotFound(name) => {
                 write!(f, "format not found in this FFmpeg build: '{name}'")
-            },
+            }
             RsmediaError::Unsupported(reason) => write!(f, "unsupported operation: {reason}"),
             RsmediaError::InvalidConfig(reason) => write!(f, "invalid configuration: {reason}"),
             RsmediaError::Other(message) => write!(f, "{message}"),
@@ -214,8 +224,7 @@ mod tests {
 
     #[test]
     fn test_context_chain() {
-        let err: std::result::Result<(), RsmpegError> =
-            Err(RsmpegError::DecoderDrainError);
+        let err: std::result::Result<(), RsmpegError> = Err(RsmpegError::DecoderDrainError);
         let wrapped = err.context("Failed to drain decoder").unwrap_err();
         assert_eq!(
             wrapped.to_string(),

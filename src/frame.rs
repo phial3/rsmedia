@@ -680,7 +680,9 @@ impl MediaFrame<u8> {
         let (width, height) = rgb.dimensions();
         let data =
             ndarray::Array3::from_shape_vec((height as usize, width as usize, 3), rgb.into_raw())
-                .map_err(|e| RsmediaError::custom(format!("Failed to build ndarray from image: {e}")))?;
+                .map_err(|e| {
+                RsmediaError::custom(format!("Failed to build ndarray from image: {e}"))
+            })?;
         Self::new_video(
             width as usize,
             height as usize,
@@ -989,7 +991,9 @@ where
         // 检查所有通道
         for (ch, plane) in frame.data.iter().enumerate().take(channels) {
             if plane.is_null() {
-                return Err(RsmediaError::custom(format!("Channel {ch} data pointer is null")));
+                return Err(RsmediaError::custom(format!(
+                    "Channel {ch} data pointer is null"
+                )));
             }
         }
 

@@ -233,7 +233,10 @@ mod tests {
         assert!(unsafe { c_char_to_str_list(std::ptr::null()) }.is_empty());
         // single value
         let c = CString::new("mp4").unwrap();
-        assert_eq!(unsafe { c_char_to_str_list(c.as_ptr()) }, vec!["mp4".to_string()]);
+        assert_eq!(
+            unsafe { c_char_to_str_list(c.as_ptr()) },
+            vec!["mp4".to_string()]
+        );
     }
 
     #[test]

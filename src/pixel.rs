@@ -1272,7 +1272,9 @@ impl PixelFormat {
     pub fn count_planes(&self) -> Result<i32> {
         let cnt = unsafe { ffi::av_pix_fmt_count_planes((*self).into()) };
         if cnt < 0 {
-            return Err(RsmediaError::custom(format!("Failed to get plane count:{cnt}")));
+            return Err(RsmediaError::custom(format!(
+                "Failed to get plane count:{cnt}"
+            )));
         }
         Ok(cnt)
     }
@@ -1299,7 +1301,9 @@ pub fn find_best_pix_fmt(
     };
 
     match PixelFormat::from(flags) {
-        PixelFormat::NONE => Err(RsmediaError::custom(format!("Failed to find best pix fmt:{flags}"))),
+        PixelFormat::NONE => Err(RsmediaError::custom(format!(
+            "Failed to find best pix fmt:{flags}"
+        ))),
         fmt => Ok(fmt),
     }
 }

@@ -18,7 +18,9 @@ pub fn fill_linesizes(pix_fmt: PixelFormat, width: i32) -> Result<[i32; 4]> {
 
     // >= 0 in case of success, a negative error code otherwise
     if ret < 0 {
-        return Err(RsmediaError::custom(format!("Failed to fill linesizes: {ret}")));
+        return Err(RsmediaError::custom(format!(
+            "Failed to fill linesizes: {ret}"
+        )));
     }
 
     Ok(linesizes)
@@ -38,7 +40,9 @@ pub fn get_linesize(pix_fmt: PixelFormat, width: u32, plane: usize) -> Result<us
 
     // returns the computed size in bytes
     if ret <= 0 {
-        return Err(RsmediaError::custom(format!("Failed to get line size, ret: {ret}")));
+        return Err(RsmediaError::custom(format!(
+            "Failed to get line size, ret: {ret}"
+        )));
     }
 
     Ok(ret as usize)
@@ -108,7 +112,9 @@ pub fn copy_frame_to_buffer(frame: &AVFrame) -> Result<Vec<u8>> {
         buffer.truncate(bytes);
         Ok(buffer)
     } else {
-        Err(RsmediaError::custom(format!("Failed to copy image:{bytes}")))
+        Err(RsmediaError::custom(format!(
+            "Failed to copy image:{bytes}"
+        )))
     }
 }
 
@@ -218,10 +224,7 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
         // 计算平面数据在缓冲区中的偏移量
         let data_offset = frame.data[plane_idx].offset_from((*buf_ptr).data) as usize;
         if data_offset >= (*buf_ptr).size {
-            return Err(format_err!(
-                "Invalid data offset for plane {}",
-                plane_idx
-            ));
+            return Err(format_err!("Invalid data offset for plane {}", plane_idx));
         }
 
         // 计算平面数据地址加上偏移量
@@ -523,8 +526,8 @@ pub fn to_ndarray(frame: &AVFrame) -> Result<ndarray::Array3<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ab_glyph::PxScale;
     use crate::error::Context;
+    use ab_glyph::PxScale;
     use image::{ImageBuffer, Rgb};
 
     /// Create an image with the given text and a gradient color.

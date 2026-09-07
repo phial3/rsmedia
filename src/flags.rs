@@ -129,8 +129,9 @@ pub enum MediaType {
 
 impl MediaType {
     pub fn get_media_type_string(&self) -> String {
-        avutil::get_media_type_string(*self as _)
-            .map_or("Unknown".to_string(), |s| strutils::cstr_to_string(s).unwrap())
+        avutil::get_media_type_string(*self as _).map_or("Unknown".to_string(), |s| {
+            strutils::cstr_to_string(s).unwrap()
+        })
     }
 }
 
@@ -190,8 +191,9 @@ impl SampleFormat {
     }
 
     pub fn get_sample_fmt_name(&self) -> String {
-        avutil::get_sample_fmt_name(*self as _)
-            .map_or("Unknown".to_string(), |s| strutils::cstr_to_string(s).unwrap())
+        avutil::get_sample_fmt_name(*self as _).map_or("Unknown".to_string(), |s| {
+            strutils::cstr_to_string(s).unwrap()
+        })
     }
 
     pub fn get_packed_sample_fmt(&self) -> Option<SampleFormat> {

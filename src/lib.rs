@@ -5,7 +5,6 @@ pub mod frame;
 #[cfg(feature = "ndarray")]
 pub use frame::{MediaFrame, MediaFrameFormat, MediaFrameType};
 pub mod codec;
-pub use codec::{CodecConfig, CodecInfo, FormatInfo, Profile};
 pub mod colors;
 pub mod error;
 pub mod filter;
@@ -20,12 +19,11 @@ pub mod options;
 pub mod pixel;
 pub mod resize;
 pub mod stream;
+pub mod strutils;
 pub mod swctx;
 pub mod time;
-pub mod strutils;
 
-pub use swctx::ScaleAlgorithm;
-
+pub use codec::{CodecConfig, FormatInfo, Profile};
 pub use decode::{Decoder, DecoderBuilder};
 pub use encode::{Encoder, EncoderBuilder};
 pub use error::{Error, Result, RsmediaError};
@@ -34,9 +32,10 @@ pub use init::init;
 pub use io::{Reader, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
-pub use options::Options;
+pub use options::{Options, Quality, VideoProfile};
 pub use pixel::PixelFormat;
 pub use resize::Resize;
+pub use swctx::ScaleAlgorithm;
 pub use time::Time;
 
 /// Re-export internal definition for caller to use.

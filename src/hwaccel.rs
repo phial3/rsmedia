@@ -183,9 +183,14 @@ impl HWContext {
         // create a new hardware device context
         let hw_device_ctx = {
             let device = strutils::str_to_cstring_opt(config.device_id.as_ref());
-            let opts = config.options.as_ref().map(|opts| opts.as_dict());
-            AVHWDeviceContext::create(config.device_type.into(), device.as_deref(), opts, 0)
-                .context("Failed to create hardware device context")?
+            let opts = config.options.as_ref().and_then(|opts| opts.to_dict());
+            AVHWDeviceContext::create(
+                config.device_type.into(),
+                device.as_deref(),
+                opts.as_ref(),
+                0,
+            )
+            .context("Failed to create hardware device context")?
         };
 
         log::debug!("Created hardware device context successfully. config:{config}");
@@ -525,7 +530,9 @@ impl HWDeviceType {
         } else {
             let devices = self.list_available();
             if devices.is_empty() {
-                return Err(RsmediaError::custom("No suitable hardware acceleration device found"));
+                return Err(RsmediaError::custom(
+                    "No suitable hardware acceleration device found",
+                ));
             }
             let device = devices[0];
             Ok(HWDeviceConfig::new(
