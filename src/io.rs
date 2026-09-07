@@ -9,7 +9,7 @@ use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput, AVInputForma
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
-use anyhow::{Context, Error, Result};
+use crate::error::{Context, Result, RsmediaError};
 use std::ops::{Bound, Deref};
 
 pub trait Reader {
@@ -32,7 +32,7 @@ pub trait Reader {
                 Ok(Some((Stream::wrap(av_stream, iformat, metadata), pkt)))
             }
             Ok(None) => Ok(None),
-            Err(e) => Err(Error::new(e)),
+            Err(e) => Err(RsmediaError::from(e)),
         }
     }
 
@@ -45,7 +45,7 @@ pub trait Reader {
         self.input()
             .find_best_stream(media_type as _)?
             .map(|(index, codec)| (index, utils::to_string(codec.name()).unwrap()))
-            .ok_or(Error::msg(format!(
+            .ok_or(RsmediaError::custom(format!(
                 "No stream found for MediaType:{media_type:?}"
             )))
     }
@@ -112,10 +112,10 @@ impl<'a> StreamReaderBuilder<'a> {
         let src_path = self.source.as_path().to_str().unwrap();
         // RAII CString，FFI 使用后由析构自动释放
         let src_cstr = std::ffi::CString::new(src_path)
-            .map_err(|e| Error::msg(format!("Invalid source path '{src_path}': {e}")))?;
+            .map_err(|e| RsmediaError::custom(format!("Invalid source path '{src_path}': {e}")))?;
         let protocol = unsafe { ffi::avio_find_protocol_name(src_cstr.as_ptr()) };
         if protocol.is_null() {
-            return Err(Error::msg(format!(
+            return Err(RsmediaError::custom(format!(
                 "Unsupported input source protocol: {src_path}"
             )));
         }
@@ -213,7 +213,7 @@ impl StreamReader {
                 flags,
             );
             if res < 0 {
-                return Err(Error::msg(format!("Seek to frame failed: {res}")));
+                return Err(RsmediaError::custom(format!("Seek to frame failed: {res}")));
             }
             Ok(())
         }
@@ -236,7 +236,7 @@ impl StreamReader {
             let res = ffi::avformat_seek_file(self.input.as_mut_ptr(), -1, start, ts, end, 0);
             if res < 0 {
                 // >=0 on success, error code otherwise
-                return Err(Error::msg(format!("Seek file failed: {res}")));
+                return Err(RsmediaError::custom(format!("Seek file failed: {res}")));
             }
             Ok(())
         }
@@ -781,7 +781,7 @@ pub(crate) fn output_raw(format: &str) -> Result<AVFormatContextOutput> {
             0 => Ok(AVFormatContextOutput::from_raw(
                 std::ptr::NonNull::new(output_ptr).unwrap(),
             )),
-            e => Err(Error::new(RsmpegError::from(e))),
+            e => Err(RsmpegError::AVError(e).into()),
         }
     }
 }
@@ -804,7 +804,7 @@ pub(crate) fn output_raw_buf_start(output: &mut AVFormatContextOutput) -> Result
                 (*output.as_mut_ptr()).pb = p;
                 Ok(())
             }
-            _ => Err(Error::msg(
+            _ => Err(RsmediaError::custom(
                 "Failed to open dynamic buffer for output context.",
             )),
         }
@@ -899,7 +899,7 @@ pub fn output_raw_packetized_buf_start(
             if !buffer.is_null() {
                 ffi::av_free(buffer as *mut std::ffi::c_void);
             }
-            return Err(Error::msg("Failed to allocate AVIOContext"));
+            return Err(RsmediaError::custom("Failed to allocate AVIOContext"));
         }
 
         // Setting `max_packet_size` will let the underlying IO stream know that this buffer must be
@@ -969,7 +969,7 @@ pub(crate) fn flush_output(output: &mut AVFormatContextOutput) -> Result<()> {
     unsafe {
         match ffi::av_write_frame(output.as_mut_ptr(), std::ptr::null_mut()) {
             0 | 1 => Ok(()),
-            e => Err(Error::new(RsmpegError::from(e))),
+            e => Err(RsmpegError::AVError(e).into()),
         }
     }
 }
@@ -1096,7 +1096,7 @@ pub fn sdp(output_fmt_ctx: &AVFormatContextOutput) -> Result<String> {
         if ret == 0 {
             Ok(utils::from_c_char(buf_ptr))
         } else {
-            Err(Error::new(RsmpegError::from(ret)))
+            Err(RsmpegError::AVError(ret).into())
         }
     }
 }

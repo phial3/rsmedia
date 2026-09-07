@@ -1,4 +1,4 @@
-use anyhow::{Error, Result};
+use crate::error::{Result, RsmediaError};
 #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
 use rsmpeg::avcodec::AVCodecContext;
 use rsmpeg::avcodec::{AVCodec, AVCodecRef};
@@ -15,7 +15,7 @@ impl CodecConfig {
     pub fn new(id: ffi::AVCodecID) -> Result<Self> {
         let codec = AVCodec::find_encoder(id)
             .or_else(|| AVCodec::find_decoder(id))
-            .ok_or_else(|| Error::msg(format!("Codec id:{id} not found.")))?;
+            .ok_or_else(|| RsmediaError::custom(format!("Codec id:{id} not found.")))?;
         #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
         {
             Ok(Self { codec })
@@ -30,7 +30,7 @@ impl CodecConfig {
     pub fn new_with_name(codec_name: &CStr) -> Result<Self> {
         let codec = AVCodec::find_encoder_by_name(codec_name)
             .or_else(|| AVCodec::find_decoder_by_name(codec_name))
-            .ok_or_else(|| Error::msg(format!("Codec not found by name: '{codec_name:?}'")))?;
+            .ok_or_else(|| RsmediaError::custom(format!("Codec not found by name: '{codec_name:?}'")))?;
         #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
         {
             Ok(Self { codec })

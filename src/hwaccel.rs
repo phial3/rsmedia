@@ -5,7 +5,7 @@ use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
 use rsmpeg::{UnsafeDerefMut, ffi};
 
-use anyhow::{Context, Error, Result};
+use crate::error::{Context, Result, RsmediaError};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::cell::UnsafeCell;
@@ -266,7 +266,7 @@ impl HWContext {
 
         // Check if input frame is actually in hardware memory
         if !self.is_hw_frame(hw_frame) {
-            return Err(Error::msg(format!(
+            return Err(RsmediaError::custom(format!(
                 "Input frame is not a valid hardware frame: format={:?}, expected={:?}, hw_frames_ctx={:?}",
                 hw_frame.format,
                 self.config.hw_pixel_format,
@@ -285,7 +285,7 @@ impl HWContext {
                 // 否则 hw_frame 析构（unref）后 decoder->hw_frames_ctx 变成悬空指针 → double-free/UAF。
                 let ref_counter = ffi::av_buffer_ref(hw_frame.hw_frames_ctx);
                 if ref_counter.is_null() {
-                    return Err(Error::msg(
+                    return Err(RsmediaError::custom(
                         "Failed to av_buffer_ref hw_frames_ctx for decoder",
                     ));
                 }
@@ -351,7 +351,7 @@ impl HWContext {
 
         // Check if input frame format matches our software format
         if !self.is_sw_frame(sw_frame) {
-            return Err(Error::msg(format!(
+            return Err(RsmediaError::custom(format!(
                 "Input frame format ({:?}) doesn't match expected software format ({:?})",
                 sw_frame.format, self.config.sw_pixel_format
             )));
@@ -360,7 +360,7 @@ impl HWContext {
         // 确保编码器上下文有硬件帧上下文
         let mut hw_frames_ctx = encoder
             .hw_frames_ctx_mut()
-            .ok_or_else(|| Error::msg("Encoder has no hardware frames context"))?;
+            .ok_or_else(|| RsmediaError::custom("Encoder has no hardware frames context"))?;
 
         // 创建硬件帧
         let mut hw_frame = AVFrame::new();
@@ -525,7 +525,7 @@ impl HWDeviceType {
         } else {
             let devices = self.list_available();
             if devices.is_empty() {
-                return Err(Error::msg("No suitable hardware acceleration device found"));
+                return Err(RsmediaError::custom("No suitable hardware acceleration device found"));
             }
             let device = devices[0];
             Ok(HWDeviceConfig::new(

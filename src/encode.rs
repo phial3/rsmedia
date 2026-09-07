@@ -16,7 +16,7 @@ use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket};
 use rsmpeg::avutil::{self, AVAudioFifo, AVChannelLayout, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
 
-use anyhow::{Context, Error, Result};
+use crate::error::{Context, Result, RsmediaError};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -289,7 +289,7 @@ impl EncoderBuilder {
     fn setup_codec_context(&self, encoder: &mut AVCodecContext) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != encoder.codec_type {
-            return Err(Error::msg(format!(
+            return Err(RsmediaError::custom(format!(
                 "Encoder codec type not supported: {:?} vs. {:?}",
                 media_type, encoder.codec_type
             )));
@@ -313,7 +313,7 @@ impl EncoderBuilder {
             encoder.set_sample_fmt(self.sample_format as _);
             encoder.set_time_base(self.effective_time_base());
         } else {
-            return Err(Error::msg(format!(
+            return Err(RsmediaError::custom(format!(
                 "Unsupported media type: {media_type:?}"
             )));
         }
@@ -368,7 +368,7 @@ impl EncoderBuilder {
                     MediaType::VIDEO => Self::VIDEO_CODEC_NAME,
                     MediaType::AUDIO => Self::AUDIO_CODEC_NAME,
                     _ => {
-                        return Err(Error::msg(
+                        return Err(RsmediaError::custom(
                             format!("Unsupported media type:{media_type:?}",),
                         ));
                     }
@@ -411,7 +411,7 @@ impl EncoderBuilder {
             let mut graph = FilterGraph::new();
             // check Filter media type
             if !filters.iter().all(|f| f.media_type() == media_type) {
-                return Err(Error::msg(format!(
+                return Err(RsmediaError::custom(format!(
                     "Filter media type mismatch for encoder type {media_type:?}"
                 )));
             }
@@ -714,7 +714,7 @@ impl Encoder {
                     Err(rsmpeg::error::RsmpegError::SendFrameAgainError) => {
                         self.drain_encoder_packets()?;
                     }
-                    Err(e) => return Err(Error::new(e)),
+                    Err(e) => return Err(RsmediaError::from(e)),
                 }
             }
             Ok(())
@@ -870,7 +870,7 @@ impl Encoder {
                 Err(rsmpeg::error::RsmpegError::SendFrameAgainError) => {
                     self.drain_encoder_packets()?;
                 }
-                Err(e) => return Err(Error::new(e)),
+                Err(e) => return Err(RsmediaError::from(e)),
             }
         }
         Ok(())
@@ -884,7 +884,7 @@ impl Encoder {
                 Ok(pkt) => self.pending_packets.push_back(pkt),
                 Err(rsmpeg::error::RsmpegError::EncoderDrainError) => break,
                 Err(rsmpeg::error::RsmpegError::EncoderFlushedError) => break,
-                Err(e) => return Err(Error::new(e)),
+                Err(e) => return Err(RsmediaError::from(e)),
             }
         }
         Ok(())
@@ -928,7 +928,7 @@ impl Encoder {
             }
             _ => {
                 // do nothing
-                return Err(Error::msg(format!(
+                return Err(RsmediaError::custom(format!(
                     "Unsupported encode frame media type: {:?}",
                     self.media_type
                 )));
@@ -951,7 +951,7 @@ impl Encoder {
                     return Ok(());
                 }
                 if !self.config.is_support_pixel_format(frame.format) {
-                    return Err(Error::msg(format!(
+                    return Err(RsmediaError::custom(format!(
                         "Unsupported video encoder frame pixel format: {:?}",
                         frame.format
                     )));
@@ -960,21 +960,21 @@ impl Encoder {
 
             MediaType::AUDIO => {
                 if !self.config.is_support_sample_format(frame.format) {
-                    return Err(Error::msg(format!(
+                    return Err(RsmediaError::custom(format!(
                         "Unsupported encode audio frame sample format: {:?}",
                         frame.format
                     )));
                 }
 
                 if !self.config.is_support_frame_rates(self.context.framerate) {
-                    return Err(Error::msg(format!(
+                    return Err(RsmediaError::custom(format!(
                         "Unsupported encode audio frame rate: {:?}",
                         self.context.framerate
                     )));
                 }
 
                 if !self.config.is_support_sample_rate(frame.sample_rate) {
-                    return Err(Error::msg(format!(
+                    return Err(RsmediaError::custom(format!(
                         "Unsupported encode audio frame sample rate: {:?}",
                         frame.sample_rate
                     )));
@@ -1098,7 +1098,7 @@ impl Encoder {
                 self.state = EncoderState::Flushed;
                 Ok(None)
             }
-            Err(err) => Err(Error::new(err)),
+            Err(err) => Err(RsmediaError::from(err)),
         }
     }
 
@@ -1386,8 +1386,8 @@ mod tests {
 
     /// 滤镜因 FFmpeg 构建配置缺失（如 `drawtext` 依赖 libfreetype、`gamma` 等）
     /// 初始化失败时优雅跳过，避免环境差异导致测试失败。
-    fn is_filter_unavailable(e: &anyhow::Error) -> bool {
-        let low = format!("{e:#}").to_lowercase();
+    fn is_filter_unavailable(e: &RsmediaError) -> bool {
+        let low = format!("{e}").to_lowercase();
         low.contains("no such filter")
             || low.contains("filter not found")
             || low.contains("not found")
@@ -1395,7 +1395,7 @@ mod tests {
     }
 
     /// 编码器因 FFmpeg 构建配置缺失（如 libmp3lame/libtheora/libx265）时跳过
-    fn is_encoder_unavailable(e: &anyhow::Error) -> bool {
+    fn is_encoder_unavailable(e: &RsmediaError) -> bool {
         e.to_string().contains("not available in this FFmpeg build")
     }
 
@@ -1599,7 +1599,9 @@ mod tests {
             let codec_name = spec.codec.unwrap_or("libx264");
             // 编码器存在性取决于 FFmpeg 构建配置（如 libtheora/libx265），缺失时跳过
             if AVCodec::find_encoder_by_name(&utils::from_str(codec_name)).is_none() {
-                anyhow::bail!("encoder {codec_name} not available in this FFmpeg build");
+                return Err(RsmediaError::codec_not_found(format!(
+                    "encoder {codec_name} not available in this FFmpeg build"
+                )));
             }
             let codec_name = utils::from_str(codec_name);
             let codec_config = CodecConfig::new_with_name(&codec_name)?;
@@ -2286,7 +2288,9 @@ mod tests {
             let codec_name = spec.codec.unwrap_or("aac");
             // 编码器存在性取决于 FFmpeg 构建配置（如 libmp3lame/libopus），缺失时跳过
             let Some(codec) = AVCodec::find_encoder_by_name(&utils::from_str(codec_name)) else {
-                anyhow::bail!("encoder {codec_name} not available in this FFmpeg build");
+                return Err(RsmediaError::codec_not_found(format!(
+                    "encoder {codec_name} not available in this FFmpeg build"
+                )));
             };
             let config = CodecConfig::from_codec(codec);
 
@@ -2379,7 +2383,11 @@ mod tests {
                         ))?;
                     }
                 }
-                other => anyhow::bail!("unsupported test sample format: {other:?}"),
+                other => {
+                    return Err(RsmediaError::unsupported(format!(
+                        "test sample format: {other:?}"
+                    )))
+                },
             }
             encoder.finish()?;
             println!(
@@ -2417,7 +2425,11 @@ mod tests {
                 SampleFormat::FLTP | SampleFormat::FLT => decode_check!(f32),
                 SampleFormat::S16 | SampleFormat::S16P => decode_check!(i16),
                 SampleFormat::S32P => decode_check!(i32),
-                other => anyhow::bail!("unsupported decoded sample format: {other:?}"),
+                other => {
+                    return Err(RsmediaError::unsupported(format!(
+                        "decoded sample format: {other:?}"
+                    )))
+                },
             }
             assert!(
                 decoded_frames > 0,

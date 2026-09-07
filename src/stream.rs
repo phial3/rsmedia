@@ -7,7 +7,7 @@ use rsmpeg::avformat::{AVInputFormatRef, AVStream};
 use rsmpeg::avutil::AVDictionaryRef;
 use rsmpeg::ffi;
 
-use anyhow::{Error, Result};
+use crate::error::{Result, RsmediaError};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -133,7 +133,7 @@ impl StreamInfo {
             .input()
             .streams()
             .get(stream_index)
-            .ok_or(Error::msg(format!(
+            .ok_or(RsmediaError::custom(format!(
                 "reader stream: {stream_index} not found!"
             )))?;
 
@@ -145,7 +145,7 @@ impl StreamInfo {
             .output()
             .streams()
             .get(stream_index)
-            .ok_or(Error::msg(format!(
+            .ok_or(RsmediaError::custom(format!(
                 "writer stream: {stream_index} not found!"
             )))?;
 

@@ -15,7 +15,7 @@ use rsmpeg::avformat::AVStream;
 use rsmpeg::avutil::{self, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
 
-use anyhow::{Context, Error, Result};
+use crate::error::{Context, Result, RsmediaError};
 use std::sync::Arc;
 
 /// Builds a [`Decoder`].
@@ -115,7 +115,7 @@ impl DecoderBuilder {
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
-            return Err(Error::msg(format!(
+            return Err(RsmediaError::custom(format!(
                 "Decoder codec type not supported: {:?} vs. {:?}",
                 media_type, decoder.codec_type
             )));
@@ -180,7 +180,7 @@ impl DecoderBuilder {
             .input()
             .streams()
             .get(stream_index)
-            .ok_or(Error::msg(format!("stream: {stream_index} not found!")))?;
+            .ok_or(RsmediaError::custom(format!("stream: {stream_index} not found!")))?;
 
         let codec = {
             let codec_name = if let Some(ref codec_name) = self.codec_name {
@@ -219,7 +219,7 @@ impl DecoderBuilder {
                     .find_hw_pixel_format_with_codec(&codec)
                     .ok_or_else(|| {
                         let codec_name = utils::to_string(codec.name()).unwrap();
-                        Error::msg(format!(
+                        RsmediaError::custom(format!(
                             "Decoder with HW acceleration is not supported for codec: {codec_name}"
                         ))
                     })?;
@@ -274,7 +274,7 @@ impl DecoderBuilder {
             let mut graph = FilterGraph::new();
             // 验证 Filter 链的媒体类型是否与当前流匹配
             if !filters.iter().all(|f| f.media_type() == media_type) {
-                return Err(Error::msg(format!(
+                return Err(RsmediaError::custom(format!(
                     "Filter media type mismatch for stream type {media_type:?}"
                 )));
             }
@@ -472,7 +472,7 @@ impl Decoder {
         T: MediaFrameType,
     {
         if self.is_complete() {
-            return Err(Error::msg(
+            return Err(RsmediaError::custom(
                 "Decoder cannot decode after flushed. Call reset().",
             ));
         }
@@ -554,7 +554,7 @@ impl Decoder {
         R: Reader,
     {
         if self.is_complete() {
-            return Err(Error::msg(
+            return Err(RsmediaError::custom(
                 "Decoder cannot decode after flushed. Call reset().",
             ));
         }
@@ -786,7 +786,7 @@ impl Decoder {
                         .compute_for((sw_frame.width as u32, sw_frame.height as u32))
                         .ok_or_else(|| {
                             let (w, h) = (sw_frame.width, sw_frame.height);
-                            Error::msg(format!("Cannot resize frame {w}x{h} into {resize:?}"))
+                            RsmediaError::custom(format!("Cannot resize frame {w}x{h} into {resize:?}"))
                         })?,
                     None => (sw_frame.width as u32, sw_frame.height as u32),
                 };
@@ -857,7 +857,7 @@ impl Decoder {
             }
             Err(e) => {
                 log::warn!("Failed to receive frame from decoder: {e}");
-                Err(Error::new(e))
+                Err(RsmediaError::from(e))
             }
         }
     }
@@ -1015,7 +1015,7 @@ impl<R: Reader> DecoderWrapper<R> {
                 .seek_to_timestamp(timestamp_milliseconds)
                 .inspect(|_| self.decoder.flush())
         } else {
-            Err(Error::msg("Seek is only supported for StreamReader"))
+            Err(RsmediaError::custom("Seek is only supported for StreamReader"))
         }
     }
 
@@ -1033,7 +1033,7 @@ impl<R: Reader> DecoderWrapper<R> {
                 )
                 .inspect(|_| self.decoder.flush())
         } else {
-            Err(Error::msg(
+            Err(RsmediaError::custom(
                 "Seek to frame is only supported for StreamReader",
             ))
         }
@@ -1049,7 +1049,7 @@ impl<R: Reader> DecoderWrapper<R> {
                 .seek_to_start()
                 .inspect(|_| self.decoder.flush())
         } else {
-            Err(Error::msg(
+            Err(RsmediaError::custom(
                 "Seek to start is only supported for StreamReader",
             ))
         }

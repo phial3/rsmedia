@@ -1,4 +1,6 @@
 /// Color: 0xRRGGBBAA
+use crate::error::{Result, format_err};
+
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Color(pub u32);
 
@@ -63,7 +65,7 @@ impl Color {
         xs.iter().copied().map(Into::into).collect()
     }
 
-    pub fn try_create_palette<A: TryInto<Self> + Copy>(xs: &[A]) -> anyhow::Result<Vec<Self>>
+    pub fn try_create_palette<A: TryInto<Self> + Copy>(xs: &[A]) -> Result<Vec<Self>>
     where
         <A as TryInto<Self>>::Error: std::fmt::Debug,
     {
@@ -71,7 +73,7 @@ impl Color {
             .copied()
             .map(|x| {
                 x.try_into()
-                    .map_err(|e| anyhow::anyhow!("Failed to convert: {:?}", e))
+                    .map_err(|e| format_err!("Failed to convert: {:?}", e))
             })
             .collect()
     }
@@ -217,7 +219,7 @@ impl From<Color> for [u8; 3] {
 impl TryFrom<&str> for Color {
     type Error = &'static str;
 
-    fn try_from(x: &str) -> Result<Self, Self::Error> {
+    fn try_from(x: &str) -> std::result::Result<Self, Self::Error> {
         let hex = x.trim_start_matches('#');
         let hex = match hex.len() {
             6 => format!("{hex}ff"),

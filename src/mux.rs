@@ -7,7 +7,7 @@ use crate::{Decoder, DecoderBuilder, Encoder, Location, StreamReader, StreamWrit
 
 use rsmpeg::avutil::AVFrame;
 
-use anyhow::{Context, Error, Result};
+use crate::error::{Context, Result, RsmediaError};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -111,14 +111,14 @@ impl<W: Writer> Muxer<W> {
         self.streams
             .iter()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| Error::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut MuxerStream> {
         self.streams
             .iter_mut()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| Error::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
     /// Mux a single packet. This will mux a single packet.
@@ -288,14 +288,14 @@ impl<R: Reader> Demuxer<R> {
         self.streams
             .iter()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| Error::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut DemuxerStream> {
         self.streams
             .iter_mut()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| Error::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
     fn set_flushed(&self, stream_index: usize) {
@@ -398,7 +398,7 @@ mod tests {
     use super::*;
     use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter, utils};
 
-    use anyhow::{Context, Result};
+    use crate::error::{Context, Result};
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
     use std::path::Path;
 
@@ -483,7 +483,9 @@ mod tests {
         for ch in 0..channels {
             let data_ptr = unsafe {
                 let ptr = (*frame.as_mut_ptr()).data[ch] as *mut f32;
-                anyhow::ensure!(!ptr.is_null(), "Audio data pointer is null");
+                if ptr.is_null() {
+                    return Err(RsmediaError::custom("Audio data pointer is null"));
+                }
                 std::slice::from_raw_parts_mut(ptr, nb_samples)
             };
 

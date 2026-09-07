@@ -6,6 +6,7 @@ pub mod frame;
 pub use frame::{MediaFrame, MediaFrameFormat, MediaFrameType};
 pub mod codec;
 pub mod colors;
+pub mod error;
 pub mod filter;
 pub mod flags;
 pub mod hwaccel;
@@ -26,6 +27,7 @@ pub use swctx::ScaleAlgorithm;
 
 pub use decode::{Decoder, DecoderBuilder};
 pub use encode::{Encoder, EncoderBuilder};
+pub use error::{Error, Result, RsmediaError};
 pub use flags::{MediaType, SampleFormat};
 pub use init::init;
 pub use io::{Reader, Writer};

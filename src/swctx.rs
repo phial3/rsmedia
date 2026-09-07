@@ -5,7 +5,7 @@ use rsmpeg::ffi;
 use rsmpeg::swresample::SwrContext;
 use rsmpeg::swscale::SwsContext;
 
-use anyhow::{Context, Error, Result};
+use crate::error::{Context, Result, RsmediaError};
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////// Video Scaler SwsContext ////////////////////////////////////////////
@@ -143,7 +143,9 @@ pub fn scale_with_flags(
     scaler_algo: ScaleAlgorithm,
 ) -> Result<AVFrame> {
     if !src_frame.hw_frames_ctx.is_null() {
-        anyhow::bail!("Hardware frames are not supported in this software scalar");
+        return Err(RsmediaError::unsupported(
+            "Hardware frames are not supported in this software scalar",
+        ));
     }
 
     let mut dst_frame = AVFrame::new();
@@ -170,7 +172,7 @@ pub fn scale_with_flags(
         ffi::sws_scale_frame(sws_ctx.as_mut_ptr(), dst_frame_ptr, src_frame.as_ptr())
     };
     if ret < 0 {
-        return Err(Error::msg(format!("Failed to scale frame, ret: {ret}")));
+        return Err(RsmediaError::custom(format!("Failed to scale frame, ret: {ret}")));
     }
 
     log::debug!(
@@ -221,11 +223,13 @@ pub fn convert(
     out_sample_rate: i32,
 ) -> Result<AVSamples> {
     if !src_frame.hw_frames_ctx.is_null() {
-        anyhow::bail!("Hardware frames are not supported in this software re-sampler");
+        return Err(RsmediaError::unsupported(
+            "Hardware frames are not supported in this software re-sampler",
+        ));
     }
 
     if src_frame.sample_rate < 1 || src_frame.nb_samples < 1 {
-        return Err(Error::msg("Invalid input frame."));
+        return Err(RsmediaError::custom("Invalid input frame."));
     }
 
     let mut swr_ctx = setup_resampler(
@@ -257,7 +261,7 @@ pub fn convert(
             .context("Could not convert input samples")?
     };
     if ret < 0 {
-        return Err(Error::msg(format!(
+        return Err(RsmediaError::custom(format!(
             "Failed to convert input samples, ret: {ret}"
         )));
     }
@@ -287,11 +291,13 @@ pub fn convert_frame(
     out_sample_rate: i32,
 ) -> Result<AVFrame> {
     if !src_frame.hw_frames_ctx.is_null() {
-        anyhow::bail!("Hardware frames are not supported in this software re-sampler");
+        return Err(RsmediaError::unsupported(
+            "Hardware frames are not supported in this software re-sampler",
+        ));
     }
 
     if src_frame.sample_rate < 1 || src_frame.nb_samples < 1 {
-        return Err(Error::msg("Invalid input frame."));
+        return Err(RsmediaError::custom("Invalid input frame."));
     }
 
     let swr_ctx = setup_resampler(
@@ -348,7 +354,7 @@ pub fn convert_frame(
 mod tests {
     use super::*;
     use crate::{SampleFormat, time};
-    use anyhow::{Context, Result};
+    use crate::error::{Context, Result};
     use rsmpeg::avutil::AVChannelLayout;
     use rsmpeg::ffi;
 
@@ -483,7 +489,7 @@ mod tests {
             ffi::AV_SAMPLE_FMT_S64 | ffi::AV_SAMPLE_FMT_S64P => {
                 fill_samples!(i64, i64::MAX)
             }
-            _ => return Err(Error::msg("Unsupported sample format")),
+            _ => return Err(RsmediaError::custom("Unsupported sample format")),
         }
         Ok(())
     }
