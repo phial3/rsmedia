@@ -8,11 +8,12 @@ use crate::io::Writer;
 use crate::options::{Options, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
 use crate::stream::StreamInfo;
+use crate::subtitle::SubtitleSegment;
 use crate::swctx::ScaleAlgorithm;
 use crate::time::Rescale;
 use crate::{Location, MediaType, SampleFormat, StreamWriter, strutils, swctx, time};
 
-use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket};
+use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket, AVSubtitle};
 use rsmpeg::avutil::{self, AVAudioFifo, AVChannelLayout, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
 
@@ -50,6 +51,10 @@ pub struct EncoderBuilder {
     level: Option<String>,
     quality: Option<Quality>,
     profile: Option<VideoProfile>,
+    /// Subtitle ASS script header (`[Script Info]` + `[V4+ Styles]` + `[Events]`
+    /// format line). Required for subtitle encoders; in a transcode pipeline
+    /// forward it from the decoded subtitle stream instead of hand-crafting one.
+    subtitle_header: Option<String>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
     scale_algorithm: ScaleAlgorithm,
@@ -76,6 +81,16 @@ impl EncoderBuilder {
     /// default codec
     const VIDEO_CODEC_NAME: &'static str = "libx264";
     const AUDIO_CODEC_NAME: &'static str = "aac";
+    /// 字幕默认编码器：subrip（通用文本格式）。MP4 容器请用
+    /// [`Self::with_codec_name`] 指定 `mov_text`。
+    const SUBTITLE_CODEC_NAME: &'static str = "subrip";
+
+    /// 字幕编码器时间基分母：1/1000 秒（毫秒精度），与 ffmpeg CLI 行为一致。
+    const SUBTITLE_TIME_BASE_DEN: i32 = 1000;
+
+    /// 单条字幕编码缓冲区大小。mov_text 载荷 = 2 字节大端长度 + 文本，
+    /// subrip = 纯文本；按文本长度的 2 倍 + 256 分配已足够宽裕。
+    const SUBTITLE_BUFFER_SIZE: usize = 8192;
 
     /// Codecs whose FFmpeg wrapper exposes the `crf` private option
     /// (checked when [`Quality::Crf`] is requested).
@@ -123,6 +138,33 @@ impl EncoderBuilder {
             .with_sample_rate(sample_rate)
             .with_sample_format(sample_format)
             .with_media_type(MediaType::AUDIO)
+    }
+
+    /// Create a subtitle encoder.
+    ///
+    /// The default codec is `subrip`; for MP4 output select `mov_text` via
+    /// [`Self::with_codec_name`]. The encoder time base defaults to 1/1000
+    /// (millisecond precision), matching the ffmpeg CLI.
+    ///
+    /// A subtitle encoder requires an ASS script header before opening:
+    /// provide it via [`Self::with_subtitle_header`] — in a transcode pipeline
+    /// forward the header from the decoded subtitle stream, otherwise pass a
+    /// complete `[Script Info]` / `[V4+ Styles]` / `[Events]` header (see the
+    /// `subtitle` example).
+    pub fn new_subtitle() -> Self {
+        Self::default().with_media_type(MediaType::SUBTITLE)
+    }
+
+    /// Set the ASS script header for subtitle encoders.
+    ///
+    /// Subtitle encoders (subrip, mov_text, ...) fail to open with
+    /// `AVERROR_INVALIDDATA` unless an ASS header is set. An empty or partial
+    /// header opens but silently mis-parses dialogues, so always provide a
+    /// complete header. In a transcode pipeline copy the header from the
+    /// decoder side (it is populated by subtitle decoders on open).
+    pub fn with_subtitle_header(mut self, header: impl Into<String>) -> Self {
+        self.subtitle_header = Some(header.into());
+        self
     }
 
     /// Set the width of the video stream.
@@ -331,6 +373,8 @@ impl EncoderBuilder {
         match self.media_type {
             MediaType::VIDEO => avutil::av_inv_q(self.frame_rate),
             MediaType::AUDIO => time::new_rational(1, self.sample_rate),
+            // 字幕：1/1000（毫秒精度），与 ffmpeg CLI 一致
+            MediaType::SUBTITLE => time::new_rational(1, Self::SUBTITLE_TIME_BASE_DEN),
             _ => self.time_base,
         }
     }
@@ -390,6 +434,9 @@ impl EncoderBuilder {
             encoder.set_sample_rate(self.sample_rate);
             encoder.set_sample_fmt(sample_format as _);
             encoder.set_time_base(self.effective_time_base());
+        } else if media_type == MediaType::SUBTITLE {
+            // 字幕编码器只需 time_base（毫秒精度），无像素/采样格式、码率等概念
+            encoder.set_time_base(self.effective_time_base());
         } else {
             return Err(RsmediaError::custom(format!(
                 "Unsupported media type: {media_type:?}"
@@ -447,7 +494,11 @@ impl EncoderBuilder {
     /// [`Self::resolve_pixel_format`]：显式指定则校验（fail fast），
     /// 未指定优先 [`SampleFormat::FLTP`]（aac/mp3 等原生平面浮点格式），
     /// 不支持时取支持列表首个（如 `pcm_s16le` 为 S16）。
-    fn resolve_sample_format(&self, config: &CodecConfig, codec_name: &str) -> Result<SampleFormat> {
+    fn resolve_sample_format(
+        &self,
+        config: &CodecConfig,
+        codec_name: &str,
+    ) -> Result<SampleFormat> {
         match self.sample_format {
             Some(fmt) => {
                 if !config.is_support_sample_format(fmt as i32) {
@@ -510,6 +561,7 @@ impl EncoderBuilder {
             None => match media_type {
                 MediaType::VIDEO => Self::VIDEO_CODEC_NAME.to_string(),
                 MediaType::AUDIO => Self::AUDIO_CODEC_NAME.to_string(),
+                MediaType::SUBTITLE => Self::SUBTITLE_CODEC_NAME.to_string(),
                 _ => {
                     return Err(RsmediaError::custom(format!(
                         "Unsupported media type:{media_type:?}",
@@ -540,9 +592,15 @@ impl EncoderBuilder {
         let config = CodecConfig::from_codec(codec);
         // P0-2 自动格式协商：显式指定的格式立即校验（fail fast），未指定的
         // 从编码器支持列表中挑选，避免把帧转进一个编码器不支持的格式后才
-        // 在写入阶段报错。
-        let pixel_format = self.resolve_pixel_format(&config, &codec_name)?;
-        let sample_format = self.resolve_sample_format(&config, &codec_name)?;
+        // 在写入阶段报错。字幕编码器无像素/采样格式概念，跳过协商。
+        let (pixel_format, sample_format) = if media_type == MediaType::SUBTITLE {
+            (PixelFormat::YUV420P, SampleFormat::FLTP)
+        } else {
+            (
+                self.resolve_pixel_format(&config, &codec_name)?,
+                self.resolve_sample_format(&config, &codec_name)?,
+            )
+        };
 
         self.setup_codec_context(&mut encode_ctx, use_crf, pixel_format, sample_format)?;
 
@@ -569,7 +627,9 @@ impl EncoderBuilder {
                     })
                 }
                 _ => {
-                    panic!("Unsupported filter for media type: {media_type:?}");
+                    return Err(RsmediaError::custom(format!(
+                        "Unsupported filter for media type: {media_type:?}"
+                    )));
                 }
             };
             let mut graph = FilterGraph::new();
@@ -678,6 +738,27 @@ impl EncoderBuilder {
             // 用户显式选项覆盖 quality 默认值
             opts.merge(user_opts);
         }
+
+        // 字幕编码器（mov_text/subrip 等）init 时会执行
+        // `ff_ass_split(avctx->subtitle_header)`，未设置时返回 NULL →
+        // AVERROR_INVALIDDATA。header 必须由调用方提供：转码时从解码器侧
+        // 传递（解码器 open 时填充），authoring 场景用
+        // [`EncoderBuilder::with_subtitle_header`] 显式给出。
+        if media_type == MediaType::SUBTITLE {
+            let Some(header) = &self.subtitle_header else {
+                return Err(RsmediaError::custom(
+                    "subtitle encoder requires an ASS script header: provide it via \
+                     EncoderBuilder::with_subtitle_header, or forward it from the decoded \
+                     subtitle stream in a transcode pipeline",
+                ));
+            };
+            let header_c = std::ffi::CString::new(header.as_str())
+                .map_err(|e| RsmediaError::custom(format!("Invalid subtitle header: {e}")))?;
+            encode_ctx
+                .set_subtitle_header(header_c.as_c_str())
+                .context("Failed to set subtitle header")?;
+        }
+
         encode_ctx
             .open(opts.into_dict())
             .context("Failed to open encode context")?;
@@ -725,6 +806,7 @@ impl Default for EncoderBuilder {
             profile: None,
             level: None,
             filters: None,
+            subtitle_header: None,
             hw_device_config: None,
             scale_algorithm: ScaleAlgorithm::default(),
         }
@@ -850,6 +932,77 @@ impl Encoder {
             packets.push(pkt);
         }
         Ok(packets)
+    }
+
+    /// ASS 时间格式 `H:MM:SS.cc`（厘秒精度）。
+    fn ass_timestamp(ms: i64) -> String {
+        let ms = ms.max(0);
+        let (h, rem) = (ms / 3_600_000, ms % 3_600_000);
+        let (m, rem) = (rem / 60_000, rem % 60_000);
+        let (s, cs) = (rem / 1000, (rem % 1000) / 10);
+        format!("{h}:{m:02}:{s:02}.{cs:02}")
+    }
+
+    /// 编码一条字幕段落（仅字幕编码器）。
+    ///
+    /// 字幕编码走 rsmpeg 的 [`AVCodecContext::encode_subtitle`]（同步 API，无
+    /// send_frame/receive_packet 队列），与音视频的 [`Self::encode_raw`] 不同：
+    /// 每条段落恰好产出 0 或 1 包，无需 flush。pts/duration 已按编码器
+    /// time_base（1/1000 毫秒精度）设置。
+    pub fn encode_subtitle_segment(&mut self, segment: &SubtitleSegment) -> Result<Vec<AVPacket>> {
+        if self.media_type != MediaType::SUBTITLE {
+            return Err(RsmediaError::custom(format!(
+                "encode_subtitle_segment requires a subtitle encoder, got media type: {:?}",
+                self.media_type
+            )));
+        }
+        if segment.text.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 构建含单个 ASS 文本 rect 的 AVSubtitle：rect 的 ass 为完整
+        // Dialogue 行（含起止时间），由 rsmpeg 分配并在 subtitle Drop 时
+        // 经 avsubtitle_free 释放。
+        let mut subtitle = AVSubtitle::new();
+        let dialogue = format!(
+            "Dialogue: 0,{},{},Default,,0,0,0,,{}",
+            Self::ass_timestamp(segment.start_ms),
+            Self::ass_timestamp(segment.end_ms),
+            segment.text
+        );
+        let dialogue_c = std::ffi::CString::new(dialogue)
+            .map_err(|e| RsmediaError::custom(format!("Subtitle text contains NUL byte: {e}")))?;
+        subtitle
+            .push_ass_rect(dialogue_c.as_c_str())
+            .context("Failed to build subtitle rect")?;
+
+        let mut buf = vec![0u8; EncoderBuilder::SUBTITLE_BUFFER_SIZE];
+        let len = self
+            .context
+            .encode_subtitle(&subtitle, &mut buf)
+            .context("Subtitle encoding failed")?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut packet = AVPacket::new();
+        let ret = unsafe { ffi::av_new_packet(packet.as_mut_ptr(), len as i32) };
+        if ret < 0 {
+            return Err(RsmediaError::from(rsmpeg::error::RsmpegError::from(ret)));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), (*packet.as_mut_ptr()).data, len);
+        }
+
+        // 编码器 time_base 为 1/1000，pts/duration 直接使用毫秒值；
+        // dts = pts（字幕无 B 帧重排）。
+        let pts = segment.start_ms;
+        packet.set_pts(pts);
+        packet.set_dts(pts);
+        packet.set_duration(segment.duration_ms().max(1));
+        packet.set_pos(-1);
+
+        Ok(vec![packet])
     }
 
     fn send_frame_to_encoder(&mut self, frame_opt: Option<AVFrame>) -> Result<()> {
@@ -1309,14 +1462,12 @@ impl Encoder {
         index: usize,
         out_stream_time_base: ffi::AVRational,
     ) -> Result<()> {
-        // 始终发送 EOS 并排空编码器。
-        //
-        // 旧实现在此对无 `AV_CODEC_CAP_DELAY` 的编码器提前返回，假设"无延迟 =
-        // 编码器不缓冲数据"。这是错误的：开启帧线程（thread_count > 1，默认
-        // 即为 CPU 核数）的编码器即使没有 DELAY 能力标志，也会在内部线程队列
-        // 缓冲若干帧，提前返回会丢失末尾帧（实测 mjpeg 5 帧丢 1 帧）。对真正
-        // 无缓冲的编码器，发送 EOS 后立即返回 Flushed，代价可忽略。此外提前
-        // 返回还会跳过下方滤镜缓冲帧与音频 FIFO 末帧的冲刷，同为隐患。
+        // 字幕编码器走同步 API（avcodec_encode_subtitle），无内部缓冲，
+        // 不支持 send/receive flush（send_frame(None) 会崩溃），直接返回。
+        if self.media_type == MediaType::SUBTITLE {
+            self.state = EncoderState::Flushed;
+            return Ok(());
+        }
 
         if let Some(filter) = self.filter_graph.as_mut() {
             let frames = filter.flush()?;
@@ -1424,7 +1575,8 @@ impl<W: Writer> EncoderWrapper<W> {
     /// 创建一个新的编码器包装器
     pub fn new(encoder: Encoder, writer: W, stream_index: usize, interleaved: bool) -> Self {
         let stream_info = StreamInfo::from_writer(&writer, stream_index).unwrap();
-        // 当前帧时长：视频按帧率，音频按采样数/采样率
+        // 当前帧时长：视频按帧率，音频按采样数/采样率；字幕时间戳由段落自带
+        // （start_ms/end_ms），不使用自动递增 pts，帧时长置 0。
         let duration = match encoder.media_type {
             // 帧时长 = 1 / frame_rate，即取帧率(fr.num / fr.den)的倒数 (fr.den / fr.num)
             MediaType::VIDEO => {
@@ -1436,6 +1588,7 @@ impl<W: Writer> EncoderWrapper<W> {
                 Some(encoder.frame_size() as i64),
                 time::new_rational(1, encoder.sample_rate().max(1)),
             ),
+            MediaType::SUBTITLE => time::Time::zero(),
             _ => panic!("No supported encoder for media_type."),
         };
         Self {
@@ -1484,6 +1637,44 @@ impl<W: Writer> EncoderWrapper<W> {
         }
 
         Ok(())
+    }
+
+    /// 编码一条字幕段落并写入输出（仅字幕编码器）。
+    ///
+    /// 时间戳由段落自带（start_ms/end_ms），无需调用方设置 pts。
+    pub fn encode_subtitle_segment(&mut self, segment: &SubtitleSegment) -> Result<()> {
+        // Write file header if we hadn't done that yet.
+        if !self.have_written_header {
+            self.writer.write_header()?;
+            self.have_written_header = true;
+        }
+
+        for mut packet in self.encoder.encode_subtitle_segment(segment)? {
+            packet.set_stream_index(self.stream_index as i32);
+            // 实时获取输出流时间基（write_header 后 muxer 可能调整 timescale）。
+            packet.rescale_ts(
+                self.time_base(),
+                self.writer.stream_time_base(self.stream_index),
+            );
+
+            if self.interleaved {
+                self.writer.write_interleaved(&mut packet)?;
+            } else {
+                self.writer.write_frame(&mut packet)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 编码多条字幕段落并写入输出，返回成功写入的段落数。
+    pub fn encode_subtitle_segments(&mut self, segments: &[SubtitleSegment]) -> Result<usize> {
+        let mut count = 0;
+        for segment in segments {
+            self.encode_subtitle_segment(segment)?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// 写入一帧，并自动维护时间戳（pts）。
@@ -2035,7 +2226,6 @@ mod tests {
         /// 显式指定不支持的格式时 `build()` 立即报错。
         #[test]
         fn test_negotiate_sample_format_pcm() -> Result<()> {
-            use crate::frame::MediaFrame;
             use crate::{DecoderBuilder, MediaType};
 
             let sample_rate = 44_100u32;
@@ -2054,12 +2244,8 @@ mod tests {
                 .with_codec_name("pcm_s16le".to_string())
                 .build_wrapped(path.as_path())?;
             for _ in 0..frames_to_write {
-                let frame = sine_audio_frame::<f32>(
-                    440.0,
-                    channels,
-                    samples_per_frame,
-                    sample_rate,
-                );
+                let frame =
+                    sine_audio_frame::<f32>(440.0, channels, samples_per_frame, sample_rate);
                 encoder.write_frame(frame)?;
             }
             encoder.finish()?;

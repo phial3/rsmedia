@@ -20,6 +20,7 @@ pub mod pixel;
 pub mod resize;
 pub mod stream;
 pub mod strutils;
+pub mod subtitle;
 pub mod swctx;
 pub mod time;
 
@@ -35,6 +36,7 @@ pub use location::{Location, Url};
 pub use options::{Options, Quality, VideoProfile};
 pub use pixel::PixelFormat;
 pub use resize::Resize;
+pub use subtitle::{SubtitleSegment, copy_subtitle_stream};
 pub use swctx::ScaleAlgorithm;
 pub use time::Time;
 
