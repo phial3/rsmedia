@@ -484,10 +484,10 @@ impl Decoder {
         Ok(loop {
             if !read_exhausted {
                 match reader.read_packet() {
-                    Ok(Some((stream, packet))) => {
-                        if stream.index() != self.stream_index() {
+                    Ok(Some((stream_index, packet))) => {
+                        if stream_index != self.stream_index() {
                             // skip other streams
-                            log::trace!("skip stream index: {}, {:?}", stream.index(), packet);
+                            log::trace!("skip stream index: {}, {:?}", stream_index, packet);
                             continue;
                         }
                         if let Some(frame) = self.decode_packet(&packet)? {
@@ -566,10 +566,10 @@ impl Decoder {
         Ok(loop {
             if !read_exhausted {
                 match reader.read_packet() {
-                    Ok(Some((stream, packet))) => {
-                        if stream.index() != self.stream_index() {
+                    Ok(Some((stream_index, packet))) => {
+                        if stream_index != self.stream_index() {
                             // skip other streams
-                            log::trace!("skip stream index: {}, {:?}", stream.index(), packet);
+                            log::trace!("skip stream index: {}, {:?}", stream_index, packet);
                             continue;
                         }
                         if let Some(frame) = self.decode_raw_packet(&packet)? {

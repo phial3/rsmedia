@@ -314,8 +314,7 @@ impl<R: Reader> Demuxer<R> {
         loop {
             if !read_exhausted {
                 match self.reader.read_packet() {
-                    Ok(Some((stream, packet))) => {
-                        let stream_idx = stream.index();
+                    Ok(Some((stream_idx, packet))) => {
                         let demux_stream = self
                             .streams
                             .iter_mut()
@@ -845,16 +844,16 @@ mod tests {
             .write_header(&mut None)
             .context("Writer header failed.")?;
 
-        while let Some((in_stream, mut packet)) =
+        while let Some((input_stream_index, mut packet)) =
             input_reader.read_packet().context("Read packet failed.")?
         {
-            let input_stream_index = in_stream.index();
             let Some(output_stream_index) = stream_mapping[input_stream_index] else {
                 continue;
             };
             {
+                let in_stream = &input_reader.input().streams()[input_stream_index];
                 let output_stream = &output.streams()[output_stream_index];
-                packet.rescale_ts(in_stream.time_base(), output_stream.time_base);
+                packet.rescale_ts(in_stream.time_base, output_stream.time_base);
                 packet.set_stream_index(output_stream_index as i32);
                 packet.set_pos(-1);
             }

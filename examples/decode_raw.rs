@@ -42,9 +42,9 @@ fn main() -> Result<()> {
     let stream_index = raw_decoder.stream_index();
     let mut packet_count = 0;
 
-    while let Some((stream, packet)) = reader.read_packet()? {
+    while let Some((packet_stream_index, packet)) = reader.read_packet()? {
         // 跳过其它流的 packet
-        if stream.index() != stream_index {
+        if packet_stream_index != stream_index {
             continue;
         }
         if let Some(frame) = raw_decoder.decode_raw_packet(&packet)? {

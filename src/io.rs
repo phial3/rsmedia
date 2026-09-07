@@ -1,7 +1,6 @@
 use crate::flags::MediaType;
 use crate::location::Location;
 use crate::options::Options;
-use crate::stream::Stream;
 use crate::strutils;
 
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
@@ -19,18 +18,14 @@ pub trait Reader {
     fn input(&self) -> &AVFormatContextInput;
     fn input_mut(&mut self) -> &mut AVFormatContextInput;
 
-    fn read_packet(&mut self) -> Result<Option<(Stream<'_>, AVPacket)>> {
+    /// Read the next packet. Returns `None` on EOF.
+    ///
+    /// 成功时返回 `(packet 所属流的 index, packet)`；调用方如需更多流信息
+    /// （time_base、metadata 等），可通过 `self.input().streams().get(index)`
+    /// 直接使用 rsmpeg 的 [`AVStream`]。
+    fn read_packet(&mut self) -> Result<Option<(usize, AVPacket)>> {
         match self.input_mut().read_packet() {
-            Ok(Some(pkt)) => {
-                let av_stream = self
-                    .input()
-                    .streams()
-                    .get(pkt.stream_index as usize)
-                    .unwrap();
-                let iformat = self.input().iformat();
-                let metadata = self.input().metadata();
-                Ok(Some((Stream::wrap(av_stream, iformat, metadata), pkt)))
-            }
+            Ok(Some(pkt)) => Ok(Some((pkt.stream_index as usize, pkt))),
             Ok(None) => Ok(None),
             Err(e) => Err(RsmediaError::from(e)),
         }

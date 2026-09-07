@@ -2,14 +2,12 @@ use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
 use crate::{MediaType, Options, PixelFormat, SampleFormat, strutils};
 
-use rsmpeg::avcodec::{AVCodec, AVCodecParametersRef, AVPacket};
-use rsmpeg::avformat::{AVInputFormatRef, AVStream};
-use rsmpeg::avutil::AVDictionaryRef;
+use rsmpeg::avcodec::AVCodec;
+use rsmpeg::avformat::AVStream;
 use rsmpeg::ffi;
 
 use crate::error::{Result, RsmediaError};
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
 
@@ -458,125 +456,3 @@ impl std::fmt::Display for StreamInfo {
 
 unsafe impl Send for StreamInfo {}
 unsafe impl Sync for StreamInfo {}
-
-//////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////
-
-pub struct Stream<'a> {
-    av_stream: &'a AVStream,
-    iformat: AVInputFormatRef<'a>,
-    metadata: Option<AVDictionaryRef<'a>>,
-}
-
-impl<'a> Stream<'a> {
-    pub fn wrap(
-        av_stream: &'a AVStream,
-        iformat: AVInputFormatRef<'a>,
-        metadata: Option<AVDictionaryRef<'a>>,
-    ) -> Stream<'a> {
-        Stream {
-            av_stream,
-            iformat,
-            metadata,
-        }
-    }
-
-    pub fn iformat(&self) -> &AVInputFormatRef<'a> {
-        &self.iformat
-    }
-
-    pub fn ctx_metadata(&self) -> &Option<AVDictionaryRef<'a>> {
-        &self.metadata
-    }
-}
-
-impl Stream<'_> {
-    pub fn id(&self) -> i32 {
-        self.av_stream.id
-    }
-
-    pub fn index(&self) -> usize {
-        self.av_stream.index as usize
-    }
-
-    pub fn time_base(&self) -> ffi::AVRational {
-        self.av_stream.time_base
-    }
-
-    pub fn start_time(&self) -> i64 {
-        self.av_stream.start_time
-    }
-
-    pub fn duration(&self) -> i64 {
-        self.av_stream.duration
-    }
-
-    pub fn nb_frames(&self) -> i64 {
-        self.av_stream.nb_frames
-    }
-
-    pub fn disposition(&self) -> i32 {
-        self.av_stream.disposition
-    }
-
-    pub fn discard(&self) -> ffi::AVDiscard {
-        self.av_stream.discard
-    }
-
-    pub fn r_frame_rate(&self) -> ffi::AVRational {
-        self.av_stream.r_frame_rate
-    }
-
-    pub fn avg_frame_rate(&self) -> ffi::AVRational {
-        self.av_stream.avg_frame_rate
-    }
-
-    pub fn parameters(&self) -> AVCodecParametersRef<'_> {
-        self.av_stream.codecpar()
-    }
-
-    pub fn metadata(&self) -> Option<AVDictionaryRef<'_>> {
-        self.av_stream.metadata()
-    }
-}
-
-impl PartialEq for Stream<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.av_stream.id == other.av_stream.id
-    }
-}
-
-impl Eq for Stream<'_> {}
-
-/////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////
-
-pub struct PacketSideData<'a> {
-    ptr: *mut ffi::AVPacketSideData,
-    _marker: PhantomData<&'a AVPacket>,
-}
-
-impl PacketSideData<'_> {
-    pub fn wrap(ptr: *mut ffi::AVPacketSideData) -> Self {
-        PacketSideData {
-            ptr,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn as_ptr(&self) -> *const ffi::AVPacketSideData {
-        self.ptr as *const _
-    }
-
-    pub fn kind(&self) -> ffi::AVPacketSideDataType {
-        unsafe { ffi::AVPacketSideDataType::from((*self.as_ptr()).type_) }
-    }
-
-    pub fn size(&self) -> usize {
-        unsafe { (*self.as_ptr()).size }
-    }
-
-    pub fn data(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts((*self.as_ptr()).data, (*self.as_ptr()).size) }
-    }
-}
