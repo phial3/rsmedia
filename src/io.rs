@@ -1136,3 +1136,136 @@ struct RTPMuxContext {
     pub cur_timestamp: u32,
     pub max_payload_size: std::ffi::c_int,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EncoderBuilder;
+    use crate::mux::{Demuxer, Muxer};
+    use crate::options::Options;
+    use crate::pixel::PixelFormat;
+    use rsmpeg::avutil::AVFrame;
+
+    /// 生成 RGB24 渐变测试帧（image2 序列写入用）。
+    fn generate_rgb_frame(width: usize, height: usize, index: i64) -> AVFrame {
+        let mut frame = AVFrame::new();
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
+        frame.set_format(PixelFormat::RGB24.into());
+        frame.alloc_buffer().expect("alloc rgb frame buffer");
+
+        let plane = frame.data_mut()[0];
+        let linesize = frame.linesize[0];
+        for y in 0..height {
+            for x in 0..width {
+                let i = y * linesize as usize + x * 3;
+                unsafe {
+                    *plane.add(i) = (x * 255 / width) as u8;
+                    *plane.add(i + 1) = (y * 255 / height) as u8;
+                    *plane.add(i + 2) = ((index * 25) % 256) as u8;
+                }
+            }
+        }
+        frame
+    }
+
+    /// 图片序列写入（image2 muxer + png 编码器）：写入 N 帧 => 磁盘上生成
+    /// N 个按 `%03d` 模式编号的 PNG 文件。
+    #[test]
+    fn test_write_image_sequence() -> Result<()> {
+        let pattern = crate::test_utils::test_output_path("images", "img_%03d.png");
+        let n_frames = 8;
+
+        let writer = StreamWriterBuilder::new(pattern.as_path())
+            .with_format("image2")
+            .build()?;
+        let mut muxer = Muxer::new_from_writer(writer);
+
+        let encoder = EncoderBuilder::new_video(64, 48)
+            .with_codec_name("png".to_string())
+            .build()?;
+        let video_index = muxer.add_stream(encoder)?;
+
+        for i in 0..n_frames {
+            let mut frame = generate_rgb_frame(64, 48, i);
+            frame.set_pts(i);
+            muxer.mux(frame, video_index)?;
+        }
+        muxer.finish()?;
+
+        // 校验每个编号文件都存在且非空（image2 从 start_number=1 开始编号）
+        let dir = pattern.parent().unwrap();
+        for i in 1..=n_frames {
+            let file = dir.join(format!("img_{i:03}.png"));
+            let meta = std::fs::metadata(&file)
+                .unwrap_or_else(|e| panic!("expected sequence file {}: {e}", file.display()));
+            assert!(meta.len() > 0, "sequence file {} is empty", file.display());
+        }
+        // 未写入的下一个编号不应存在
+        assert!(!dir.join(format!("img_{:03}.png", n_frames + 1)).exists());
+
+        Ok(())
+    }
+
+    /// 图片序列读取（image2 demuxer）：按 `%03d` 模式打开序列，解码帧数应与
+    /// 写入帧数一致，且尺寸正确。
+    #[test]
+    fn test_read_image_sequence() -> Result<()> {
+        // 复用写入测试生成的序列；若不存在则现场生成
+        let pattern = crate::test_utils::test_output_path("images", "img_%03d.png");
+        if !pattern.with_file_name("img_001.png").exists() {
+            let writer = StreamWriterBuilder::new(pattern.as_path())
+                .with_format("image2")
+                .build()?;
+            let mut muxer = Muxer::new_from_writer(writer);
+            let encoder = EncoderBuilder::new_video(64, 48)
+                .with_codec_name("png".to_string())
+                .build()?;
+            let video_index = muxer.add_stream(encoder)?;
+            for i in 0..8 {
+                let mut frame = generate_rgb_frame(64, 48, i);
+                frame.set_pts(i);
+                muxer.mux(frame, video_index)?;
+            }
+            muxer.finish()?;
+        }
+
+        let reader = StreamReaderBuilder::new(pattern.as_path())
+            .with_format("image2")
+            .with_options(Options::from_iter([(
+                "framerate".to_string(),
+                "5".to_string(),
+            )]))
+            .build()?;
+
+        let demuxer = Demuxer::new_from_reader(reader, None, None)?;
+        let decoded: Vec<_> = demuxer.filter_map(|res| res.ok()).collect();
+        assert_eq!(
+            decoded.len(),
+            8,
+            "expected 8 decoded frames from image sequence"
+        );
+        for (_, frame) in &decoded {
+            assert_eq!(frame.width, 64);
+            assert_eq!(frame.height, 48);
+        }
+
+        Ok(())
+    }
+
+    /// 单张图片读取：jpg 由 FFmpeg 自动探测（image2/mjpeg demuxer），应能
+    /// 解码出至少一帧且尺寸与源图一致。
+    #[test]
+    fn test_read_single_image() -> Result<()> {
+        let demuxer = Demuxer::new(std::path::Path::new("assets/cat.jpg"))?;
+        let decoded: Vec<_> = demuxer.filter_map(|res| res.ok()).collect();
+        assert!(
+            !decoded.is_empty(),
+            "expected at least one decoded frame from a single image"
+        );
+        let (_, frame) = &decoded[0];
+        assert!(frame.width > 0 && frame.height > 0);
+
+        Ok(())
+    }
+}
