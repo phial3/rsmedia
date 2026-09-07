@@ -531,9 +531,13 @@ impl Decoder {
         })
     }
 
-    /// Decode a single frame as a `MediaFrame<u8>` (video) or `MediaFrame<f32>` (audio).
+    /// Decode a single frame as a `MediaFrame<u8>`.
     ///
-    /// Convenience for `decode::<u8>()` which is the common video path.
+    /// Convenience for `decode::<u8>()` which is the common video path
+    /// (8-bit formats such as YUV420P/RGB24). For audio the sample type must
+    /// match the codec's native sample format size — use `decode::<f32>()`
+    /// for FLTP/FLT output or [`decode_raw`](Self::decode_raw) to avoid the
+    /// typed conversion entirely.
     ///
     /// # Return value
     ///

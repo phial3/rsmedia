@@ -50,5 +50,10 @@ pub use rsmpeg::avutil;
 pub mod test_utils {
     // Single source of truth for test-output helpers; shared with integration
     // tests via `include!` so the path logic is not duplicated.
+    //
+    // `tests/common/mod.rs` refers to this crate as `rsmedia::...` (it is also
+    // compiled standalone by integration tests). Alias the crate root so the
+    // same paths resolve inside the library too.
+    use crate as rsmedia;
     include!("../tests/common/mod.rs");
 }

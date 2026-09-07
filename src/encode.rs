@@ -359,6 +359,10 @@ impl EncoderBuilder {
     }
 
     /// Some formats want stream headers to be separate.
+    ///
+    /// 仅对独立的 [`Self::build()`] 路径生效；`build_wrapped*` 路径会按
+    /// 实际输出容器的 `AVFMT_GLOBALHEADER` flag 自动派生（见
+    /// [`Self::build_wrapped_with_writer`]），显式设置会被覆盖。
     pub fn with_oformat_flags(mut self, flags: AvFormatFlags) -> Self {
         self.oformat_flags = flags as i32;
         self
@@ -536,10 +540,16 @@ impl EncoderBuilder {
 
     /// Build an [`EncoderWrapper`] with a custom writer.
     pub fn build_wrapped_with_writer<W: Writer>(
-        self,
+        mut self,
         mut writer: W,
         interleaved: bool,
     ) -> Result<EncoderWrapper<W>> {
+        // 按实际输出容器派生全局头 flag（与 ffmpeg CLI 一致）。
+        // mp4/mkv/flac 等 AVFMT_GLOBALHEADER 格式要求编码器在 open 前设置
+        // AV_CODEC_FLAG_GLOBAL_HEADER，extradata（AAC AudioSpecificConfig、
+        // flac STREAMINFO 等）才会生成并随 codecpar 写入容器；mpegts/avi
+        // 等带内头格式则不能设置，否则 x264 等编码器不再输出带内参数集。
+        self.oformat_flags = writer.output().oformat().flags;
         let encoder = self.build()?;
         let index = writer.add_stream(encoder.codecpar(), encoder.time_base());
         Ok(EncoderWrapper::new(encoder, writer, index, interleaved))
@@ -3068,6 +3078,62 @@ mod tests {
             }
 
             assert_container_results("audio containers", passed, skipped, failed);
+        }
+
+        /// 全局头格式（AVFMT_GLOBALHEADER）的 extradata 端到端验证。
+        ///
+        /// 全局头容器要求编码参数以 extradata 随流写入：flac 的 STREAMINFO、
+        /// AAC 的 AudioSpecificConfig。编码器须在 open 前设置
+        /// AV_CODEC_FLAG_GLOBAL_HEADER（由实际输出容器派生），否则流缺少
+        /// 解码所需的带外参数。严格验证：读回输出文件断言 extradata 存在。
+        #[test]
+        fn test_global_header_extradata() -> Result<()> {
+            use crate::io::Reader as _;
+
+            // 1) flac → .flac：STREAMINFO 必须作为 extradata 存在
+            let flac_path =
+                crate::test_utils::test_output_path("encode", "rsmedia_global_header.flac");
+            crate::test_utils::remove_test_output(&flac_path);
+            let mut encoder = EncoderBuilder::new_audio(0, 2, 44_100, SampleFormat::S16)
+                .with_codec_name("flac".to_string())
+                .build_wrapped(flac_path.as_path())?;
+            for _ in 0..44_100 / 1024 {
+                encoder.write_frame(sine_audio_frame::<i16>(440.0, 2, 1024, 44_100))?;
+            }
+            encoder.finish()?;
+
+            let reader = crate::io::StreamReader::new(flac_path.as_path())?;
+            let stream = reader.input().streams().first().unwrap();
+            assert_eq!(stream.codecpar().codec_id, ffi::AV_CODEC_ID_FLAC);
+            assert!(
+                stream.codecpar().extradata_size > 0,
+                "flac STREAMINFO must be carried as extradata in the output stream"
+            );
+            drop(reader);
+            crate::test_utils::remove_test_output(&flac_path);
+
+            // 2) aac → .m4a（MP4 全局头容器）：AudioSpecificConfig 必须存在
+            let m4a_path =
+                crate::test_utils::test_output_path("encode", "rsmedia_global_header.m4a");
+            crate::test_utils::remove_test_output(&m4a_path);
+            let mut encoder = EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP)
+                .with_codec_name("aac".to_string())
+                .build_wrapped(m4a_path.as_path())?;
+            for _ in 0..44_100 / 1024 {
+                encoder.write_frame(sine_audio_frame::<f32>(440.0, 2, 1024, 44_100))?;
+            }
+            encoder.finish()?;
+
+            let reader = crate::io::StreamReader::new(m4a_path.as_path())?;
+            let stream = reader.input().streams().first().unwrap();
+            assert_eq!(stream.codecpar().codec_id, ffi::AV_CODEC_ID_AAC);
+            assert!(
+                stream.codecpar().extradata_size > 0,
+                "AAC AudioSpecificConfig must be carried as extradata in the output stream"
+            );
+            drop(reader);
+            crate::test_utils::remove_test_output(&m4a_path);
+            Ok(())
         }
 
         /// 音频编解码往返测试：编码若干 AAC 音频帧，解码回验证采样率/通道数/总采样数。

@@ -6,6 +6,7 @@ use crate::stream::StreamInfo;
 use crate::{Decoder, DecoderBuilder, Encoder, Location, StreamReader, StreamWriter};
 
 use rsmpeg::avutil::AVFrame;
+use rsmpeg::ffi;
 
 use crate::error::{Context, Result, RsmediaError};
 use dashmap::DashMap;
@@ -52,6 +53,13 @@ pub struct Muxer<W: Writer> {
     interleaved: bool,
     have_written_header: bool,
     have_written_trailer: bool,
+    /// Container-level metadata (e.g. "title", "artist"), applied to the
+    /// format context right before the header is written.
+    metadata: HashMap<String, String>,
+    /// Per-stream metadata (e.g. "language"), keyed by the output stream
+    /// index returned from [`Muxer::add_stream`], applied right before the
+    /// header is written.
+    stream_metadata: HashMap<usize, HashMap<String, String>>,
 }
 
 pub struct MuxerStream {
@@ -89,6 +97,8 @@ impl<W: Writer> Muxer<W> {
             interleaved: false,
             have_written_header: false,
             have_written_trailer: false,
+            metadata: HashMap::new(),
+            stream_metadata: HashMap::new(),
         }
     }
 
@@ -119,6 +129,108 @@ impl<W: Writer> Muxer<W> {
             .iter_mut()
             .find(|s| s.stream_index == index)
             .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
+    }
+
+    /// Sets a container-level metadata entry, e.g. `title`, `artist`,
+    /// `comment`. Applied when the container header is written, i.e. before
+    /// the first [`Self::mux`] call; entries set after the header is written
+    /// are ignored (with a warning).
+    ///
+    /// Keys and values must not contain interior NUL bytes.
+    pub fn set_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<&mut Self> {
+        let (key, value) = validate_metadata_pair(key, value)?;
+        if self.have_written_header {
+            log::warn!("set_metadata({key:?}) after header write has no effect");
+        }
+        self.metadata.insert(key, value);
+        Ok(self)
+    }
+
+    /// Sets a per-stream metadata entry for the stream with index returned
+    /// from [`Self::add_stream`]. The common case is `language` with an
+    /// ISO 639-2 code ("chi", "eng", "und", ...), which players use to pick
+    /// audio/subtitle tracks.
+    ///
+    /// Applied when the container header is written; keys and values must not
+    /// contain interior NUL bytes.
+    pub fn set_stream_metadata(
+        &mut self,
+        stream_index: usize,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<&mut Self> {
+        let (key, value) = validate_metadata_pair(key, value)?;
+        let nb_streams = self.writer.output().nb_streams as usize;
+        if stream_index >= nb_streams {
+            return Err(RsmediaError::invalid_config(format!(
+                "stream index {stream_index} out of range (nb_streams={nb_streams})"
+            )));
+        }
+        if self.have_written_header {
+            log::warn!(
+                "set_stream_metadata({stream_index}, {key:?}) after header write has no effect"
+            );
+        }
+        self.stream_metadata
+            .entry(stream_index)
+            .or_default()
+            .insert(key, value);
+        Ok(self)
+    }
+
+    /// Applies container-level and per-stream metadata to the raw format
+    /// context.
+    ///
+    /// Must be called exactly once, immediately before `write_header`, as
+    /// FFmpeg only reads metadata during `avformat_write_header`. rsmpeg
+    /// exposes output streams only immutably (`AVStreamRef`), so the raw
+    /// stream array is accessed here instead; this is sound because the
+    /// writer exclusively owns the context and no streams are added after
+    /// this point.
+    fn apply_metadata(&mut self) {
+        if self.metadata.is_empty() && self.stream_metadata.is_empty() {
+            return;
+        }
+        let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
+
+        for (key, value) in &self.metadata {
+            let (k, v) = (
+                crate::strutils::str_to_cstring(key),
+                crate::strutils::str_to_cstring(value),
+            );
+            let ret = unsafe { ffi::av_dict_set(&mut ctx.metadata, k.as_ptr(), v.as_ptr(), 0) };
+            if ret < 0 {
+                log::warn!("av_dict_set({key:?}) failed: {ret}");
+            }
+        }
+
+        let streams =
+            unsafe { std::slice::from_raw_parts_mut(ctx.streams, ctx.nb_streams as usize) };
+        for (idx, entries) in &self.stream_metadata {
+            let Some(stream) = streams.get_mut(*idx) else {
+                log::warn!(
+                    "stream metadata: index {idx} out of range (nb_streams={})",
+                    ctx.nb_streams
+                );
+                continue;
+            };
+            for (key, value) in entries {
+                let (k, v) = (
+                    crate::strutils::str_to_cstring(key),
+                    crate::strutils::str_to_cstring(value),
+                );
+                let ret = unsafe {
+                    ffi::av_dict_set(&mut (**stream).metadata, k.as_ptr(), v.as_ptr(), 0)
+                };
+                if ret < 0 {
+                    log::warn!("av_dict_set(stream {idx}, {key:?}) failed: {ret}");
+                }
+            }
+        }
     }
 
     /// Mux a single packet. This will mux a single packet.
@@ -152,6 +264,7 @@ impl<W: Writer> Muxer<W> {
             Ok(last_out)
         } else {
             self.have_written_header = true;
+            self.apply_metadata();
             self.writer.write_header()?;
             self.mux(frame, stream_idx)
         }
@@ -191,6 +304,23 @@ impl<W: Writer> Muxer<W> {
 
 unsafe impl<W: Writer> Send for Muxer<W> {}
 unsafe impl<W: Writer> Sync for Muxer<W> {}
+
+/// Validates a metadata key/value pair: rejects interior NUL bytes, which
+/// cannot be represented in the C strings handed to `av_dict_set`.
+fn validate_metadata_pair(
+    key: impl Into<String>,
+    value: impl Into<String>,
+) -> Result<(String, String)> {
+    let (key, value) = (key.into(), value.into());
+    for (what, s) in [("key", &key), ("value", &value)] {
+        if s.contains('\0') {
+            return Err(RsmediaError::invalid_config(format!(
+                "metadata {what} contains interior NUL byte: {s:?}"
+            )));
+        }
+    }
+    Ok((key, value))
+}
 
 impl<W: Writer> Drop for Muxer<W> {
     fn drop(&mut self) {
@@ -619,6 +749,106 @@ mod tests {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// 容器级 metadata 与流级 language 标签的写入与回读验证（多轨场景）。
+    #[test]
+    fn test_mux_metadata_and_language() -> Result<()> {
+        use std::ffi::CStr;
+        use std::ptr;
+
+        let output_path = crate::test_utils::test_output_path("mux", "test_mux_metadata.mp4");
+
+        let (width, height) = (320, 240);
+        let sample_rate = 44_100;
+        let nb_samples = 1024;
+
+        let video_encoder = Encoder::new_video(width, height)?;
+        let video_time_base = video_encoder.time_base();
+        let video_frame_rate = video_encoder.frame_rate();
+        let audio_encoder = Encoder::new_audio(2, sample_rate, SampleFormat::FLTP).unwrap();
+        let audio_time_base = audio_encoder.time_base();
+
+        let mut muxer = Muxer::new(output_path.as_path())?;
+        let video_index = muxer.add_stream(video_encoder)?;
+        let audio_index = muxer.add_stream(audio_encoder)?;
+
+        // 参数校验：内嵌 NUL 与越界索引必须 fail fast
+        assert!(muxer.set_metadata("bad\0key", "v").is_err());
+        assert!(muxer.set_metadata("title", "bad\0value").is_err());
+        assert!(muxer.set_stream_metadata(99, "language", "eng").is_err());
+
+        muxer.set_metadata("title", "rsmedia metadata test")?;
+        muxer.set_metadata("artist", "rsmedia")?;
+        muxer.set_stream_metadata(video_index, "language", "und")?;
+        muxer.set_stream_metadata(audio_index, "language", "chi")?;
+
+        // 1 秒视频 + 1 秒音频（header 在首个 mux 调用时写入，metadata 届时生效）
+        for index in 0..video_frame_rate.den as i64 {
+            let mut frame = generate_video_frame(width, height, index);
+            frame.set_pts(index * video_time_base.den as i64);
+            frame.set_time_base(video_time_base);
+            muxer.mux(frame, video_index)?;
+        }
+        let mut total_samples = 0i64;
+        for _ in 0..(sample_rate / nb_samples) {
+            let mut frame =
+                generate_audio_sine_wave_frame(440.0, 2, nb_samples as usize, sample_rate)?;
+            frame.set_pts(total_samples);
+            frame.set_time_base(audio_time_base);
+            muxer.mux(frame, audio_index)?;
+            total_samples += nb_samples as i64;
+        }
+        muxer.finish()?;
+
+        // 回读验证：容器级 title/artist 与各流 language 标签
+        let reader = StreamReader::new(output_path.as_path())?;
+        let input = reader.input();
+
+        let get_str = |dict: *mut ffi::AVDictionary, key: &CStr| -> Option<String> {
+            unsafe {
+                let entry = ffi::av_dict_get(dict, key.as_ptr(), ptr::null(), 0);
+                if entry.is_null() {
+                    None
+                } else {
+                    Some(
+                        crate::strutils::cstr_to_string(CStr::from_ptr((*entry).value))
+                            .expect("metadata value is UTF8"),
+                    )
+                }
+            }
+        };
+
+        let title = get_str(input.metadata, c"title");
+        assert_eq!(
+            title.as_deref(),
+            Some("rsmedia metadata test"),
+            "container title metadata mismatch"
+        );
+
+        let artist = get_str(input.metadata, c"artist");
+        assert_eq!(artist.as_deref(), Some("rsmedia"));
+
+        let streams = input.streams();
+        let video_lang = get_str(
+            streams[video_index]
+                .metadata()
+                .map(|d| d.as_ptr() as *mut _)
+                .unwrap_or(ptr::null_mut()),
+            c"language",
+        );
+        assert_eq!(video_lang.as_deref(), Some("und"));
+
+        let audio_lang = get_str(
+            streams[audio_index]
+                .metadata()
+                .map(|d| d.as_ptr() as *mut _)
+                .unwrap_or(ptr::null_mut()),
+            c"language",
+        );
+        assert_eq!(audio_lang.as_deref(), Some("chi"));
 
         Ok(())
     }
