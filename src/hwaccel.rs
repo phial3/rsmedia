@@ -1,13 +1,13 @@
+use crate::error::{Context, Result, RsmediaError};
 use crate::pixel::PixelFormat;
 use crate::{Options, imgutils, strutils};
 
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
 use rsmpeg::{UnsafeDerefMut, ffi};
 
-use crate::error::{Context, Result, RsmediaError};
-use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
@@ -98,6 +98,38 @@ impl HWDeviceConfig {
             device_id,
             None,
         )
+    }
+
+    /// build AMD AMF HWDeviceConfig（Windows 平台，基于 D3D11 设备）。
+    ///
+    /// FFmpeg 的 AMF 编码器（`h264_amf`/`hevc_amf`/`av1_amf`）没有独立的
+    /// hw_context 类型，挂在 `AV_HWDEVICE_TYPE_D3D11VA` 下：软件帧（NV12）
+    /// 先上传到 D3D11 surface，再由 AMF 编码。
+    #[cfg(target_os = "windows")]
+    pub fn amf(device_id: Option<String>) -> Self {
+        Self::new(
+            HWDeviceType::D3D11VA,
+            PixelFormat::D3D11,
+            PixelFormat::NV12,
+            device_id,
+            None,
+        )
+    }
+
+    /// 按当前平台自动选择最佳可用的硬件加速配置。
+    ///
+    /// 依 [`HWDeviceType::platform_preference`] 的平台优先级依次探测
+    /// （`av_hwdevice_iterate_types`），返回第一个可用的设备配置；全部不可用
+    /// （无 GPU / 无驱动 / 无 FFmpeg 支持编译）时返回错误，**不会**回退到
+    /// 随机设备 —— 需要软件路径时由调用方显式省略 hw 配置。
+    pub fn auto_platform() -> Result<Self> {
+        HWDeviceType::auto_platform_config(None)
+    }
+
+    /// [`Self::auto_platform`] 的可定制版本：传入自定义候选顺序（如只想在
+    /// CUDA 与 QSV 之间选择）。`None` 使用平台默认优先级。
+    pub fn auto_platform_with(candidates: Option<Vec<HWDeviceType>>) -> Result<Self> {
+        HWDeviceType::auto_platform_config(candidates)
     }
 }
 
@@ -502,6 +534,70 @@ impl HWDeviceType {
         self.list_available().contains(&self)
     }
 
+    /// 当前平台的硬件加速优先级（从高到低）。
+    ///
+    /// 排序依据与 FFmpeg CLI / 主流转码器的默认习惯一致：
+    /// - macOS: VideoToolbox（Apple Silicon/Intel 均原生支持）
+    /// - Windows: D3D11VA（承载 AMD AMF 及通用 D3D11 hwaccel）> QSV > CUDA > Vulkan
+    /// - Linux: VAAPI（Intel/AMD 开箱即用）> CUDA > Vulkan
+    /// - Android: MediaCodec
+    pub fn platform_preference() -> Vec<HWDeviceType> {
+        match std::env::consts::OS {
+            "macos" => vec![HWDeviceType::VIDEOTOOLBOX, HWDeviceType::VULKAN],
+            "windows" => vec![
+                HWDeviceType::D3D11VA,
+                HWDeviceType::QSV,
+                HWDeviceType::CUDA,
+                HWDeviceType::VULKAN,
+                HWDeviceType::DXVA2,
+            ],
+            "linux" => vec![
+                HWDeviceType::VAAPI,
+                HWDeviceType::CUDA,
+                HWDeviceType::VULKAN,
+                HWDeviceType::VDPAU,
+                HWDeviceType::OPENCL,
+                HWDeviceType::DRM,
+            ],
+            "android" => vec![HWDeviceType::MEDIACODEC],
+            _ => vec![],
+        }
+    }
+
+    /// 平台自动选择：按 [`Self::platform_preference`]（或调用方自定义候选）
+    /// 顺序探测，返回第一个可用设备的配置。
+    ///
+    /// # Arguments
+    ///
+    /// * `candidates` - 自定义候选顺序；`None` 使用平台默认优先级。
+    pub fn auto_platform_config(candidates: Option<Vec<HWDeviceType>>) -> Result<HWDeviceConfig> {
+        let preference = candidates.unwrap_or_else(Self::platform_preference);
+        if preference.is_empty() {
+            return Err(RsmediaError::custom(format!(
+                "No hardware acceleration preference defined for platform: {}",
+                std::env::consts::OS
+            )));
+        }
+        let available = preference[0].list_available();
+        let device = preference
+            .into_iter()
+            .find(|ty| available.contains(ty))
+            .ok_or_else(|| {
+                RsmediaError::custom(format!(
+                    "No available hardware acceleration device on {} (candidates probed, available: {available:?})",
+                    std::env::consts::OS
+                ))
+            })?;
+        log::info!("Auto-selected hardware device: {device:?}");
+        Ok(HWDeviceConfig::new(
+            device,
+            device.default_hw_pixel_format(),
+            device.default_sw_pixel_format(),
+            None,
+            None,
+        ))
+    }
+
     /// List available hardware acceleration device types on this system.
     ///
     /// Uses `av_hwdevice_iterate_types` internally.
@@ -617,8 +713,9 @@ impl From<ffi::AVHWDeviceType> for HWDeviceType {
             #[cfg(feature = "ffmpeg7")]
             ffi::AV_HWDEVICE_TYPE_D3D12VA => HWDeviceType::D3D12VA,
 
+            // 未知/当前版本不支持的类型映射为 NONE，避免 panic。
             #[allow(unreachable_patterns)]
-            _ => panic!("Unknown HWDeviceType"),
+            _ => HWDeviceType::NONE,
         }
     }
 }
@@ -659,5 +756,136 @@ unsafe extern "C" fn hwaccel_get_format(
             p = p.add(1);
         }
         ffi::AV_PIX_FMT_NONE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 所有变体与 ffi 值双向映射后应保持自身（编译期常量，跨平台一致）。
+    #[test]
+    fn test_hw_device_type_roundtrip() {
+        let variants = [
+            HWDeviceType::NONE,
+            HWDeviceType::VDPAU,
+            HWDeviceType::CUDA,
+            HWDeviceType::VAAPI,
+            HWDeviceType::DXVA2,
+            HWDeviceType::QSV,
+            HWDeviceType::VIDEOTOOLBOX,
+            HWDeviceType::D3D11VA,
+            HWDeviceType::DRM,
+            HWDeviceType::OPENCL,
+            HWDeviceType::MEDIACODEC,
+            HWDeviceType::VULKAN,
+        ];
+        for v in variants {
+            let ffi_value: ffi::AVHWDeviceType = v.into();
+            assert_eq!(
+                HWDeviceType::from(ffi_value),
+                v,
+                "roundtrip failed for {v:?}"
+            );
+        }
+    }
+
+    /// 平台优先级：每个已知平台都应定义非空列表，且首选设备符合平台惯例。
+    #[test]
+    fn test_platform_preference() {
+        let preference = HWDeviceType::platform_preference();
+        match std::env::consts::OS {
+            "macos" => {
+                assert_eq!(preference[0], HWDeviceType::VIDEOTOOLBOX);
+            }
+            "windows" => {
+                assert_eq!(preference[0], HWDeviceType::D3D11VA);
+                assert!(preference.contains(&HWDeviceType::QSV));
+            }
+            "linux" => {
+                assert_eq!(preference[0], HWDeviceType::VAAPI);
+                assert!(preference.contains(&HWDeviceType::CUDA));
+            }
+            "android" => {
+                assert_eq!(preference, vec![HWDeviceType::MEDIACODEC]);
+            }
+            _ => {}
+        }
+    }
+
+    /// `list_available` 与 `is_available` 的一致性；探测过程不应 panic。
+    #[test]
+    fn test_list_available_consistency() {
+        let variants = [
+            HWDeviceType::CUDA,
+            HWDeviceType::VAAPI,
+            HWDeviceType::VIDEOTOOLBOX,
+            HWDeviceType::D3D11VA,
+            HWDeviceType::VULKAN,
+        ];
+        for v in variants {
+            assert_eq!(v.is_available(), v.list_available().contains(&v));
+        }
+    }
+
+    /// 平台自动选择：有可用设备时返回平台优先级内的配置；无设备时返回
+    /// 描述性错误（CI / 无 GPU 环境），不应 panic。
+    #[test]
+    fn test_auto_platform() {
+        match HWDeviceConfig::auto_platform() {
+            Ok(config) => {
+                assert!(
+                    HWDeviceType::platform_preference().contains(&config.device_type),
+                    "auto-selected device {:?} not in platform preference",
+                    config.device_type
+                );
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("No available hardware acceleration"),
+                    "unexpected error: {message}"
+                );
+            }
+        }
+    }
+
+    /// 自定义候选：只允许 D3D11VA（AMD AMF 的承载设备类型）。
+    /// 可用时应给出 D3D11 硬件格式 + NV12 软件格式；不可用时应优雅报错。
+    #[test]
+    fn test_auto_platform_amf_candidate() {
+        match HWDeviceConfig::auto_platform_with(Some(vec![HWDeviceType::D3D11VA])) {
+            Ok(config) => {
+                assert_eq!(config.device_type, HWDeviceType::D3D11VA);
+                assert_eq!(config.hw_pixel_format, PixelFormat::D3D11);
+                assert_eq!(config.sw_pixel_format, PixelFormat::NV12);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("No available hardware acceleration"),
+                    "unexpected error: {message}"
+                );
+            }
+        }
+    }
+
+    /// 空候选列表应报错而不是 panic（未知平台 / 显式空 vec）。
+    #[test]
+    fn test_auto_platform_empty_candidates() {
+        let result = HWDeviceConfig::auto_platform_with(Some(Vec::new()));
+        assert!(result.is_err());
+    }
+
+    /// AMF builder 仅在 Windows 上编译：验证字段映射（D3D11VA 设备 + D3D11
+    /// 硬件格式 + NV12 软件格式）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_amf_config_builder() {
+        let config = HWDeviceConfig::amf(Some("0".to_string()));
+        assert_eq!(config.device_type, HWDeviceType::D3D11VA);
+        assert_eq!(config.hw_pixel_format, PixelFormat::D3D11);
+        assert_eq!(config.sw_pixel_format, PixelFormat::NV12);
+        assert_eq!(config.device_id.as_deref(), Some("0"));
     }
 }

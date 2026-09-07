@@ -439,6 +439,14 @@ impl StreamInfo {
                     ffi::AV_CODEC_ID_HEVC => Some("hevc_vulkan".to_string()),
                     _ => None,
                 },
+                // Windows：D3D11VA 设备类型承载 AMD AMF 编码器
+                //（AMF 无独立 hwcontext，挂在 d3d11va 下）。
+                HWDeviceType::D3D11VA => match codec_id {
+                    ffi::AV_CODEC_ID_H264 => Some("h264_amf".to_string()),
+                    ffi::AV_CODEC_ID_HEVC => Some("hevc_amf".to_string()),
+                    ffi::AV_CODEC_ID_AV1 => Some("av1_amf".to_string()),
+                    _ => None,
+                },
                 _ => None,
             }
         } else {
