@@ -31,6 +31,12 @@ pub struct Filter {
     name: &'static str,
     media_type: MediaType,
     spec: String,
+    /// 滤镜图要求的**输入**格式声明（如 GIF 调色板链要求 RGB 输入）。
+    ///
+    /// `Some(fmt)` 时：编码器/解码器侧把输入帧先转换到 `fmt` 再进图，且
+    /// buffer/abuffer 源按 `fmt` 配置（sink 仍按协商格式）。`None` 时沿用
+    /// 协商格式（默认，src/sink 同格式，零行为变化）。
+    input_format: Option<FrameFormat>,
 }
 
 impl Filter {
@@ -39,7 +45,19 @@ impl Filter {
             name,
             media_type,
             spec,
+            input_format: None,
         }
+    }
+
+    /// 声明滤镜图要求的输入格式（视频=像素格式 / 音频=采样格式，覆盖默认的
+    /// "协商格式"）。
+    ///
+    /// `PixelFormat`/`SampleFormat` 均可隐式转入 [`FrameFormat`]，调用形如
+    /// `.with_input_format(PixelFormat::RGB24)` 或
+    /// `.with_input_format(SampleFormat::FLT)`。
+    pub fn with_input_format(mut self, format: impl Into<FrameFormat>) -> Self {
+        self.input_format = Some(format.into());
+        self
     }
 
     pub fn name(&self) -> &'static str {
@@ -52,6 +70,10 @@ impl Filter {
 
     pub fn spec(&self) -> String {
         self.spec.clone()
+    }
+
+    pub fn input_format(&self) -> Option<FrameFormat> {
+        self.input_format
     }
 }
 
@@ -624,6 +646,44 @@ pub mod video {
     pub fn deblock() -> Filter {
         Filter::new("deblock", MediaType::VIDEO, "deblock".to_string())
     }
+
+    /// GIF 单遍调色板滤镜链（palettegen/paletteuse），输出 pal8 帧供 `gif`
+    /// 编码器直接编码。
+    ///
+    /// 构建的滤镜图：
+    /// `fps=<fps>,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse[输出]`
+    ///
+    /// palettegen 统计**全部**输入帧的最优 256 色调色板（EOF 时才输出），
+    /// paletteuse 用它把帧量化为 pal8 —— 即 FFmpeg 官方推荐的单遍 GIF 调色板
+    /// 管线；palettegen/paletteuse 之间的帧缓存在图内完成，无需两遍编码。
+    ///
+    /// * `fps` - 输出帧率（GIF 体积敏感，通常 10~15）。
+    /// * `dither` - 抖动算法（`"bayer"`/`"floyd_steinberg"`/`"none"` 等），
+    ///   `None` 使用 FFmpeg 默认（sierra2_4a）。
+    ///
+    /// 输入为 RGB 帧：滤镜声明了 RGB24 输入格式，编码器侧自动把输入帧转到
+    /// RGB24 再进图；输出 pal8 与 `gif` 编码器原生格式一致。
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rsmedia::{EncoderBuilder, filter::video};
+    /// let encoder = EncoderBuilder::new_video(320, 240)
+    ///     .with_codec_name("gif".to_string())
+    ///     .with_fps(10.0)
+    ///     .with_filters(vec![video::gif_palette(10.0, None)])
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn gif_palette(fps: f32, dither: Option<&str>) -> Filter {
+        let dither_part = dither.map(|d| format!(":dither={d}")).unwrap_or_default();
+        Filter::new(
+            "paletteuse",
+            MediaType::VIDEO,
+            format!("fps={fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse{dither_part}"),
+        )
+        .with_input_format(PixelFormat::RGB24)
+    }
 }
 
 pub mod audio {
@@ -889,7 +949,12 @@ impl FilterParams {
 pub struct VideoParams {
     pub width: i32,
     pub height: i32,
+    /// 滤镜图**输出**（sink）像素格式：编码器协商格式。
     pub format: PixelFormat,
+    /// 滤镜图**输入**（buffer 源）像素格式：默认与 `format` 相同；当滤镜链
+    /// 声明了不同的输入格式（如 GIF 调色板链要求 RGB 输入、输出 pal8）时，
+    /// 由编码器侧设置为声明的输入格式，src→sink 的格式转换由滤镜图内完成。
+    pub src_format: PixelFormat,
     pub time_base: ffi::AVRational,
     pub frame_rate: ffi::AVRational,
     pub pixel_aspect: ffi::AVRational,
@@ -900,7 +965,12 @@ pub struct VideoParams {
 pub struct AudioParams {
     pub nb_channels: i32,
     pub sample_rate: i32,
+    /// 滤镜图**输出**（abuffersink 约束）采样格式：编码器/解码器协商格式。
     pub format: SampleFormat,
+    /// 滤镜图**输入**（abuffer）采样格式：默认与 `format` 相同；当滤镜链
+    /// 声明了不同的输入格式（[`Filter::with_input_format`]）时，由编码器/
+    /// 解码器侧设置为声明的格式，src→sink 的格式转换由图内滤镜完成。
+    pub src_format: SampleFormat,
     pub time_base: ffi::AVRational,
 }
 
@@ -982,11 +1052,14 @@ impl FilterGraph {
     /// `buffersink`: <https://ffmpeg.org/ffmpeg-filters.html#buffersink>
     fn setup_video_filters(&mut self, params: &VideoParams, spec: String) -> Result<()> {
         let args = {
+            // buffer 源按"滤镜图输入格式"配置（默认=编码器格式）；sink 仍按
+            // 编码器协商格式约束。二者不同时（如 GIF 调色板链 RGB→pal8），
+            // 格式转换由图内的滤镜（paletteuse/format 等）完成。
             let args = format!(
                 "width={}:height={}:pix_fmt={}:time_base={}/{}:frame_rate={}/{}:pixel_aspect={}/{}",
                 params.width,
                 params.height,
-                params.format.get_pix_fmt_name(),
+                params.src_format.get_pix_fmt_name(),
                 params.time_base.num,
                 params.time_base.den,
                 params.frame_rate.num,
@@ -1057,7 +1130,7 @@ impl FilterGraph {
                 params.time_base.num,
                 params.time_base.den,
                 params.sample_rate,
-                params.format.get_sample_fmt_name(),
+                params.src_format.get_sample_fmt_name(),
                 channel_desc.to_string_lossy(),
             );
             CString::new(args)?

@@ -617,12 +617,22 @@ impl EncoderBuilder {
 
         // 在 hw_device_config / codec_opts 被 move 之前构造 filter graph：
         // 此位置 self 尚未被部分 move，可直接借用 self 计算 time_base。
+        // 滤镜链可声明要求的输入格式（如 GIF 调色板链要求 RGB 输入、输出
+        // pal8；音频链可声明输入采样格式）；未声明时输入格式=编码器协商格式
+        // （src/sink 同格式，零行为变化）。
+        let filter_input_format = self
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.iter().find_map(|f| f.input_format()));
         let mut filter_graph = if let Some(filters) = self.filters.as_ref() {
             let filter_params = match media_type {
                 MediaType::VIDEO => {
                     FilterParams::Video(VideoParams {
                         width: self.width as i32,
                         height: self.height as i32,
+                        src_format: filter_input_format
+                            .and_then(FrameFormat::into_pixel)
+                            .unwrap_or(pixel_format),
                         format: pixel_format,
                         time_base: self.effective_time_base(),
                         frame_rate: self.frame_rate,
@@ -634,6 +644,9 @@ impl EncoderBuilder {
                         nb_channels: self.nb_channels,
                         sample_rate: self.sample_rate,
                         format: sample_format,
+                        src_format: filter_input_format
+                            .and_then(FrameFormat::into_sample)
+                            .unwrap_or(sample_format),
                         time_base: self.effective_time_base(), // time_base = 1 / sample_rate
                     })
                 }
@@ -778,6 +791,7 @@ impl EncoderBuilder {
             config,
             hw_context,
             media_type,
+            filter_input_format,
             filter_graph,
             context: encode_ctx,
             state: EncoderState::Normal,
@@ -849,6 +863,10 @@ pub struct Encoder {
     config: CodecConfig,
     context: AVCodecContext,
     filter_graph: Option<FilterGraph>,
+    /// 滤镜图输入格式声明（来自 [`Filter::input_format`]）。仅当滤镜图
+    /// 存在时可能为 `Some`；输入帧进图前需转换到该格式（视频=像素格式，
+    /// 音频=采样格式；默认=编码器协商格式）。
+    filter_input_format: Option<FrameFormat>,
     hw_context: Option<Arc<HWContext>>,
     media_type: MediaType,
     state: EncoderState,
@@ -1019,27 +1037,38 @@ impl Encoder {
     fn send_frame_to_encoder(&mut self, frame_opt: Option<AVFrame>) -> Result<()> {
         if let Some(frame) = frame_opt {
             // 正常编码帧：经过 filter（如有）
-            // 视频：滤镜 buffer 源按 `self.pixel_format` 配置；输入帧若携带其它像素格式
-            // （如测试用的 RGB24），需先转成该格式再进图，否则 FFmpeg 自动格式转换
-            // 路径会越界读写（SIGSEGV）。此转换与无滤镜时 `send_frame_post_filter`
-            // 里的 `rescale` 行为一致。
-            // 音频：滤镜 buffer 源按 `self.sample_format` 配置；与视频不同，音频帧无需
-            // 像素格式转换，直接进图即可（格式统一由滤镜后的 `rescale` 处理）。
-            let need_format_convert =
-                self.media_type == MediaType::VIDEO && frame.format != self.pix_fmt().into();
-            let enc_fmt = self.pix_fmt();
+            // 滤镜 buffer/abuffer 源按"滤镜图输入格式"配置（声明优先，见
+            // `Filter::with_input_format`；默认=编码器协商格式）。输入帧格式
+            // 与图输入格式不一致时需先转换再进图：
+            // - 视频：像素格式转换（swscale）。直接送入不匹配的 buffer 源会
+            //   触发 FFmpeg 自动格式转换路径的越界读写（SIGSEGV）。此转换与
+            //   无滤镜时 `send_frame_post_filter` 里的 `rescale` 行为一致。
+            // - 音频：采样格式转换（swresample，速率/声道不变）。abuffer 拒绝
+            //   属性不符的帧（"Changing frame properties on the fly"），图内
+            //   格式变化由滤镜链（如 aformat）完成，滤镜后 `rescale` 兜底。
+            let graph_input_format = self.filter_input_format.unwrap_or_else(|| {
+                // 无声明时图输入=编码器协商格式
+                match self.media_type {
+                    MediaType::VIDEO => FrameFormat::Pixel(self.pix_fmt()),
+                    _ => FrameFormat::Sample(self.sample_fmt()),
+                }
+            });
             let scale_algorithm = self.scale_algorithm;
             if let Some(graph) = self.filter_graph.as_mut() {
-                let frame = if need_format_convert {
-                    swctx::scale_with_flags(
-                        &frame,
-                        frame.width,
-                        frame.height,
-                        enc_fmt,
-                        scale_algorithm,
-                    )?
-                } else {
-                    frame
+                let frame = match graph_input_format {
+                    FrameFormat::Pixel(dst) if frame.format != dst as i32 => {
+                        swctx::scale_with_flags(
+                            &frame,
+                            frame.width,
+                            frame.height,
+                            dst,
+                            scale_algorithm,
+                        )?
+                    }
+                    FrameFormat::Sample(dst) if frame.format != dst as i32 => {
+                        swctx::convert_frame(&frame, frame.ch_layout, dst as _, frame.sample_rate)?
+                    }
+                    _ => frame,
                 };
                 match graph.process_frame(Some(frame))? {
                     Some(filtered) => self.send_frame_post_filter(filtered)?,

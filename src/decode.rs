@@ -260,6 +260,8 @@ impl DecoderBuilder {
                     FilterParams::Video(VideoParams {
                         width: init_width,
                         height: init_height,
+                        // 解码器输出已统一为 YUV420P，滤镜图 src/sink 同格式
+                        src_format: PixelFormat::YUV420P,
                         format: PixelFormat::YUV420P, // 确保视频帧 filter 的输入格式是 YUV420P
                         time_base: decode_ctx.time_base,
                         frame_rate: decode_ctx.framerate,
@@ -270,6 +272,7 @@ impl DecoderBuilder {
                     nb_channels: decode_ctx.ch_layout.nb_channels,
                     sample_rate: decode_ctx.sample_rate,
                     format: SampleFormat::from(decode_ctx.sample_fmt),
+                    src_format: SampleFormat::from(decode_ctx.sample_fmt),
                     time_base: decode_ctx.time_base,
                 }),
                 _ => panic!("Unsupported filter for media type: {media_type:?}"),
