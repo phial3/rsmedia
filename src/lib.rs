@@ -34,6 +34,7 @@ pub use init::init;
 pub use io::{Reader, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
+pub use mux::Chapter;
 pub use options::{Options, Quality, VideoProfile};
 pub use pcm::{PcmSink, PcmSpec};
 pub use pixel::PixelFormat;
