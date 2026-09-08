@@ -5,11 +5,10 @@ use crate::{Options, imgutils, strutils};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
-use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
+use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
 use rsmpeg::{UnsafeDerefMut, ffi};
 
 use std::collections::HashMap;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 /// Hardware device configuration.

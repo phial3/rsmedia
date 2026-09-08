@@ -201,9 +201,7 @@ impl StreamInfo {
             FrameFormat::Pixel(PixelFormat::NONE)
         };
 
-        let bytes_per_sample = format
-            .into_sample()
-            .and_then(|s| s.get_bytes_per_sample());
+        let bytes_per_sample = format.into_sample().and_then(|s| s.get_bytes_per_sample());
 
         // descriptor() 返回 Result，未知格式时返回错误而非 panic
         let pix_fmt_desc = if codec_type.is_video() {
@@ -306,7 +304,10 @@ impl StreamInfo {
         let (sar_num, sar_den) = if sample_aspect_ratio.num <= 0 || sample_aspect_ratio.den <= 0 {
             (1, 1)
         } else {
-            (sample_aspect_ratio.num as i64, sample_aspect_ratio.den as i64)
+            (
+                sample_aspect_ratio.num as i64,
+                sample_aspect_ratio.den as i64,
+            )
         };
         let mut num: i32 = 0;
         let mut den: i32 = 1;
@@ -336,8 +337,7 @@ impl StreamInfo {
         let nb_side_data = codecpar.nb_coded_side_data.max(0) as usize;
         if nb_side_data > 0 && !codecpar.coded_side_data.is_null() {
             unsafe {
-                let entries =
-                    std::slice::from_raw_parts(codecpar.coded_side_data, nb_side_data);
+                let entries = std::slice::from_raw_parts(codecpar.coded_side_data, nb_side_data);
                 for entry in entries {
                     if entry.type_ == ffi::AV_PKT_DATA_DISPLAYMATRIX && entry.size >= 9 * 4 {
                         // av_display_rotation_get 返回逆时针角度，取负为顺时针
@@ -348,7 +348,9 @@ impl StreamInfo {
         }
 
         // 2. rotate metadata 标签（旧 demuxer 回退）
-        map.get("rotate").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
+        map.get("rotate")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
     }
 
     fn get_extra_data(stream: &AVStream) -> Option<Vec<u8>> {
@@ -392,7 +394,8 @@ impl StreamInfo {
         let hw_codec_name = hw_device_type
             .and_then(|hw| hw_decoder_name(hw, codec_id))
             .filter(|name| {
-                let exists = AVCodec::find_decoder_by_name(&strutils::str_to_cstring(name)).is_some();
+                let exists =
+                    AVCodec::find_decoder_by_name(&strutils::str_to_cstring(name)).is_some();
                 if !exists {
                     log::debug!(
                         "HW decoder '{name}' not registered in this FFmpeg build, \
@@ -414,7 +417,8 @@ impl StreamInfo {
         let hw_codec_name = hw_device_type
             .and_then(|hw| hw_encoder_name(hw, codec_id))
             .filter(|name| {
-                let exists = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(name)).is_some();
+                let exists =
+                    AVCodec::find_encoder_by_name(&strutils::str_to_cstring(name)).is_some();
                 if !exists {
                     log::debug!(
                         "HW encoder '{name}' not registered in this FFmpeg build, \
@@ -606,7 +610,10 @@ mod tests {
         let vaapi = info
             .find_decoder_name(Some(HWDeviceType::VAAPI))
             .expect("vaapi lookup");
-        assert_eq!(vaapi, generic, "VAAPI must fall back to the generic decoder");
+        assert_eq!(
+            vaapi, generic,
+            "VAAPI must fall back to the generic decoder"
+        );
         assert_ne!(vaapi, "h264_vaapi");
     }
 

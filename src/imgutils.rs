@@ -524,6 +524,50 @@ pub fn to_ndarray(frame: &AVFrame) -> Result<ndarray::Array3<u8>> {
     }
 }
 
+/// 将 `AVFrame` 转换为 `image::DynamicImage`。
+///
+/// packed 8bit 格式（RGB24/RGBA/GRAY8）直接从帧数据构建，其他格式
+/// （YUV 系列、BGR 族等）经 swscale 统一转为 RGB24 再构建。
+/// 不依赖 `ndarray` feature。硬件帧需先下载到内存（见
+/// [`crate::hwaccel::HWContext::hw_download`]）。
+pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
+    let (width, height) = (frame.width as u32, frame.height as u32);
+    if width == 0 || height == 0 {
+        return Err(RsmediaError::custom("Invalid frame dimensions"));
+    }
+
+    let build =
+        |pix_fmt: PixelFormat, buf: Vec<u8>| -> Option<image::DynamicImage> {
+            match pix_fmt {
+                PixelFormat::RGB24 => image::RgbImage::from_raw(width, height, buf)
+                    .map(image::DynamicImage::ImageRgb8),
+                PixelFormat::RGBA => image::RgbaImage::from_raw(width, height, buf)
+                    .map(image::DynamicImage::ImageRgba8),
+                PixelFormat::GRAY8 => image::GrayImage::from_raw(width, height, buf)
+                    .map(image::DynamicImage::ImageLuma8),
+                _ => None,
+            }
+        };
+
+    let pix_fmt = PixelFormat::from(frame.format);
+    match pix_fmt {
+        PixelFormat::RGB24 | PixelFormat::RGBA | PixelFormat::GRAY8 => {
+            let buf = copy_frame_to_buffer(frame)?;
+            build(pix_fmt, buf)
+                .ok_or_else(|| RsmediaError::custom("Failed to build image from frame data"))
+        }
+        _ => {
+            // 其他格式（YUV/BGR 族等）：swscale 统一转 RGB24
+            let rgb =
+                crate::swctx::scale_frame(frame, frame.width, frame.height, PixelFormat::RGB24)?;
+            let buf = copy_frame_to_buffer(&rgb)?;
+            image::RgbImage::from_raw(width, height, buf)
+                .map(image::DynamicImage::ImageRgb8)
+                .ok_or_else(|| RsmediaError::custom("Failed to build image from RGB24 data"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

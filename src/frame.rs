@@ -167,14 +167,12 @@ where
         let expected_c = if format == PixelFormat::YUV420P {
             3
         } else {
-            format
-                .packed_channels()
-                .ok_or_else(|| {
-                    RsmediaError::custom(format!(
-                        "Unsupported pixel format for ndarray: {format:?}, only YUV420P and \
+            format.packed_channels().ok_or_else(|| {
+                RsmediaError::custom(format!(
+                    "Unsupported pixel format for ndarray: {format:?}, only YUV420P and \
                          packed 8-bit formats are supported"
-                    ))
-                })?
+                ))
+            })?
         };
         if h != height || w != width || c != expected_c {
             return Err(RsmediaError::custom(format!(
@@ -206,14 +204,12 @@ where
         let expected_c = if format == PixelFormat::YUV420P {
             3
         } else {
-            format
-                .packed_channels()
-                .ok_or_else(|| {
-                    RsmediaError::custom(format!(
-                        "Unsupported pixel format for ndarray: {format:?}, only YUV420P and \
+            format.packed_channels().ok_or_else(|| {
+                RsmediaError::custom(format!(
+                    "Unsupported pixel format for ndarray: {format:?}, only YUV420P and \
                          packed 8-bit formats are supported"
-                    ))
-                })?
+                ))
+            })?
         };
         let data = ndarray::Array3::<T>::zeros((height, width, expected_c));
         Self::new_video(width, height, format, time_base, data)
@@ -1119,8 +1115,7 @@ mod tests {
             for y in 0..height {
                 for x in 0..width {
                     for c in 0..ch {
-                        *data.add(y * linesize + x * ch + c) =
-                            ((x + y * 3 + c * 7) % 256) as u8;
+                        *data.add(y * linesize + x * ch + c) = ((x + y * 3 + c * 7) % 256) as u8;
                     }
                 }
             }

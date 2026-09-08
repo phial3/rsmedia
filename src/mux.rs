@@ -647,7 +647,7 @@ impl<R: Reader> Demuxer<R> {
                 Err(e) => {
                     return Err(RsmediaError::custom(format!(
                         "Failed to build decoder: {e:#}"
-                    )))
+                    )));
                 }
             };
 

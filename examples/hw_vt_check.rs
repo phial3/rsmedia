@@ -1,6 +1,8 @@
 use rsmedia::{
-    DecoderBuilder, EncoderBuilder, MediaType, PixelFormat, colors, frame::MediaFrame,
-    hwaccel::{HWDeviceConfig, HWDeviceType}, time,
+    DecoderBuilder, EncoderBuilder, MediaType, PixelFormat, colors,
+    frame::MediaFrame,
+    hwaccel::{HWDeviceConfig, HWDeviceType},
+    time,
 };
 use std::path::PathBuf;
 

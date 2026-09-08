@@ -1120,6 +1120,22 @@ impl<R: Reader> DecoderWrapper<R> {
         self.decoder.decode_subtitle_segment(&mut self.reader)
     }
 
+    /// Seek 到指定时间点并解码一帧原始 `AVFrame`（视频）。
+    ///
+    /// 缩略图/封面提取的核心路径：seek 定位到目标时间之前最近的关键帧
+    /// （`AVSEEK_FLAG_BACKWARD` 语义），从该帧开始解码。若 reader 不支持
+    /// seek（如内存缓冲），静默从头解码第一帧。
+    ///
+    /// 返回 `Ok(None)` 表示到达流末尾且无帧可解。转换为图片请用
+    /// [`imgutils::to_dynamic_image`](crate::imgutils::to_dynamic_image)。
+    pub fn decode_raw_at(&mut self, timestamp_ms: i64) -> Result<Option<AVFrame>> {
+        // seek 失败（不支持 seek 的 reader）不视为错误：退化为解码第一帧
+        if self.seek_to_timestamp(timestamp_ms).is_err() {
+            log::debug!("seek to {timestamp_ms}ms failed, decoding from the current position");
+        }
+        self.decode_raw()
+    }
+
     pub fn stream_info(&self) -> &StreamInfo {
         &self.stream_info
     }
@@ -1192,11 +1208,81 @@ impl<R: Reader> DecoderWrapper<R> {
     }
 }
 
+/// 一站式从输入获取一帧视频缩略图，返回 `image::DynamicImage`。
+///
+/// 内部流程：构建视频解码器（RGB24 输出 + [`Resize::Fit`] 保持纵横比缩放）
+/// → seek 到目标时间 → 解码一帧原始 `AVFrame` → 转为
+/// [`image::DynamicImage`](imgutils::to_dynamic_image)。
+/// 不依赖 `ndarray` feature，适合生成封面图 / 视频预览等场景。
+///
+/// # Arguments
+///
+/// * `source` - 输入（文件路径 / URL 等，见 [`Location`]）
+/// * `timestamp_milliseconds` - 取帧时间点；`None` 时取**流中点**
+///   （视频开头往往是黑帧/淡入，中点更容易取到有代表性的画面；
+///   时长未知的流退化为取第一帧）
+/// * `max_dims` - 缩略图最大 (宽, 高)；实际尺寸按纵横比缩放，
+///   源小于该尺寸时不放大
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use rsmedia::thumbnail;
+/// # use std::path::Path;
+/// let img = thumbnail(Path::new("assets/mp4.mp4"), None, (320, 240)).unwrap();
+/// println!("thumbnail: {}x{}", img.width(), img.height());
+/// img.save("thumbnail.png").unwrap();
+/// ```
+pub fn thumbnail(
+    source: impl Into<Location>,
+    timestamp_ms: Option<i64>,
+    max_dims: (u32, u32),
+) -> Result<image::DynamicImage> {
+    let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+        .with_pix_fmt(PixelFormat::RGB24)
+        .with_resize(Resize::Fit(max_dims.0, max_dims.1))
+        .build_wrapped(source)
+        .context("Failed to build thumbnail decoder")?;
+
+    // None → 流中点；时长未知（0）→ 第一帧
+    let ts = timestamp_ms.unwrap_or_else(|| {
+        let info = decoder.stream_info();
+        let mid_secs = info.duration as f64 * avutil::av_q2d(info.time_base) / 2.0;
+        (mid_secs * 1000.0).round().max(0.0) as i64
+    });
+
+    let frame = decoder
+        .decode_raw_at(ts)?
+        .ok_or_else(|| RsmediaError::custom("No video frame decoded for thumbnail"))?;
+
+    crate::imgutils::to_dynamic_image(&frame).context("Failed to convert AVFrame to image")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::filter;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_thumbnail() -> Result<()> {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+        // 默认取流中点，Fit 缩放保持纵横比
+        let img = thumbnail(video_path, None, (320, 240))?;
+        assert!(img.width() > 0 && img.height() > 0);
+        assert!(
+            img.width() <= 320 && img.height() <= 240,
+            "thumbnail dims {}x{} exceed 320x240",
+            img.width(),
+            img.height()
+        );
+        assert_eq!(img.color().channel_count(), 3, "expected RGB output");
+
+        // 指定时间点
+        let img = thumbnail(video_path, Some(1000), (64, 64))?;
+        assert!(img.width() > 0 && img.height() > 0);
+        Ok(())
+    }
 
     #[test]
     fn test_decode_video() -> Result<()> {
