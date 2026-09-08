@@ -125,10 +125,10 @@ impl SubtitleSegment {
         for rect in subtitle.rect_iter() {
             match rect.type_() {
                 ffi::SUBTITLE_ASS => {
-                    if let Some(ass) = rect.ass() {
-                        if let Some(text) = ass_dialogue_text(ass) {
-                            texts.push(text);
-                        }
+                    if let Some(ass) = rect.ass()
+                        && let Some(text) = ass_dialogue_text(ass)
+                    {
+                        texts.push(text);
                     }
                 }
                 ffi::SUBTITLE_TEXT => {
@@ -221,8 +221,8 @@ mod tests {
     /// AVSubtitle.pts 为 AV_TIME_BASE 微秒，start_display_time 相对 pts 毫秒）。
     #[test]
     fn test_subtitle_decode_roundtrip() -> Result<()> {
-        use crate::decode::DecoderBuilder;
         use crate::MediaType;
+        use crate::decode::DecoderBuilder;
 
         let path = test_support::test_output_path("subtitle", "rsmedia_decode_rt.mp4");
         test_support::remove_test_output(&path);
@@ -271,8 +271,8 @@ mod tests {
             c"Dialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,Hello, world, with, commas",
         )?;
 
-        let seg = SubtitleSegment::from_avsubtitle(&sub)
-            .expect("ASS rect should convert to a segment");
+        let seg =
+            SubtitleSegment::from_avsubtitle(&sub).expect("ASS rect should convert to a segment");
         assert_eq!(seg.text, "Hello, world, with, commas");
         // Dialogue 行内的时间戳不参与换算：展示时间来自 pts + display_time
         // （此处 AVSubtitle::new 的 pts 为 0，仅验证 display_time 路径）

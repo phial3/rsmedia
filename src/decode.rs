@@ -614,10 +614,7 @@ impl Decoder {
     ///     println!("{}-{}ms: {}", segment.start_ms, segment.end_ms, segment.text);
     /// }
     /// ```
-    pub fn decode_subtitle_segment<R>(
-        &mut self,
-        reader: &mut R,
-    ) -> Result<Option<SubtitleSegment>>
+    pub fn decode_subtitle_segment<R>(&mut self, reader: &mut R) -> Result<Option<SubtitleSegment>>
     where
         R: Reader,
     {
@@ -642,10 +639,10 @@ impl Decoder {
                             log::trace!("skip stream index: {stream_index}");
                             continue;
                         }
-                        if let Some(subtitle) = self.decode_subtitle_packet(Some(&mut packet))? {
-                            if let Some(segment) = SubtitleSegment::from_avsubtitle(&subtitle) {
-                                return Ok(Some(segment));
-                            }
+                        if let Some(subtitle) = self.decode_subtitle_packet(Some(&mut packet))?
+                            && let Some(segment) = SubtitleSegment::from_avsubtitle(&subtitle)
+                        {
+                            return Ok(Some(segment));
                         }
                     }
                     None => {
