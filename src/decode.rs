@@ -1,4 +1,4 @@
-use crate::codec::AvCodecFlags;
+use crate::codec::AVCodecFlag;
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 #[cfg(feature = "ndarray")]
@@ -9,7 +9,7 @@ use crate::options::Options;
 use crate::resize::Resize;
 use crate::stream::StreamInfo;
 use crate::strutils;
-use crate::swctx::{self, ScaleAlgorithm};
+use crate::swctx::{self, SwsFlags};
 use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
@@ -22,14 +22,14 @@ use std::sync::Arc;
 /// Builds a [`Decoder`].
 #[derive(Debug)]
 pub struct DecoderBuilder {
-    flags: AvCodecFlags,
+    flags: AVCodecFlag,
     thread_count: usize,
     media_type: MediaType,
     codec_name: Option<String>,
     codec_opts: Option<Options>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
-    scale_algorithm: ScaleAlgorithm,
+    scale_algorithm: SwsFlags,
     resize: Option<Resize>,
 }
 
@@ -47,14 +47,14 @@ impl DecoderBuilder {
             codec_opts: None,
             hw_device_config: None,
             thread_count: num_cpus::get(),
-            flags: AvCodecFlags::LOW_DELAY,
-            scale_algorithm: ScaleAlgorithm::default(),
+            flags: AVCodecFlag::LOW_DELAY,
+            scale_algorithm: SwsFlags::default(),
             resize: None,
         }
     }
 
     /// Set decoding flags.
-    pub fn with_flags(mut self, flags: AvCodecFlags) -> Self {
+    pub fn with_flags(mut self, flags: AVCodecFlag) -> Self {
         self.flags = flags;
         self
     }
@@ -95,10 +95,10 @@ impl DecoderBuilder {
     /// Set the scaling algorithm used when converting decoded frames to a
     /// canonical pixel format (e.g. YUV420P).
     ///
-    /// Defaults to [`ScaleAlgorithm::Bicubic`]. Use
-    /// [`ScaleAlgorithm::Bilinear`] for output consistent with FFmpeg's command
-    /// line default, or [`ScaleAlgorithm::Area`] when downscaling.
-    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
+    /// Defaults to [`SwsFlags::BICUBIC`]. Use
+    /// [`SwsFlags::BILINEAR`] for output consistent with FFmpeg's command
+    /// line default, or [`SwsFlags::AREA`] when downscaling.
+    pub fn with_scale_algorithm(mut self, algorithm: SwsFlags) -> Self {
         self.scale_algorithm = algorithm;
         self
     }
@@ -340,7 +340,7 @@ pub struct Decoder {
     stream_index: usize,
     media_type: MediaType,
     state: DecoderState,
-    scale_algorithm: ScaleAlgorithm,
+    scale_algorithm: SwsFlags,
     resize: Option<Resize>,
 }
 
@@ -478,61 +478,12 @@ impl Decoder {
     where
         T: MediaFrameType,
     {
-        if self.is_complete() {
-            return Err(RsmediaError::custom(
-                "Decoder cannot decode after flushed. Call reset().",
-            ));
-        }
-
-        let mut read_exhausted = false;
-        Ok(loop {
-            if !read_exhausted {
-                match reader.read_packet() {
-                    Ok(Some((stream_index, packet))) => {
-                        if stream_index != self.stream_index() {
-                            // skip other streams
-                            log::trace!("skip stream index: {}, {:?}", stream_index, packet);
-                            continue;
-                        }
-                        if let Some(frame) = self.decode_packet(&packet)? {
-                            break Some(frame);
-                        }
-                    }
-                    Ok(None) => {
-                        log::debug!("No more packets, Reader exhausted.");
-                        read_exhausted = true;
-                        continue;
-                    }
-                    Err(e) => {
-                        log::error!("Error reading packet: {e}");
-                        return Err(e);
-                    }
-                }
-            } else {
-                match self.drain() {
-                    Ok(Some(frame)) => {
-                        break Some(frame);
-                    }
-                    Ok(None) => {
-                        // None 可能来自 Drained（EAGAIN，解码器仍有缓冲帧待产出）或
-                        // Flushed（EOF）。若是 Drained 需继续 drain，否则会丢失尾部帧
-                        // （多见于含 B 帧的码流）。
-                        if self.is_drained() {
-                            log::debug!("Decoder drained, keep draining.");
-                            continue;
-                        }
-                        log::debug!("Decoder flushed. EOF reached.");
-                        // self.reset();
-                        // read_exhausted = false;
-                        break None;
-                    }
-                    Err(e) => {
-                        log::error!("Error to drain decoder: {e}");
-                        return Err(e);
-                    }
-                }
-            }
-        })
+        decode_stream(
+            self,
+            reader,
+            Decoder::decode_packet::<T>,
+            Decoder::drain::<T>,
+        )
     }
 
     /// Decode a single frame as a `MediaFrame<u8>`.
@@ -564,58 +515,7 @@ impl Decoder {
     where
         R: Reader,
     {
-        if self.is_complete() {
-            return Err(RsmediaError::custom(
-                "Decoder cannot decode after flushed. Call reset().",
-            ));
-        }
-
-        let mut read_exhausted = false;
-        Ok(loop {
-            if !read_exhausted {
-                match reader.read_packet() {
-                    Ok(Some((stream_index, packet))) => {
-                        if stream_index != self.stream_index() {
-                            // skip other streams
-                            log::trace!("skip stream index: {}, {:?}", stream_index, packet);
-                            continue;
-                        }
-                        if let Some(frame) = self.decode_raw_packet(&packet)? {
-                            break Some(frame);
-                        }
-                    }
-                    Ok(None) => {
-                        log::debug!("No more packets, Reader exhausted.");
-                        read_exhausted = true;
-                        continue;
-                    }
-                    Err(e) => {
-                        log::error!("Error reading packet: {e}");
-                        return Err(e);
-                    }
-                }
-            } else {
-                match self.drain_raw() {
-                    Ok(Some(frame)) => {
-                        break Some(frame);
-                    }
-                    Ok(None) => {
-                        if self.is_drained() {
-                            log::debug!("Decoder drained, keep draining.");
-                            continue;
-                        }
-                        log::debug!("Decoder flushed. EOF reached.");
-                        // self.reset();
-                        // read_exhausted = false;
-                        break None;
-                    }
-                    Err(e) => {
-                        log::error!("Error to drain decoder: {e}");
-                        return Err(e);
-                    }
-                }
-            }
-        })
+        decode_stream(self, reader, Decoder::decode_raw_packet, Decoder::drain_raw)
     }
 
     /// Decode a [`Packet`].
@@ -874,6 +774,74 @@ impl Decoder {
             }
         }
     }
+}
+
+/// 驱动“读 packet → 解码 → EOF 排空”的通用状态机，供 [`Decoder::decode`] 与
+/// [`Decoder::decode_raw`] 复用。`on_packet` 处理单个输入包，`on_drain` 处理 EOF
+/// 阶段的排空；二者共用同一套“忽略非目标流 / 报错即返回 / 排空到底”的语义。
+fn decode_stream<O, OP, OD>(
+    decoder: &mut Decoder,
+    reader: &mut impl Reader,
+    mut on_packet: OP,
+    mut on_drain: OD,
+) -> Result<Option<O>>
+where
+    OP: FnMut(&mut Decoder, &AVPacket) -> Result<Option<O>>,
+    OD: FnMut(&mut Decoder) -> Result<Option<O>>,
+{
+    if decoder.is_complete() {
+        return Err(RsmediaError::custom(
+            "Decoder cannot decode after flushed. Call reset().",
+        ));
+    }
+
+    let mut read_exhausted = false;
+    Ok(loop {
+        if !read_exhausted {
+            match reader.read_packet() {
+                Ok(Some((stream_index, packet))) => {
+                    if stream_index != decoder.stream_index() {
+                        // 跳过其它流
+                        log::trace!("skip stream index: {}, {:?}", stream_index, packet);
+                        continue;
+                    }
+                    if let Some(out) = on_packet(decoder, &packet)? {
+                        break Some(out);
+                    }
+                }
+                Ok(None) => {
+                    log::debug!("No more packets, Reader exhausted.");
+                    read_exhausted = true;
+                    continue;
+                }
+                Err(e) => {
+                    log::error!("Error reading packet: {e}");
+                    return Err(e);
+                }
+            }
+        } else {
+            match on_drain(decoder) {
+                Ok(Some(out)) => break Some(out),
+                Ok(None) => {
+                    // None 可能来自 Drained（EAGAIN，解码器仍有缓冲帧待产出）或
+                    // Flushed（EOF）。若是 Drained 需继续 drain，否则会丢失尾部帧
+                    // （多见于含 B 帧的码流）。
+                    if decoder.is_drained() {
+                        log::debug!("Decoder drained, keep draining.");
+                        continue;
+                    }
+                    log::debug!("Decoder flushed. EOF reached.");
+                    // self.reset();
+                    // read_exhausted = false;
+                    break None;
+                }
+                Err(e) => {
+                    log::error!("Error to drain decoder: {e}");
+                    return Err(e);
+                }
+            }
+        }
+    })
 }
 
 /// Important note: Do not forget to drain the decoder after the reader is exhausted. It may still

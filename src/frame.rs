@@ -111,6 +111,42 @@ pub struct MediaFrame<T> {
     pub best_effort_timestamp: i64,
 }
 
+impl<T: MediaFrameType> Default for MediaFrame<T> {
+    /// 返回一个字段均为中性默认值的空帧；具体构造器（[`Self::new_video`] / [`Self::new_audio`]）
+    /// 通过 struct-update 语法只覆盖本方相关的字段，从而消除重复的默认初始化。
+    fn default() -> Self {
+        Self {
+            pts: 0,
+            dts: 0,
+            duration: 0,
+            pkt_duration: 0,
+            // 占位格式，具体构造器会覆盖；默认中性值用于避免越界访问。
+            format: FrameFormat::Pixel(PixelFormat::NONE),
+            data: Default::default(),
+            time_base: time::new_rational(0, 1),
+            media_type: MediaType::DATA,
+            width: 0,
+            height: 0,
+            pict_type: ffi::AV_PICTURE_TYPE_NONE,
+            sample_rate: 0,
+            nb_samples: 0,
+            nb_channels: 0,
+            key_frame: false,
+            flags: 0,
+            quality: 0,
+            repeat_pict: 0,
+            // 色彩属性默认标记为“未知”（UNSPECIFIED/RANGE_UNSPECIFIED=0），
+            // 避免把 0 误当成 AV_COL_SPC_RGB 写入 AVFrame，干扰滤镜/编码器的色彩判定。
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_primaries: ffi::AVCOL_PRI_UNSPECIFIED,
+            color_trc: ffi::AVCOL_TRC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
+            sample_aspect_ratio: time::new_rational(0, 1),
+            best_effort_timestamp: ffi::AV_NOPTS_VALUE,
+        }
+    }
+}
+
 impl<T> MediaFrame<T>
 where
     T: MediaFrameType,
@@ -133,30 +169,11 @@ where
         Ok(Self {
             width,
             height,
-            time_base,
             data,
-            format: FrameFormat::Pixel(format),
-            pts: 0,
-            dts: 0,
-            duration: 0,
-            pkt_duration: 0,
+            time_base,
             media_type: MediaType::VIDEO,
-            pict_type: ffi::AV_PICTURE_TYPE_NONE,
-            sample_rate: 0,
-            nb_samples: 0,
-            nb_channels: 0,
-            key_frame: false,
-            flags: 0,
-            quality: 0,
-            repeat_pict: 0,
-            // 色彩属性默认标记为“未知”（UNSPECIFIED/RANGE_UNSPECIFIED=0），
-            // 避免把 0 误当成 AVCOL_SPC_RGB 写入 AVFrame，干扰滤镜/编码器的色彩判定。
-            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
-            color_primaries: ffi::AVCOL_PRI_UNSPECIFIED,
-            color_trc: ffi::AVCOL_TRC_UNSPECIFIED,
-            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
-            sample_aspect_ratio: time::new_rational(0, 1),
-            best_effort_timestamp: ffi::AV_NOPTS_VALUE,
+            format: FrameFormat::Pixel(format),
+            ..Self::default()
         })
     }
 
@@ -196,24 +213,8 @@ where
             sample_rate,
             nb_samples,
             nb_channels,
-            pts: 0,
-            dts: 0,
-            duration: 0,
-            pkt_duration: 0,
-            width: 0,
-            height: 0,
             media_type: MediaType::AUDIO,
-            pict_type: ffi::AV_PICTURE_TYPE_NONE,
-            key_frame: false,
-            flags: 0,
-            quality: 0,
-            repeat_pict: 0,
-            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
-            color_primaries: ffi::AVCOL_PRI_UNSPECIFIED,
-            color_trc: ffi::AVCOL_TRC_UNSPECIFIED,
-            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
-            sample_aspect_ratio: time::new_rational(0, 1),
-            best_effort_timestamp: ffi::AV_NOPTS_VALUE,
+            ..Self::default()
         })
     }
 
@@ -293,35 +294,24 @@ where
         // 是最可靠的音频信号；width/height 是视频帧的固有属性。
         if frame.nb_samples > 0 {
             // Audio frame
-            Ok(Self {
+            let mut m = Self {
+                format: FrameFormat::Sample(SampleFormat::from(format)),
                 pts,
                 dts,
-                format: FrameFormat::Sample(SampleFormat::from(format)),
                 duration,
-                pkt_duration: 0,
-                width: 0,
-                height: 0,
                 time_base,
                 data: audio_data(frame)?,
                 media_type: MediaType::AUDIO,
-                pict_type: ffi::AV_PICTURE_TYPE_NONE,
                 sample_rate: frame.sample_rate as u32,
                 nb_samples: frame.nb_samples as u32,
                 nb_channels: frame.ch_layout.nb_channels as u32,
-                key_frame: frame.flags & ffi::AV_FRAME_FLAG_KEY as i32 != 0,
-                flags: frame.flags,
-                quality: frame.quality,
-                repeat_pict: frame.repeat_pict,
-                color_space: frame.colorspace,
-                color_primaries: frame.color_primaries,
-                color_trc: frame.color_trc,
-                color_range: frame.color_range,
-                sample_aspect_ratio: frame.sample_aspect_ratio,
-                best_effort_timestamp: frame.best_effort_timestamp,
-            })
+                ..Self::default()
+            };
+            m.copy_avframe_meta(frame);
+            Ok(m)
         } else if width > 0 && height > 0 {
             // Video frame
-            Ok(Self {
+            let mut m = Self {
                 width,
                 height,
                 pts,
@@ -332,24 +322,28 @@ where
                 data: video_data(frame)?,
                 media_type: MediaType::VIDEO,
                 pict_type: frame.pict_type,
-                sample_rate: 0,
-                nb_samples: 0,
-                nb_channels: 0,
-                key_frame: frame.flags & ffi::AV_FRAME_FLAG_KEY as i32 != 0,
-                flags: frame.flags,
-                quality: frame.quality,
-                repeat_pict: frame.repeat_pict,
-                color_space: frame.colorspace,
-                color_primaries: frame.color_primaries,
-                color_trc: frame.color_trc,
-                color_range: frame.color_range,
-                sample_aspect_ratio: frame.sample_aspect_ratio,
                 pkt_duration: frame.duration,
-                best_effort_timestamp: frame.best_effort_timestamp,
-            })
+                ..Self::default()
+            };
+            m.copy_avframe_meta(frame);
+            Ok(m)
         } else {
             Err(RsmediaError::custom("Unsupported frame format"))
         }
+    }
+
+    /// 从 `AVFrame` 拷贝与编解码/色彩相关的元数据字段（两个构造分支完全一致的部分）。
+    fn copy_avframe_meta(&mut self, frame: &AVFrame) {
+        self.key_frame = frame.flags & ffi::AV_FRAME_FLAG_KEY as i32 != 0;
+        self.flags = frame.flags;
+        self.quality = frame.quality;
+        self.repeat_pict = frame.repeat_pict;
+        self.color_space = frame.colorspace;
+        self.color_primaries = frame.color_primaries;
+        self.color_trc = frame.color_trc;
+        self.color_range = frame.color_range;
+        self.sample_aspect_ratio = frame.sample_aspect_ratio;
+        self.best_effort_timestamp = frame.best_effort_timestamp;
     }
 
     /// 转换为新AVFrame
@@ -685,6 +679,19 @@ fn validate_format_type_size<T>(format: i32, expected_size: usize) -> Result<()>
     Ok(())
 }
 
+/// 返回指定采样格式的单样本字节数；不支持的格式返回错误。
+fn audio_sample_size(format: i32) -> Result<usize> {
+    match format {
+        ffi::AV_SAMPLE_FMT_U8 | ffi::AV_SAMPLE_FMT_U8P => Ok(1),
+        ffi::AV_SAMPLE_FMT_S16 | ffi::AV_SAMPLE_FMT_S16P => Ok(2),
+        ffi::AV_SAMPLE_FMT_S32 | ffi::AV_SAMPLE_FMT_S32P => Ok(4),
+        ffi::AV_SAMPLE_FMT_FLT | ffi::AV_SAMPLE_FMT_FLTP => Ok(4),
+        ffi::AV_SAMPLE_FMT_DBL | ffi::AV_SAMPLE_FMT_DBLP => Ok(8),
+        ffi::AV_SAMPLE_FMT_S64 | ffi::AV_SAMPLE_FMT_S64P => Ok(8),
+        _ => Err(RsmediaError::custom("Unsupported sample format")),
+    }
+}
+
 /// ndarray => AVFrame:
 /// 对 U 和 V 进行下采样，恢复到 YUV420P 格式所需的较低分辨率
 /// 减少数据的采样率，降低分辨率或数据量。
@@ -797,15 +804,7 @@ where
     }
 
     // 校验 T 的大小与帧实际采样格式元素大小一致，避免因大小不符造成越界写
-    let sample_size = match frame.format {
-        ffi::AV_SAMPLE_FMT_U8 | ffi::AV_SAMPLE_FMT_U8P => 1,
-        ffi::AV_SAMPLE_FMT_S16 | ffi::AV_SAMPLE_FMT_S16P => 2,
-        ffi::AV_SAMPLE_FMT_S32 | ffi::AV_SAMPLE_FMT_S32P => 4,
-        ffi::AV_SAMPLE_FMT_FLT | ffi::AV_SAMPLE_FMT_FLTP => 4,
-        ffi::AV_SAMPLE_FMT_DBL | ffi::AV_SAMPLE_FMT_DBLP => 8,
-        ffi::AV_SAMPLE_FMT_S64 | ffi::AV_SAMPLE_FMT_S64P => 8,
-        _ => return Err(RsmediaError::custom("Unsupported sample format")),
-    };
+    let sample_size = audio_sample_size(frame.format)?;
     validate_format_type_size::<T>(frame.format, sample_size)?;
 
     // 分配视频缓冲区
@@ -945,15 +944,7 @@ where
     T: MediaFrameType,
 {
     // 类型大小验证
-    let sample_size = match frame.format {
-        ffi::AV_SAMPLE_FMT_U8 | ffi::AV_SAMPLE_FMT_U8P => 1,
-        ffi::AV_SAMPLE_FMT_S16 | ffi::AV_SAMPLE_FMT_S16P => 2,
-        ffi::AV_SAMPLE_FMT_S32 | ffi::AV_SAMPLE_FMT_S32P => 4,
-        ffi::AV_SAMPLE_FMT_FLT | ffi::AV_SAMPLE_FMT_FLTP => 4,
-        ffi::AV_SAMPLE_FMT_DBL | ffi::AV_SAMPLE_FMT_DBLP => 8,
-        ffi::AV_SAMPLE_FMT_S64 | ffi::AV_SAMPLE_FMT_S64P => 8,
-        _ => return Err(RsmediaError::custom("Unsupported sample format")),
-    };
+    let sample_size = audio_sample_size(frame.format)?;
     validate_format_type_size::<T>(frame.format, sample_size)?;
 
     // check

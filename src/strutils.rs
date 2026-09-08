@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::raw::c_char;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// &Path -> &Cstr
 pub fn path_to_cstring<P: AsRef<Path> + ?Sized>(path: &P) -> CString {
@@ -12,10 +12,9 @@ pub fn path_to_cstring<P: AsRef<Path> + ?Sized>(path: &P) -> CString {
 
     #[cfg(not(unix))]
     {
-        use std::os::windows::ffi::OsStrExt;
-        let wide: Vec<u16> = path.as_ref().as_os_str().encode_wide().collect();
-        let path_str = String::from_utf16_lossy(&wide);
-        CString::new(path_str.as_bytes()).unwrap()
+        // Windows 下 OsStr 内部为 WTF-8，to_string_lossy() 可直接得到 UTF-8 字节。
+        // 与 os_str_to_cstring 保持一致，避免 UTF-16 (from_utf16_lossy) 的有损往返。
+        CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes()).unwrap()
     }
 }
 
@@ -24,27 +23,33 @@ pub fn path_to_cstring_opt<P: AsRef<Path> + ?Sized>(path: Option<&P>) -> Option<
     path.map(path_to_cstring)
 }
 
-/// &Cstr -> &Path
+/// &Cstr -> 路径
 /// - Unix: 使用原始字节直接构造路径（允许任意字节）
-/// - Windows: 假设输入为 UTF-16 LE 编码的字节序列
-pub fn cstr_to_path<C: AsRef<CStr> + ?Sized>(cstr: &C) -> &Path {
+/// - Windows: 输入视为 UTF-8 字节序列（与 [`path_to_cstring`]、[`os_str_to_cstring`] 的编码一致）
+///
+/// 返回拥有所有权的 [`PathBuf`]：Windows 上把任意字节安全地映射为合法路径需要分配，
+/// 无法再借用返回 `&Path`。
+pub fn cstr_to_path<C: AsRef<CStr> + ?Sized>(cstr: &C) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        Path::new(OsStr::from_bytes(cstr.as_ref().to_bytes()))
+        PathBuf::from(OsStr::from_bytes(cstr.as_ref().to_bytes()))
     }
 
     #[cfg(not(unix))]
     {
-        let bytes = cstr.as_ref().to_bytes();
-        match std::str::from_utf8(bytes) {
-            Ok(s) => Path::new(s),
-            Err(_) => {
-                // not UTF-8
-                let os_str = unsafe { OsStr::from_encoded_bytes_unchecked(bytes) };
-                Path::new(os_str)
-            }
-        }
+        // let bytes = cstr.as_ref().to_bytes();
+        // match std::str::from_utf8(bytes) {
+        //     Ok(s) => Path::new(s),
+        //     Err(_) => {
+        //         // not UTF-8
+        //         let os_str = unsafe { OsStr::from_encoded_bytes_unchecked(bytes) };
+        //         Path::new(os_str)
+        //     }
+        // }
+        // 按 UTF-8 解码（丢失字节替换为 U+FFFD）。不再使用 from_encoded_bytes_unchecked，
+        // 因为直接拼凑出的字节不保证满足 Windows OsStr 的 WTF-8 不变量，属未定义行为。
+        PathBuf::from(cstr.as_ref().to_string_lossy().into_owned())
     }
 }
 
@@ -61,6 +66,36 @@ pub fn str_to_cstring_opt<S: AsRef<str> + ?Sized>(s: Option<&S>) -> Option<CStri
 /// &Cstr -> String
 pub fn cstr_to_string<C: AsRef<CStr> + ?Sized>(cstr: &C) -> Result<String, std::str::Utf8Error> {
     cstr.as_ref().to_str().map(String::from)
+}
+
+/// &Cstr -> String
+///
+/// 宽松版本：非法 UTF-8 字节会被替换为 `U+FFFD`，始终成功。
+pub fn cstr_to_string_lossy<C: AsRef<CStr> + ?Sized>(cstr: &C) -> String {
+    cstr.as_ref().to_string_lossy().into_owned()
+}
+
+/// OsStr -> String
+///
+/// 跨平台统一返回可读字符串：Unix 下非法 UTF-8 字节替换为 `U+FFFD`，
+/// Windows 下由 WTF-8 转 UTF-8。适用于日志、展示等无需保留原始字节的场景。
+pub fn os_str_to_string(os: impl AsRef<OsStr>) -> String {
+    os.as_ref().to_string_lossy().into_owned()
+}
+
+/// Path -> String
+///
+/// 便捷封装 [`cstr_to_string`/`os_str_to_string`]：路径转可读字符串（lossy）。
+pub fn path_to_string(path: impl AsRef<Path>) -> String {
+    os_str_to_string(path.as_ref().as_os_str())
+}
+
+/// &str -> OsString
+///
+/// 显式封装 `OsString::from`，与 `str_to_cstring`/`os_str_to_string` 配对，
+/// 明确"从 UTF-8 str 构造平台 OsStr"的意图，避免隐式 `From`。
+pub fn str_to_os_string(s: impl AsRef<str>) -> OsString {
+    OsString::from(s.as_ref())
 }
 
 /// OsStr -> CString
@@ -266,5 +301,44 @@ mod tests {
 
         let none_str: Option<&str> = None;
         assert!(str_to_cstring_opt(none_str).is_none());
+    }
+
+    #[test]
+    fn test_cstr_to_string_lossy() {
+        // 合法 UTF-8
+        let ok = CString::new("hello").unwrap();
+        assert_eq!(cstr_to_string_lossy(&ok), "hello");
+
+        // 非法 UTF-8 字节被替换为 U+FFFD（\u{FFFD}）
+        let bad_bytes = CString::new(vec![0xFF, 0xFE]).unwrap();
+        let got = cstr_to_string_lossy(&bad_bytes);
+        assert_eq!(got, "\u{FFFD}\u{FFFD}");
+
+        // 与严格版本在有效输入上一致
+        assert_eq!(cstr_to_string_lossy(&ok), cstr_to_string(&ok).unwrap());
+    }
+
+    #[test]
+    fn test_os_str_and_path_to_string() {
+        let s = "媒体/文件.txt";
+        // OsStr -> String
+        assert_eq!(os_str_to_string(s), s);
+        // Path -> String
+        assert_eq!(path_to_string(Path::new(s)), s);
+        // PathBuf -> String
+        assert_eq!(path_to_string(PathBuf::from(s)), s);
+        // 断言 os_str/path_to_string 与 lossy 一致（含非法字节时也往返为 lossy 字符串）
+        assert_eq!(os_str_to_string(PathBuf::from(s).as_os_str()), s);
+    }
+
+    #[test]
+    fn test_str_to_os_string() {
+        let s = "测试字符串";
+        let os = str_to_os_string(s);
+        // OsString 可安全转回 str
+        assert_eq!(os.to_str(), Some(s));
+
+        // 与 OsString::from 等价
+        assert_eq!(str_to_os_string("path/to/x"), OsString::from("path/to/x"));
     }
 }

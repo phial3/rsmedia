@@ -13,40 +13,29 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::ptr::NonNull;
 
-/// 媒体类型（对应 FFmpeg `AVMEDIA_TYPE_*`）：流的分类属性。
-///
-/// 放在 stream 模块 —— 它是 [`StreamInfo::media_type`] 等流描述的核心维度。
-#[repr(i32)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MediaType {
-    UNKNOWN = ffi::AVMEDIA_TYPE_UNKNOWN,
-    VIDEO = ffi::AVMEDIA_TYPE_VIDEO,
-    AUDIO = ffi::AVMEDIA_TYPE_AUDIO,
-    DATA = ffi::AVMEDIA_TYPE_DATA,
-    SUBTITLE = ffi::AVMEDIA_TYPE_SUBTITLE,
-    ATTACHMENT = ffi::AVMEDIA_TYPE_ATTACHMENT,
-}
+// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，
+// 未知/版本差异的 `AVMEDIA_TYPE_*` 回退为 `UNKNOWN`（而非 panic）。
+// 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）——
+// 挂在宏调用外部的 doc 注释 rustdoc 不认，会触发 unused_doc_comments 警告。
+ffi_enum!(
+    /// 媒体类型（对应 FFmpeg `AVMEDIA_TYPE_*`）：流的分类属性
+    MediaType => ffi::AVMediaType,
+    repr = i32,
+    fallback = Self::UNKNOWN {
+        UNKNOWN => ffi::AVMEDIA_TYPE_UNKNOWN;
+        VIDEO => ffi::AVMEDIA_TYPE_VIDEO;
+        AUDIO => ffi::AVMEDIA_TYPE_AUDIO;
+        DATA => ffi::AVMEDIA_TYPE_DATA;
+        SUBTITLE => ffi::AVMEDIA_TYPE_SUBTITLE;
+        ATTACHMENT => ffi::AVMEDIA_TYPE_ATTACHMENT;
+    }
+);
 
 impl MediaType {
     pub fn get_media_type_string(&self) -> String {
         avutil::get_media_type_string(*self as _).map_or("Unknown".to_string(), |s| {
             strutils::cstr_to_string(s).unwrap()
         })
-    }
-}
-
-impl From<ffi::AVMediaType> for MediaType {
-    fn from(item: ffi::AVMediaType) -> Self {
-        match item {
-            ffi::AVMEDIA_TYPE_UNKNOWN => MediaType::UNKNOWN,
-            ffi::AVMEDIA_TYPE_VIDEO => MediaType::VIDEO,
-            ffi::AVMEDIA_TYPE_AUDIO => MediaType::AUDIO,
-            ffi::AVMEDIA_TYPE_DATA => MediaType::DATA,
-            ffi::AVMEDIA_TYPE_SUBTITLE => MediaType::SUBTITLE,
-            ffi::AVMEDIA_TYPE_ATTACHMENT => MediaType::ATTACHMENT,
-            // 遇到未知/版本差异的类型时回退为 UNKNOWN 而非 panic，避免库内部直接崩溃
-            _ => MediaType::UNKNOWN,
-        }
     }
 }
 
@@ -332,64 +321,8 @@ impl StreamInfo {
     pub fn find_decoder_name(&self, hw_device_type: Option<HWDeviceType>) -> Option<String> {
         let codec_id = self.codec_id as ffi::AVCodecID;
         let codec_name = strutils::cstr_to_string(AVCodec::find_decoder(codec_id)?.name()).unwrap();
-
-        let hw_codec_name = if let Some(hw_type) = hw_device_type {
-            match hw_type {
-                HWDeviceType::CUDA => match codec_id {
-                    ffi::AV_CODEC_ID_H264 => Some("h264_cuvid".to_string()),
-                    ffi::AV_CODEC_ID_HEVC => Some("hevc_cuvid".to_string()),
-                    ffi::AV_CODEC_ID_MPEG1VIDEO => Some("mpeg1_cuvid".to_string()),
-                    ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_cuvid".to_string()),
-                    ffi::AV_CODEC_ID_MPEG4 => Some("mpeg4_cuvid".to_string()),
-                    ffi::AV_CODEC_ID_VC1 => Some("vc1_cuvid".to_string()),
-                    ffi::AV_CODEC_ID_VP8 => Some("vp8_cuvid".to_string()),
-                    ffi::AV_CODEC_ID_VP9 => Some("vp9_cuvid".to_string()),
-                    ffi::AV_CODEC_ID_AV1 => Some("av1_cuvid".to_string()),
-                    ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_cuvid".to_string()),
-                    _ => None,
-                },
-                HWDeviceType::QSV => match codec_id {
-                    ffi::AV_CODEC_ID_H264 => Some("h264_qsv".to_string()),
-                    ffi::AV_CODEC_ID_HEVC => Some("hevc_qsv".to_string()),
-                    ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_qsv".to_string()),
-                    ffi::AV_CODEC_ID_VC1 => Some("vc1_qsv".to_string()),
-                    ffi::AV_CODEC_ID_VP8 => Some("vp8_qsv".to_string()),
-                    ffi::AV_CODEC_ID_VP9 => Some("vp9_qsv".to_string()),
-                    ffi::AV_CODEC_ID_AV1 => Some("av1_qsv".to_string()),
-                    ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_qsv".to_string()),
-                    _ => None,
-                },
-                HWDeviceType::VAAPI => {
-                    // VAAPI使用通用解码器，但需要特定配置
-                    match codec_id {
-                        ffi::AV_CODEC_ID_H264 => Some("h264_vaapi".to_string()),
-                        ffi::AV_CODEC_ID_HEVC => Some("hevc_vaapi".to_string()),
-                        ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_vaapi".to_string()),
-                        ffi::AV_CODEC_ID_VP8 => Some("vp8_vaapi".to_string()),
-                        ffi::AV_CODEC_ID_VP9 => Some("vp9_vaapi".to_string()),
-                        ffi::AV_CODEC_ID_AV1 => Some("av1_vaapi".to_string()),
-                        ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_vaapi".to_string()),
-                        ffi::AV_CODEC_ID_VC1 => Some("vc1_vaapi".to_string()),
-                        _ => None,
-                    }
-                }
-                HWDeviceType::VULKAN => match codec_id {
-                    ffi::AV_CODEC_ID_H264 => Some("h264_vulkan".to_string()),
-                    ffi::AV_CODEC_ID_HEVC => Some("hevc_vulkan".to_string()),
-                    ffi::AV_CODEC_ID_AV1 => Some("av1_vulkan".to_string()),
-                    _ => None,
-                },
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        if hw_codec_name.is_some() {
-            hw_codec_name
-        } else {
-            Some(codec_name)
-        }
+        let hw_codec_name = hw_device_type.and_then(|hw| hw_decoder_name(hw, codec_id));
+        Some(hw_codec_name.unwrap_or(codec_name))
     }
 
     /// find encoder name, if we have hw_device_type, will use hw accelerated codec name
@@ -400,64 +333,112 @@ impl StreamInfo {
     ) -> Option<String> {
         let codec_id = stream_info.codec_id as ffi::AVCodecID;
         let codec_name = strutils::cstr_to_string(AVCodec::find_encoder(codec_id)?.name()).unwrap();
+        let hw_codec_name = hw_device_type.and_then(|hw| hw_encoder_name(hw, codec_id));
+        Some(hw_codec_name.unwrap_or(codec_name))
+    }
+}
 
-        let hw_codec_name = if let Some(hw_type) = hw_device_type {
-            match hw_type {
-                HWDeviceType::CUDA => match codec_id {
-                    ffi::AV_CODEC_ID_H264 => Some("h264_nvenc".to_string()),
-                    ffi::AV_CODEC_ID_HEVC => Some("hevc_nvenc".to_string()),
-                    ffi::AV_CODEC_ID_AV1 => Some("av1_nvenc".to_string()),
-                    _ => None,
-                },
-                HWDeviceType::QSV => match codec_id {
-                    ffi::AV_CODEC_ID_H264 => Some("h264_qsv".to_string()),
-                    ffi::AV_CODEC_ID_HEVC => Some("hevc_qsv".to_string()),
-                    ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_qsv".to_string()),
-                    ffi::AV_CODEC_ID_VP9 => Some("vp9_qsv".to_string()),
-                    ffi::AV_CODEC_ID_AV1 => Some("av1_qsv".to_string()),
-                    ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_qsv".to_string()),
-                    _ => None,
-                },
-                HWDeviceType::VAAPI => match codec_id {
-                    ffi::AV_CODEC_ID_H264 => Some("h264_vaapi".to_string()),
-                    ffi::AV_CODEC_ID_HEVC => Some("hevc_vaapi".to_string()),
-                    ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_vaapi".to_string()),
-                    ffi::AV_CODEC_ID_VP8 => Some("vp8_vaapi".to_string()),
-                    ffi::AV_CODEC_ID_VP9 => Some("vp9_vaapi".to_string()),
-                    ffi::AV_CODEC_ID_AV1 => Some("av1_vaapi".to_string()),
-                    ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_vaapi".to_string()),
-                    _ => None,
-                },
-                HWDeviceType::VIDEOTOOLBOX => match codec_id {
-                    ffi::AV_CODEC_ID_H264 => Some("h264_videotoolbox".to_string()),
-                    ffi::AV_CODEC_ID_HEVC => Some("hevc_videotoolbox".to_string()),
-                    ffi::AV_CODEC_ID_PRORES => Some("prores_videotoolbox".to_string()),
-                    _ => None,
-                },
-                HWDeviceType::VULKAN => match codec_id {
-                    ffi::AV_CODEC_ID_H264 => Some("h264_vulkan".to_string()),
-                    ffi::AV_CODEC_ID_HEVC => Some("hevc_vulkan".to_string()),
-                    _ => None,
-                },
-                // Windows：D3D11VA 设备类型承载 AMD AMF 编码器
-                //（AMF 无独立 hwcontext，挂在 d3d11va 下）。
-                HWDeviceType::D3D11VA => match codec_id {
-                    ffi::AV_CODEC_ID_H264 => Some("h264_amf".to_string()),
-                    ffi::AV_CODEC_ID_HEVC => Some("hevc_amf".to_string()),
-                    ffi::AV_CODEC_ID_AV1 => Some("av1_amf".to_string()),
-                    _ => None,
-                },
+/// 返回解码器对应的硬件加速编解码器名称（如 `h264_cuvid`），当前设备类型
+/// 不支持该编码时返回 `None`（调用方随后回退到软件解码器）。
+fn hw_decoder_name(hw_type: HWDeviceType, codec_id: ffi::AVCodecID) -> Option<String> {
+    match hw_type {
+        HWDeviceType::CUDA => match codec_id {
+            ffi::AV_CODEC_ID_H264 => Some("h264_cuvid".to_string()),
+            ffi::AV_CODEC_ID_HEVC => Some("hevc_cuvid".to_string()),
+            ffi::AV_CODEC_ID_MPEG1VIDEO => Some("mpeg1_cuvid".to_string()),
+            ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_cuvid".to_string()),
+            ffi::AV_CODEC_ID_MPEG4 => Some("mpeg4_cuvid".to_string()),
+            ffi::AV_CODEC_ID_VC1 => Some("vc1_cuvid".to_string()),
+            ffi::AV_CODEC_ID_VP8 => Some("vp8_cuvid".to_string()),
+            ffi::AV_CODEC_ID_VP9 => Some("vp9_cuvid".to_string()),
+            ffi::AV_CODEC_ID_AV1 => Some("av1_cuvid".to_string()),
+            ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_cuvid".to_string()),
+            _ => None,
+        },
+        HWDeviceType::QSV => match codec_id {
+            ffi::AV_CODEC_ID_H264 => Some("h264_qsv".to_string()),
+            ffi::AV_CODEC_ID_HEVC => Some("hevc_qsv".to_string()),
+            ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_qsv".to_string()),
+            ffi::AV_CODEC_ID_VC1 => Some("vc1_qsv".to_string()),
+            ffi::AV_CODEC_ID_VP8 => Some("vp8_qsv".to_string()),
+            ffi::AV_CODEC_ID_VP9 => Some("vp9_qsv".to_string()),
+            ffi::AV_CODEC_ID_AV1 => Some("av1_qsv".to_string()),
+            ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_qsv".to_string()),
+            _ => None,
+        },
+        HWDeviceType::VAAPI => {
+            // VAAPI 使用通用解码器，但需要特定配置
+            match codec_id {
+                ffi::AV_CODEC_ID_H264 => Some("h264_vaapi".to_string()),
+                ffi::AV_CODEC_ID_HEVC => Some("hevc_vaapi".to_string()),
+                ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_vaapi".to_string()),
+                ffi::AV_CODEC_ID_VP8 => Some("vp8_vaapi".to_string()),
+                ffi::AV_CODEC_ID_VP9 => Some("vp9_vaapi".to_string()),
+                ffi::AV_CODEC_ID_AV1 => Some("av1_vaapi".to_string()),
+                ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_vaapi".to_string()),
+                ffi::AV_CODEC_ID_VC1 => Some("vc1_vaapi".to_string()),
                 _ => None,
             }
-        } else {
-            None
-        };
-
-        if hw_codec_name.is_some() {
-            hw_codec_name
-        } else {
-            Some(codec_name)
         }
+        HWDeviceType::VULKAN => match codec_id {
+            ffi::AV_CODEC_ID_H264 => Some("h264_vulkan".to_string()),
+            ffi::AV_CODEC_ID_HEVC => Some("hevc_vulkan".to_string()),
+            ffi::AV_CODEC_ID_AV1 => Some("av1_vulkan".to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 硬件编码器对应的硬件编解码器名称（如 `h264_nvenc`），设备类型不支持该
+/// 编码时返回 `None`（调用方随后回退到软件编码器）。
+fn hw_encoder_name(hw_type: HWDeviceType, codec_id: ffi::AVCodecID) -> Option<String> {
+    match hw_type {
+        HWDeviceType::CUDA => match codec_id {
+            ffi::AV_CODEC_ID_H264 => Some("h264_nvenc".to_string()),
+            ffi::AV_CODEC_ID_HEVC => Some("hevc_nvenc".to_string()),
+            ffi::AV_CODEC_ID_AV1 => Some("av1_nvenc".to_string()),
+            _ => None,
+        },
+        HWDeviceType::QSV => match codec_id {
+            ffi::AV_CODEC_ID_H264 => Some("h264_qsv".to_string()),
+            ffi::AV_CODEC_ID_HEVC => Some("hevc_qsv".to_string()),
+            ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_qsv".to_string()),
+            ffi::AV_CODEC_ID_VP9 => Some("vp9_qsv".to_string()),
+            ffi::AV_CODEC_ID_AV1 => Some("av1_qsv".to_string()),
+            ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_qsv".to_string()),
+            _ => None,
+        },
+        HWDeviceType::VAAPI => match codec_id {
+            ffi::AV_CODEC_ID_H264 => Some("h264_vaapi".to_string()),
+            ffi::AV_CODEC_ID_HEVC => Some("hevc_vaapi".to_string()),
+            ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_vaapi".to_string()),
+            ffi::AV_CODEC_ID_VP8 => Some("vp8_vaapi".to_string()),
+            ffi::AV_CODEC_ID_VP9 => Some("vp9_vaapi".to_string()),
+            ffi::AV_CODEC_ID_AV1 => Some("av1_vaapi".to_string()),
+            ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_vaapi".to_string()),
+            _ => None,
+        },
+        HWDeviceType::VIDEOTOOLBOX => match codec_id {
+            ffi::AV_CODEC_ID_H264 => Some("h264_videotoolbox".to_string()),
+            ffi::AV_CODEC_ID_HEVC => Some("hevc_videotoolbox".to_string()),
+            ffi::AV_CODEC_ID_PRORES => Some("prores_videotoolbox".to_string()),
+            _ => None,
+        },
+        HWDeviceType::VULKAN => match codec_id {
+            ffi::AV_CODEC_ID_H264 => Some("h264_vulkan".to_string()),
+            ffi::AV_CODEC_ID_HEVC => Some("hevc_vulkan".to_string()),
+            _ => None,
+        },
+        // Windows：D3D11VA 设备类型承载 AMD AMF 编码器
+        //（AMF 无独立 hwcontext，挂在 d3d11va 下）。
+        HWDeviceType::D3D11VA => match codec_id {
+            ffi::AV_CODEC_ID_H264 => Some("h264_amf".to_string()),
+            ffi::AV_CODEC_ID_HEVC => Some("hevc_amf".to_string()),
+            ffi::AV_CODEC_ID_AV1 => Some("av1_amf".to_string()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

@@ -11,7 +11,7 @@ use crate::pixel::PixelFormat;
 use crate::stream::StreamInfo;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
-use crate::swctx::{self, ScaleAlgorithm};
+use crate::swctx::{self, SwsFlags};
 use crate::time::{self, Rescale};
 use crate::{Location, MediaType, SampleFormat, StreamWriter};
 
@@ -58,7 +58,7 @@ pub struct EncoderBuilder {
     subtitle_header: Option<String>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
-    scale_algorithm: ScaleAlgorithm,
+    scale_algorithm: SwsFlags,
 }
 
 impl EncoderBuilder {
@@ -325,7 +325,7 @@ impl EncoderBuilder {
     /// encoder's target pixel format (e.g. RGB24 -> YUV420P).
     ///
     /// Defaults to [`ScaleAlgorithm::Bicubic`].
-    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
+    pub fn with_scale_algorithm(mut self, algorithm: SwsFlags) -> Self {
         self.scale_algorithm = algorithm;
         self
     }
@@ -346,6 +346,10 @@ impl EncoderBuilder {
     }
 
     pub fn with_sample_rate(mut self, sample_rate: i32) -> Self {
+        assert!(
+            sample_rate > 0,
+            "sample_rate must be positive, got {sample_rate}"
+        );
         self.sample_rate = sample_rate;
         self
     }
@@ -480,13 +484,7 @@ impl EncoderBuilder {
             }
             None => {
                 let negotiated = match config.supported_pixel_formats() {
-                    Ok(Some(list)) if !list.is_empty() => {
-                        if list.contains(&(PixelFormat::YUV420P as i32)) {
-                            PixelFormat::YUV420P
-                        } else {
-                            PixelFormat::from(list[0])
-                        }
-                    }
+                    Ok(Some(list)) if !list.is_empty() => PixelFormat::from(list[0]),
                     _ => PixelFormat::YUV420P,
                 };
                 log::debug!("negotiated pixel format {negotiated:?} for encoder '{codec_name}'");
@@ -833,7 +831,7 @@ impl Default for EncoderBuilder {
             filters: None,
             subtitle_header: None,
             hw_device_config: None,
-            scale_algorithm: ScaleAlgorithm::default(),
+            scale_algorithm: SwsFlags::default(),
         }
     }
 }
@@ -870,7 +868,7 @@ pub struct Encoder {
     hw_context: Option<Arc<HWContext>>,
     media_type: MediaType,
     state: EncoderState,
-    scale_algorithm: ScaleAlgorithm,
+    scale_algorithm: SwsFlags,
     /// 编码器缓冲满（send_frame 返回 EAGAIN）时，先行排空的已就绪包暂存于此， 由 `receive_packet` 优先取出，
     /// 避免丢包。按 FIFO 出队（`pop_front`）， 保证与编码器输出顺序一致（否则 dts 会乱序、mux 报错）。
     pending_packets: VecDeque<AVPacket>,
@@ -2557,7 +2555,7 @@ mod tests {
         #[test]
         fn test_param_combination_roundtrip() -> Result<()> {
             use crate::filter::Filter;
-            use crate::{DecoderBuilder, MediaType, Resize, ScaleAlgorithm};
+            use crate::{DecoderBuilder, MediaType, Resize, SwsFlags};
 
             let codecs: &[(&str, bool)] = &[
                 ("libx264", true), // 支持延迟滤镜插值
@@ -2569,11 +2567,7 @@ mod tests {
                 Some(Resize::Exact(32, 32)),   // 精确尺寸
                 Some(Resize::FitEven(16, 16)), // 保持宽高比、偶数尺寸
             ];
-            let algos: &[ScaleAlgorithm] = &[
-                ScaleAlgorithm::Bicubic,
-                ScaleAlgorithm::Point,
-                ScaleAlgorithm::Lanczos,
-            ];
+            let algos: &[SwsFlags] = &[SwsFlags::BICUBIC, SwsFlags::POINT, SwsFlags::LANCZOS];
             let fps_list: &[f32] = &[24.0, 30.0];
 
             for &(codec, delayed) in codecs {

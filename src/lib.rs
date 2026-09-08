@@ -1,3 +1,6 @@
+#[macro_use]
+mod macros;
+
 pub mod decode;
 pub mod encode;
 #[cfg(feature = "ndarray")]
@@ -42,7 +45,7 @@ pub use pixel::PixelFormat;
 pub use resize::Resize;
 pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
-pub use swctx::ScaleAlgorithm;
+pub use swctx::SwsFlags;
 pub use time::Time;
 
 /// Re-export internal definition for caller to use.

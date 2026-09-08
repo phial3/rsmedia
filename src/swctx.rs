@@ -9,36 +9,6 @@ use rsmpeg::swscale::SwsContext;
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////// Video Scaler SwsContext ////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// 缩放算法选择。对应 FFmpeg 的 `sws_flags` 缩放算法位，多个质量相关 flag
-/// （`SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND | SWS_BITEXACT`）恒被附加。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum ScaleAlgorithm {
-    /// 快速双线性插值（性能优先，质量略逊）
-    FastBilinear,
-    /// 双线性插值，与 FFmpeg 命令行默认一致
-    Bilinear,
-    /// 双三次插值（默认，质量/性能均衡）
-    #[default]
-    Bicubic,
-    /// 实验性算法（`SWS_X`）
-    Experimental,
-    /// 最近邻（阶跃边缘，无平滑）
-    Point,
-    /// 面积平均（适合缩小）
-    Area,
-    /// 双三次亮度 + 双线性色度（`SWS_BICUBLIN`）
-    BicubicLinear,
-    /// 高斯插值
-    Gaussian,
-    /// sinc 插值
-    Sinc,
-    /// Lanczos 插值（高质量）
-    Lanczos,
-    /// 三次 Keys 样条
-    Spline,
-}
-
 // FFmpeg `SwsFlags` 定义参考（对应 swscale 头的开关位，见
 // https://ffmpeg.org/doxygen/trunk/swscale_8h_source.html ）：
 //   SWS_STRICT         1 << 11   Return an error on underspecified conversions.
@@ -61,28 +31,52 @@ pub enum ScaleAlgorithm {
 //   SWS_SINC           1 <<  8   unwindowed sinc
 //   SWS_LANCZOS        1 <<  9   3-tap sinc/sinc
 //   SWS_SPLINE         1 << 10   unwindowed natural cubic spline
-impl ScaleAlgorithm {
+ffi_const!(
+    /// Sws scale filter flags (SWS_*)
+    #[allow(non_camel_case_types)]
+    SwsFlags, u32 {
+        /// fast bilinear filtering
+        FAST_BILINEAR => ffi::SWS_FAST_BILINEAR;
+        /// bilinear filtering
+        BILINEAR => ffi::SWS_BILINEAR;
+        /// 2-tap cubic B-spline
+        BICUBIC => ffi::SWS_BICUBIC;
+        /// experimental
+        X => ffi::SWS_X;
+        /// nearest neighbor
+        POINT => ffi::SWS_POINT;
+        /// area averaging
+        AREA => ffi::SWS_AREA;
+        /// bicubic luma, bilinear chroma
+        BICUBLIN => ffi::SWS_BICUBLIN;
+        /// gaussian approximation
+        GAUSS => ffi::SWS_GAUSS;
+        /// unwindowed sinc
+        SINC => ffi::SWS_SINC;
+        /// 3‑tap sinc/sinc
+        LANCZOS => ffi::SWS_LANCZOS;
+        /// unwindowed natural cubic spline
+        SPLINE => ffi::SWS_SPLINE;
+    }
+);
+
+impl SwsFlags {
     /// 返回该算法对应的完整 swscale flags（算法位 + 质量 flag）。
-    // 不同 FFmpeg 版本/平台下 `ffi::SWS_*` 常量类型不同（u32 / i32），统一转 u32
+    /// （`SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND | SWS_BITEXACT`）恒被附加。
     #[allow(clippy::unnecessary_cast)]
-    pub fn flags(self) -> u32 {
-        let mut flags = match self {
-            Self::FastBilinear => ffi::SWS_FAST_BILINEAR,
-            Self::Bilinear => ffi::SWS_BILINEAR,
-            Self::Bicubic => ffi::SWS_BICUBIC,
-            Self::Experimental => ffi::SWS_X,
-            Self::Point => ffi::SWS_POINT,
-            Self::Area => ffi::SWS_AREA,
-            Self::BicubicLinear => ffi::SWS_BICUBLIN,
-            Self::Gaussian => ffi::SWS_GAUSS,
-            Self::Sinc => ffi::SWS_SINC,
-            Self::Lanczos => ffi::SWS_LANCZOS,
-            Self::Spline => ffi::SWS_SPLINE,
-        } as u32;
-        flags |= ffi::SWS_FULL_CHR_H_INT as u32;
-        flags |= ffi::SWS_ACCURATE_RND as u32;
-        flags |= ffi::SWS_BITEXACT as u32;
-        flags
+    pub fn complete(self) -> u32 {
+        let mut flag = self.as_raw() as u32;
+        flag |= ffi::SWS_FULL_CHR_H_INT as u32;
+        flag |= ffi::SWS_ACCURATE_RND as u32;
+        flag |= ffi::SWS_BITEXACT as u32;
+        flag
+    }
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for SwsFlags {
+    fn default() -> Self {
+        Self::BICUBIC
     }
 }
 
@@ -127,7 +121,7 @@ pub fn scale_frame(
         dst_width,
         dst_height,
         dst_pix_fmt,
-        ScaleAlgorithm::default(),
+        SwsFlags::default(),
     )
 }
 
@@ -139,7 +133,7 @@ pub fn scale_with_flags(
     dst_width: i32,
     dst_height: i32,
     dst_pix_fmt: PixelFormat,
-    scaler_algo: ScaleAlgorithm,
+    scaler_algo: SwsFlags,
 ) -> Result<AVFrame> {
     if !src_frame.hw_frames_ctx.is_null() {
         return Err(RsmediaError::unsupported(
@@ -162,7 +156,7 @@ pub fn scale_with_flags(
         dst_width,
         dst_height,
         dst_pix_fmt.into(),
-        scaler_algo.flags(),
+        scaler_algo.complete(),
     )
     .context("Failed to create swscale context.")?;
 
@@ -216,13 +210,8 @@ fn setup_resampler(
     Ok(swr_ctx)
 }
 
-/// Audio resampling frame
-pub fn convert(
-    src_frame: &AVFrame,
-    out_ch_layout: ffi::AVChannelLayout,
-    out_sample_fmt: ffi::AVSampleFormat,
-    out_sample_rate: i32,
-) -> Result<AVSamples> {
+/// 校验重采样输入帧：不支持硬件帧，且采样率/样本数必须有效。
+fn check_resampler_input(src_frame: &AVFrame) -> Result<()> {
     if !src_frame.hw_frames_ctx.is_null() {
         return Err(RsmediaError::unsupported(
             "Hardware frames are not supported in this software re-sampler",
@@ -232,6 +221,17 @@ pub fn convert(
     if src_frame.sample_rate < 1 || src_frame.nb_samples < 1 {
         return Err(RsmediaError::custom("Invalid input frame."));
     }
+    Ok(())
+}
+
+/// Audio resampling frame
+pub fn convert(
+    src_frame: &AVFrame,
+    out_ch_layout: ffi::AVChannelLayout,
+    out_sample_fmt: ffi::AVSampleFormat,
+    out_sample_rate: i32,
+) -> Result<AVSamples> {
+    check_resampler_input(src_frame)?;
 
     let mut resampler = Resampler::new(
         src_frame.ch_layout,
@@ -269,15 +269,7 @@ pub fn convert_frame(
     out_sample_fmt: ffi::AVSampleFormat,
     out_sample_rate: i32,
 ) -> Result<AVFrame> {
-    if !src_frame.hw_frames_ctx.is_null() {
-        return Err(RsmediaError::unsupported(
-            "Hardware frames are not supported in this software re-sampler",
-        ));
-    }
-
-    if src_frame.sample_rate < 1 || src_frame.nb_samples < 1 {
-        return Err(RsmediaError::custom("Invalid input frame."));
-    }
+    check_resampler_input(src_frame)?;
 
     let mut resampler = Resampler::new(
         src_frame.ch_layout,
@@ -397,13 +389,11 @@ impl Resampler {
         out_ch_layout: ffi::AVChannelLayout,
         out_sample_fmt: ffi::AVSampleFormat,
     ) -> Result<AVSamples> {
-        let mut out_samples = AVSamples::new(
-            out_ch_layout.nb_channels,
-            src_frame.nb_samples,
-            out_sample_fmt,
-            0,
-        )
-        .context("Create samples buffer failed.")?;
+        // 容量按输出样本数的上界分配，避免上采样（in < out）时尾部样本被丢弃。
+        let capacity = self.get_out_samples(src_frame.nb_samples);
+        let mut out_samples =
+            AVSamples::new(out_ch_layout.nb_channels, capacity, out_sample_fmt, 0)
+                .context("Create samples buffer failed.")?;
 
         let ret = unsafe {
             self.swr

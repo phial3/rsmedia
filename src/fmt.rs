@@ -11,62 +11,68 @@ use crate::strutils;
 use rsmpeg::avutil;
 use rsmpeg::ffi;
 
-/// 输出格式旗标（对应 FFmpeg `AVFMT_*`）。
-#[repr(u32)]
-#[allow(non_camel_case_types)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum AvFormatFlags {
-    NO_FILE = ffi::AVFMT_NOFILE,
-    NEED_NUMBER = ffi::AVFMT_NEEDNUMBER,
-    SHOW_IDS = ffi::AVFMT_SHOW_IDS,
-    GLOBAL_HEADER = ffi::AVFMT_GLOBALHEADER,
-    NO_TIMESTAMPS = ffi::AVFMT_NOTIMESTAMPS,
-    GENERIC_INDEX = ffi::AVFMT_GENERIC_INDEX,
-    TS_DISCONT = ffi::AVFMT_TS_DISCONT,
-    VARIABLE_FPS = ffi::AVFMT_VARIABLE_FPS,
-    NO_DIMENSIONS = ffi::AVFMT_NODIMENSIONS,
-    NO_STREAMS = ffi::AVFMT_NOSTREAMS,
-    NO_BINSEARCH = ffi::AVFMT_NOBINSEARCH,
-    NO_GENSEARCH = ffi::AVFMT_NOGENSEARCH,
-    NO_BYTE_SEEK = ffi::AVFMT_NO_BYTE_SEEK,
-    #[cfg(not(any(feature = "ffmpeg8", feature = "ffmpeg9")))]
-    ALLOW_FLUSH = ffi::AVFMT_ALLOW_FLUSH,
-    TS_NONSTRICT = ffi::AVFMT_TS_NONSTRICT,
-    TS_NEGATIVE = ffi::AVFMT_TS_NEGATIVE,
-    SEEK_TO_PTS = ffi::AVFMT_SEEK_TO_PTS,
-}
+ffi_const!(
+    /// 对应 FFmpeg `AVFMT_*`
+    #[allow(non_camel_case_types)]
+    AvFormatFlags, u32 {
+    NO_FILE => ffi::AVFMT_NOFILE;
+    NEED_NUMBER => ffi::AVFMT_NEEDNUMBER;
+    SHOW_IDS => ffi::AVFMT_SHOW_IDS;
+    GLOBAL_HEADER => ffi::AVFMT_GLOBALHEADER;
+    NO_TIMESTAMPS => ffi::AVFMT_NOTIMESTAMPS;
+    GENERIC_INDEX => ffi::AVFMT_GENERIC_INDEX;
+    TS_DISCONT => ffi::AVFMT_TS_DISCONT;
+    VARIABLE_FPS => ffi::AVFMT_VARIABLE_FPS;
+    NO_DIMENSIONS => ffi::AVFMT_NODIMENSIONS;
+    NO_STREAMS => ffi::AVFMT_NOSTREAMS;
+    NO_BINSEARCH => ffi::AVFMT_NOBINSEARCH;
+    NO_GENSEARCH => ffi::AVFMT_NOGENSEARCH;
+    NO_BYTE_SEEK => ffi::AVFMT_NO_BYTE_SEEK;
+    #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+    ALLOW_FLUSH => ffi::AVFMT_ALLOW_FLUSH;
+    TS_NONSTRICT => ffi::AVFMT_TS_NONSTRICT;
+    TS_NEGATIVE => ffi::AVFMT_TS_NEGATIVE;
+    FIXED_FRAMESIZE => ffi::AVFMT_FIXED_FRAMESIZE;
+    SEEK_TO_PTS => ffi::AVFMT_SEEK_TO_PTS;
+});
 
-/// 音频采样格式（对应 FFmpeg `AV_SAMPLE_FMT_*`）。
-#[repr(i32)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SampleFormat {
-    /// < none
-    NONE = ffi::AV_SAMPLE_FMT_NONE,
-    /// < unsigned 8 bits
-    U8 = ffi::AV_SAMPLE_FMT_U8,
-    /// < signed 16 bits
-    S16 = ffi::AV_SAMPLE_FMT_S16,
-    /// < signed 32 bits
-    S32 = ffi::AV_SAMPLE_FMT_S32,
-    /// < float
-    FLT = ffi::AV_SAMPLE_FMT_FLT,
-    /// < double
-    DBL = ffi::AV_SAMPLE_FMT_DBL,
-    /// < unsigned 8 bits, planar
-    U8P = ffi::AV_SAMPLE_FMT_U8P,
-    /// < signed 16 bits, planar
-    S16P = ffi::AV_SAMPLE_FMT_S16P,
-    /// < signed 32 bits, planar
-    S32P = ffi::AV_SAMPLE_FMT_S32P,
-    /// < float, planar
-    FLTP = ffi::AV_SAMPLE_FMT_FLTP,
-    /// < double, planar
-    DBLP = ffi::AV_SAMPLE_FMT_DBLP,
-    /// < signed 64 bits
-    S64 = ffi::AV_SAMPLE_FMT_S64,
-    /// < signed 64 bits, planar
-    S64P = ffi::AV_SAMPLE_FMT_S64P,
-}
+// 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）。
+ffi_enum!(
+    /// 音频采样格式（对应 FFmpeg `AV_SAMPLE_FMT_*`）。
+    ///
+    /// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，
+    /// 未知/版本差异的 `AV_SAMPLE_FMT_*` 回退为 `NONE`（而非 panic）。
+    SampleFormat => ffi::AVSampleFormat,
+    repr = i32,
+    fallback = Self::NONE {
+        /// < none
+        NONE => ffi::AV_SAMPLE_FMT_NONE;
+        /// < unsigned 8 bits
+        U8 => ffi::AV_SAMPLE_FMT_U8;
+        /// < signed 16 bits
+        S16 => ffi::AV_SAMPLE_FMT_S16;
+        /// < signed 32 bits
+        S32 => ffi::AV_SAMPLE_FMT_S32;
+        /// < float
+        FLT => ffi::AV_SAMPLE_FMT_FLT;
+        /// < double
+        DBL => ffi::AV_SAMPLE_FMT_DBL;
+        /// < unsigned 8 bits, planar
+        U8P => ffi::AV_SAMPLE_FMT_U8P;
+        /// < signed 16 bits, planar
+        S16P => ffi::AV_SAMPLE_FMT_S16P;
+        /// < signed 32 bits, planar
+        S32P => ffi::AV_SAMPLE_FMT_S32P;
+        /// < float, planar
+        FLTP => ffi::AV_SAMPLE_FMT_FLTP;
+        /// < double, planar
+        DBLP => ffi::AV_SAMPLE_FMT_DBLP;
+        /// < signed 64 bits
+        S64 => ffi::AV_SAMPLE_FMT_S64;
+        /// < signed 64 bits, planar
+        S64P => ffi::AV_SAMPLE_FMT_S64P;
+    }
+);
 
 impl SampleFormat {
     pub fn is_planar(&self) -> bool {
@@ -89,28 +95,6 @@ impl SampleFormat {
 
     pub fn get_planar_sample_fmt(&self) -> Option<SampleFormat> {
         avutil::get_planar_sample_fmt(*self as _).map(SampleFormat::from)
-    }
-}
-
-impl From<ffi::AVSampleFormat> for SampleFormat {
-    fn from(item: ffi::AVSampleFormat) -> Self {
-        match item {
-            ffi::AV_SAMPLE_FMT_NONE => SampleFormat::NONE,
-            ffi::AV_SAMPLE_FMT_U8 => SampleFormat::U8,
-            ffi::AV_SAMPLE_FMT_S16 => SampleFormat::S16,
-            ffi::AV_SAMPLE_FMT_S32 => SampleFormat::S32,
-            ffi::AV_SAMPLE_FMT_FLT => SampleFormat::FLT,
-            ffi::AV_SAMPLE_FMT_DBL => SampleFormat::DBL,
-            ffi::AV_SAMPLE_FMT_U8P => SampleFormat::U8P,
-            ffi::AV_SAMPLE_FMT_S16P => SampleFormat::S16P,
-            ffi::AV_SAMPLE_FMT_S32P => SampleFormat::S32P,
-            ffi::AV_SAMPLE_FMT_FLTP => SampleFormat::FLTP,
-            ffi::AV_SAMPLE_FMT_DBLP => SampleFormat::DBLP,
-            ffi::AV_SAMPLE_FMT_S64 => SampleFormat::S64,
-            ffi::AV_SAMPLE_FMT_S64P => SampleFormat::S64P,
-            // 遇到未知/版本差异的格式时回退为 NONE 而非 panic，避免库内部直接崩溃
-            _ => SampleFormat::NONE,
-        }
     }
 }
 
