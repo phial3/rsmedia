@@ -154,8 +154,8 @@ where
     /// 创建视频帧
     ///
     /// `data` 的 C 维度必须与格式的分量数一致：packed 8bit 格式为
-    /// `packed_channels()`（GRAY8=1 / RGB24、BGR24=3 / RGBA 族=4），
-    /// YUV420P 为 3（U/V 以 2x2 块代表值存储）。
+    /// `packed_channels()`（GRAY8=1 / YUYV422、UYVY422=2 / RGB24、BGR24=3 /
+    /// RGBA 族=4），YUV420P 为 3（U/V 以 2x2 块代表值存储）。
     pub fn new_video(
         width: usize,
         height: usize,
@@ -2058,9 +2058,9 @@ mod tests {
         Ok(())
     }
 
-    /// 全部 packed 8bit 格式（GRAY8/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）的
+    /// 全部 packed 8bit 格式（GRAY8/YUYV422/UYVY422/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）的
     /// `AVFrame → MediaFrame → AVFrame` 无损往返：构造确定数据 → ndarray →
-    /// 逐字节比对。C 维度必须等于 `packed_channels`（1/3/4）。
+    /// 逐字节比对。C 维度必须等于 `packed_channels`（1/2/3/4）。
     #[test]
     fn test_packed_formats_lossless_roundtrip() -> Result<()> {
         let (width, height) = (65usize, 49usize); // 非 32 对齐，考察 linesize padding
@@ -2072,6 +2072,8 @@ mod tests {
             PixelFormat::BGRA,
             PixelFormat::ARGB,
             PixelFormat::ABGR,
+            PixelFormat::YUYV422,
+            PixelFormat::UYVY422,
         ] {
             let ch = fmt.packed_channels().expect("packed format");
 

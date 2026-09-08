@@ -358,6 +358,9 @@ impl HWContext {
     /// This method transfers the frame data from GPU memory to CPU memory,
     /// converting from hardware pixel format to software pixel format.
     ///
+    /// 纯函数：transfer 使用的 `AVHWFramesContext` 取自 `hw_frame` 自身的
+    /// `hw_frames_ctx`（解码器输出帧自带），无需解码器上下文参与。
+    ///
     /// # Arguments
     /// * `hw_frame` - The source frame in hardware memory
     ///
@@ -370,7 +373,7 @@ impl HWContext {
     /// let sw_frame = hw_context.hw_download(&hw_frame)?;
     /// // Now sw_frame contains the data in CPU memory
     /// ```
-    pub fn hw_download(&self, decoder: &mut AVCodecContext, hw_frame: &AVFrame) -> Result<AVFrame> {
+    pub fn hw_download(&self, hw_frame: &AVFrame) -> Result<AVFrame> {
         let hw_down_start = std::time::Instant::now();
 
         // Check if input frame is actually in hardware memory
@@ -381,25 +384,6 @@ impl HWContext {
                 self.config.hw_pixel_format,
                 hw_frame.hw_frames_ctx.is_null()
             )));
-        }
-
-        unsafe {
-            if decoder.hw_frames_ctx().is_none() {
-                log::debug!(
-                    "decoder hw_frames_ctx is null, is_hwaccel:{}",
-                    decoder.is_hwaccel()
-                );
-                // 通过 av_buffer_ref 为解码器申请一份独立引用，
-                // 而不是把 hw_frame 自身的 hw_frames_ctx 指针直接搬走（from_raw 会转移所有权）。
-                // 否则 hw_frame 析构（unref）后 decoder->hw_frames_ctx 变成悬空指针 → double-free/UAF。
-                let ref_counter = ffi::av_buffer_ref(hw_frame.hw_frames_ctx);
-                let frames_ctx = NonNull::new(ref_counter)
-                    .map(|ptr| AVHWFramesContext::from_raw(ptr))
-                    .ok_or_else(|| {
-                        RsmediaError::custom("Failed to av_buffer_ref hw_frames_ctx for decoder")
-                    })?;
-                decoder.set_hw_frames_ctx(frames_ctx);
-            }
         }
 
         // 创建软件帧

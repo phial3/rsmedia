@@ -81,8 +81,6 @@ pub struct StreamInfo {
     pub bit_rate: i64,
     /// combination of AV_DISPOSITION_*
     pub disposition: i32,
-    /// discard of AVDISCARD_*
-    pub discard: i32,
     /// codec profile
     pub profile: i32,
     /// codec level, eg. 3.1, 4.1 etc.
@@ -99,8 +97,6 @@ pub struct StreamInfo {
     pub real_frame_rate: ffi::AVRational,
     /// Number of bits in timestamps. Used for wrapping control.
     pub pts_wrap_bits: i32,
-    /// Flags indicating events happening on the stream, a combination of AVSTREAM_EVENT_FLAG_*.
-    pub event_flags: i32,
     /// video_delay
     pub video_delay: i32,
     /// Video sample aspect ratio
@@ -252,7 +248,6 @@ impl StreamInfo {
             start_time: stream.start_time,
             nb_frames: stream.nb_frames,
             disposition: stream.disposition,
-            discard: stream.discard,
             profile: codecpar.profile,
             level: codecpar.level,
             // Video
@@ -263,7 +258,6 @@ impl StreamInfo {
             avg_frame_rate: stream.avg_frame_rate,
             real_frame_rate: stream.r_frame_rate,
             pts_wrap_bits: stream.pts_wrap_bits,
-            event_flags: stream.event_flags,
             video_delay: codecpar.video_delay,
             sample_aspect_ratio: codecpar.sample_aspect_ratio,
             display_aspect_ratio: Self::compute_display_aspect_ratio(
@@ -328,18 +322,33 @@ impl StreamInfo {
         ffi::AVRational { num, den }
     }
 
-    fn get_stream_display_rotation(_stream: &AVStream, map: &HashMap<String, String>) -> f64 {
-        fn get_rotation_from_metadata(map: &HashMap<String, String>) -> f64 {
-            if let Some(value) = map.get("rotate") {
-                value.parse::<f64>().unwrap_or(0.0)
-            } else {
-                0.0
+    /// 读取视频流旋转角度（度，顺时针）。
+    ///
+    /// 优先级：
+    /// 1. **side_data display matrix**（`AV_PKT_DATA_DISPLAYMATRIX`，FFmpeg 6+
+    ///    移到 `codecpar.coded_side_data`）：手机拍摄视频的标准存储方式，
+    ///    `av_display_rotation_get` 返回**逆时针**角度，取负转为顺时针语义。
+    /// 2. `rotate` metadata 标签：旧版 mov/mp4 demuxer 的写入方式（新版
+    ///    demuxer 会同时写入 side_data，两者一致时优先 side_data）。
+    fn get_stream_display_rotation(stream: &AVStream, map: &HashMap<String, String>) -> f64 {
+        // 1. side_data display matrix（codecpar.coded_side_data，FFmpeg 6+）
+        let codecpar = stream.codecpar();
+        let nb_side_data = codecpar.nb_coded_side_data.max(0) as usize;
+        if nb_side_data > 0 && !codecpar.coded_side_data.is_null() {
+            unsafe {
+                let entries =
+                    std::slice::from_raw_parts(codecpar.coded_side_data, nb_side_data);
+                for entry in entries {
+                    if entry.type_ == ffi::AV_PKT_DATA_DISPLAYMATRIX && entry.size >= 9 * 4 {
+                        // av_display_rotation_get 返回逆时针角度，取负为顺时针
+                        return -ffi::av_display_rotation_get(entry.data as *const i32);
+                    }
+                }
             }
         }
 
-        // FIXME:
-        // firstly, should get side_data from stream, and find rotation side_data
-        get_rotation_from_metadata(map)
+        // 2. rotate metadata 标签（旧 demuxer 回退）
+        map.get("rotate").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
     }
 
     fn get_extra_data(stream: &AVStream) -> Option<Vec<u8>> {

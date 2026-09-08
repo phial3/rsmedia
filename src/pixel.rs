@@ -375,13 +375,18 @@ impl PixelFormat {
 
     /// packed（单平面、8bit/分量）像素格式的每像素分量数。
     ///
-    /// 这些格式可直接映射为 `[H, W, C]` ndarray（C=1/3/4）且无损往返
-    /// （GRAY8/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）。
+    /// 这些格式可直接映射为 `[H, W, C]` ndarray（C=1/2/3/4）：
+    /// - GRAY8=1 / RGB24、BGR24=3 / RGBA 族=4：无损往返
+    /// - YUYV422、UYVY422=2：每像素 2 字节（Y + 半采样色度），
+    ///   `[H, W, 2]` u8 的行内存与格式字节流完全一致；语义上偶数列的
+    ///   分量 1 是第一色度（YUYV 为 U），奇数列是第二色度（V）
+    ///
     /// 返回 `None` 表示非 packed 8bit 格式（planar / 半平面 / 位流 / 硬件格式等），
     /// 需经 swscale 转换或专用分支处理。
     pub const fn packed_channels(self) -> Option<usize> {
         match self {
             Self::GRAY8 => Some(1),
+            Self::YUYV422 | Self::UYVY422 => Some(2),
             Self::RGB24 | Self::BGR24 => Some(3),
             Self::RGBA | Self::BGRA | Self::ARGB | Self::ABGR => Some(4),
             _ => None,

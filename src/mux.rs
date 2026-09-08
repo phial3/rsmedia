@@ -621,12 +621,35 @@ impl<R: Reader> Demuxer<R> {
                 );
                 continue;
             };
-            let decoder = DecoderBuilder::new(media_type)
-                .with_codec_name(codec_name)
+            let decoder = match DecoderBuilder::new(media_type)
+                .with_codec_name(codec_name.clone())
                 .with_hardware_device(device_config.clone())
                 .with_filters(filter_map.get(&media_type).cloned())
                 .build_from_reader(&reader)
-                .context("Failed to build decoder")?;
+            {
+                Ok(decoder) => decoder,
+                Err(e) if device_type.is_some() => {
+                    // 硬件解码器构建失败（如 hw 初始化失败）：回退软件解码器重试，
+                    // 与 find_decoder_name 的回退语义对齐；再失败才让错误上抛。
+                    log::warn!(
+                        "HW decoder '{codec_name}' failed to build: {e:#}; \
+                         falling back to software decoder"
+                    );
+                    let software_name = stream_info
+                        .find_decoder_name(None)
+                        .unwrap_or_else(|| codec_name.clone());
+                    DecoderBuilder::new(media_type)
+                        .with_codec_name(software_name)
+                        .with_filters(filter_map.get(&media_type).cloned())
+                        .build_from_reader(&reader)
+                        .context("Failed to build decoder (hw and software both failed)")?
+                }
+                Err(e) => {
+                    return Err(RsmediaError::custom(format!(
+                        "Failed to build decoder: {e:#}"
+                    )))
+                }
+            };
 
             streams.push(DemuxerStream::new(decoder, stream_info));
         }

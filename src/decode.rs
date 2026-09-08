@@ -121,7 +121,8 @@ impl DecoderBuilder {
     ///
     /// 默认 [`PixelFormat::YUV420P`]。支持：
     /// - [`PixelFormat::YUV420P`]（专用分支，U/V 以 2x2 块代表值存入 `[H, W, 3]`）
-    /// - 全部 packed 8bit 格式：GRAY8 `[H,W,1]` / RGB24、BGR24 `[H,W,3]` /
+    /// - 全部 packed 8bit 格式（见 [`PixelFormat::packed_channels`]）：
+    ///   GRAY8 `[H,W,1]` / YUYV422、UYVY422 `[H,W,2]` / RGB24、BGR24 `[H,W,3]` /
     ///   RGBA、BGRA、ARGB、ABGR `[H,W,4]`（无损往返）
     ///
     /// 源格式与目标不一致时由 swscale 自动转换（如 NV12 → RGBA）。
@@ -287,7 +288,8 @@ impl DecoderBuilder {
                 if fmt != PixelFormat::YUV420P && fmt.packed_channels().is_none() {
                     return Err(RsmediaError::custom(format!(
                         "Unsupported output pixel format: {fmt:?}, only YUV420P and packed 8-bit \
-                         formats (GRAY8/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR) are supported"
+                         formats (GRAY8/YUYV422/UYVY422/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR) are \
+                         supported"
                     )));
                 }
                 fmt
@@ -742,7 +744,7 @@ impl Decoder {
     where
         T: MediaFrameType,
     {
-        // Video Frame: YUV420P 专用分支 + packed 8bit 格式（GRAY8/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）
+        // Video Frame: YUV420P 专用分支 + packed 8bit 格式（GRAY8/YUYV422/UYVY422/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）
         MediaFrame::<T>::from_avframe(&frame)
     }
 
@@ -828,7 +830,7 @@ impl Decoder {
             Some(hw_ctx) if hw_ctx.is_hw_frame(&decoded_frame) => {
                 // hw_frame -> sw_frame
                 hw_ctx
-                    .hw_download(&mut self.context, &decoded_frame)
+                    .hw_download(&decoded_frame)
                     .context("Failed HW frame download")?
             }
             _ => {
