@@ -9,7 +9,7 @@ use rsmpeg::swscale::SwsContext;
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////// Video Scaler SwsContext ////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// FFmpeg `SwsFlags` 定义参考（对应 swscale 头的开关位，见
+// FFmpeg `SWS_*` 定义参考（对应 swscale 头的开关位，见
 // https://ffmpeg.org/doxygen/trunk/swscale_8h_source.html ）：
 //   SWS_STRICT         1 << 11   Return an error on underspecified conversions.
 //   SWS_PRINT_INFO     1 << 12   Emit verbose log of scaling parameters.
@@ -31,11 +31,19 @@ use rsmpeg::swscale::SwsContext;
 //   SWS_SINC           1 <<  8   unwindowed sinc
 //   SWS_LANCZOS        1 <<  9   3-tap sinc/sinc
 //   SWS_SPLINE         1 << 10   unwindowed natural cubic spline
-ffi_enum_wrap!(
+//
+// 版本差异（详见 https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/doc/APIchanges）：
+// - FFmpeg 6/7：`SWS_*` 是裸整型常量，`ffi::SwsFlags` 类型别名不存在；
+//   libswscale 只有 legacy 路径（`sws_getContext()` 初始化 + `sws_scale_frame()`）。
+// - FFmpeg 8+：`SWS_*` 常量类型化为 `ffi::SwsFlags`（MSVC 上底层为 `c_int`，Unix 为
+//   `c_uint`），`sws_init_context()` 被废弃，官方推荐 `sws_alloc_context()` → 设置字段
+//   → `sws_scale_frame()` 的全动态模式（FFmpeg 9 起拒绝 legacy/modern 混用）。
+// `ffi_enum!` 判别值的 `as u32` 归一化使 6/7 的裸常量与 8+ 的 `ffi::SwsFlags` 别名
+// 常量都能编译，故这里统一用 `ffi_enum!` 单表定义，无需按版本复制变体表。
+ffi_enum!(
     /// Sws scale filter flags (SWS_*)
     #[allow(non_camel_case_types)]
-    SwsFlags => ffi::SwsFlags,
-    repr = u32 {
+    SwsFlags, u32 {
         /// fast bilinear filtering
         FAST_BILINEAR => ffi::SWS_FAST_BILINEAR;
         /// bilinear filtering
@@ -81,6 +89,12 @@ impl Default for SwsFlags {
     }
 }
 
+/// 创建软件缩放上下文（按 FFmpeg 版本走新旧 API 路径）：
+/// - FFmpeg 6/7：legacy 路径，`sws_getContext()` 一次性传入源/目标参数完成初始化；
+/// - FFmpeg 8+：modern 全动态路径，`sws_alloc_context()` 分配后仅设置 flags 字段，
+///   尺寸/格式等参数由 `sws_scale_frame()` 从帧属性推导（`sws_init_context()` 自
+///   FFmpeg 8.0 起废弃，FFmpeg 9 起拒绝 legacy/modern API 混用）。
+#[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
 fn setup_scaler(
     src_width: i32,
     src_height: i32,
@@ -90,8 +104,7 @@ fn setup_scaler(
     dst_pix_fmt: ffi::AVPixelFormat,
     flags: u32,
 ) -> Result<SwsContext> {
-    // new sws_ctx
-    let sws_ctx = SwsContext::get_context(
+    SwsContext::get_context(
         src_width,
         src_height,
         src_pix_fmt,
@@ -103,8 +116,25 @@ fn setup_scaler(
         None,
         None,
     )
-    .context("Failed to create a swscale context.")?;
+    .context("Failed to create a swscale context.")
+}
 
+/// FFmpeg 8+ 的 modern 全动态路径：参数签名与 6/7 分支保持一致以便调用方无感切换，
+/// 除 flags 外的参数（尺寸/格式）由 [`SwsContext::scale_full_frame`] 从帧属性推导，
+/// 此处忽略。
+#[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+#[allow(unused_variables)]
+fn setup_scaler(
+    src_width: i32,
+    src_height: i32,
+    src_pix_fmt: ffi::AVPixelFormat,
+    dst_width: i32,
+    dst_height: i32,
+    dst_pix_fmt: ffi::AVPixelFormat,
+    flags: u32,
+) -> Result<SwsContext> {
+    let mut sws_ctx = SwsContext::alloc().context("Failed to allocate a swscale context.")?;
+    sws_ctx.set_flags(flags);
     Ok(sws_ctx)
 }
 
@@ -161,15 +191,30 @@ pub fn scale_with_flags(
     )
     .context("Failed to create swscale context.")?;
 
-    let ret = unsafe {
-        let dst_frame_ptr = dst_frame.as_mut_ptr();
-        ffi::sws_scale_frame(sws_ctx.as_mut_ptr(), dst_frame_ptr, src_frame.as_ptr())
-    };
-    if ret < 0 {
-        return Err(RsmediaError::custom(format!(
-            "Failed to scale frame, ret: {ret}"
-        )));
+    // FFmpeg 6/7：legacy 初始化的上下文直调 `sws_scale_frame`（对已初始化上下文属
+    // 向后兼容用法）；FFmpeg 8+：全动态上下文必须走 modern 封装
+    // [`SwsContext::scale_full_frame`]，FFmpeg 9 起对未初始化的上下文直调底层
+    // `sws_scale_frame` 会因新旧 API 混用而拒绝（AVERROR EINVAL）。
+    #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+    {
+        let ret = unsafe {
+            ffi::sws_scale_frame(
+                sws_ctx.as_mut_ptr(),
+                dst_frame.as_mut_ptr(),
+                src_frame.as_ptr(),
+            )
+        };
+        if ret < 0 {
+            return Err(RsmediaError::custom(format!(
+                "Failed to call sws_scale_frame, ret: {ret}"
+            )));
+        }
     }
+
+    #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+    sws_ctx
+        .scale_full_frame(&mut dst_frame, src_frame)
+        .context("Failed to scale frame.")?;
 
     log::debug!(
         "Sws scale from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
@@ -770,6 +815,109 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// 用确定性数据填充 YUV420P 帧的全部平面（保证转换产物非零可断言）。
+    unsafe fn fill_yuv420p(frame: &mut AVFrame) {
+        for plane in 0..3usize {
+            let height = if plane == 0 {
+                frame.height
+            } else {
+                frame.height / 2
+            };
+            let data = unsafe {
+                std::slice::from_raw_parts_mut(
+                    frame.data[plane],
+                    frame.linesize[plane] as usize * height as usize,
+                )
+            };
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+        }
+    }
+
+    /// 视频缩放：64x64 YUV420P -> 32x32 RGB24。
+    ///
+    /// 覆盖 [`scale_with_flags`] 的完整执行路径——FFmpeg 6/7 走 legacy
+    /// `sws_scale_frame`，FFmpeg 8+ 走 modern `scale_full_frame`。
+    #[test]
+    fn test_scale_frame_video() -> Result<()> {
+        let mut src = AVFrame::new();
+        src.set_width(64);
+        src.set_height(64);
+        src.set_format(PixelFormat::YUV420P.into());
+        src.alloc_buffer().context("alloc src buffer")?;
+        unsafe { fill_yuv420p(&mut src) };
+
+        let dst = scale_with_flags(&src, 32, 32, PixelFormat::RGB24, SwsFlags::LANCZOS)
+            .context("scale failed")?;
+
+        assert_eq!(dst.width, 32);
+        assert_eq!(dst.height, 32);
+        assert_eq!(dst.format, PixelFormat::RGB24.into());
+
+        // 输出缓冲非零
+        unsafe {
+            let data = std::slice::from_raw_parts(dst.data[0], dst.linesize[0] as usize * 32);
+            assert!(!data.iter().all(|&b| b == 0), "scaled output is empty");
+        }
+        Ok(())
+    }
+
+    /// FFmpeg 8+ modern 全动态参数的完整用法验证（6/7 无这些类型化字段）：
+    ///
+    /// - `flags`（`u32` 位标志）：算法位（`SWS_*` 滤波器选择）+ 质量位
+    ///   （`SWS_ACCURATE_RND`/`SWS_BITEXACT` 等），rsmedia 公开路径经
+    ///   [`SwsFlags::complete`] 组装；
+    /// - `threads`：并行线程数，0 = 自动；
+    /// - `dither`（`SwsDither`）：抖动算法，作用于色深降低/Bayer 输出，
+    ///   默认 AUTO；
+    /// - `alpha_blend`（`SwsAlphaBlend`）：目标带 alpha 通道时的逐像素混合
+    ///   方式，默认 NONE（直接覆盖）；
+    /// - `scaler` / `backends`（仅 FFmpeg 9）：显式选择 scaler 类型与实现
+    ///   后端，`scaler` 非默认值时覆盖 flags 的算法位。
+    #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+    #[test]
+    fn test_scale_modern_options() -> Result<()> {
+        use rsmpeg::swscale::SwsContext;
+
+        let mut src = AVFrame::new();
+        src.set_width(64);
+        src.set_height(64);
+        src.set_format(PixelFormat::YUV420P.into());
+        src.alloc_buffer().context("alloc src buffer")?;
+        unsafe { fill_yuv420p(&mut src) };
+
+        let mut ctx = SwsContext::alloc().context("allocate sws context")?;
+        ctx.set_flags(SwsFlags::LANCZOS.complete());
+        ctx.set_threads(0);
+        ctx.set_dither(ffi::SWS_DITHER_AUTO);
+        ctx.set_alpha_blend(ffi::SWS_ALPHA_BLEND_NONE);
+        #[cfg(feature = "ffmpeg9")]
+        {
+            // 显式指定 scaler 类型（覆盖 flags 算法位）与允许的实现后端。
+            ctx.set_scaler(ffi::SWS_SCALE_BICUBIC);
+            ctx.set_backends(ffi::SWS_BACKEND_ALL);
+        }
+
+        let mut dst = AVFrame::new();
+        dst.set_width(32);
+        dst.set_height(32);
+        dst.set_format(PixelFormat::RGB24.into());
+        dst.alloc_buffer().context("alloc dst buffer")?;
+
+        ctx.scale_full_frame(&mut dst, &src)
+            .context("scale with modern options failed")?;
+
+        assert_eq!(dst.width, 32);
+        assert_eq!(dst.height, 32);
+        assert_eq!(dst.format, PixelFormat::RGB24.into());
+        unsafe {
+            let data = std::slice::from_raw_parts(dst.data[0], dst.linesize[0] as usize * 32);
+            assert!(!data.iter().all(|&b| b == 0), "scaled output is empty");
+        }
         Ok(())
     }
 }
