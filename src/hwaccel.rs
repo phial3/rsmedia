@@ -391,7 +391,7 @@ impl HWContext {
                 // 否则 hw_frame 析构（unref）后 decoder->hw_frames_ctx 变成悬空指针 → double-free/UAF。
                 let ref_counter = ffi::av_buffer_ref(hw_frame.hw_frames_ctx);
                 let frames_ctx = NonNull::new(ref_counter)
-                    .map(|ptr| unsafe { AVHWFramesContext::from_raw(ptr) })
+                    .map(|ptr| AVHWFramesContext::from_raw(ptr))
                     .ok_or_else(|| {
                         RsmediaError::custom("Failed to av_buffer_ref hw_frames_ctx for decoder")
                     })?;

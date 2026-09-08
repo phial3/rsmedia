@@ -146,8 +146,6 @@ impl CodecConfig {
         #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
         {
             let fmts = self.context.get_supported_pix_fmts(Some(&self.codec))?;
-            // FFmpeg 约定：查询结果为 NULL 表示"支持所有值"，rsmpeg 将其映射为
-            // 空切片；归一化为 None，与 FFmpeg 6 静态字段为 NULL 的语义一致。
             Ok(if fmts.is_empty() { None } else { Some(fmts) })
         }
     }
@@ -160,7 +158,6 @@ impl CodecConfig {
         #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
         {
             let fmts = self.context.get_supported_sample_fmts(Some(&self.codec))?;
-            // 同上：空列表（FFmpeg NULL）表示"支持所有值"，归一化为 None。
             Ok(if fmts.is_empty() { None } else { Some(fmts) })
         }
     }
@@ -171,11 +168,8 @@ impl CodecConfig {
             Ok(self.codec.supported_framerates())
         }
         #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
-        unsafe {
-            let rates: &[ffi::AVRational] = self
-                .context
-                .get_supported_config(Some(&self.codec), ffi::AV_CODEC_CONFIG_FRAME_RATE)?;
-            // 空列表（FFmpeg NULL）表示"支持所有值"，归一化为 None。
+        {
+            let rates = self.context.get_supported_frame_rates(Some(&self.codec))?;
             Ok(if rates.is_empty() { None } else { Some(rates) })
         }
     }
@@ -186,11 +180,8 @@ impl CodecConfig {
             Ok(self.codec.supported_samplerates())
         }
         #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
-        unsafe {
-            let rates: &[i32] = self
-                .context
-                .get_supported_config(Some(&self.codec), ffi::AV_CODEC_CONFIG_SAMPLE_RATE)?;
-            // 空列表（FFmpeg NULL）表示"支持所有值"，归一化为 None。
+        {
+            let rates = self.context.get_supported_sample_rates(Some(&self.codec))?;
             Ok(if rates.is_empty() { None } else { Some(rates) })
         }
     }
