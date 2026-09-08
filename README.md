@@ -16,10 +16,11 @@ such as reading, writing, muxing, encoding, decoding, Picture Quality Enhancemen
 
 ## 🛠 S️️tatus
 
-⚠️ This project is still a work-in-progress, and will contain bugs. Some parts
-of the API have not been flushed out yet. Use with caution.
+please use latest release version.
 
-Currently supported: **FFmpeg 6 / 7 / 8 / 9** on **macOS, Linux, Windows** (x86_64 / arm64).
+Currently supported: 
+
+**FFmpeg 6 / 7 / 8 / 9** on **macOS, Linux, Windows** (x86_64 / arm64).
 
 ## Wiki
 
