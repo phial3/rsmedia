@@ -193,11 +193,47 @@ impl std::fmt::Display for HWDeviceConfig {
 /// Uses DashMap for better concurrent read/write performance.
 static HW_CTX_CACHE: Lazy<DashMap<HWDeviceConfig, Arc<HWContext>>> = Lazy::new(DashMap::new);
 
+/// 缓存容量上限：超出时自动驱逐**未被使用**（引用计数为 1）的条目。
+///
+/// 硬件设备上下文持有 GPU 资源，长驻进程中持续切换配置（device_id / 选项 /
+/// 设备类型组合不同）会不断产生新条目；不设上限会导致 GPU 资源泄漏。
+/// 典型应用只使用 1~2 种配置，8 已留足余量。仍在使用的条目不会被驱逐，
+/// 全部在使用中时可超额容纳（等待 [`clear_hw_ctx_cache`] 后续清理）。
+const HW_CTX_CACHE_MAX_ENTRIES: usize = 8;
+
+/// 容量超限时驱逐未使用条目（保留使用中的与新创建的 `keep` 条目）。
+fn prune_hw_ctx_cache(keep: &HWDeviceConfig) {
+    if HW_CTX_CACHE.len() <= HW_CTX_CACHE_MAX_ENTRIES {
+        return;
+    }
+    let mut removed = 0;
+    HW_CTX_CACHE.retain(|config, ctx| {
+        if Arc::strong_count(ctx) > 1 || config == keep {
+            true
+        } else {
+            removed += 1;
+            false
+        }
+    });
+    if HW_CTX_CACHE.len() > HW_CTX_CACHE_MAX_ENTRIES {
+        log::warn!(
+            "HW context cache still holds {} entries (> {HW_CTX_CACHE_MAX_ENTRIES}) \
+             after pruning {removed}: all in use, will shrink once released.",
+            HW_CTX_CACHE.len()
+        );
+    } else if removed > 0 {
+        log::debug!("Pruned {removed} unused hardware device context(s) (cache over cap).");
+    }
+}
+
 /// 清理硬件上下文缓存。
 ///
 /// 移除所有**当前未被使用**（引用计数为 1，仅缓存自身持有）的硬件设备上下文，
 /// 释放对应的 GPU 资源。仍在被解码器/编码器使用的上下文会保留，待其释放后
 /// 可再次调用清理。
+///
+/// 除本手动 API 外，缓存超过 [`HW_CTX_CACHE_MAX_ENTRIES`] 时会在新建条目时
+/// 自动驱逐未使用条目。
 ///
 /// 返回被移除的条目数。
 pub fn clear_hw_ctx_cache() -> usize {
@@ -260,6 +296,9 @@ impl HWContext {
         });
         // Insert into cache (lock-free write)
         HW_CTX_CACHE.insert(config, ctx.clone());
+        // 超过容量上限时自动驱逐未使用的旧条目（本条目刚插入、且被局部
+        // `ctx` 持有，不会被驱逐）
+        prune_hw_ctx_cache(&ctx.config);
 
         Ok(ctx)
     }
@@ -351,12 +390,11 @@ impl HWContext {
                 // 而不是把 hw_frame 自身的 hw_frames_ctx 指针直接搬走（from_raw 会转移所有权）。
                 // 否则 hw_frame 析构（unref）后 decoder->hw_frames_ctx 变成悬空指针 → double-free/UAF。
                 let ref_counter = ffi::av_buffer_ref(hw_frame.hw_frames_ctx);
-                if ref_counter.is_null() {
-                    return Err(RsmediaError::custom(
-                        "Failed to av_buffer_ref hw_frames_ctx for decoder",
-                    ));
-                }
-                let frames_ctx = AVHWFramesContext::from_raw(NonNull::new_unchecked(ref_counter));
+                let frames_ctx = NonNull::new(ref_counter)
+                    .map(|ptr| unsafe { AVHWFramesContext::from_raw(ptr) })
+                    .ok_or_else(|| {
+                        RsmediaError::custom("Failed to av_buffer_ref hw_frames_ctx for decoder")
+                    })?;
                 decoder.set_hw_frames_ctx(frames_ctx);
             }
         }

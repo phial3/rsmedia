@@ -22,7 +22,10 @@
 use crate::error::Result;
 use crate::io::{Reader, Writer};
 
+use rsmpeg::avcodec::AVSubtitle;
 use rsmpeg::ffi;
+
+use std::ffi::CStr;
 
 /// Copy subtitle packets from a reader stream to a writer stream (passthrough).
 ///
@@ -90,6 +93,89 @@ impl SubtitleSegment {
     pub fn duration_ms(&self) -> i64 {
         self.end_ms - self.start_ms
     }
+
+    /// 从解码得到的 [`AVSubtitle`] 提取纯文本段落。
+    ///
+    /// 时间戳语义（FFmpeg 文档）：`AVSubtitle.pts` 为 packet pts 换算成的
+    /// `AV_TIME_BASE`（微秒）；`start/end_display_time` 为相对 pts 的毫秒偏移：
+    /// `start_ms = pts/1000 + start_display_time`，`end_ms` 同理。
+    ///
+    /// 文本提取：优先 `SUBTITLE_ASS` rect（取 Dialogue 行第 10 个字段，即
+    /// 第 9 个逗号之后的部分，并将 ASS 硬换行 `\N` 转为换行符），其次
+    /// `SUBTITLE_TEXT` rect（纯文本）。`SUBTITLE_BITMAP`（如 DVB 字幕）无法
+    /// 表示为文本，跳过该 rect。
+    ///
+    /// 与 [`crate::encode::Encoder::encode_subtitle_segment`] 对称：编码时把
+    /// 纯文本放进 Dialogue 行第 10 字段，此处逆变换还原。
+    ///
+    /// 返回 [`None`] 表示该 subtitle 无文本 rect（如位图字幕或空段落）。
+    pub fn from_avsubtitle(subtitle: &AVSubtitle) -> Option<Self> {
+        // 空段落（num_rects == 0，rects 可能为 null）直接短路：
+        // rect_iter 对空 subtitle 的 from_raw_parts(null, 0) 依赖底层修复
+        // （rsmpeg 侧已修复），此处早退保持独立于底层版本的健壮性。
+        if subtitle.num_rects() == 0 {
+            return None;
+        }
+
+        let pts_ms = subtitle.pts / 1000;
+        let start_ms = pts_ms + subtitle.start_display_time as i64;
+        let end_ms = pts_ms + subtitle.end_display_time as i64;
+
+        let mut texts: Vec<String> = Vec::new();
+        for rect in subtitle.rect_iter() {
+            match rect.type_() {
+                ffi::SUBTITLE_ASS => {
+                    if let Some(ass) = rect.ass() {
+                        if let Some(text) = ass_dialogue_text(ass) {
+                            texts.push(text);
+                        }
+                    }
+                }
+                ffi::SUBTITLE_TEXT => {
+                    if let Some(text) = rect.text() {
+                        texts.push(text.to_string_lossy().into_owned());
+                    }
+                }
+                ty => {
+                    // SUBTITLE_BITMAP / SUBTITLE_NONE：无法表示为文本
+                    log::debug!("Skip non-text subtitle rect type: {ty}");
+                }
+            }
+        }
+        if texts.is_empty() {
+            return None;
+        }
+        Some(Self {
+            start_ms,
+            end_ms,
+            text: texts.join("\n"),
+        })
+    }
+}
+
+/// 从 ASS `Dialogue:` 行提取正文文本（第 10 个字段，即第 9 个逗号之后）。
+///
+/// 行格式：`Dialogue: layer,start,end,style,name,marginL,marginR,marginV,effect,text`。
+/// 正文本身可包含逗号，因此只按前 9 个逗号切分。
+fn ass_dialogue_text(ass: &CStr) -> Option<String> {
+    let line = ass.to_str().ok()?;
+    let mut commas = 0usize;
+    let mut text_start = None;
+    for (i, ch) in line.char_indices() {
+        if ch == ',' {
+            commas += 1;
+            if commas == 9 {
+                text_start = Some(i + 1);
+                break;
+            }
+        }
+    }
+    let text = &line[text_start?..];
+    if text.is_empty() {
+        return None;
+    }
+    // ASS 硬换行 `\N` 与软换行 `\n` 统一转换为换行符
+    Some(text.replace("\\N", "\n").replace("\\n", "\n"))
 }
 
 #[cfg(test)]
@@ -126,6 +212,86 @@ mod tests {
             SubtitleSegment::new(2000, 4000, "Second subtitle"),
             SubtitleSegment::new(4000, 6000, "Third subtitle"),
         ]
+    }
+
+    /// 通用 Decoder 字幕解码全链路验证：编码（mov_text）→ mux → demux →
+    /// [`Decoder::decode_subtitle_segment`] 解码 → 还原 [`SubtitleSegment`]。
+    ///
+    /// 严格验证：段落数、文本内容、start_ms 与编码输入一致（时间戳语义：
+    /// AVSubtitle.pts 为 AV_TIME_BASE 微秒，start_display_time 相对 pts 毫秒）。
+    #[test]
+    fn test_subtitle_decode_roundtrip() -> Result<()> {
+        use crate::decode::DecoderBuilder;
+        use crate::MediaType;
+
+        let path = test_support::test_output_path("subtitle", "rsmedia_decode_rt.mp4");
+        test_support::remove_test_output(&path);
+
+        // 1) Encode: mov_text segments into an MP4
+        let segments = sample_segments();
+        let mut encoder = EncoderBuilder::new_subtitle()
+            .with_codec_name(Some("mov_text".to_string()))
+            .with_subtitle_header(ASS_HEADER)
+            .build_wrapped(path.as_path())?;
+        encoder.encode_subtitle_segments(&segments)?;
+        encoder.finish()?;
+
+        // 2) Decode: via the generic Decoder subtitle channel
+        let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
+            .with_codec_name(Some("mov_text".to_string()))
+            .build_wrapped(path.as_path())?;
+        let mut decoded: Vec<SubtitleSegment> = Vec::new();
+        while let Some(segment) = decoder.decode_subtitle_segment()? {
+            decoded.push(segment);
+        }
+
+        // 3) Verify roundtrip
+        assert_eq!(decoded.len(), segments.len(), "decoded: {decoded:?}");
+        for (got, want) in decoded.iter().zip(segments.iter()) {
+            assert_eq!(got.text, want.text, "text mismatch");
+            assert_eq!(got.start_ms, want.start_ms, "start_ms mismatch");
+            assert_eq!(got.end_ms, want.end_ms, "end_ms mismatch");
+        }
+
+        // 4) Flushed 之后继续解码应报错（与音视频路径语义一致）
+        assert!(decoder.decode_subtitle_segment().is_err());
+
+        Ok(())
+    }
+
+    /// `SubtitleSegment::from_avsubtitle` 的单元测试：ASS rect 文本提取
+    /// （含逗号的正文不能被字段切分截断）、`\N` 硬换行转换、时间戳换算。
+    #[test]
+    fn test_from_avsubtitle_ass_rect() -> Result<()> {
+        use rsmpeg::avcodec::AVSubtitle;
+
+        let mut sub = AVSubtitle::new();
+        // 正文 "Hello, world, with, commas" 含 4 个逗号，若按逗号无脑切分会截断
+        sub.push_ass_rect(
+            c"Dialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,Hello, world, with, commas",
+        )?;
+
+        let seg = SubtitleSegment::from_avsubtitle(&sub)
+            .expect("ASS rect should convert to a segment");
+        assert_eq!(seg.text, "Hello, world, with, commas");
+        // Dialogue 行内的时间戳不参与换算：展示时间来自 pts + display_time
+        // （此处 AVSubtitle::new 的 pts 为 0，仅验证 display_time 路径）
+        assert_eq!(seg.start_ms, 0);
+        assert_eq!(seg.end_ms, 0);
+
+        // \N 硬换行 → 换行符
+        let mut sub2 = AVSubtitle::new();
+        sub2.push_ass_rect(
+            c"Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,line one\\Nline two",
+        )?;
+        let seg2 = SubtitleSegment::from_avsubtitle(&sub2).expect("should convert");
+        assert_eq!(seg2.text, "line one\nline two");
+
+        // 无文本 rect（如空 subtitle）→ None
+        let empty = AVSubtitle::new();
+        assert!(SubtitleSegment::from_avsubtitle(&empty).is_none());
+
+        Ok(())
     }
 
     /// Encode subtitles as mov_text into an MP4 file via the generic Encoder,
