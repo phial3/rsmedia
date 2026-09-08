@@ -188,6 +188,7 @@ macro_rules! ffi_enum_wrap_from {
 ///     }
 /// );
 /// ```
+#[allow(unused_macros)]
 macro_rules! ffi_enum_wrap {
     (
         $(#[$em:meta])*
