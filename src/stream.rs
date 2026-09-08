@@ -1,4 +1,5 @@
 use crate::error::{Result, RsmediaError};
+use crate::fmt::FrameFormat;
 use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
 use crate::strutils;
@@ -53,8 +54,10 @@ pub struct StreamInfo {
     pub codec_id: u32,
     /// Codec Additional Info
     pub codec_tag: u32,
-    /// Video: [`PixelFormat`], Audio: [`SampleFormat`]
-    pub format: i32,
+    /// 统一格式表示：Video 为 [`FrameFormat::Pixel`]（[`PixelFormat`]），
+    /// Audio 为 [`FrameFormat::Sample`]（[`SampleFormat`]）；
+    /// 字幕/数据等无格式概念的流回退为 [`FrameFormat::Pixel`]([`PixelFormat::NONE`])。
+    pub format: FrameFormat,
     /// Number of bits per sample or zero if unknown for the given codec.
     pub bits_per_sample: i32,
     /// Only return non-zero if the bits per sample is exactly correct, not an approximation.
@@ -105,17 +108,17 @@ pub struct StreamInfo {
     /// Display aspect ratio
     pub display_aspect_ratio: ffi::AVRational,
     /// Video color space, eg: ffi::AVCOL_SPC_*
-    pub color_space: usize,
+    pub color_space: ffi::AVColorSpace,
     /// Video color range, eg: ffi::AVCOL_RANGE_*
-    pub color_range: usize,
+    pub color_range: ffi::AVColorRange,
     /// Video color primaries, eg: ffi::AVCOL_PRI_*
-    pub color_primaries: usize,
+    pub color_primaries: ffi::AVColorPrimaries,
     /// Video color transfer, eg: ffi::AVCOL_TRC_*
-    pub color_transfer: usize,
+    pub color_transfer: ffi::AVColorTransferCharacteristic,
     /// Location of chroma samples, eg: ffi::AVCHROMA_LOC_*
-    pub chroma_location: usize,
+    pub chroma_location: ffi::AVChromaLocation,
     /// Video field order
-    pub field_order: usize,
+    pub field_order: ffi::AVFieldOrder,
     /// Video rotation
     pub rotation: f64,
 
@@ -144,6 +147,15 @@ pub struct StreamInfo {
     // extra
     pub extra_data: Option<Vec<u8>>,
     pub metadata: HashMap<String, String>,
+    /// **借用指针**：指向源 [`AVStream`] 的 `AVCodecParameters`（供 mux 透传，
+    /// 见 [`Self::into_parts`]）。
+    ///
+    /// # Safety / 生命周期
+    ///
+    /// 该指针**不持有所有权**，其有效期绑定到构建本 `StreamInfo` 的 reader/
+    /// writer：宿主 `AVFormatContext` 释放后此指针悬空。尽管本类型标记了
+    /// `Send + Sync`（用于跨线程传递快照字段），`codec_parameters` 只能在
+    /// 宿主仍存活时解引用。长期方案：改为 owned 的 codec 参数快照。
     pub codec_parameters: NonNull<ffi::AVCodecParameters>,
 }
 
@@ -184,11 +196,18 @@ impl StreamInfo {
         let metadata = stream
             .metadata()
             .map_or(HashMap::new(), |d| Options::from_dict(&d).into());
-        let bytes_per_sample = if codec_type.is_audio() {
-            SampleFormat::from(codecpar.format).get_bytes_per_sample()
+        // 统一格式：视频 → 像素格式，音频 → 采样格式，其他 → NONE 占位
+        let format = if codec_type.is_video() {
+            FrameFormat::Pixel(PixelFormat::from(codecpar.format))
+        } else if codec_type.is_audio() {
+            FrameFormat::Sample(SampleFormat::from(codecpar.format))
         } else {
-            None
+            FrameFormat::Pixel(PixelFormat::NONE)
         };
+
+        let bytes_per_sample = format
+            .into_sample()
+            .and_then(|s| s.get_bytes_per_sample());
 
         // descriptor() 返回 Result，未知格式时返回错误而非 panic
         let pix_fmt_desc = if codec_type.is_video() {
@@ -223,7 +242,7 @@ impl StreamInfo {
             #[allow(clippy::unnecessary_cast)]
             codec_id: codecpar.codec_id as u32,
             codec_tag: codecpar.codec_tag,
-            format: codecpar.format,
+            format,
             bits_per_sample,
             exact_bits_per_sample,
             bits_per_pixel,
@@ -252,12 +271,12 @@ impl StreamInfo {
                 codecpar.width,
                 codecpar.height,
             ),
-            color_space: codecpar.color_space as usize,
-            color_range: codecpar.color_range as usize,
-            color_transfer: codecpar.color_trc as usize,
-            color_primaries: codecpar.color_primaries as usize,
-            chroma_location: codecpar.chroma_location as usize,
-            field_order: codecpar.field_order as usize,
+            color_space: codecpar.color_space,
+            color_range: codecpar.color_range,
+            color_transfer: codecpar.color_trc,
+            color_primaries: codecpar.color_primaries,
+            chroma_location: codecpar.chroma_location,
+            field_order: codecpar.field_order,
             rotation: Self::get_stream_display_rotation(stream, &metadata),
             // Audio
             sample_rate: codecpar.sample_rate,
@@ -380,11 +399,8 @@ impl StreamInfo {
     /// if not, will use current stream codec name
     ///
     /// 与 [`Self::find_decoder_name`] 对称：硬件编码器名同样经验证存在后才使用。
-    pub fn find_encoder_name(
-        stream_info: &StreamInfo,
-        hw_device_type: Option<HWDeviceType>,
-    ) -> Option<String> {
-        let codec_id = stream_info.codec_id as ffi::AVCodecID;
+    pub fn find_encoder_name(&self, hw_device_type: Option<HWDeviceType>) -> Option<String> {
+        let codec_id = self.codec_id as ffi::AVCodecID;
         let codec_name = strutils::cstr_to_string(AVCodec::find_encoder(codec_id)?.name()).unwrap();
         let hw_codec_name = hw_device_type
             .and_then(|hw| hw_encoder_name(hw, codec_id))
@@ -498,14 +514,9 @@ impl std::fmt::Debug for StreamInfo {
             let codec_id = self.codec_id as ffi::AVCodecID;
             strutils::c_char_to_str(ffi::avcodec_get_name(codec_id))
         };
-        let format = {
-            if self.media_type == MediaType::VIDEO {
-                PixelFormat::from(self.format).get_pix_fmt_name().to_owned()
-            } else if self.media_type == MediaType::AUDIO {
-                SampleFormat::from(self.format).get_sample_fmt_name()
-            } else {
-                format!("Unknown:{}", self.format).to_string()
-            }
+        let format = match self.format {
+            FrameFormat::Pixel(p) => p.get_pix_fmt_name().to_owned(),
+            FrameFormat::Sample(s) => s.get_sample_fmt_name(),
         };
         let stream_type = self.media_type.get_media_type_string();
         write!(

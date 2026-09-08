@@ -1,6 +1,6 @@
 use rsmedia::{
     EncoderBuilder, MediaType, Options, PixelFormat, SampleFormat, StreamWriterBuilder,
-    hwaccel::HWDeviceType,
+    hwaccel::{HWDeviceConfig, HWDeviceType},
     mux::{Demuxer, Muxer},
 };
 
@@ -38,13 +38,20 @@ fn main() {
                 // build video encoder
                 EncoderBuilder::new_video(stream_info.width as usize, stream_info.height as usize)
                     // cuda acceleration
-                    .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
+                    .with_hardware_device(
+                        HWDeviceConfig::auto_platform_with(&[HWDeviceType::CUDA]).ok(),
+                    )
                     .with_codec_name("h264_nvenc".to_string())
                     // notes: options must be match with input video encoder codec,
                     .with_options(Options::preset_h264_nvenc())
                     .with_bit_rate(stream_info.bit_rate)
                     // video
-                    .with_pixel_format(PixelFormat::from(stream_info.format))
+                    .with_pixel_format(
+                        stream_info
+                            .format
+                            .into_pixel()
+                            .unwrap_or(PixelFormat::YUV420P),
+                    )
                     .build()
                     .unwrap()
             } else if stream_info.media_type == MediaType::AUDIO {
@@ -53,7 +60,10 @@ fn main() {
                     stream_info.bit_rate,
                     stream_info.channel_layout.nb_channels,
                     stream_info.sample_rate,
-                    SampleFormat::from(stream_info.format),
+                    stream_info
+                        .format
+                        .into_sample()
+                        .unwrap_or(SampleFormat::NONE),
                 )
                 .build()
                 .unwrap()

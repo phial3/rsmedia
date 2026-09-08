@@ -372,6 +372,21 @@ impl PixelFormat {
         }
         Ok(cnt)
     }
+
+    /// packed（单平面、8bit/分量）像素格式的每像素分量数。
+    ///
+    /// 这些格式可直接映射为 `[H, W, C]` ndarray（C=1/3/4）且无损往返
+    /// （GRAY8/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）。
+    /// 返回 `None` 表示非 packed 8bit 格式（planar / 半平面 / 位流 / 硬件格式等），
+    /// 需经 swscale 转换或专用分支处理。
+    pub const fn packed_channels(self) -> Option<usize> {
+        match self {
+            Self::GRAY8 => Some(1),
+            Self::RGB24 | Self::BGR24 => Some(3),
+            Self::RGBA | Self::BGRA | Self::ARGB | Self::ABGR => Some(4),
+            _ => None,
+        }
+    }
 }
 
 /// 返回最佳像素格式，或错误

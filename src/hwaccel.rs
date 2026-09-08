@@ -56,12 +56,15 @@ impl HWDeviceConfig {
     }
 
     /// build CUDA HWDeviceConfig
-    pub fn cuda(id: Option<usize>) -> Self {
+    ///
+    /// `device_id` 为 GPU 编号字符串（如 `"0"`、`"1"`），与其他设备构造器
+    /// 的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。
+    pub fn cuda(device_id: Option<String>) -> Self {
         Self::new(
             HWDeviceType::CUDA,
             PixelFormat::CUDA,
             PixelFormat::NV12,
-            id.map(|id| format!("{id}")),
+            device_id,
             None,
         )
     }
@@ -126,9 +129,9 @@ impl HWDeviceConfig {
     }
 
     /// [`Self::auto_platform`] 的可定制版本：传入自定义候选顺序（如只想在
-    /// CUDA 与 QSV 之间选择）。`None` 使用平台默认优先级。
-    pub fn auto_platform_with(candidates: Option<Vec<HWDeviceType>>) -> Result<Self> {
-        HWDeviceType::auto_platform_config(candidates)
+    /// CUDA 与 QSV 之间选择）；空切片返回错误（等价于无候选可探测）。
+    pub fn auto_platform_with(candidates: &[HWDeviceType]) -> Result<Self> {
+        HWDeviceType::auto_platform_config(Some(candidates))
     }
 }
 
@@ -654,9 +657,12 @@ impl HWDeviceType {
     ///
     /// # Arguments
     ///
-    /// * `candidates` - 自定义候选顺序；`None` 使用平台默认优先级。
-    pub fn auto_platform_config(candidates: Option<Vec<HWDeviceType>>) -> Result<HWDeviceConfig> {
-        let preference = candidates.unwrap_or_else(Self::platform_preference);
+    /// * `candidates` - 自定义候选顺序（空切片必报错）；`None` 使用平台默认优先级。
+    pub fn auto_platform_config(candidates: Option<&[HWDeviceType]>) -> Result<HWDeviceConfig> {
+        let preference: Vec<HWDeviceType> = match candidates {
+            Some(list) => list.to_vec(),
+            None => Self::platform_preference(),
+        };
         if preference.is_empty() {
             return Err(RsmediaError::custom(format!(
                 "No hardware acceleration preference defined for platform: {}",
@@ -697,34 +703,6 @@ impl HWDeviceType {
                 hwdevice_type = ffi::av_hwdevice_iterate_types(hwdevice_type);
             }
             hw_device_types
-        }
-    }
-
-    /// Find the best available hardware acceleration device config on this system.
-    pub fn auto_best_config(self) -> Result<HWDeviceConfig> {
-        if self.is_available() {
-            Ok(HWDeviceConfig::new(
-                self,
-                self.default_hw_pixel_format(),
-                self.default_sw_pixel_format(),
-                None,
-                None,
-            ))
-        } else {
-            let devices = self.list_available();
-            if devices.is_empty() {
-                return Err(RsmediaError::custom(
-                    "No suitable hardware acceleration device found",
-                ));
-            }
-            let device = devices[0];
-            Ok(HWDeviceConfig::new(
-                device,
-                device.default_hw_pixel_format(),
-                device.default_sw_pixel_format(),
-                None,
-                None,
-            ))
         }
     }
 
@@ -940,7 +918,7 @@ mod tests {
     /// 可用时应给出 D3D11 硬件格式 + NV12 软件格式；不可用时应优雅报错。
     #[test]
     fn test_auto_platform_amf_candidate() {
-        match HWDeviceConfig::auto_platform_with(Some(vec![HWDeviceType::D3D11VA])) {
+        match HWDeviceConfig::auto_platform_with(&[HWDeviceType::D3D11VA]) {
             Ok(config) => {
                 assert_eq!(config.device_type, HWDeviceType::D3D11VA);
                 assert_eq!(config.hw_pixel_format, PixelFormat::D3D11);
@@ -956,10 +934,10 @@ mod tests {
         }
     }
 
-    /// 空候选列表应报错而不是 panic（未知平台 / 显式空 vec）。
+    /// 空候选列表应报错而不是 panic（未知平台 / 显式空列表）。
     #[test]
     fn test_auto_platform_empty_candidates() {
-        let result = HWDeviceConfig::auto_platform_with(Some(Vec::new()));
+        let result = HWDeviceConfig::auto_platform_with(&[]);
         assert!(result.is_err());
     }
 

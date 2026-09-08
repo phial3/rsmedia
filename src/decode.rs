@@ -119,13 +119,16 @@ impl DecoderBuilder {
 
     /// Set the output pixel format of decoded video frames.
     ///
-    /// 默认 [`PixelFormat::YUV420P`]。仅支持 [`PixelFormat::YUV420P`] 与
-    /// [`PixelFormat::RGB24`]（[`MediaFrame`] 的 ndarray 表示仅覆盖这两种格式；
-    /// 需要其他格式请用 [`decode_raw`](Decoder::decode_raw) 获取原始
-    /// `AVFrame`，或通过滤镜 `format` 转换）。
+    /// 默认 [`PixelFormat::YUV420P`]。支持：
+    /// - [`PixelFormat::YUV420P`]（专用分支，U/V 以 2x2 块代表值存入 `[H, W, 3]`）
+    /// - 全部 packed 8bit 格式：GRAY8 `[H,W,1]` / RGB24、BGR24 `[H,W,3]` /
+    ///   RGBA、BGRA、ARGB、ABGR `[H,W,4]`（无损往返）
     ///
-    /// 仅对视频解码器有效；对音频/字幕解码器配置会在构建时返回错误
-    /// （快速失败，不静默忽略）。
+    /// 源格式与目标不一致时由 swscale 自动转换（如 NV12 → RGBA）。
+    /// 其他格式请用 [`decode_raw`](Decoder::decode_raw) 获取原始 `AVFrame`，
+    /// 或通过滤镜 `format` 转换。
+    ///
+    /// 仅对视频解码器有效；其他媒体类型构建时返回错误（fail-fast）。
     ///
     /// 注意：[`PixelFormat::YUV420P`] 要求输出宽高为偶数（色度平面下采样），
     /// 建议搭配 [`Resize::FitEven`] 保证尺寸约束。
@@ -275,13 +278,16 @@ impl DecoderBuilder {
         let stream_info = StreamInfo::from_stream(input_stream)?;
         log::info!("{stream_info}");
 
-        // 输出像素格式：仅视频有效，约束为 MediaFrame 支持的 YUV420P/RGB24。
+        // 输出像素格式：仅视频有效。支持 YUV420P 专用分支 + 全部 packed 8bit
+        // 格式（GRAY8/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR，见
+        // `PixelFormat::packed_channels`）；解码输出经 swscale 统一转换到目标格式。
         // 非视频类型配置了 pix_fmt 视为调用方错误，快速失败而非静默忽略。
         let output_pix_fmt = match (media_type, self.pix_fmt) {
             (MediaType::VIDEO, Some(fmt)) => {
-                if !matches!(fmt, PixelFormat::YUV420P | PixelFormat::RGB24) {
+                if fmt != PixelFormat::YUV420P && fmt.packed_channels().is_none() {
                     return Err(RsmediaError::custom(format!(
-                        "Unsupported output pixel format: {fmt:?}, only YUV420P/RGB24 are supported"
+                        "Unsupported output pixel format: {fmt:?}, only YUV420P and packed 8-bit \
+                         formats (GRAY8/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR) are supported"
                     )));
                 }
                 fmt
@@ -736,7 +742,7 @@ impl Decoder {
     where
         T: MediaFrameType,
     {
-        // Video Frame pixel YUV420P, RGB24 is supported
+        // Video Frame: YUV420P 专用分支 + packed 8bit 格式（GRAY8/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）
         MediaFrame::<T>::from_avframe(&frame)
     }
 

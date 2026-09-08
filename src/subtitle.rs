@@ -110,9 +110,6 @@ impl SubtitleSegment {
     ///
     /// 返回 [`None`] 表示该 subtitle 无文本 rect（如位图字幕或空段落）。
     pub fn from_avsubtitle(subtitle: &AVSubtitle) -> Option<Self> {
-        // 空段落（num_rects == 0，rects 可能为 null）直接短路：
-        // rect_iter 对空 subtitle 的 from_raw_parts(null, 0) 依赖底层修复
-        // （rsmpeg 侧已修复），此处早退保持独立于底层版本的健壮性。
         if subtitle.num_rects() == 0 {
             return None;
         }

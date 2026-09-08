@@ -246,7 +246,7 @@ fn main() -> Result<(), Box<dyn Error>> {
   let output_path = Path::new("/tmp/rainbow.mp4");
   let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
           // encoder with CUDA acceleration
-          // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
+          // .with_hardware_device(HWDeviceConfig::auto_platform_with(&[HWDeviceType::CUDA]).ok())
           // libx264, libx265, h264_nvenc, h264_vaapi
           // .with_codec_name("h264_nvenc".to_string())
           // .with_options(Options::preset_h264_nvenc())
