@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_image_text() -> Result<()> {
-        let output_path = crate::test_utils::test_output_path("imgutils", "image_with_text.png");
+        let output_path = crate::test_support::test_output_path("imgutils", "image_with_text.png");
         let rgb = create_image_with_text(640, 480, "Hello, world!");
         rgb.save(output_path)?;
         Ok(())

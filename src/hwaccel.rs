@@ -497,36 +497,47 @@ impl HWContext {
 unsafe impl Send for HWContext {}
 unsafe impl Sync for HWContext {}
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum HWDeviceType {
-    /// ffi definition NONE: 0
-    NONE,
-    /// Video Decode and Presentation API for Unix (VDPAU)
-    VDPAU,
-    /// NVIDIA CUDA
-    CUDA,
-    /// Video Acceleration API (VA-API)
-    VAAPI,
-    /// DirectX Video Acceleration 2.0
-    DXVA2,
-    /// Quick Sync Video
-    QSV,
-    /// VideoToolbox
-    VIDEOTOOLBOX,
-    /// Direct3D 11 Video Acceleration
-    D3D11VA,
-    /// Linux Direct Rendering Manager
-    DRM,
-    /// OpenCL
-    OPENCL,
-    /// MediaCodec
-    MEDIACODEC,
-    /// Vulkan
-    VULKAN,
-    /// Direct3D 12 Video Acceleration
-    #[cfg(feature = "ffmpeg7")]
-    D3D12VA,
-}
+ffi_enum_wrap_from!(
+    /// 硬件设备类型（对应 FFmpeg `AV_HWDEVICE_TYPE_*`）。
+    ///
+    /// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，
+    /// 未知/当前版本不支持的设备类型回退为 `NONE`（而非 panic）。
+    HWDeviceType => ffi::AVHWDeviceType,
+    repr = u32,
+    fallback = Self::NONE {
+        /// ffi definition NONE: 0
+        NONE => ffi::AV_HWDEVICE_TYPE_NONE;
+        /// Video Decode and Presentation API for Unix (VDPAU)
+        VDPAU => ffi::AV_HWDEVICE_TYPE_VDPAU;
+        /// NVIDIA CUDA
+        CUDA => ffi::AV_HWDEVICE_TYPE_CUDA;
+        /// Video Acceleration API (VA-API)
+        VAAPI => ffi::AV_HWDEVICE_TYPE_VAAPI;
+        /// DirectX Video Acceleration 2.0
+        DXVA2 => ffi::AV_HWDEVICE_TYPE_DXVA2;
+        /// Quick Sync Video
+        QSV => ffi::AV_HWDEVICE_TYPE_QSV;
+        /// VideoToolbox
+        VIDEOTOOLBOX => ffi::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+        /// Direct3D 11 Video Acceleration
+        D3D11VA => ffi::AV_HWDEVICE_TYPE_D3D11VA;
+        /// Linux Direct Rendering Manager
+        DRM => ffi::AV_HWDEVICE_TYPE_DRM;
+        /// OpenCL
+        OPENCL => ffi::AV_HWDEVICE_TYPE_OPENCL;
+        /// MediaCodec
+        MEDIACODEC => ffi::AV_HWDEVICE_TYPE_MEDIACODEC;
+        /// Vulkan
+        VULKAN => ffi::AV_HWDEVICE_TYPE_VULKAN;
+        /// Direct3D 12 Video Acceleration
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        D3D12VA => ffi::AV_HWDEVICE_TYPE_D3D12VA;
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        AMF => ffi::AV_HWDEVICE_TYPE_AMF;
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        OHCODEC => ffi::AV_HWDEVICE_TYPE_OHCODEC;
+    }
+);
 
 impl HWDeviceType {
     /// Whether or not the device type is available on this system.
@@ -578,13 +589,15 @@ impl HWDeviceType {
                 std::env::consts::OS
             )));
         }
-        let available = preference[0].list_available();
+        // 逐个候选探测可用性，避免只用首个候选的 available 集合去匹配其它候选，
+        // 导致首个候选不可用但后续候选可用时误判为“无可用设备”。
         let device = preference
-            .into_iter()
-            .find(|ty| available.contains(ty))
+            .iter()
+            .find(|ty| ty.is_available())
+            .copied()
             .ok_or_else(|| {
                 RsmediaError::custom(format!(
-                    "No available hardware acceleration device on {} (candidates probed, available: {available:?})",
+                    "No available hardware acceleration device on {} (candidates probed: {preference:?})",
                     std::env::consts::OS
                 ))
             })?;
@@ -656,8 +669,12 @@ impl HWDeviceType {
             HWDeviceType::OPENCL => PixelFormat::OPENCL,
             HWDeviceType::MEDIACODEC => PixelFormat::MEDIACODEC,
             HWDeviceType::VULKAN => PixelFormat::VULKAN,
-            #[cfg(feature = "ffmpeg7")]
+            #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
             HWDeviceType::D3D12VA => PixelFormat::D3D12,
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+            HWDeviceType::AMF => PixelFormat::AMF_SURFACE,
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+            HWDeviceType::OHCODEC => PixelFormat::OHCODEC,
         }
     }
 
@@ -691,52 +708,6 @@ impl HWDeviceType {
                 }
             }
             i += 1;
-        }
-    }
-}
-
-impl From<ffi::AVHWDeviceType> for HWDeviceType {
-    fn from(value: ffi::AVHWDeviceType) -> Self {
-        match value {
-            ffi::AV_HWDEVICE_TYPE_NONE => HWDeviceType::NONE,
-            ffi::AV_HWDEVICE_TYPE_VDPAU => HWDeviceType::VDPAU,
-            ffi::AV_HWDEVICE_TYPE_CUDA => HWDeviceType::CUDA,
-            ffi::AV_HWDEVICE_TYPE_VAAPI => HWDeviceType::VAAPI,
-            ffi::AV_HWDEVICE_TYPE_DXVA2 => HWDeviceType::DXVA2,
-            ffi::AV_HWDEVICE_TYPE_QSV => HWDeviceType::QSV,
-            ffi::AV_HWDEVICE_TYPE_VIDEOTOOLBOX => HWDeviceType::VIDEOTOOLBOX,
-            ffi::AV_HWDEVICE_TYPE_D3D11VA => HWDeviceType::D3D11VA,
-            ffi::AV_HWDEVICE_TYPE_DRM => HWDeviceType::DRM,
-            ffi::AV_HWDEVICE_TYPE_OPENCL => HWDeviceType::OPENCL,
-            ffi::AV_HWDEVICE_TYPE_MEDIACODEC => HWDeviceType::MEDIACODEC,
-            ffi::AV_HWDEVICE_TYPE_VULKAN => HWDeviceType::VULKAN,
-            #[cfg(feature = "ffmpeg7")]
-            ffi::AV_HWDEVICE_TYPE_D3D12VA => HWDeviceType::D3D12VA,
-
-            // 未知/当前版本不支持的类型映射为 NONE，避免 panic。
-            #[allow(unreachable_patterns)]
-            _ => HWDeviceType::NONE,
-        }
-    }
-}
-
-impl From<HWDeviceType> for ffi::AVHWDeviceType {
-    fn from(value: HWDeviceType) -> Self {
-        match value {
-            HWDeviceType::NONE => ffi::AV_HWDEVICE_TYPE_NONE,
-            HWDeviceType::VDPAU => ffi::AV_HWDEVICE_TYPE_VDPAU,
-            HWDeviceType::CUDA => ffi::AV_HWDEVICE_TYPE_CUDA,
-            HWDeviceType::VAAPI => ffi::AV_HWDEVICE_TYPE_VAAPI,
-            HWDeviceType::DXVA2 => ffi::AV_HWDEVICE_TYPE_DXVA2,
-            HWDeviceType::QSV => ffi::AV_HWDEVICE_TYPE_QSV,
-            HWDeviceType::VIDEOTOOLBOX => ffi::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
-            HWDeviceType::D3D11VA => ffi::AV_HWDEVICE_TYPE_D3D11VA,
-            HWDeviceType::DRM => ffi::AV_HWDEVICE_TYPE_DRM,
-            HWDeviceType::OPENCL => ffi::AV_HWDEVICE_TYPE_OPENCL,
-            HWDeviceType::MEDIACODEC => ffi::AV_HWDEVICE_TYPE_MEDIACODEC,
-            HWDeviceType::VULKAN => ffi::AV_HWDEVICE_TYPE_VULKAN,
-            #[cfg(feature = "ffmpeg7")]
-            HWDeviceType::D3D12VA => ffi::AV_HWDEVICE_TYPE_D3D12VA,
         }
     }
 }

@@ -1,3 +1,6 @@
+#[macro_use]
+mod macros;
+
 pub mod decode;
 pub mod encode;
 #[cfg(feature = "ndarray")]
@@ -42,23 +45,12 @@ pub use pixel::PixelFormat;
 pub use resize::Resize;
 pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
-pub use swctx::ScaleAlgorithm;
+pub use swctx::SwsFlags;
 pub use time::Time;
 
 /// Re-export internal definition for caller to use.
 pub use rsmpeg::avutil;
 
-/// Test utilities - compiled only for library unit tests, so they never
-/// pollute the shipped binary. Integration tests get the same helpers from
-/// `tests/common/mod.rs` (see that file for the single source of truth).
+/// Unit-test helpers
 #[cfg(test)]
-pub mod test_utils {
-    // Single source of truth for test-output helpers; shared with integration
-    // tests via `include!` so the path logic is not duplicated.
-    //
-    // `tests/common/mod.rs` refers to this crate as `rsmedia::...` (it is also
-    // compiled standalone by integration tests). Alias the crate root so the
-    // same paths resolve inside the library too.
-    use crate as rsmedia;
-    include!("../tests/common/mod.rs");
-}
+pub mod test_support;

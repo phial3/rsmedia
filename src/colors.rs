@@ -86,14 +86,21 @@ impl Color {
     }
 
     pub fn palette_distinct(count: usize) -> Vec<Color> {
+        if count == 0 {
+            return Vec::new();
+        }
         (0..count)
             .map(|i| {
                 // 均匀分布色相(0-360度)
                 let hue = (i as f32 * 360.0 / count as f32) % 360.0;
-                // 固定饱和度和亮度为适中值
+                // 固定饱和度和亮度为适中值；from_hsl 的 s/l 取值范围为 0-100
                 let saturation = 0.7;
                 let lightness = 0.5;
-                Color::from_hsl(hue as u16, saturation as u16, lightness as u16)
+                Color::from_hsl(
+                    hue as u16,
+                    (saturation * 100.0) as u16,
+                    (lightness * 100.0) as u16,
+                )
             })
             .collect()
     }

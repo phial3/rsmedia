@@ -11,29 +11,49 @@ use rsmpeg::ffi;
 use std::ffi::CStr;
 use std::fmt;
 
-/// 解码器旗标（对应 FFmpeg `AV_CODEC_FLAG_*`）。
-#[repr(u32)]
-#[allow(non_camel_case_types)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum AvCodecFlags {
-    UNALIGNED = ffi::AV_CODEC_FLAG_UNALIGNED,
-    QSCALE = ffi::AV_CODEC_FLAG_QSCALE,
-    _4MV = ffi::AV_CODEC_FLAG_4MV,
-    OUTPUT_CORRUPT = ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT,
-    QPEL = ffi::AV_CODEC_FLAG_QPEL,
-    PASS1 = ffi::AV_CODEC_FLAG_PASS1,
-    PASS2 = ffi::AV_CODEC_FLAG_PASS2,
-    GRAY = ffi::AV_CODEC_FLAG_GRAY,
-    PSNR = ffi::AV_CODEC_FLAG_PSNR,
-    INTERLACED_DCT = ffi::AV_CODEC_FLAG_INTERLACED_DCT,
-    LOW_DELAY = ffi::AV_CODEC_FLAG_LOW_DELAY,
-    GLOBAL_HEADER = ffi::AV_CODEC_FLAG_GLOBAL_HEADER,
-    BITEXACT = ffi::AV_CODEC_FLAG_BITEXACT,
-    AC_PRED = ffi::AV_CODEC_FLAG_AC_PRED,
-    LOOP_FILTER = ffi::AV_CODEC_FLAG_LOOP_FILTER,
-    INTERLACED_ME = ffi::AV_CODEC_FLAG_INTERLACED_ME,
-    CLOSED_GOP = ffi::AV_CODEC_FLAG_CLOSED_GOP,
-}
+ffi_enum!(
+    /// 对应 FFmpeg `AV_CODEC_FLAG_*`
+    #[allow(non_camel_case_types)]
+    AVCodecFlag, u32 {
+    UNALIGNED => ffi::AV_CODEC_FLAG_UNALIGNED;
+    QSCALE => ffi::AV_CODEC_FLAG_QSCALE;
+    X4MV => ffi::AV_CODEC_FLAG_4MV;
+    OUTPUT_CORRUPT => ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT;
+    QPEL => ffi::AV_CODEC_FLAG_QPEL;
+    RECON_FRAME => ffi::AV_CODEC_FLAG_RECON_FRAME;
+    COPY_OPAQUE => ffi::AV_CODEC_FLAG_COPY_OPAQUE;
+    FRAME_DURATION => ffi::AV_CODEC_FLAG_FRAME_DURATION;
+    PASS1 => ffi::AV_CODEC_FLAG_PASS1;
+    PASS2 => ffi::AV_CODEC_FLAG_PASS2;
+    LOOP_FILTER => ffi::AV_CODEC_FLAG_LOOP_FILTER;
+    GRAY => ffi::AV_CODEC_FLAG_GRAY;
+    PSNR => ffi::AV_CODEC_FLAG_PSNR;
+    INTERLACED_DCT => ffi::AV_CODEC_FLAG_INTERLACED_DCT;
+    LOW_DELAY => ffi::AV_CODEC_FLAG_LOW_DELAY;
+    GLOBAL_HEADER => ffi::AV_CODEC_FLAG_GLOBAL_HEADER;
+    BITEXACT => ffi::AV_CODEC_FLAG_BITEXACT;
+    AC_PRED => ffi::AV_CODEC_FLAG_AC_PRED;
+    INTERLACED_ME => ffi::AV_CODEC_FLAG_INTERLACED_ME;
+    CLOSED_GOP => ffi::AV_CODEC_FLAG_CLOSED_GOP;
+});
+
+ffi_enum!(
+    /// 对应 FFmpeg `AV_CODEC_FLAG2_*`
+    #[allow(non_camel_case_types)]
+    AVCodecFlag2, u32 {
+    FAST => ffi::AV_CODEC_FLAG2_FAST;
+        NO_OUTPUT => ffi::AV_CODEC_FLAG2_NO_OUTPUT;
+        LOCAL_HEADER => ffi::AV_CODEC_FLAG2_LOCAL_HEADER;
+        CHUNKS => ffi::AV_CODEC_FLAG2_CHUNKS;
+        IGNORE_CROP => ffi::AV_CODEC_FLAG2_IGNORE_CROP;
+        #[cfg(feature = "ffmpeg9")]
+        FIXED_FRAME_SIZE => ffi::AV_CODEC_FLAG2_FIXED_FRAME_SIZE;
+        SHOW_ALL => ffi::AV_CODEC_FLAG2_SHOW_ALL;
+        EXPORT_MVS => ffi::AV_CODEC_FLAG2_EXPORT_MVS;
+        SKIP_MANUAL => ffi::AV_CODEC_FLAG2_SKIP_MANUAL;
+        RO_FLUSH_NOOP => ffi::AV_CODEC_FLAG2_RO_FLUSH_NOOP;
+        ICC_PROFILES => ffi::AV_CODEC_FLAG2_ICC_PROFILES;
+});
 
 pub struct CodecConfig {
     codec: AVCodecRef<'static>,
@@ -46,7 +66,7 @@ impl CodecConfig {
         let codec = AVCodec::find_encoder(id)
             .or_else(|| AVCodec::find_decoder(id))
             .ok_or_else(|| RsmediaError::custom(format!("Codec id:{id} not found.")))?;
-        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(Self { codec })
         }
@@ -63,7 +83,7 @@ impl CodecConfig {
             .ok_or_else(|| {
                 RsmediaError::custom(format!("Codec not found by name: '{codec_name:?}'"))
             })?;
-        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(Self { codec })
         }
@@ -75,7 +95,7 @@ impl CodecConfig {
     }
 
     pub fn from_codec(codec: AVCodecRef<'static>) -> Self {
-        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Self { codec }
         }
@@ -119,7 +139,7 @@ impl CodecConfig {
 
 impl CodecConfig {
     pub fn supported_pixel_formats(&self) -> Result<Option<&[ffi::AVPixelFormat]>> {
-        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(self.codec.pix_fmts())
         }
@@ -133,7 +153,7 @@ impl CodecConfig {
     }
 
     pub fn supported_sample_formats(&self) -> Result<Option<&[ffi::AVSampleFormat]>> {
-        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(self.codec.sample_fmts())
         }
@@ -146,7 +166,7 @@ impl CodecConfig {
     }
 
     pub fn supported_frame_rates(&self) -> Result<Option<&[ffi::AVRational]>> {
-        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(self.codec.supported_framerates())
         }
@@ -161,7 +181,7 @@ impl CodecConfig {
     }
 
     pub fn supported_sample_rates(&self) -> Result<Option<&[i32]>> {
-        #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(self.codec.supported_samplerates())
         }
