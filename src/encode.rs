@@ -551,7 +551,7 @@ impl EncoderBuilder {
         self.ofmt_flag = writer.output().oformat().flags as u32;
         let encoder = self.build()?;
         let index = writer.add_stream(encoder.codecpar(), encoder.time_base());
-        Ok(EncoderWrapper::new(encoder, writer, index, interleaved))
+        EncoderWrapper::new(encoder, writer, index, interleaved)
     }
 
     /// Build an [`Encoder`].
@@ -1589,11 +1589,10 @@ impl Drop for Encoder {
 
 /// SAFETY:
 /// - Encoder contains `AVCodecContext`, which is not inherently thread-safe.
-/// - We implement `Send`/`Sync` only because `Encoder` is guaranteed to be used
-///   in a single-threaded context or externally synchronized by the caller.
-/// - If used across threads, caller must ensure no concurrent access.
+///   Sharing `&Encoder` across threads (`Sync`) cannot be guaranteed, so only
+///   `Send` is implemented: moving an Encoder to another thread for exclusive
+///   use is safe, as all resources move with the object.
 unsafe impl Send for Encoder {}
-unsafe impl Sync for Encoder {}
 
 /// 编码器包装器，持有编码器和写入器
 pub struct EncoderWrapper<W: Writer> {
@@ -1611,8 +1610,14 @@ pub struct EncoderWrapper<W: Writer> {
 
 impl<W: Writer> EncoderWrapper<W> {
     /// 创建一个新的编码器包装器
-    pub fn new(encoder: Encoder, writer: W, stream_index: usize, interleaved: bool) -> Self {
-        let stream_info = StreamInfo::from_writer(&writer, stream_index).unwrap();
+    pub fn new(
+        encoder: Encoder,
+        writer: W,
+        stream_index: usize,
+        interleaved: bool,
+    ) -> Result<Self> {
+        let stream_info = StreamInfo::from_writer(&writer, stream_index)
+            .context("Failed to create stream info from writer")?;
         // 当前帧时长：视频按帧率，音频按采样数/采样率；字幕时间戳由段落自带
         // （start_ms/end_ms），不使用自动递增 pts，帧时长置 0。
         let duration = match encoder.media_type {
@@ -1627,9 +1632,14 @@ impl<W: Writer> EncoderWrapper<W> {
                 time::new_rational(1, encoder.sample_rate().max(1)),
             ),
             MediaType::SUBTITLE => time::Time::zero(),
-            _ => panic!("No supported encoder for media_type."),
+            _ => {
+                return Err(RsmediaError::custom(format!(
+                    "No supported encoder for media_type: {:?}",
+                    encoder.media_type
+                )));
+            }
         };
-        Self {
+        Ok(Self {
             writer,
             encoder,
             interleaved,
@@ -1639,7 +1649,7 @@ impl<W: Writer> EncoderWrapper<W> {
             have_written_trailer: false,
             position: time::Time::zero(),
             frame_duration: duration,
-        }
+        })
     }
 
     #[cfg(feature = "ndarray")]

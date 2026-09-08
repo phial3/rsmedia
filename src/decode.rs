@@ -31,6 +31,8 @@ pub struct DecoderBuilder {
     hw_device_config: Option<HWDeviceConfig>,
     scale_algorithm: SwsFlags,
     resize: Option<Resize>,
+    /// 解码输出目标像素格式（仅视频），默认 [`PixelFormat::YUV420P`]。
+    pix_fmt: Option<PixelFormat>,
 }
 
 impl DecoderBuilder {
@@ -50,6 +52,7 @@ impl DecoderBuilder {
             flags: AVCodecFlag::LOW_DELAY,
             scale_algorithm: SwsFlags::default(),
             resize: None,
+            pix_fmt: None,
         }
     }
 
@@ -113,6 +116,22 @@ impl DecoderBuilder {
         self
     }
 
+    /// Set the output pixel format of decoded video frames.
+    ///
+    /// 默认 [`PixelFormat::YUV420P`]。仅支持 [`PixelFormat::YUV420P`] 与
+    /// [`PixelFormat::RGB24`]（[`MediaFrame`] 的 ndarray 表示仅覆盖这两种格式；
+    /// 需要其他格式请用 [`decode_raw`](Decoder::decode_raw) 获取原始
+    /// `AVFrame`，或通过滤镜 `format` 转换）。
+    ///
+    /// 仅对视频解码器有效；音频解码器忽略此设置。
+    ///
+    /// 注意：[`PixelFormat::YUV420P`] 要求输出宽高为偶数（色度平面下采样），
+    /// 建议搭配 [`Resize::FitEven`] 保证尺寸约束。
+    pub fn with_pix_fmt(mut self, pix_fmt: PixelFormat) -> Self {
+        self.pix_fmt = Some(pix_fmt);
+        self
+    }
+
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
@@ -167,7 +186,7 @@ impl DecoderBuilder {
     /// [`build_wrapped`](DecoderBuilder::build_wrapped) 一致。
     pub fn build_wrapped_with_reader<R: Reader>(self, reader: R) -> Result<DecoderWrapper<R>> {
         let decoder = self.build_from_reader(&reader)?;
-        Ok(DecoderWrapper::new(decoder, reader))
+        DecoderWrapper::new(decoder, reader)
     }
 
     /// 用给定的 reader 构建**裸** [`Decoder`]（不持有 reader）。
@@ -254,20 +273,30 @@ impl DecoderBuilder {
         let stream_info = StreamInfo::from_stream(input_stream)?;
         log::info!("{stream_info}");
 
+        // 输出像素格式：仅视频有效，约束为 MediaFrame 支持的 YUV420P/RGB24
+        let output_pix_fmt = match (media_type, self.pix_fmt) {
+            (MediaType::VIDEO, Some(fmt)) => {
+                if !matches!(fmt, PixelFormat::YUV420P | PixelFormat::RGB24) {
+                    return Err(RsmediaError::custom(format!(
+                        "Unsupported output pixel format: {fmt:?}, only YUV420P/RGB24 are supported"
+                    )));
+                }
+                fmt
+            }
+            _ => PixelFormat::YUV420P,
+        };
+
         let filter_graph = if let Some(filters) = self.filters {
             let filter_params = match media_type {
-                MediaType::VIDEO => {
-                    FilterParams::Video(VideoParams {
-                        width: init_width,
-                        height: init_height,
-                        // 解码器输出已统一为 YUV420P，滤镜图 src/sink 同格式
-                        src_format: PixelFormat::YUV420P,
-                        format: PixelFormat::YUV420P, // 确保视频帧 filter 的输入格式是 YUV420P
-                        time_base: decode_ctx.time_base,
-                        frame_rate: decode_ctx.framerate,
-                        pixel_aspect: decode_ctx.sample_aspect_ratio,
-                    })
-                }
+                MediaType::VIDEO => FilterParams::Video(VideoParams {
+                    width: init_width,
+                    height: init_height,
+                    src_format: output_pix_fmt,
+                    format: output_pix_fmt,
+                    time_base: decode_ctx.time_base,
+                    frame_rate: decode_ctx.framerate,
+                    pixel_aspect: decode_ctx.sample_aspect_ratio,
+                }),
                 MediaType::AUDIO => FilterParams::Audio(AudioParams {
                     nb_channels: decode_ctx.ch_layout.nb_channels,
                     sample_rate: decode_ctx.sample_rate,
@@ -275,7 +304,11 @@ impl DecoderBuilder {
                     src_format: SampleFormat::from(decode_ctx.sample_fmt),
                     time_base: decode_ctx.time_base,
                 }),
-                _ => panic!("Unsupported filter for media type: {media_type:?}"),
+                _ => {
+                    return Err(RsmediaError::custom(format!(
+                        "Unsupported filter for media type: {media_type:?}"
+                    )));
+                }
             };
 
             let mut graph = FilterGraph::new();
@@ -306,6 +339,7 @@ impl DecoderBuilder {
             state: DecoderState::Normal,
             scale_algorithm: self.scale_algorithm,
             resize: self.resize,
+            output_pix_fmt,
         })
     }
 }
@@ -342,6 +376,8 @@ pub struct Decoder {
     state: DecoderState,
     scale_algorithm: SwsFlags,
     resize: Option<Resize>,
+    /// 解码输出目标像素格式（仅视频）
+    output_pix_fmt: PixelFormat,
 }
 
 impl Decoder {
@@ -681,16 +717,16 @@ impl Decoder {
             }
         };
 
-        // 3. 确保输入Filter的视频帧的格式为 YUV420P
+        // 3. 统一视频输出格式（如 YUV420P / RGB24，由 `with_pix_fmt` 配置）
         // 例如：
         // 无硬件加速，默认解码格式 YUV420P
-        // 存在硬件加速帧，则转换 NV12 -> YUV420P
-        // 注意：这里无论是否有 Filter，都会统一转成 YUV420P（因为
+        // 存在硬件加速帧，则转换 NV12 -> 目标格式
+        // 注意：这里无论是否有 Filter，都会统一转成目标格式（因为
         // `MediaFrame` 视频目前主要支持 YUV420P/RGB24）。因此即使源是
-        // yuv444p / nv12 / 10-bit，解码输出也会被转成 YUV420P，不会颜色错乱。
+        // yuv444p / nv12 / 10-bit，解码输出也会被转成目标格式，不会颜色错乱。
         let raw_frame = match self.media_type {
             MediaType::VIDEO => {
-                let target_sw_pix_fmt = PixelFormat::YUV420P;
+                let target_sw_pix_fmt = self.output_pix_fmt;
                 // 计算目标尺寸：无 resize 时保持源尺寸，有 resize 时按策略计算
                 let (out_w, out_h) = match self.resize {
                     Some(resize) => resize
@@ -905,32 +941,15 @@ impl Drop for Decoder {
                 log::warn!("Failed to send flush packet to decoder: {e}")
             }
         }
-
-        unsafe {
-            // explicitly drop the hw_context to release the hardware resources
-            // 1. malloc(): unsorted double linked list corrupted
-            // 2. malloc(): mismatching next->prev_size (unsorted)
-            // 3. free(): invalid pointer
-            // 4. double free or corruption (!prev)
-            // 5. corrupted double-linked list Aborted (core dumped)
-            let codec_ctx_ptr = self.context.as_mut_ptr();
-            if !codec_ctx_ptr.is_null() {
-                if !(*codec_ctx_ptr).hw_frames_ctx.is_null() {
-                    let _hw_frames = (*codec_ctx_ptr).hw_frames_ctx;
-                    (*codec_ctx_ptr).hw_frames_ctx = std::ptr::null_mut();
-                }
-
-                if !(*codec_ctx_ptr).hw_device_ctx.is_null() {
-                    let _hw_device = (*codec_ctx_ptr).hw_device_ctx;
-                    (*codec_ctx_ptr).hw_device_ctx = std::ptr::null_mut();
-                }
-            }
-        }
     }
 }
 
+/// SAFETY:
+/// - `Decoder` 内含 `AVCodecContext` / filter graph，FFmpeg 不保证其线程安全，
+///   `&Decoder` 跨线程共享（`Sync`）无法成立，故不实现 `Sync`。
+/// - `Send`（move 到另一线程独占使用）是安全的：所有资源随对象移动，
+///   无线程局部句柄。
 unsafe impl Send for Decoder {}
-unsafe impl Sync for Decoder {}
 
 /// 解码器包装器，持有 Decoder 和 Reader
 pub struct DecoderWrapper<R: Reader> {
@@ -941,13 +960,14 @@ pub struct DecoderWrapper<R: Reader> {
 
 impl<R: Reader> DecoderWrapper<R> {
     /// 创建一个新的解码器包装器
-    pub fn new(decoder: Decoder, reader: R) -> Self {
-        let stream_info = StreamInfo::from_reader(&reader, decoder.stream_index()).unwrap();
-        Self {
+    pub fn new(decoder: Decoder, reader: R) -> Result<Self> {
+        let stream_info = StreamInfo::from_reader(&reader, decoder.stream_index())
+            .context("Failed to create stream info from reader")?;
+        Ok(Self {
             reader,
             decoder,
             stream_info,
-        }
+        })
     }
 
     /// 解码下一帧（媒体帧）
@@ -1139,6 +1159,36 @@ mod tests {
         assert!(frames > 0, "expected at least one decoded frame");
 
         Ok(())
+    }
+
+    /// 验证 `with_pix_fmt(RGB24)`：解码输出应为 RGB24；同时 MediaFrame 路径
+    /// 可正常转换。
+    #[test]
+    fn test_decode_video_with_pix_fmt_rgb24() -> Result<()> {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_pix_fmt(PixelFormat::RGB24)
+            .build_wrapped(video_path)?;
+
+        let mut frames = 0usize;
+        while let Some(frame) = decoder.decode_raw()? {
+            assert_eq!(frame.format, PixelFormat::RGB24.into());
+            frames += 1;
+        }
+        assert!(frames > 0, "expected at least one decoded frame");
+
+        Ok(())
+    }
+
+    /// `with_pix_fmt` 不支持的格式应在构建时返回错误而非 panic。
+    #[test]
+    fn test_decode_video_with_pix_fmt_unsupported() {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+        let result = DecoderBuilder::new(MediaType::VIDEO)
+            .with_pix_fmt(PixelFormat::NV12)
+            .build_wrapped(video_path);
+        assert!(result.is_err());
     }
 
     /// 验证 `with_resize` 与 `scale` filter 两种缩放方式结果一致，且同时使用时

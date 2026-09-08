@@ -20,7 +20,6 @@ ffi_enum!(
 });
 
 ffi_enum_wrap_from!(
-    /// Pixel format definitions in bindings.
     #[allow(non_camel_case_types)]
     PixelFormat => ffi::AVPixelFormat,
     repr = i32,

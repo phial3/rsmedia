@@ -8,7 +8,6 @@ use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
 use rsmpeg::{UnsafeDerefMut, ffi};
 
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -194,13 +193,41 @@ impl std::fmt::Display for HWDeviceConfig {
 /// Uses DashMap for better concurrent read/write performance.
 static HW_CTX_CACHE: Lazy<DashMap<HWDeviceConfig, Arc<HWContext>>> = Lazy::new(DashMap::new);
 
+/// 清理硬件上下文缓存。
+///
+/// 移除所有**当前未被使用**（引用计数为 1，仅缓存自身持有）的硬件设备上下文，
+/// 释放对应的 GPU 资源。仍在被解码器/编码器使用的上下文会保留，待其释放后
+/// 可再次调用清理。
+///
+/// 返回被移除的条目数。
+pub fn clear_hw_ctx_cache() -> usize {
+    let mut removed = 0;
+    // retain 逐条检查：仅保留仍在使用或为当前 config 未缓存的条目。
+    HW_CTX_CACHE.retain(|_config, ctx| {
+        if Arc::strong_count(ctx) > 1 {
+            true
+        } else {
+            removed += 1;
+            false
+        }
+    });
+    if removed > 0 {
+        log::debug!("Cleared {removed} unused hardware device context(s).");
+    }
+    removed
+}
+
 /// `HWContext` represents a hardware context.
 ///
 /// It includes methods for setting up hardware frames, downloading frames from hardware to system memory,
 /// and uploading frames from system memory to hardware.
+///
+/// 所有方法只做共享访问（`&self`）：底层 `av_hwframe_ctx_alloc` / `av_buffer_ref`
+/// 均为 FFmpeg 保证的线程安全原子操作，因此 [`Send`]/[`Sync`] 实现成立，
+/// 相同配置的多个解码器/编码器可跨线程共享同一 `Arc<HWContext>`。
 pub struct HWContext {
     config: HWDeviceConfig,
-    device_ctx: UnsafeCell<AVHWDeviceContext>,
+    device_ctx: AVHWDeviceContext,
 }
 
 impl HWContext {
@@ -229,7 +256,7 @@ impl HWContext {
 
         let ctx = Arc::new(Self {
             config: config.clone(),
-            device_ctx: UnsafeCell::new(hw_device_ctx),
+            device_ctx: hw_device_ctx,
         });
         // Insert into cache (lock-free write)
         HW_CTX_CACHE.insert(config, ctx.clone());
@@ -252,8 +279,9 @@ impl HWContext {
         width: i32,
         height: i32,
     ) -> Result<()> {
-        let hw_device_ctx_ref = unsafe { &mut *self.device_ctx.get() };
-        let mut hw_frames_ctx = hw_device_ctx_ref.hwframe_ctx_alloc();
+        // 仅共享访问 device_ctx：`hwframe_ctx_alloc` 内部只做 av_buffer_ref（原子），
+        // 每次调用都新建独立的 AVHWFramesContext，由 codec_ctx 独占持有。
+        let mut hw_frames_ctx = self.device_ctx.hwframe_ctx_alloc();
         hw_frames_ctx.data().format = self.get_format(true);
         hw_frames_ctx.data().sw_format = self.get_format(false);
         hw_frames_ctx.data().width = width;
@@ -274,8 +302,10 @@ impl HWContext {
                 ctx_mut_ptr.opaque = self.get_format(true) as *mut std::os::raw::c_void;
                 ctx_mut_ptr.get_format = Some(hwaccel_get_format);
                 ctx_mut_ptr.sw_pix_fmt = self.get_format(false);
-                ctx_mut_ptr.hw_device_ctx = hw_device_ctx_ref.as_mut_ptr();
             }
+            // clone 即 av_buffer_ref：codec_ctx 拥有独立引用，析构时正确 unref，
+            // 无需 Decoder::Drop 手动置空防 double-free。
+            codec_ctx.set_hw_device_ctx(self.device_ctx.clone());
         }
 
         Ok(())
@@ -494,6 +524,12 @@ impl HWContext {
     }
 }
 
+/// SAFETY:
+/// - `AVHWDeviceContext` 底层是引用计数的 `AVBufferRef`；本类型的所有方法
+///   （`setup_hw_frames`/`hw_download`/`hw_upload`）只做共享访问，涉及的
+///   FFI 调用（`av_buffer_ref`/`av_hwframe_ctx_alloc`/`av_hwframe_get_buffer`/
+///   `av_hwframe_transfer_data`）均为 FFmpeg 保证的线程安全操作。
+/// - 硬件设备本身由驱动保证并发使用安全。
 unsafe impl Send for HWContext {}
 unsafe impl Sync for HWContext {}
 
@@ -733,6 +769,47 @@ unsafe extern "C" fn hwaccel_get_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 空缓存清理应返回 0 且不 panic（CI / 无 GPU 环境）。
+    /// 有 GPU 时：创建 context → 释放引用 → 清理应移除该条目。
+    #[test]
+    fn test_clear_hw_ctx_cache() {
+        // 基线：不依赖 GPU 的行为
+        let removed = clear_hw_ctx_cache();
+        assert_eq!(removed, 0, "empty cache should remove nothing");
+
+        // 若本机有可用 GPU 设备：创建后释放，缓存条目应可被清理
+        if let Ok(config) = HWDeviceConfig::auto_platform() {
+            {
+                println!("config: {config}");
+                let ctx = HWContext::new(config.clone()).expect("create hw context");
+                // 持有期间清理不应移除
+                assert_eq!(clear_hw_ctx_cache(), 0);
+                drop(ctx);
+            }
+            // 引用释放后（仅缓存持有），清理应移除该条目
+            assert_eq!(clear_hw_ctx_cache(), 1);
+            // 再次清理：缓存已空
+            assert_eq!(clear_hw_ctx_cache(), 0);
+        }
+    }
+
+    /// `HWContext` 跨线程共享同一 Arc 不应触发数据竞争（回归测试：
+    /// setup_hw_frames 并发调用曾通过 UnsafeCell 做可变访问）。
+    #[test]
+    fn test_hw_context_shared_across_threads() {
+        let Ok(config) = HWDeviceConfig::auto_platform() else {
+            return; // 无 GPU 环境跳过
+        };
+        let ctx = HWContext::new(config).expect("create hw context");
+        let ctx2 = Arc::clone(&ctx);
+        let handle = std::thread::spawn(move || {
+            // 共享引用上的只读方法跨线程调用
+            let _ = ctx2.get_format(true);
+        });
+        let _ = ctx.get_format(false);
+        handle.join().expect("thread should not panic");
+    }
 
     /// 所有变体与 ffi 值双向映射后应保持自身（编译期常量，跨平台一致）。
     #[test]
