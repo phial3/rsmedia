@@ -66,7 +66,7 @@ impl CodecConfig {
         let codec = AVCodec::find_encoder(id)
             .or_else(|| AVCodec::find_decoder(id))
             .ok_or_else(|| RsmediaError::custom(format!("Codec id:{id} not found.")))?;
-        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(Self { codec })
         }
@@ -83,7 +83,7 @@ impl CodecConfig {
             .ok_or_else(|| {
                 RsmediaError::custom(format!("Codec not found by name: '{codec_name:?}'"))
             })?;
-        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(Self { codec })
         }
@@ -95,7 +95,7 @@ impl CodecConfig {
     }
 
     pub fn from_codec(codec: AVCodecRef<'static>) -> Self {
-        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Self { codec }
         }
@@ -139,7 +139,7 @@ impl CodecConfig {
 
 impl CodecConfig {
     pub fn supported_pixel_formats(&self) -> Result<Option<&[ffi::AVPixelFormat]>> {
-        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(self.codec.pix_fmts())
         }
@@ -153,7 +153,7 @@ impl CodecConfig {
     }
 
     pub fn supported_sample_formats(&self) -> Result<Option<&[ffi::AVSampleFormat]>> {
-        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(self.codec.sample_fmts())
         }
@@ -166,7 +166,7 @@ impl CodecConfig {
     }
 
     pub fn supported_frame_rates(&self) -> Result<Option<&[ffi::AVRational]>> {
-        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(self.codec.supported_framerates())
         }
@@ -181,7 +181,7 @@ impl CodecConfig {
     }
 
     pub fn supported_sample_rates(&self) -> Result<Option<&[i32]>> {
-        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+        #[cfg(feature = "ffmpeg6")]
         {
             Ok(self.codec.supported_samplerates())
         }
