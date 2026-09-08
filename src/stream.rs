@@ -247,7 +247,11 @@ impl StreamInfo {
             event_flags: stream.event_flags,
             video_delay: codecpar.video_delay,
             sample_aspect_ratio: codecpar.sample_aspect_ratio,
-            display_aspect_ratio: stream.sample_aspect_ratio,
+            display_aspect_ratio: Self::compute_display_aspect_ratio(
+                codecpar.sample_aspect_ratio,
+                codecpar.width,
+                codecpar.height,
+            ),
             color_space: codecpar.color_space as usize,
             color_range: codecpar.color_range as usize,
             color_transfer: codecpar.color_trc as usize,
@@ -271,6 +275,38 @@ impl StreamInfo {
             extra_data: Self::get_extra_data(stream),
             codec_parameters: NonNull::new(stream.codecpar).unwrap(),
         })
+    }
+
+    /// 计算显示宽高比 DAR = SAR × (width / height)。
+    ///
+    /// SAR 未知（0/1，FFmpeg 惯例按方形像素处理）时退化为 width/height。
+    /// 用 `av_reduce` 规约分数（与 FFmpeg 内部一致），避免溢出且得到最简比。
+    fn compute_display_aspect_ratio(
+        sample_aspect_ratio: ffi::AVRational,
+        width: i32,
+        height: i32,
+    ) -> ffi::AVRational {
+        if width <= 0 || height <= 0 {
+            return ffi::AVRational { num: 0, den: 1 };
+        }
+        // SAR 未知/非法时按方形像素（1/1）处理
+        let (sar_num, sar_den) = if sample_aspect_ratio.num <= 0 || sample_aspect_ratio.den <= 0 {
+            (1, 1)
+        } else {
+            (sample_aspect_ratio.num as i64, sample_aspect_ratio.den as i64)
+        };
+        let mut num: i32 = 0;
+        let mut den: i32 = 1;
+        unsafe {
+            ffi::av_reduce(
+                &mut num,
+                &mut den,
+                sar_num * width as i64,
+                sar_den * height as i64,
+                i32::MAX as i64,
+            );
+        }
+        ffi::AVRational { num, den }
     }
 
     fn get_stream_display_rotation(_stream: &AVStream, map: &HashMap<String, String>) -> f64 {
@@ -318,22 +354,50 @@ impl StreamInfo {
 
     /// find codec name, if have hw_device_type, will use hw accelerated codec name
     /// if not, will use current stream codec name
+    ///
+    /// 硬件解码器名先经 `find_decoder_by_name` 验证存在（表项可能因 FFmpeg
+    /// 版本/编译选项不存在，如 ffmpeg6 无 `*_vulkan` 解码器），不存在时
+    /// 回退到通用软件解码器名。
     pub fn find_decoder_name(&self, hw_device_type: Option<HWDeviceType>) -> Option<String> {
         let codec_id = self.codec_id as ffi::AVCodecID;
         let codec_name = strutils::cstr_to_string(AVCodec::find_decoder(codec_id)?.name()).unwrap();
-        let hw_codec_name = hw_device_type.and_then(|hw| hw_decoder_name(hw, codec_id));
+        let hw_codec_name = hw_device_type
+            .and_then(|hw| hw_decoder_name(hw, codec_id))
+            .filter(|name| {
+                let exists = AVCodec::find_decoder_by_name(&strutils::str_to_cstring(name)).is_some();
+                if !exists {
+                    log::debug!(
+                        "HW decoder '{name}' not registered in this FFmpeg build, \
+                         falling back to software decoder '{codec_name}'"
+                    );
+                }
+                exists
+            });
         Some(hw_codec_name.unwrap_or(codec_name))
     }
 
     /// find encoder name, if we have hw_device_type, will use hw accelerated codec name
     /// if not, will use current stream codec name
+    ///
+    /// 与 [`Self::find_decoder_name`] 对称：硬件编码器名同样经验证存在后才使用。
     pub fn find_encoder_name(
         stream_info: &StreamInfo,
         hw_device_type: Option<HWDeviceType>,
     ) -> Option<String> {
         let codec_id = stream_info.codec_id as ffi::AVCodecID;
         let codec_name = strutils::cstr_to_string(AVCodec::find_encoder(codec_id)?.name()).unwrap();
-        let hw_codec_name = hw_device_type.and_then(|hw| hw_encoder_name(hw, codec_id));
+        let hw_codec_name = hw_device_type
+            .and_then(|hw| hw_encoder_name(hw, codec_id))
+            .filter(|name| {
+                let exists = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(name)).is_some();
+                if !exists {
+                    log::debug!(
+                        "HW encoder '{name}' not registered in this FFmpeg build, \
+                         falling back to software encoder '{codec_name}'"
+                    );
+                }
+                exists
+            });
         Some(hw_codec_name.unwrap_or(codec_name))
     }
 }
@@ -366,20 +430,6 @@ fn hw_decoder_name(hw_type: HWDeviceType, codec_id: ffi::AVCodecID) -> Option<St
             ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_qsv".to_string()),
             _ => None,
         },
-        HWDeviceType::VAAPI => {
-            // VAAPI 使用通用解码器，但需要特定配置
-            match codec_id {
-                ffi::AV_CODEC_ID_H264 => Some("h264_vaapi".to_string()),
-                ffi::AV_CODEC_ID_HEVC => Some("hevc_vaapi".to_string()),
-                ffi::AV_CODEC_ID_MPEG2VIDEO => Some("mpeg2_vaapi".to_string()),
-                ffi::AV_CODEC_ID_VP8 => Some("vp8_vaapi".to_string()),
-                ffi::AV_CODEC_ID_VP9 => Some("vp9_vaapi".to_string()),
-                ffi::AV_CODEC_ID_AV1 => Some("av1_vaapi".to_string()),
-                ffi::AV_CODEC_ID_MJPEG => Some("mjpeg_vaapi".to_string()),
-                ffi::AV_CODEC_ID_VC1 => Some("vc1_vaapi".to_string()),
-                _ => None,
-            }
-        }
         HWDeviceType::VULKAN => match codec_id {
             ffi::AV_CODEC_ID_H264 => Some("h264_vulkan".to_string()),
             ffi::AV_CODEC_ID_HEVC => Some("hevc_vulkan".to_string()),
@@ -484,3 +534,85 @@ impl std::fmt::Display for StreamInfo {
 
 unsafe impl Send for StreamInfo {}
 unsafe impl Sync for StreamInfo {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::StreamReader;
+
+    /// DAR = SAR × (W/H)，各退化路径与规约均正确。
+    #[test]
+    fn test_compute_display_aspect_ratio() {
+        let ar = |num: i32, den: i32| ffi::AVRational { num, den };
+        let eq_ar = |a: ffi::AVRational, b: ffi::AVRational| a.num == b.num && a.den == b.den;
+
+        // SAR 未知（0/1）→ 方形像素，DAR = W/H
+        assert!(eq_ar(
+            StreamInfo::compute_display_aspect_ratio(ar(0, 1), 1920, 1080),
+            ar(16, 9)
+        ));
+        // SAR 1/1 → DAR = W/H
+        assert!(eq_ar(
+            StreamInfo::compute_display_aspect_ratio(ar(1, 1), 1920, 1080),
+            ar(16, 9)
+        ));
+        // 变形宽银幕：SAR 2/1 + 720x576(5/4) → DAR = 5/2
+        assert!(eq_ar(
+            StreamInfo::compute_display_aspect_ratio(ar(2, 1), 720, 576),
+            ar(5, 2)
+        ));
+        // 分数需规约：SAR 118/81 + 1920x1080 → 118*16/(81*9) = 1888/729（已最简）
+        assert!(eq_ar(
+            StreamInfo::compute_display_aspect_ratio(ar(118, 81), 1920, 1080),
+            ar(1888, 729)
+        ));
+        // 非视频流（W/H 为 0）→ 0/1
+        assert!(eq_ar(
+            StreamInfo::compute_display_aspect_ratio(ar(1, 1), 0, 0),
+            ar(0, 1)
+        ));
+    }
+
+    /// VAAPI 必须回退到通用软件解码器（`h264_vaapi` 是编码器名，
+    /// 若返回会导致 Demuxer 构建失败）。
+    #[test]
+    fn test_find_decoder_name_vaapi_falls_back() {
+        let reader =
+            StreamReader::new(std::path::Path::new("assets/mp4.mp4")).expect("open test asset");
+        let info = StreamInfo::from_reader(&reader, 0).expect("read stream 0");
+        assert_eq!(info.media_type, MediaType::VIDEO);
+
+        let generic = info.find_decoder_name(None).expect("generic decoder");
+        let vaapi = info
+            .find_decoder_name(Some(HWDeviceType::VAAPI))
+            .expect("vaapi lookup");
+        assert_eq!(vaapi, generic, "VAAPI must fall back to the generic decoder");
+        assert_ne!(vaapi, "h264_vaapi");
+    }
+
+    /// 存在性验证：表中列出但当前 FFmpeg 构建未注册的硬件解码器（如
+    /// ffmpeg6 无 `*_vulkan`）应回退到软件解码器，而不是返回无效名字。
+    #[test]
+    fn test_find_decoder_name_unregistered_hw_falls_back() {
+        let reader =
+            StreamReader::new(std::path::Path::new("assets/mp4.mp4")).expect("open test asset");
+        let info = StreamInfo::from_reader(&reader, 0).expect("read stream 0");
+
+        for hw in [HWDeviceType::CUDA, HWDeviceType::VULKAN, HWDeviceType::QSV] {
+            let name = info
+                .find_decoder_name(Some(hw))
+                .unwrap_or_else(|| panic!("lookup for {hw:?}"));
+            let registered = if let Some(codec) =
+                AVCodec::find_decoder_by_name(&strutils::str_to_cstring(&name))
+            {
+                strutils::cstr_to_string(codec.name()).unwrap() == name
+            } else {
+                false
+            };
+            assert!(
+                registered,
+                "find_decoder_name({hw:?}) returned '{name}' which is not registered"
+            );
+        }
+    }
+}
