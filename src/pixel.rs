@@ -3,7 +3,7 @@ use crate::error::{Result, RsmediaError};
 use rsmpeg::avutil::AVPixFmtDescriptorRef;
 use rsmpeg::ffi;
 
-ffi_const!(
+ffi_enum!(
     /// ===== AV_PIX_FMT_FLAG_* 像素格式描述标志 =====
     AVPixFmtFlag, u32 {
     BE => ffi::AV_PIX_FMT_FLAG_BE;
@@ -19,7 +19,7 @@ ffi_const!(
     XYZ => ffi::AV_PIX_FMT_FLAG_XYZ;
 });
 
-ffi_enum!(
+ffi_enum_wrap_from!(
     /// Pixel format definitions in bindings.
     #[allow(non_camel_case_types)]
     PixelFormat => ffi::AVPixelFormat,

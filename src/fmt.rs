@@ -11,7 +11,7 @@ use crate::strutils;
 use rsmpeg::avutil;
 use rsmpeg::ffi;
 
-ffi_const!(
+ffi_enum!(
     /// 对应 FFmpeg `AVFMT_*`
     #[allow(non_camel_case_types)]
     AVFormatFlag, u32 {
@@ -32,12 +32,13 @@ ffi_const!(
     ALLOW_FLUSH => ffi::AVFMT_ALLOW_FLUSH;
     TS_NONSTRICT => ffi::AVFMT_TS_NONSTRICT;
     TS_NEGATIVE => ffi::AVFMT_TS_NEGATIVE;
+    #[cfg(feature = "ffmpeg9")]
     FIXED_FRAMESIZE => ffi::AVFMT_FIXED_FRAMESIZE;
     SEEK_TO_PTS => ffi::AVFMT_SEEK_TO_PTS;
 });
 
 // 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）。
-ffi_enum!(
+ffi_enum_wrap_from!(
     /// 音频采样格式（对应 FFmpeg `AV_SAMPLE_FMT_*`）。
     ///
     /// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，

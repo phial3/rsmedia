@@ -17,7 +17,7 @@ use std::ptr::NonNull;
 // 未知/版本差异的 `AVMEDIA_TYPE_*` 回退为 `UNKNOWN`（而非 panic）。
 // 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）——
 // 挂在宏调用外部的 doc 注释 rustdoc 不认，会触发 unused_doc_comments 警告。
-ffi_enum!(
+ffi_enum_wrap_from!(
     /// 媒体类型（对应 FFmpeg `AVMEDIA_TYPE_*`）：流的分类属性
     MediaType => ffi::AVMediaType,
     repr = i32,

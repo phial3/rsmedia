@@ -497,7 +497,7 @@ impl HWContext {
 unsafe impl Send for HWContext {}
 unsafe impl Sync for HWContext {}
 
-ffi_enum!(
+ffi_enum_wrap_from!(
     /// 硬件设备类型（对应 FFmpeg `AV_HWDEVICE_TYPE_*`）。
     ///
     /// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，

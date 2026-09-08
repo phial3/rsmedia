@@ -11,7 +11,7 @@ use rsmpeg::ffi;
 use std::ffi::CStr;
 use std::fmt;
 
-ffi_const!(
+ffi_enum!(
     /// 对应 FFmpeg `AV_CODEC_FLAG_*`
     #[allow(non_camel_case_types)]
     AVCodecFlag, u32 {
@@ -37,7 +37,7 @@ ffi_const!(
     CLOSED_GOP => ffi::AV_CODEC_FLAG_CLOSED_GOP;
 });
 
-ffi_const!(
+ffi_enum!(
     /// 对应 FFmpeg `AV_CODEC_FLAG2_*`
     #[allow(non_camel_case_types)]
     AVCodecFlag2, u32 {
@@ -46,6 +46,7 @@ ffi_const!(
         LOCAL_HEADER => ffi::AV_CODEC_FLAG2_LOCAL_HEADER;
         CHUNKS => ffi::AV_CODEC_FLAG2_CHUNKS;
         IGNORE_CROP => ffi::AV_CODEC_FLAG2_IGNORE_CROP;
+        #[cfg(feature = "ffmpeg9")]
         FIXED_FRAME_SIZE => ffi::AV_CODEC_FLAG2_FIXED_FRAME_SIZE;
         SHOW_ALL => ffi::AV_CODEC_FLAG2_SHOW_ALL;
         EXPORT_MVS => ffi::AV_CODEC_FLAG2_EXPORT_MVS;

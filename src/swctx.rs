@@ -31,10 +31,11 @@ use rsmpeg::swscale::SwsContext;
 //   SWS_SINC           1 <<  8   unwindowed sinc
 //   SWS_LANCZOS        1 <<  9   3-tap sinc/sinc
 //   SWS_SPLINE         1 << 10   unwindowed natural cubic spline
-ffi_const!(
+ffi_enum_wrap!(
     /// Sws scale filter flags (SWS_*)
     #[allow(non_camel_case_types)]
-    SwsFlags, u32 {
+    SwsFlags => ffi::SwsFlags,
+    repr = u32 {
         /// fast bilinear filtering
         FAST_BILINEAR => ffi::SWS_FAST_BILINEAR;
         /// bilinear filtering
