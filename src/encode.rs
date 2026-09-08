@@ -1,7 +1,7 @@
 use crate::codec::CodecConfig;
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
-use crate::fmt::{AvFormatFlags, FrameFormat};
+use crate::fmt::{AVFormatFlag, FrameFormat};
 #[cfg(feature = "ndarray")]
 use crate::frame::{MediaFrame, MediaFrameType};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
@@ -44,7 +44,7 @@ pub struct EncoderBuilder {
     pkt_time_base: ffi::AVRational,
     frame_rate: ffi::AVRational,
     /// config
-    oformat_flags: i32,
+    ofmt_flag: u32,
     thread_count: usize,
     media_type: MediaType,
     codec_name: Option<String>,
@@ -368,8 +368,8 @@ impl EncoderBuilder {
     /// 仅对独立的 [`Self::build()`] 路径生效；`build_wrapped*` 路径会按
     /// 实际输出容器的 `AVFMT_GLOBALHEADER` flag 自动派生（见
     /// [`Self::build_wrapped_with_writer`]），显式设置会被覆盖。
-    pub fn with_oformat_flags(mut self, flags: AvFormatFlags) -> Self {
-        self.oformat_flags = flags as i32;
+    pub fn with_oformat_flags(mut self, flag: AVFormatFlag) -> Self {
+        self.ofmt_flag = flag.as_raw();
         self
     }
 
@@ -453,7 +453,7 @@ impl EncoderBuilder {
         }
 
         // Some formats want stream headers to be separate.
-        if self.oformat_flags & ffi::AVFMT_GLOBALHEADER as i32 != 0 {
+        if self.ofmt_flag & AVFormatFlag::GLOBAL_HEADER.as_raw() != 0 {
             encoder.set_flags(encoder.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
         }
         unsafe {
@@ -548,7 +548,7 @@ impl EncoderBuilder {
         // AV_CODEC_FLAG_GLOBAL_HEADER，extradata（AAC AudioSpecificConfig、
         // flac STREAMINFO 等）才会生成并随 codecpar 写入容器；mpegts/avi
         // 等带内头格式则不能设置，否则 x264 等编码器不再输出带内参数集。
-        self.oformat_flags = writer.output().oformat().flags;
+        self.ofmt_flag = writer.output().oformat().flags as u32;
         let encoder = self.build()?;
         let index = writer.add_stream(encoder.codecpar(), encoder.time_base());
         Ok(EncoderWrapper::new(encoder, writer, index, interleaved))
@@ -815,7 +815,7 @@ impl Default for EncoderBuilder {
             fps: Self::FRAME_RATE as f32,
             gop_size: 0,
             max_b_frames: 0,
-            oformat_flags: AvFormatFlags::GLOBAL_HEADER as i32,
+            ofmt_flag: AVFormatFlag::GLOBAL_HEADER.as_raw(),
             // audio
             nb_channels: 2,
             sample_rate: 44100,

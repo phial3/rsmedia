@@ -14,7 +14,7 @@ use rsmpeg::ffi;
 ffi_const!(
     /// 对应 FFmpeg `AVFMT_*`
     #[allow(non_camel_case_types)]
-    AvFormatFlags, u32 {
+    AVFormatFlag, u32 {
     NO_FILE => ffi::AVFMT_NOFILE;
     NEED_NUMBER => ffi::AVFMT_NEEDNUMBER;
     SHOW_IDS => ffi::AVFMT_SHOW_IDS;
