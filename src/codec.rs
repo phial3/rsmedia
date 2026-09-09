@@ -11,6 +11,18 @@ use rsmpeg::ffi;
 use std::ffi::CStr;
 use std::fmt;
 
+/// 编解码器（编码器/解码器共用）的推进状态。
+///
+/// - `Normal`：正常接收帧。
+/// - `Drained`：已收到 EOF/停止信号，正在排空内部缓冲，但不再接收新帧。
+/// - `Flushed`：排空完成，所有包已产出。
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CodecContextState {
+    Normal,
+    Drained,
+    Flushed,
+}
+
 ffi_enum!(
     /// 对应 FFmpeg `AV_CODEC_FLAG_*`
     #[allow(non_camel_case_types)]

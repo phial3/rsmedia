@@ -5,14 +5,13 @@ use crate::io::{Reader, Writer};
 use crate::strutils;
 use crate::{Options, PixelFormat, SampleFormat};
 
-use rsmpeg::avcodec::AVCodec;
+use rsmpeg::avcodec::{AVCodec, AVCodecParameters};
 use rsmpeg::avformat::AVStream;
-use rsmpeg::avutil;
+use rsmpeg::avutil::{self, AVChannelLayout};
 use rsmpeg::ffi;
 
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::ptr::NonNull;
 
 // 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，
 // 未知/版本差异的 `AVMEDIA_TYPE_*` 回退为 `UNKNOWN`（而非 panic）。
@@ -122,7 +121,7 @@ pub struct StreamInfo {
     /// Audio sample rate
     pub sample_rate: i32,
     /// Audio Channel layout
-    pub channel_layout: ffi::AVChannelLayout,
+    pub channel_layout: AVChannelLayout,
     /// Audio frame size
     pub frame_size: i32,
     /// Audio block align
@@ -143,16 +142,13 @@ pub struct StreamInfo {
     // extra
     pub extra_data: Option<Vec<u8>>,
     pub metadata: HashMap<String, String>,
-    /// **借用指针**：指向源 [`AVStream`] 的 `AVCodecParameters`（供 mux 透传，
-    /// 见 [`Self::into_parts`]）。
+    /// **owned 快照**：构建本 `StreamInfo` 时通过 `avcodec_parameters_copy`
+    /// 深拷贝得到的 codec 参数，生命周期完全独立于源 reader/writer，可由
+    /// [`Self::into_parts`] 取出透传给 mux。
     ///
-    /// # Safety / 生命周期
-    ///
-    /// 该指针**不持有所有权**，其有效期绑定到构建本 `StreamInfo` 的 reader/
-    /// writer：宿主 `AVFormatContext` 释放后此指针悬空。尽管本类型标记了
-    /// `Send + Sync`（用于跨线程传递快照字段），`codec_parameters` 只能在
-    /// 宿主仍存活时解引用。长期方案：改为 owned 的 codec 参数快照。
-    pub codec_parameters: NonNull<ffi::AVCodecParameters>,
+    /// rsmpeg 的 [`AVCodecParameters`] 在 `Drop` 时调用
+    /// `avcodec_parameters_free` 释放，故不会泄漏，也不存在 use-after-free。
+    pub codec_parameters: AVCodecParameters,
 }
 
 impl StreamInfo {
@@ -272,7 +268,7 @@ impl StreamInfo {
             rotation: Self::get_stream_display_rotation(stream, &metadata),
             // Audio
             sample_rate: codecpar.sample_rate,
-            channel_layout: codecpar.ch_layout,
+            channel_layout: codecpar.ch_layout().clone(),
             frame_size: codecpar.frame_size,
             block_align: codecpar.block_align,
             initial_padding: codecpar.initial_padding,
@@ -284,7 +280,9 @@ impl StreamInfo {
             // extra
             metadata,
             extra_data: Self::get_extra_data(stream),
-            codec_parameters: NonNull::new(stream.codecpar).unwrap(),
+            // owned 深拷贝快照：`AVCodecParameters::clone` 内部经
+            // `avcodec_parameters_copy` 拷贝，Drop 时释放，生命周期独立。
+            codec_parameters: stream.codecpar().clone(),
         })
     }
 
@@ -376,9 +374,9 @@ impl StreamInfo {
     ///
     /// A tuple consisting of:
     /// * The stream index.
-    /// * Codec parameters.
+    /// * Owned codec parameters snapshot.
     /// * Original stream time base.
-    pub fn into_parts(self) -> (usize, NonNull<ffi::AVCodecParameters>, ffi::AVRational) {
+    pub fn into_parts(self) -> (usize, AVCodecParameters, ffi::AVRational) {
         (self.index, self.codec_parameters, self.time_base)
     }
 
@@ -556,6 +554,11 @@ impl std::fmt::Display for StreamInfo {
     }
 }
 
+// `StreamInfo` 完全持有自身数据（`codec_parameters` 为深拷贝的 owned 快照），
+// 不引用任何外部 reader/writer 的生命周期，可安全跨线程传递与共享。
+// 由于 rsmpeg 的 `AVCodecParameters` 仅实现了 `Send` 而未实现 `Sync`，
+// `StreamInfo` 无法自动推导 `Sync`，此处手动补上（比较 `&self` 只读访问
+// 快照字段，无数据竞争）。
 unsafe impl Send for StreamInfo {}
 unsafe impl Sync for StreamInfo {}
 

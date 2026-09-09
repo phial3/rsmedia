@@ -461,67 +461,127 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
     }
 }
 
-/// 将 AVFrame 转换为 ndarray::Array3
-#[cfg(feature = "ndarray")]
-pub fn to_ndarray(frame: &AVFrame) -> Result<ndarray::Array3<u8>> {
-    let (height, width) = (frame.height as usize, frame.width as usize);
-
-    match frame.format {
-        // RGB 格式：交错存储，直接复制
-        f if f == ffi::AV_PIX_FMT_RGB24 => {
-            let buffer = copy_frame_to_buffer(frame)?;
-            ndarray::Array3::from_shape_vec((height, width, 3), buffer)
-                .map_err(|e| format_err!("Failed to convert RGB ndarray: {}", e))
-        }
-        // YUV 格式：平面存储，需要分别处理每个平面并上采样
-        f if f == ffi::AV_PIX_FMT_YUV420P => {
-            let mut array = ndarray::Array3::zeros((height, width, 3));
-
-            unsafe {
-                // 复制 Y 平面到通道 0
-                let y_plane =
-                    std::slice::from_raw_parts(frame.data[0], height * frame.linesize[0] as usize);
-                for (y, src_row) in y_plane
-                    .chunks(frame.linesize[0] as usize)
-                    .take(height)
-                    .enumerate()
-                {
-                    array
-                        .slice_mut(ndarray::s![y, .., 0])
-                        .assign(&ndarray::ArrayView1::from(&src_row[..width]));
-                }
-
-                // 复制 U 和 V 平面到通道 1 和 2，并进行上采样
-                for (plane_idx, &plane_ptr) in [frame.data[1], frame.data[2]].iter().enumerate() {
-                    let uv_plane = std::slice::from_raw_parts(
-                        plane_ptr,
-                        (height / 2) * frame.linesize[1] as usize,
-                    );
-                    for (y, src_row) in uv_plane
-                        .chunks(frame.linesize[1] as usize)
-                        .take(height / 2)
-                        .enumerate()
-                    {
-                        for (x, &val) in src_row.iter().take(width / 2).enumerate() {
-                            let c = plane_idx + 1; // 通道索引：U=1, V=2
-                            let y2 = y * 2;
-                            let x2 = x * 2;
-                            array[[y2, x2, c]] = val;
-                            array[[y2, x2 + 1, c]] = val;
-                            array[[y2 + 1, x2, c]] = val;
-                            array[[y2 + 1, x2 + 1, c]] = val;
-                        }
-                    }
-                }
-            }
-
-            Ok(array)
-        }
-        _ => Err(format_err!(
-            "Unsupported pixel format to ndarray: {}",
-            frame.format
-        )),
+/// 用「黑」填充整幅图像，适合清屏/占位。YUV 系会按 `color_range` 选取正确的黑值，
+/// 带 alpha 的格式会将 alpha 置为不透明。
+///
+/// # Arguments
+/// * `frame` - 目标 AVFrame（需已 alloc_buffer）
+pub fn fill_black(frame: &mut AVFrame) -> Result<()> {
+    if frame.data[0].is_null() {
+        return Err(format_err!(
+            "Frame buffer is not allocated (frame.data is null)"
+        ));
     }
+    let mut dst_linesizes = [0isize; 8];
+    for i in 0..8 {
+        dst_linesizes[i] = frame.linesize[i] as isize;
+    }
+    let ret = unsafe {
+        ffi::av_image_fill_black(
+            frame.data.as_ptr(),
+            dst_linesizes.as_ptr(),
+            frame.format,
+            frame.color_range,
+            frame.width,
+            frame.height,
+        )
+    };
+    if ret < 0 {
+        return Err(format_err!("Failed to fill black, ret: {ret}"));
+    }
+    Ok(())
+}
+
+/// 用指定 RGBA 颜色填充整幅图像（子矩形内的 padding 不会被触碰）。
+/// 颜色分量按 0..255 的整数值解释（见 `av_image_fill_color`）。
+///
+/// 注意：底层 `av_image_fill_color` 自 FFmpeg 7.0 起才提供，故该函数仅在
+/// `ffmpeg7`/`ffmpeg8`/`ffmpeg9` feature 下可用。
+///
+/// # Arguments
+/// * `frame` - 目标 AVFrame（需已 alloc_buffer）
+/// * `r`/`g`/`b`/`a` - RGBA 分量（0..=255），`a` 为可选的 alpha
+#[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+pub fn fill_color(frame: &mut AVFrame, r: u8, g: u8, b: u8, a: u8) -> Result<()> {
+    if frame.data[0].is_null() {
+        return Err(format_err!(
+            "Frame buffer is not allocated (frame.data is null)"
+        ));
+    }
+    let mut dst_lines = [0isize; 8];
+    for i in 0..8 {
+        dst_lines[i] = frame.linesize[i] as isize;
+    }
+    let color = [r as u32, g as u32, b as u32, a as u32];
+    let ret = unsafe {
+        ffi::av_image_fill_color(
+            frame.data.as_ptr(),
+            dst_lines.as_ptr(),
+            frame.format,
+            color.as_ptr(),
+            frame.width,
+            frame.height,
+            0,
+        )
+    };
+    if ret < 0 {
+        return Err(format_err!("Failed to fill color, ret: {ret}"));
+    }
+    Ok(())
+}
+
+/// 校验图像尺寸是否合法：所有平面的字节数都能被有符号 int 寻址，且
+/// 不超过 `max_pixels`（`max_pixels <= 0` 表示不限制）。
+///
+/// # Arguments
+/// * `width`/`height` - 像素尺寸（须为非零）
+/// * `pix_fmt` - 像素格式（可传 `PixelFormat::NONE`）
+/// * `max_pixels` - 允许的最大像素数；<= 0 表示不限制
+pub fn check_image_size(
+    width: u32,
+    height: u32,
+    pix_fmt: PixelFormat,
+    max_pixels: i64,
+) -> Result<()> {
+    // `av_image_check_size2` 会把 `max_pixels` 当作硬上限，0 表示“0 个像素”。
+    // 这里把 <=0 归一化为“不限制”，避免误伤。
+    let max_pixels = if max_pixels > 0 { max_pixels } else { i64::MAX };
+    let ret = unsafe {
+        ffi::av_image_check_size2(
+            width,
+            height,
+            max_pixels,
+            pix_fmt.into(),
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    // >= 0 表示合法
+    if ret < 0 {
+        return Err(format_err!(
+            "Invalid image size {width}x{height} for {:?}: {ret}",
+            pix_fmt
+        ));
+    }
+    Ok(())
+}
+
+/// 根据 `frame.crop_*` 字段对帧应用裁剪，裁剪后的 `width/height` 会相应变小。
+///
+/// # Arguments
+/// * `frame` - 需裁剪的 AVFrame
+/// * `flags` - 传入 `ffi::AV_FRAME_CROP_UNALIGNED` 表示允许未对齐裁剪，否则按对齐约束
+pub fn apply_cropping(frame: &mut AVFrame, flags: i32) -> Result<()> {
+    if frame.data[0].is_null() {
+        return Err(format_err!(
+            "Frame buffer is not allocated (frame.data is null)"
+        ));
+    }
+    let ret = unsafe { ffi::av_frame_apply_cropping(frame.as_mut_ptr(), flags) };
+    if ret < 0 {
+        return Err(format_err!("Failed to apply cropping, ret: {ret}"));
+    }
+    Ok(())
 }
 
 /// 将 `AVFrame` 转换为 `image::DynamicImage`。
@@ -1029,89 +1089,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_to_ndarray() {
-        let width = 320_usize;
-        let height = 240_usize;
-
-        // 测试 RGB24 格式
-        let mut frame =
-            create_test_frame(width as i32, height as i32, ffi::AV_PIX_FMT_RGB24).unwrap();
-
-        // 填充测试数据
-        let rgb_data = vec![128u8; width * height * 3];
-        fill_frame_from_buffer(&mut frame, rgb_data).unwrap();
-
-        let array = to_ndarray(&frame).unwrap();
-        assert_eq!(array.shape(), &[height, width, 3]);
-        assert_eq!(array[[0, 0, 0]], 128);
-
-        // 测试 YUV420P 格式
-        let mut frame =
-            create_test_frame(width as i32, height as i32, ffi::AV_PIX_FMT_YUV420P).unwrap();
-
-        // 填充测试数据
-        let y_data = vec![128u8; width * height];
-        let u_data = vec![64u8; (width / 2) * (height / 2)];
-        let v_data = vec![32u8; (width / 2) * (height / 2)];
-        fill_plane_from_buffer(&mut frame, 0, y_data, width).unwrap();
-        fill_plane_from_buffer(&mut frame, 1, u_data, width / 2).unwrap();
-        fill_plane_from_buffer(&mut frame, 2, v_data, width / 2).unwrap();
-
-        // 转换为 ndarray
-        let array = to_ndarray(&frame).unwrap();
-
-        // 验证 Y 平面
-        for y in 0..height {
-            for x in 0..width {
-                assert_eq!(array[[y, x, 0]], 128);
-            }
-        }
-
-        // 验证 U 平面
-        for y in (0..height).step_by(2) {
-            for x in (0..width).step_by(2) {
-                assert_eq!(array[[y, x, 1]], 64);
-                assert_eq!(array[[y + 1, x, 1]], 64);
-                assert_eq!(array[[y, x + 1, 1]], 64);
-                assert_eq!(array[[y + 1, x + 1, 1]], 64);
-            }
-        }
-
-        // 验证 V 平面
-        for y in (0..height).step_by(2) {
-            for x in (0..width).step_by(2) {
-                assert_eq!(array[[y, x, 2]], 32);
-                assert_eq!(array[[y + 1, x, 2]], 32);
-                assert_eq!(array[[y, x + 1, 2]], 32);
-                assert_eq!(array[[y + 1, x + 1, 2]], 32);
-            }
-        }
-    }
-
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_frame_integration() {
-        // 测试完整的操作流程
-        let mut src_frame = create_test_frame(320, 240, ffi::AV_PIX_FMT_RGB24).unwrap();
-
-        // 1. 填充原始数据
-        let test_data = vec![128u8; 320 * 240 * 3];
-        fill_frame_from_buffer(&mut src_frame, test_data).unwrap();
-
-        // 2. 复制到buffer
-        let buffer = copy_frame_to_buffer(&src_frame).unwrap();
-
-        // 3. 从buffer创建新frame
-        let mut dst_frame = create_test_frame(320, 240, ffi::AV_PIX_FMT_RGB24).unwrap();
-        assert!(fill_frame_from_buffer(&mut dst_frame, buffer).is_ok());
-
-        // 4. 转换为ndarray
-        let array = to_ndarray(&dst_frame).unwrap();
-        assert_eq!(array.shape(), &[240, 320, 3]);
-    }
-
     #[test]
     fn test_fill_plane_with() {
         // YUV420P：Y 平面全分辨率，UV 平面各 1/4
@@ -1354,6 +1331,77 @@ mod tests {
             "Should fail for empty data"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_image_size() {
+        // 合法尺寸
+        assert!(check_image_size(320, 240, PixelFormat::YUV420P, 0).is_ok());
+        // max_pixels 超限
+        assert!(
+            check_image_size(10000, 10000, PixelFormat::RGB24, 1000).is_err(),
+            "Should reject size exceeding max_pixels"
+        );
+        // 0 宽或 0 高非法
+        assert!(check_image_size(0, 240, PixelFormat::RGB24, 0).is_err());
+        assert!(check_image_size(320, 0, PixelFormat::RGB24, 0).is_err());
+    }
+
+    #[test]
+    fn test_fill_black_gray() -> Result<()> {
+        // GRAY8 为有限范围（limited range）亮度，黑帧 Y = 16，非 0
+        let width = 64;
+        let height = 48;
+        let mut frame = create_test_frame(width, height, ffi::AV_PIX_FMT_GRAY8)?;
+        // 先写入非零值
+        fill_plane_from_buffer(
+            &mut frame,
+            0,
+            vec![255u8; (width * height) as usize],
+            width as usize,
+        )?;
+        fill_black(&mut frame)?;
+        let buf = get_plane_buffer(&frame, 0)?;
+        assert_eq!(
+            buf,
+            vec![16u8; (width * height) as usize],
+            "GRAY8 limited-range black frame should be all 16"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+    #[test]
+    fn test_fill_color_gray() -> Result<()> {
+        // GRAY8 用 fill_color 填灰 = 分量 r
+        let width = 64;
+        let height = 48;
+        let mut frame = create_test_frame(width, height, ffi::AV_PIX_FMT_GRAY8)?;
+        fill_color(&mut frame, 128, 0, 0, 255)?;
+        let buf = get_plane_buffer(&frame, 0)?;
+        assert!(buf.iter().all(|&v| v == 128), "GRAY8 fill should set luma");
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_cropping() -> Result<()> {
+        let mut frame = create_test_frame(64, 48, ffi::AV_PIX_FMT_YUV420P)?;
+        // 设置裁剪量（wrap 未提供字段 setter，直接经底层指针写入）
+        unsafe {
+            let raw = frame.as_mut_ptr();
+            (*raw).crop_top = 4;
+            (*raw).crop_bottom = 4;
+            (*raw).crop_left = 4;
+            (*raw).crop_right = 4;
+        }
+        // AV_FRAME_CROP_UNALIGNED 在 Windows/vcpkg 绑定中已是 i32，而在
+        // Linux 上是 u32；`as i32` 在 Windows 会触发多余的 cast 警告 unnecessary (`i32` -> `i32`)
+        #[allow(clippy::unnecessary_cast)]
+        apply_cropping(&mut frame, ffi::AV_FRAME_CROP_UNALIGNED as i32)?;
+        // 裁剪后尺寸变小
+        assert_eq!(frame.width, 56, "width after cropping wrong");
+        assert_eq!(frame.height, 40, "height after cropping wrong");
         Ok(())
     }
 }
