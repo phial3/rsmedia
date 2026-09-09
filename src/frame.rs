@@ -371,33 +371,12 @@ where
         self.best_effort_timestamp = frame.best_effort_timestamp;
     }
 
-    /// 转换为新AVFrame
-    pub fn to_avframe(&self) -> Result<AVFrame> {
-        let mut frame = AVFrame::new();
-        let mut time_base = self.time_base;
-        if self.media_type == MediaType::VIDEO {
-            // video frame
-            frame.set_width(self.width as i32);
-            frame.set_height(self.height as i32);
-            frame.set_format(self.format.as_raw());
-            frame.set_pict_type(self.pict_type);
-            fill_video_data(&mut frame, &self.data)?;
-        } else {
-            // audio frame
-            frame.set_format(self.format.as_raw());
-            frame.set_nb_samples(self.nb_samples as i32);
-            frame.set_sample_rate(self.sample_rate as i32);
-            time_base = time::new_rational(1, self.sample_rate as i32);
-            frame.set_ch_layout(
-                AVChannelLayout::from_nb_channels(self.nb_channels as i32).into_inner(),
-            );
-            fill_audio_data(&mut frame, &self.data)?;
-        };
-
-        frame.set_pts(self.pts);
-        // Keep `pkt_dts`/`duration` no write-back (rsmpeg provides no setters).
-
-        // 写回 rsmpeg setter 无法覆盖的元数据（通过 owned 句柄的裸指针写入，生命周期安全）。
+    /// 将 `MediaFrame` 的元数据字段写回 `AVFrame`，与 [`copy_avframe_meta`](Self::copy_avframe_meta)
+    /// 构成对称的读写对——新增字段时两处需同步维护。
+    ///
+    /// 相比 rsmpeg 的 setter，这里通过 owned 句柄的裸指针写入 setter 无法覆盖的字段
+    /// （`flags`/`quality`/`repeat_pict`/色彩元数据等），生命周期安全。
+    fn write_metadata(&self, frame: &mut AVFrame) {
         unsafe {
             let raw = frame.as_mut_ptr();
             (*raw).flags = self.flags;
@@ -411,7 +390,74 @@ where
             (*raw).duration = self.pkt_duration;
             (*raw).best_effort_timestamp = self.best_effort_timestamp;
         }
+    }
 
+    /// 仅拷贝标量元数据（不含大块 `data`），用于产出基于当前帧元数据的转换结果。
+    /// 避免 `self.clone()` 连同一整块图像/音频缓冲一起复制，减少转换的中间分配。
+    fn meta_only(&self) -> Self {
+        Self {
+            pts: self.pts,
+            dts: self.dts,
+            duration: self.duration,
+            format: self.format, // 调用方随后按需覆盖
+            data: Default::default(),
+            time_base: self.time_base,
+            media_type: self.media_type,
+            width: self.width,
+            height: self.height,
+            pict_type: self.pict_type,
+            sample_rate: self.sample_rate,
+            nb_samples: self.nb_samples,
+            nb_channels: self.nb_channels,
+            key_frame: self.key_frame,
+            flags: self.flags,
+            quality: self.quality,
+            repeat_pict: self.repeat_pict,
+            color_space: self.color_space,
+            color_primaries: self.color_primaries,
+            color_trc: self.color_trc,
+            color_range: self.color_range,
+            sample_aspect_ratio: self.sample_aspect_ratio,
+            pkt_duration: self.pkt_duration,
+            best_effort_timestamp: self.best_effort_timestamp,
+        }
+    }
+
+    /// 转换为新AVFrame
+    pub fn to_avframe(&self) -> Result<AVFrame> {
+        let mut frame = AVFrame::new();
+        if self.media_type == MediaType::VIDEO {
+            // video frame
+            frame.set_width(self.width as i32);
+            frame.set_height(self.height as i32);
+            frame.set_format(self.format.as_raw());
+            frame.set_pict_type(self.pict_type);
+            fill_video_data(&mut frame, &self.data)?;
+        } else {
+            // audio frame
+            frame.set_format(self.format.as_raw());
+            frame.set_nb_samples(self.nb_samples as i32);
+            frame.set_sample_rate(self.sample_rate as i32);
+            frame.set_ch_layout(
+                AVChannelLayout::from_nb_channels(self.nb_channels as i32).into_inner(),
+            );
+            fill_audio_data(&mut frame, &self.data)?;
+        };
+
+        // 写回 setter 无法覆盖的元数据（与 copy_avframe_meta 对称）。
+        self.write_metadata(&mut frame);
+        frame.set_pts(self.pts);
+        // Keep `pkt_dts`/`duration`
+
+        // 统一口径：无论视频/音频都优先使用 `time_base`；仅在未设置时才按
+        // 音频采样率推导 `1/sample_rate`，与 `from_avframe` 的推断规则一致。
+        let time_base = if self.time_base.num > 0 && self.time_base.den > 0 {
+            self.time_base
+        } else if self.media_type == MediaType::AUDIO && self.sample_rate > 0 {
+            time::new_rational(1, self.sample_rate as i32)
+        } else {
+            self.time_base
+        };
         frame.set_time_base(time_base);
         Ok(frame)
     }
@@ -520,6 +566,15 @@ where
     pub fn convert_rgb_to_yuv_with_matrix(&self, colorspace: YuvStandardMatrix) -> Result<Self> {
         self.check_rgb24_supported()?;
 
+        // YUV420P 是 2x2 色度下采样，宽高必须为偶数。
+        // 8bit / 16bit 两条路径在此处统一校验，避免各自分支产生不一致的奇尺寸语义。
+        if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
+            return Err(RsmediaError::custom(format!(
+                "RGB24 -> YUV420P requires even dimensions, got {}x{}",
+                self.width, self.height
+            )));
+        }
+
         // 大精度（16bit+）路径：u8 的 `to_rgb_bytes` 会截断低位，改用 u16 满幅计算。
         if std::mem::size_of::<T>() > 1 {
             let (height, width, _) = self.data.dim();
@@ -528,7 +583,7 @@ where
                 rgb16.push(num_traits::cast::<T, u16>(*v).unwrap_or(0));
             }
             let yuv16 = rgb_to_yuv420_16bit(&rgb16, width, height, colorspace)?;
-            let mut res = self.clone();
+            let mut res = self.meta_only();
             res.format = FrameFormat::Pixel(PixelFormat::YUV420P);
             // u16 平面转回 T（u16/u32/f32 等），保持与调用方类型一致
             res.data = ndarray::Array3::from_shape_fn((height, width, 3), |idx| {
@@ -585,33 +640,28 @@ where
             }
         }
 
-        // 复制UV平面
+        // 复制UV平面（2x2 块内 4 个 Y 像素共享同一 UV 值；宽高已保证为偶数）
         for h_uv in 0..height / 2 {
             let u_offset = h_uv * uv_stride;
-            // 对应的Y平面高度起始位置
             let h_y = h_uv * 2;
 
             for w_uv in 0..width / 2 {
-                let u_val = u_plane[u_offset + w_uv];
-                let v_val = v_plane[u_offset + w_uv];
-                // 对应的Y平面宽度起始位置
+                let u_val = num_traits::cast(u_plane[u_offset + w_uv]).unwrap_or(T::zero());
+                let v_val = num_traits::cast(v_plane[u_offset + w_uv]).unwrap_or(T::zero());
                 let w_y = w_uv * 2;
 
-                // 为2x2块中的每个像素设置相同的UV值
-                // 优化: 先计算边界条件，避免内层循环中的重复检查
-                let max_h = (h_y + 2).min(height);
-                let max_w = (w_y + 2).min(width);
-
-                for h_pos in h_y..max_h {
-                    for w_pos in w_y..max_w {
-                        yuv_data[[h_pos, w_pos, 1]] = num_traits::cast(u_val).unwrap_or(T::zero());
-                        yuv_data[[h_pos, w_pos, 2]] = num_traits::cast(v_val).unwrap_or(T::zero());
-                    }
-                }
+                yuv_data[[h_y, w_y, 1]] = u_val;
+                yuv_data[[h_y, w_y, 2]] = v_val;
+                yuv_data[[h_y, w_y + 1, 1]] = u_val;
+                yuv_data[[h_y, w_y + 1, 2]] = v_val;
+                yuv_data[[h_y + 1, w_y, 1]] = u_val;
+                yuv_data[[h_y + 1, w_y, 2]] = v_val;
+                yuv_data[[h_y + 1, w_y + 1, 1]] = u_val;
+                yuv_data[[h_y + 1, w_y + 1, 2]] = v_val;
             }
         }
 
-        let mut res = self.clone();
+        let mut res = self.meta_only();
         res.format = FrameFormat::Pixel(PixelFormat::YUV420P);
         res.data = yuv_data;
         Ok(res)
@@ -631,7 +681,7 @@ where
             let data = ndarray::Array3::from_shape_fn(self.data.dim(), |(h, w, c)| {
                 num_traits::cast::<u16, T>(rgb16[(h * width + w) * 3 + c]).unwrap_or(T::zero())
             });
-            let mut res = self.clone();
+            let mut res = self.meta_only();
             res.format = FrameFormat::Pixel(PixelFormat::RGB24);
             res.data = data;
             return Ok(res);
@@ -919,30 +969,39 @@ where
         .context("Failed to allocate video buffer")?;
 
     if let Some(ch) = expected_channels {
-        // packed 单平面通用填充：逐行拷贝 width*ch 字节（linesize 可能有对齐 padding）
-        let line_size = frame.linesize[0] as usize;
-        let width_bytes = width * ch;
-        if line_size < width_bytes {
-            return Err(RsmediaError::custom(format!(
-                "Insufficient linesize for packed format: {line_size} < {width_bytes}"
-            )));
-        }
-        unsafe {
-            let dst_ptr = frame.data[0];
-            if let Some(buffer) = data.as_standard_layout().as_slice() {
-                // 按行拷贝，ceil 到 linesize（可能有对齐 padding）
+        // packed 单平面通用填充：按行写入，正确处理 linesize 对齐 padding。
+        // 说明：`fill_frame_from_buffer` 期望的源布局来自 `av_image_fill_arrays(align=1)`，
+        // 对偶数/奇偶数宽度 + YUV422 类的 packed 格式，其递推行宽可能与我们压出的紧凑字节
+        // 不一致，故这里退化为按目标 `frame.linesize[0]` 逐行拷贝，语义最直接、可预测。
+        let dst = frame.data[0];
+        let dst_linesize = frame.linesize[0] as usize;
+        let row_bytes = width * ch;
+        let expected = width * height * ch;
+        if data.is_standard_layout()
+            && let Some(slice) = data.as_slice()
+        {
+            if slice.len() < expected {
+                return Err(RsmediaError::custom(format!(
+                    "Insufficient packed data: {} < {expected}",
+                    slice.len()
+                )));
+            }
+            unsafe {
                 for y in 0..height {
-                    let src = buffer.as_ptr().cast::<u8>().add(y * width_bytes);
-                    std::ptr::copy_nonoverlapping(src, dst_ptr.add(y * line_size), width_bytes);
+                    let src_row = (slice.as_ptr() as *const u8).add(y * row_bytes);
+                    let dst_row = dst.add(y * dst_linesize);
+                    std::ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);
                 }
-            } else {
-                // 非连续数据：逐元素放置到每行 linesize 布局
-                for y in 0..height {
-                    let row = dst_ptr.add(y * line_size);
-                    for x in 0..width {
-                        for c in 0..ch {
-                            *row.add(x * ch + c) = data[[y, x, c]].to_u8().unwrap();
-                        }
+            }
+            return Ok(());
+        }
+        // 非连续布局：逐元素按行写入目标带 padding 的行
+        for y in 0..height {
+            let dst_row = unsafe { dst.add(y * dst_linesize) };
+            for x in 0..width {
+                for c in 0..ch {
+                    unsafe {
+                        *dst_row.add(x * ch + c) = data[[y, x, c]].to_u8().unwrap();
                     }
                 }
             }
@@ -1053,38 +1112,25 @@ where
 {
     let (height, width) = (frame.height as usize, frame.width as usize);
 
-    // packed 单平面通用读取：[H, W, C]，逐行按 linesize 布局拷贝
-    //（validate 已确保 T 为 8bit，linesize 单位与字节一致）
+    // packed 单平面通用读取：[H, W, C]，复用 imgutils 平面读取（去行 padding）
+    //（validate 已确保 T 为 8bit，packed 单平面字节数恰为 width*height*channels）
     if let Some(ch) = packed_channels(frame.format) {
         validate_format_type_size::<T>(frame.format, 1)?;
 
-        let line_size = frame.linesize[0] as usize;
-        let width_bytes = width * ch;
-        if line_size < width_bytes {
+        let buffer = imgutils::get_plane_buffer(frame, 0)?;
+        let expected = width * height * ch;
+        if buffer.len() < expected {
             return Err(RsmediaError::custom(format!(
-                "Insufficient linesize for packed format: {line_size} < {width_bytes}"
+                "Insufficient packed buffer: {} < {expected}",
+                buffer.len()
             )));
         }
-        let mut array = ndarray::Array3::<T>::default((height, width, ch));
-
-        unsafe {
-            let data_ptr = frame.data[0] as *const T;
-            if data_ptr.is_null() {
-                return Err(RsmediaError::custom("Frame data is null"));
-            }
-
-            for y in 0..height {
-                let src_row = std::slice::from_raw_parts(data_ptr.add(y * line_size), width * ch);
-                let mut offset = 0;
-                for x in 0..width {
-                    for c in 0..ch {
-                        array[[y, x, c]] = src_row[offset + c];
-                    }
-                    offset += ch;
-                }
-            }
+        let mut data_t = Vec::with_capacity(expected);
+        for &b in buffer.iter().take(expected) {
+            data_t.push(num_traits::cast::<u8, T>(b).unwrap_or(T::zero()));
         }
-        return Ok(array);
+        return ndarray::Array3::from_shape_vec((height, width, ch), data_t)
+            .map_err(|_| RsmediaError::custom("Packed data shape mismatch"));
     }
 
     match frame.format {
@@ -1097,42 +1143,38 @@ where
                 )));
             }
 
-            let y_line_size = frame.linesize[0] as usize;
-            let uv_line_size = frame.linesize[1] as usize;
             let mut array = ndarray::Array3::<T>::default((height, width, 3));
 
-            unsafe {
-                // 复制 Y 平面
-                let y_src = frame.data[0] as *const T;
-                if y_src.is_null() {
-                    return Err(RsmediaError::custom("YUV Y plane data is null"));
+            // 逐平面取出去 padding 的紧凑数据，再组织为 [H, W, 3]
+            let y_plane = imgutils::get_plane_buffer(frame, 0)?;
+            let u_plane = imgutils::get_plane_buffer(frame, 1)?;
+            let v_plane = imgutils::get_plane_buffer(frame, 2)?;
+
+            let uv_h = height / 2;
+            let uv_w = width / 2;
+            if y_plane.len() < height * width
+                || u_plane.len() < uv_h * uv_w
+                || v_plane.len() < uv_h * uv_w
+            {
+                return Err(RsmediaError::custom("YUV420P plane buffer too small"));
+            }
+
+            // 复制 Y 平面（满分辨率）
+            for y in 0..height {
+                for x in 0..width {
+                    array[[y, x, 0]] =
+                        num_traits::cast::<u8, T>(y_plane[y * width + x]).unwrap_or(T::zero());
                 }
+            }
 
-                for y in 0..height {
-                    let src_row = std::slice::from_raw_parts(y_src.add(y * y_line_size), width);
-                    for (x, &val) in src_row.iter().enumerate() {
-                        array[[y, x, 0]] = val;
-                    }
-                }
-
-                // 复制 UV 平面
-                for (plane_idx, &plane_src) in [frame.data[1], frame.data[2]].iter().enumerate() {
-                    let uv_src = plane_src as *const T;
-                    if uv_src.is_null() {
-                        return Err(RsmediaError::custom("YUV UV plane data is null"));
-                    }
-
-                    let ch = plane_idx + 1; // U 平面为 1，V 平面为 2
-                    for y in 0..height / 2 {
-                        let src_row =
-                            std::slice::from_raw_parts(uv_src.add(y * uv_line_size), width / 2);
-                        for x in 0..width / 2 {
-                            let val = src_row[x];
-                            array[[y * 2, x * 2, ch]] = val;
-                            array[[y * 2 + 1, x * 2, ch]] = val;
-                            array[[y * 2, x * 2 + 1, ch]] = val;
-                            array[[y * 2 + 1, x * 2 + 1, ch]] = val;
-                        }
+            // 复制 UV 平面并 2x2 上采样（每点复制到 4 个像素）
+            for y in 0..uv_h {
+                for x in 0..uv_w {
+                    let u = num_traits::cast::<u8, T>(u_plane[y * uv_w + x]).unwrap_or(T::zero());
+                    let v = num_traits::cast::<u8, T>(v_plane[y * uv_w + x]).unwrap_or(T::zero());
+                    for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                        array[[y * 2 + dy, x * 2 + dx, 1]] = u;
+                        array[[y * 2 + dy, x * 2 + dx, 2]] = v;
                     }
                 }
             }
@@ -1162,40 +1204,30 @@ where
 
     let channels = frame.ch_layout.nb_channels as usize;
     let samples = frame.nb_samples as usize;
-    let mut buffer = Vec::with_capacity(samples * channels);
+    // 按 [1, samples, channels]（samples 外层、channels 内层）组织交错顺序
+    let mut buffer = vec![T::zero(); samples * channels];
 
     if SampleFormat::from(frame.format).is_planar() {
-        // 平面格式 (FLTP)：
-        // frame.data[0] -> [L0][L1][L2]...  // 左声道所有样本
-        // frame.data[1] -> [R0][R1][R2]...  // 右声道所有样本
-        // 检查所有通道
+        // 平面格式 (FLTP)：每通道一个连续平面。
+        // frame.data[0]=>[L0][L1]..., frame.data[1]=>[R0][R1]...
         for (ch, plane) in frame.data.iter().enumerate().take(channels) {
             if plane.is_null() {
                 return Err(RsmediaError::custom(format!(
                     "Channel {ch} data pointer is null"
                 )));
             }
-        }
-
-        // linesize 在音频中的含义：
-        // - 平面格式：每个通道的字节数（samples * sizeof(format)）
-        // - 交错格式：所有通道的字节数（samples * channels * sizeof(format)）
-        // 但在访问单个样本时，我们不需要使用 linesize，因为音频数据是连续存储的
-        for s in 0..samples {
-            for plane in frame.data.iter().take(channels) {
-                unsafe {
-                    // 获取当前通道的数据指针
-                    let plane_ptr = *plane as *const T;
-                    buffer.push(*plane_ptr.add(s));
-                }
+            // 每通道 samples 个连续样本，直接以其交织写入交错 buffer，避免逐样本下标 `push`。
+            let plane_data = unsafe { std::slice::from_raw_parts(*plane as *const T, samples) };
+            for (s, &v) in plane_data.iter().enumerate() {
+                buffer[s * channels + ch] = v;
             }
         }
     } else {
-        // 交错格式布局 (FLT)：所有声道交错,直接复制
+        // 交错格式布局 (FLT)：所有声道交错，直接整体复制
         // frame.data[0] -> [L0][R0][L1][R1]...
         unsafe {
             let data = std::slice::from_raw_parts(frame.data[0] as *const T, samples * channels);
-            buffer.extend_from_slice(data);
+            buffer.copy_from_slice(data);
         }
     }
 

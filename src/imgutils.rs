@@ -461,6 +461,125 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
     }
 }
 
+/// 用「黑」填充整幅图像，适合清屏/占位。YUV 系会按 `color_range` 选取正确的黑值，
+/// 带 alpha 的格式会将 alpha 置为不透明。
+///
+/// # Arguments
+/// * `frame` - 目标 AVFrame（需已 alloc_buffer）
+pub fn fill_black(frame: &mut AVFrame) -> Result<()> {
+    if frame.data[0].is_null() {
+        return Err(format_err!(
+            "Frame buffer is not allocated (frame.data is null)"
+        ));
+    }
+    let mut dst_linesizes = [0isize; 8];
+    for i in 0..8 {
+        dst_linesizes[i] = frame.linesize[i] as isize;
+    }
+    let ret = unsafe {
+        ffi::av_image_fill_black(
+            frame.data.as_ptr(),
+            dst_linesizes.as_ptr(),
+            frame.format,
+            frame.color_range,
+            frame.width,
+            frame.height,
+        )
+    };
+    if ret < 0 {
+        return Err(format_err!("Failed to fill black, ret: {ret}"));
+    }
+    Ok(())
+}
+
+/// 用指定 RGBA 颜色填充整幅图像（子矩形内的 padding 不会被触碰）。
+/// 颜色分量按 0..255 的整数值解释（见 `av_image_fill_color`）。
+///
+/// # Arguments
+/// * `frame` - 目标 AVFrame（需已 alloc_buffer）
+/// * `r`/`g`/`b`/`a` - RGBA 分量（0..=255），`a` 为可选的 alpha
+pub fn fill_color(frame: &mut AVFrame, r: u8, g: u8, b: u8, a: u8) -> Result<()> {
+    if frame.data[0].is_null() {
+        return Err(format_err!(
+            "Frame buffer is not allocated (frame.data is null)"
+        ));
+    }
+    let mut dst_lines = [0isize; 8];
+    for i in 0..8 {
+        dst_lines[i] = frame.linesize[i] as isize;
+    }
+    let color = [r as u32, g as u32, b as u32, a as u32];
+    let ret = unsafe {
+        ffi::av_image_fill_color(
+            frame.data.as_ptr(),
+            dst_lines.as_ptr(),
+            frame.format,
+            color.as_ptr(),
+            frame.width,
+            frame.height,
+            0,
+        )
+    };
+    if ret < 0 {
+        return Err(format_err!("Failed to fill color, ret: {ret}"));
+    }
+    Ok(())
+}
+
+/// 校验图像尺寸是否合法：所有平面的字节数都能被有符号 int 寻址，且
+/// 不超过 `max_pixels`（`max_pixels <= 0` 表示不限制）。
+///
+/// # Arguments
+/// * `width`/`height` - 像素尺寸（须为非零）
+/// * `pix_fmt` - 像素格式（可传 `PixelFormat::NONE`）
+/// * `max_pixels` - 允许的最大像素数；<= 0 表示不限制
+pub fn check_image_size(
+    width: u32,
+    height: u32,
+    pix_fmt: PixelFormat,
+    max_pixels: i64,
+) -> Result<()> {
+    // `av_image_check_size2` 会把 `max_pixels` 当作硬上限，0 表示“0 个像素”。
+    // 这里把 <=0 归一化为“不限制”，避免误伤。
+    let max_pixels = if max_pixels > 0 { max_pixels } else { i64::MAX };
+    let ret = unsafe {
+        ffi::av_image_check_size2(
+            width,
+            height,
+            max_pixels,
+            pix_fmt.into(),
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    // >= 0 表示合法
+    if ret < 0 {
+        return Err(format_err!(
+            "Invalid image size {width}x{height} for {:?}: {ret}",
+            pix_fmt
+        ));
+    }
+    Ok(())
+}
+
+/// 根据 `frame.crop_*` 字段对帧应用裁剪，裁剪后的 `width/height` 会相应变小。
+///
+/// # Arguments
+/// * `frame` - 需裁剪的 AVFrame
+/// * `flags` - 传入 `ffi::AV_FRAME_CROP_UNALIGNED` 表示允许未对齐裁剪，否则按对齐约束
+pub fn apply_cropping(frame: &mut AVFrame, flags: i32) -> Result<()> {
+    if frame.data[0].is_null() {
+        return Err(format_err!(
+            "Frame buffer is not allocated (frame.data is null)"
+        ));
+    }
+    let ret = unsafe { ffi::av_frame_apply_cropping(frame.as_mut_ptr(), flags) };
+    if ret < 0 {
+        return Err(format_err!("Failed to apply cropping, ret: {ret}"));
+    }
+    Ok(())
+}
+
 /// 将 `AVFrame` 转换为 `image::DynamicImage`。
 ///
 /// packed 8bit 格式（RGB24/RGBA/GRAY8）直接从帧数据构建，其他格式
@@ -1208,6 +1327,73 @@ mod tests {
             "Should fail for empty data"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_image_size() {
+        // 合法尺寸
+        assert!(check_image_size(320, 240, PixelFormat::YUV420P, 0).is_ok());
+        // max_pixels 超限
+        assert!(
+            check_image_size(10000, 10000, PixelFormat::RGB24, 1000).is_err(),
+            "Should reject size exceeding max_pixels"
+        );
+        // 0 宽或 0 高非法
+        assert!(check_image_size(0, 240, PixelFormat::RGB24, 0).is_err());
+        assert!(check_image_size(320, 0, PixelFormat::RGB24, 0).is_err());
+    }
+
+    #[test]
+    fn test_fill_black_gray() -> Result<()> {
+        // GRAY8 为有限范围（limited range）亮度，黑帧 Y = 16，非 0
+        let width = 64;
+        let height = 48;
+        let mut frame = create_test_frame(width, height, ffi::AV_PIX_FMT_GRAY8)?;
+        // 先写入非零值
+        fill_plane_from_buffer(
+            &mut frame,
+            0,
+            vec![255u8; (width * height) as usize],
+            width as usize,
+        )?;
+        fill_black(&mut frame)?;
+        let buf = get_plane_buffer(&frame, 0)?;
+        assert_eq!(
+            buf,
+            vec![16u8; (width * height) as usize],
+            "GRAY8 limited-range black frame should be all 16"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fill_color_gray() -> Result<()> {
+        // GRAY8 用 fill_color 填灰 = 分量 r
+        let width = 64;
+        let height = 48;
+        let mut frame = create_test_frame(width, height, ffi::AV_PIX_FMT_GRAY8)?;
+        fill_color(&mut frame, 128, 0, 0, 255)?;
+        let buf = get_plane_buffer(&frame, 0)?;
+        assert!(buf.iter().all(|&v| v == 128), "GRAY8 fill should set luma");
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_cropping() -> Result<()> {
+        let mut frame = create_test_frame(64, 48, ffi::AV_PIX_FMT_YUV420P)?;
+        // 设置裁剪量（wrap 未提供字段 setter，直接经底层指针写入）
+        unsafe {
+            let raw = frame.as_mut_ptr();
+            (*raw).crop_top = 4;
+            (*raw).crop_bottom = 4;
+            (*raw).crop_left = 4;
+            (*raw).crop_right = 4;
+        }
+        apply_cropping(&mut frame, ffi::AV_FRAME_CROP_UNALIGNED as i32)?;
+        // 裁剪后尺寸变小
+        assert_eq!(frame.width, 56, "width after cropping wrong");
+        assert_eq!(frame.height, 40, "height after cropping wrong");
         Ok(())
     }
 }
