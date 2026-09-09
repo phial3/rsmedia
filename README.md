@@ -55,6 +55,7 @@ Currently supported:
 >
 > <https://github.com/larksuite/rsmpeg>
 
+> <https://github.com/itsakeyfut/avio>
 
 ##  📦 Advanced usage
 
