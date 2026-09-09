@@ -263,8 +263,8 @@ impl DecoderBuilder {
                 // create hardware context
                 HWContext::new(cfg)
                     .and_then(|ctx| {
-                        // 注意：setup_hw_frames 可能会改变 decode_ctx.pix_fmt
-                        ctx.setup_hw_frames(true, &mut decode_ctx, init_width, init_height)?;
+                        // 注意：setup_decoder_frames 可能会改变 decode_ctx.pix_fmt
+                        ctx.setup_decoder_frames(&mut decode_ctx, init_width, init_height)?;
                         Ok(ctx)
                     })
                     .context("Hardware acceleration context initialization failed")

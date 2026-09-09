@@ -467,7 +467,7 @@ impl EncoderBuilder {
     ///
     /// * 显式指定（[`Self::with_pixel_format`]]）：软件路径立即校验编码器
     ///   是否支持，不支持时 `build()` 报错（fail fast）；硬件路径跳过校验
-    ///   （`setup_hw_frames` 会按 HW 要求重设 pix_fmt，HW 私有格式不在
+    ///   （`setup_encoder_frames` 会按 HW 要求重设 pix_fmt，HW 私有格式不在
     ///   软件支持列表内）。
     /// * 未指定：优先 [`PixelFormat::YUV420P`]（兼容性最好）；编码器不支持
     ///   时（如 mjpeg 仅接受 YUVJ 系）取支持列表首个格式；列表为 `None`
@@ -732,10 +732,8 @@ impl EncoderBuilder {
                 let (width, height) = (encode_ctx.width, encode_ctx.height);
                 HWContext::new(cfg)
                     .and_then(|ctx| {
-                        // *注意*: setup_hw_frames 会根据 HW 能力修改 encode_ctx.pix_fmt
-                        ctx.setup_hw_frames(false, &mut encode_ctx, width, height)?;
-                        // 更新 Builder 中记录的目标格式，以反映 HW 的要求
-                        // self.pixel_format = PixelFormat::from(encode_ctx.pix_fmt);
+                        // *注意*: setup_encoder_frames 会根据 HW 能力修改 encode_ctx.pix_fmt
+                        ctx.setup_encoder_frames(&mut encode_ctx, width, height)?;
                         Ok(ctx)
                     })
                     .context("Hardware acceleration context initialization failed")
