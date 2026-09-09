@@ -238,7 +238,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install dependencies
-        run: brew install pkg-config ${{ matrix.brew_formula }}
+        run: brew update && brew install pkg-config ${{ matrix.brew_formula }}
 
       - name: Check
         run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
