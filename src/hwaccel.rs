@@ -769,38 +769,65 @@ unsafe extern "C" fn hwaccel_get_format(
 mod tests {
     use super::*;
 
+    /// 串行化所有触碰 `HW_CTX_CACHE` 的测试：缓存为进程级静态，lib 测试
+    /// 共享同一进程，并行运行会破坏彼此的计数断言。
+    static HW_CACHE_TEST_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
+
+    /// 自动探测并创建硬件上下文。设备探测（`av_hwdevice_iterate_types`）
+    /// 只覆盖 FFmpeg 的**编译期**支持，运行时可能仍打不开设备（如 CI 虚机
+    /// 无 `/dev/dri` 渲染节点或 D3D11 适配器），创建失败视为"本机无可用
+    /// GPU"，打印原因并返回 `None` 让调用方跳过而非 panic。
+    fn try_auto_hw_context() -> Option<Arc<HWContext>> {
+        let config = match HWDeviceConfig::auto_platform() {
+            Ok(config) => config,
+            Err(e) => {
+                println!("skip: no hardware acceleration device probed: {e}");
+                return None;
+            }
+        };
+        println!("config: {config}");
+        match HWContext::new(config) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                println!("skip: hardware device not usable on this machine: {e}");
+                None
+            }
+        }
+    }
+
     /// 空缓存清理应返回 0 且不 panic（CI / 无 GPU 环境）。
     /// 有 GPU 时：创建 context → 释放引用 → 清理应移除该条目。
     #[test]
     fn test_clear_hw_ctx_cache() {
-        // 基线：不依赖 GPU 的行为
+        let _guard = HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 基线：先清理其它测试可能遗留的条目，再验证空缓存清理返回 0
+        let _leftovers = clear_hw_ctx_cache();
         let removed = clear_hw_ctx_cache();
         assert_eq!(removed, 0, "empty cache should remove nothing");
 
         // 若本机有可用 GPU 设备：创建后释放，缓存条目应可被清理
-        if let Ok(config) = HWDeviceConfig::auto_platform() {
-            {
-                println!("config: {config}");
-                let ctx = HWContext::new(config.clone()).expect("create hw context");
-                // 持有期间清理不应移除
-                assert_eq!(clear_hw_ctx_cache(), 0);
-                drop(ctx);
-            }
-            // 引用释放后（仅缓存持有），清理应移除该条目
-            assert_eq!(clear_hw_ctx_cache(), 1);
-            // 再次清理：缓存已空
-            assert_eq!(clear_hw_ctx_cache(), 0);
-        }
+        let Some(ctx) = try_auto_hw_context() else {
+            return;
+        };
+        // 持有期间清理不应移除
+        assert_eq!(clear_hw_ctx_cache(), 0);
+        drop(ctx);
+        // 引用释放后（仅缓存持有），清理应移除该条目
+        assert_eq!(clear_hw_ctx_cache(), 1);
+        // 再次清理：缓存已空
+        assert_eq!(clear_hw_ctx_cache(), 0);
     }
 
     /// `HWContext` 跨线程共享同一 Arc 不应触发数据竞争（回归测试：
     /// setup_hw_frames 并发调用曾通过 UnsafeCell 做可变访问）。
     #[test]
     fn test_hw_context_shared_across_threads() {
-        let Ok(config) = HWDeviceConfig::auto_platform() else {
+        let _guard = HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(ctx) = try_auto_hw_context() else {
             return; // 无 GPU 环境跳过
         };
-        let ctx = HWContext::new(config).expect("create hw context");
         let ctx2 = Arc::clone(&ctx);
         let handle = std::thread::spawn(move || {
             // 共享引用上的只读方法跨线程调用
