@@ -373,6 +373,10 @@ impl<W: Writer> Muxer<W> {
     /// written. Chapters are allocated with `av_mallocz` and ownership is
     /// transferred to the format context, which frees them in
     /// `avformat_free_context`.
+    ///
+    /// Failure handling：任一 chapter 或指针数组分配失败时，释放所有已分配的
+    /// chapter 节点并保持 `ctx.chapters` 未被设置（FFmpeg 视为无章节），既避免
+    /// 内存泄漏，也避免 `nb_chapters > 0` 时数组中出现空指针导致 FFmpeg 解引用崩溃。
     fn apply_chapters(&mut self) {
         if self.chapters.is_empty() {
             return;
@@ -380,15 +384,9 @@ impl<W: Writer> Muxer<W> {
         let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
 
         let count = self.chapters.len();
-        let chapters_ptr = unsafe {
-            ffi::av_calloc(count, std::mem::size_of::<*mut ffi::AVChapter>())
-                as *mut *mut ffi::AVChapter
-        };
-        if chapters_ptr.is_null() {
-            log::error!("av_calloc for {count} chapters failed; chapters are dropped");
-            return;
-        }
 
+        // 1) 逐章分配节点。用 Rust Vec 暂存所有权，以便失败时统一释放。
+        let mut chapter_nodes: Vec<*mut ffi::AVChapter> = Vec::with_capacity(count);
         for (i, chapter) in self.chapters.iter().enumerate() {
             // Millisecond time base: times are stored as whole milliseconds.
             let start_ms = (chapter.start * 1000.0).round() as i64;
@@ -397,8 +395,9 @@ impl<W: Writer> Muxer<W> {
                 ffi::av_mallocz(std::mem::size_of::<ffi::AVChapter>()) as *mut ffi::AVChapter
             };
             if chapter_ptr.is_null() {
-                log::error!("av_mallocz for chapter {i} failed; chapter is dropped");
-                continue;
+                log::error!("av_mallocz for chapter {i} failed; chapters are dropped");
+                Self::free_chapter_nodes(&mut chapter_nodes);
+                return;
             }
             unsafe {
                 (*chapter_ptr).id = if chapter.id != 0 {
@@ -416,12 +415,39 @@ impl<W: Writer> Muxer<W> {
                     title.as_ptr(),
                     0,
                 );
-                *chapters_ptr.add(i) = chapter_ptr;
             }
+            chapter_nodes.push(chapter_ptr);
         }
 
+        // 2) 分配连续指针数组。
+        let chapters_ptr = unsafe {
+            ffi::av_calloc(count, std::mem::size_of::<*mut ffi::AVChapter>())
+                as *mut *mut ffi::AVChapter
+        };
+        if chapters_ptr.is_null() {
+            log::error!("av_calloc for {count} chapters failed; chapters are dropped");
+            Self::free_chapter_nodes(&mut chapter_nodes);
+            return;
+        }
+
+        // 3) 复制节点指针并转移所有权给 format context。
+        unsafe {
+            std::ptr::copy_nonoverlapping(chapter_nodes.as_ptr(), chapters_ptr, count);
+        }
+        // 节点指针是裸指针，Vec 直接 Drop 不会释放它们（无 Drop 实现）；
+        // 所有权已交由 `chapters_ptr` 数组，FFmpeg 在 `avformat_free_context`
+        // 时统一释放数组与其内节点。
         ctx.chapters = chapters_ptr;
         ctx.nb_chapters = count as u32;
+    }
+
+    /// 释放一组尚未转移所有权的 chapter 节点（`av_free` 对空指针安全）。
+    fn free_chapter_nodes(nodes: &mut Vec<*mut ffi::AVChapter>) {
+        for node in nodes.drain(..) {
+            unsafe {
+                ffi::av_free(node as *mut std::os::raw::c_void);
+            }
+        }
     }
 
     /// Refreshes cached [`StreamInfo`] for every stream after the header is

@@ -1,4 +1,4 @@
-use crate::codec::CodecConfig;
+use crate::codec::{CodecConfig, CodecContextState};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::fmt::{AVFormatFlag, FrameFormat};
@@ -6,7 +6,7 @@ use crate::fmt::{AVFormatFlag, FrameFormat};
 use crate::frame::{MediaFrame, MediaFrameType};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
-use crate::options::{Options, Quality, VideoProfile};
+use crate::options::{CRF_CAPABLE_CODECS, Options, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
 use crate::stream::StreamInfo;
 use crate::strutils;
@@ -92,18 +92,6 @@ impl EncoderBuilder {
     /// 单条字幕编码缓冲区大小。mov_text 载荷 = 2 字节大端长度 + 文本，
     /// subrip = 纯文本；按文本长度的 2 倍 + 256 分配已足够宽裕。
     const SUBTITLE_BUFFER_SIZE: usize = 8192;
-
-    /// Codecs whose FFmpeg wrapper exposes the `crf` private option
-    /// (checked when [`Quality::Crf`] is requested).
-    const CRF_CAPABLE_CODECS: &'static [&'static str] = &[
-        "libx264",
-        "libx265",
-        "libvpx",
-        "libvpx-vp9",
-        "libaom-av1",
-        "libsvtav1",
-        "libopenh264",
-    ];
 
     /// Create a video encoder with the specified destination
     ///
@@ -203,10 +191,9 @@ impl EncoderBuilder {
     /// Set the rate control strategy (video encoders only; ignored for audio).
     ///
     /// * [`Quality::Crf`] — quality-targeted encoding. Applied via the codec's
-    ///   `crf` private option when supported (`libx264`, `libx265`, `libvpx`,
-    ///   `libvpx-vp9`, `libaom-av1`, `libsvtav1`, `libopenh264`); other codecs
-    ///   fall back to [`Self::with_bit_rate`] with a warning and the stream
-    ///   bit rate is left untouched.
+    ///   `crf` private option for the encoders in [`CRF_CAPABLE_CODECS`]; other
+    ///   codecs fall back to [`Self::with_bit_rate`] with a warning and the
+    ///   stream bit rate is left untouched.
     /// * [`Quality::Bitrate`] — explicit target bit rate, overriding
     ///   [`Self::with_bit_rate`].
     pub fn with_quality(mut self, quality: Quality) -> Self {
@@ -586,7 +573,7 @@ impl EncoderBuilder {
         let use_crf = media_type == MediaType::VIDEO
             && match self.quality {
                 Some(Quality::Crf(_)) => {
-                    let capable = Self::CRF_CAPABLE_CODECS.contains(&codec_name.as_str());
+                    let capable = CRF_CAPABLE_CODECS.contains(&codec_name.as_str());
                     if !capable {
                         log::warn!(
                             "codec '{codec_name}' has no CRF support, falling back to bit rate control"
@@ -790,7 +777,7 @@ impl EncoderBuilder {
             filter_input_format,
             filter_graph,
             context: encode_ctx,
-            state: EncoderState::Normal,
+            state: CodecContextState::Normal,
             scale_algorithm: self.scale_algorithm,
             pending_packets: VecDeque::new(),
             audio_fifo: None,
@@ -834,13 +821,6 @@ impl Default for EncoderBuilder {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-enum EncoderState {
-    Normal,
-    Drained,
-    Flushed,
-}
-
 /// Encodes frames into a video stream.
 ///
 /// # Example
@@ -865,7 +845,7 @@ pub struct Encoder {
     filter_input_format: Option<FrameFormat>,
     hw_context: Option<Arc<HWContext>>,
     media_type: MediaType,
-    state: EncoderState,
+    state: CodecContextState,
     scale_algorithm: SwsFlags,
     /// 编码器缓冲满（send_frame 返回 EAGAIN）时，先行排空的已就绪包暂存于此， 由 `receive_packet` 优先取出，
     /// 避免丢包。按 FIFO 出队（`pop_front`）， 保证与编码器输出顺序一致（否则 dts 会乱序、mux 报错）。
@@ -915,12 +895,12 @@ impl Encoder {
     ///
     /// This means all input has been processed, but not fully flushed.
     pub fn is_drained(&self) -> bool {
-        self.state == EncoderState::Drained
+        self.state == CodecContextState::Drained
     }
 
     /// Returns `true` if the encoder is fully flushed and finished.
     pub fn is_flushed(&self) -> bool {
-        self.state == EncoderState::Flushed
+        self.state == CodecContextState::Flushed
     }
 
     /// Encode a high-level frame (a single frame ndarray-based)
@@ -1463,12 +1443,12 @@ impl Encoder {
             Ok(pkt) => Ok(Some(pkt)),
             Err(rsmpeg::error::RsmpegError::EncoderDrainError) => {
                 log::debug!("Encoder drained, try send new frame again.");
-                self.state = EncoderState::Drained;
+                self.state = CodecContextState::Drained;
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::EncoderFlushedError) => {
                 log::debug!("Encoder flushed, EOF reached.");
-                self.state = EncoderState::Flushed;
+                self.state = CodecContextState::Flushed;
                 Ok(None)
             }
             Err(err) => Err(RsmediaError::from(err)),
@@ -1501,7 +1481,7 @@ impl Encoder {
         // 字幕编码器走同步 API（avcodec_encode_subtitle），无内部缓冲，
         // 不支持 send/receive flush（send_frame(None) 会崩溃），直接返回。
         if self.media_type == MediaType::SUBTITLE {
-            self.state = EncoderState::Flushed;
+            self.state = CodecContextState::Flushed;
             return Ok(());
         }
 

@@ -1,4 +1,4 @@
-use crate::codec::AVCodecFlag;
+use crate::codec::{AVCodecFlag, CodecContextState};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 #[cfg(feature = "ndarray")]
@@ -353,19 +353,12 @@ impl DecoderBuilder {
             hw_context,
             filter_graph,
             context: decode_ctx,
-            state: DecoderState::Normal,
+            state: CodecContextState::Normal,
             scale_algorithm: self.scale_algorithm,
             resize: self.resize,
             output_pix_fmt,
         })
     }
-}
-
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-enum DecoderState {
-    Normal,
-    Drained,
-    Flushed,
 }
 
 /// Decode video files and streams.
@@ -390,7 +383,7 @@ pub struct Decoder {
     duration: Time,
     stream_index: usize,
     media_type: MediaType,
-    state: DecoderState,
+    state: CodecContextState,
     scale_algorithm: SwsFlags,
     resize: Option<Resize>,
     /// 解码输出目标像素格式（仅视频）
@@ -506,11 +499,11 @@ impl Decoder {
 
     /// Check if decoder is in draining mode.
     pub fn is_drained(&self) -> bool {
-        self.state == DecoderState::Drained
+        self.state == CodecContextState::Drained
     }
 
     pub fn is_flushed(&self) -> bool {
-        self.state == DecoderState::Flushed
+        self.state == CodecContextState::Flushed
     }
 
     /// 解码器是否已完全结束：解码器到达 EOF，且 filter（如有）内部缓冲帧也已全部
@@ -667,7 +660,7 @@ impl Decoder {
                         }
                     }
                     None => {
-                        self.state = DecoderState::Flushed;
+                        self.state = CodecContextState::Flushed;
                         log::debug!("Subtitle decoder flushed. EOF reached.");
                         return Ok(None);
                     }
@@ -761,11 +754,11 @@ impl Decoder {
     /// [`decode_raw_packet`](Self::decode_raw_packet) 使用，可逐 packet 送入解码器并排空
     /// 缓冲帧。需要 [`MediaFrame`] 的高级调用请使用 [`drain`](Self::drain)。
     pub fn drain_raw(&mut self) -> Result<Option<AVFrame>> {
-        if self.state == DecoderState::Normal {
+        if self.state == CodecContextState::Normal {
             self.send_packet_to_decoder(None)?;
             // 已发送 EOS，进入 draining 模式。此后 EAGAIN 表示"仍在 drain"，
             // 而非 read 阶段缺包，因此在此处显式置位。
-            self.state = DecoderState::Drained;
+            self.state = CodecContextState::Drained;
         }
         self.receive_frame_from_decoder()
     }
@@ -773,7 +766,7 @@ impl Decoder {
     /// Reset the decoder to be used again after draining.
     pub fn reset(&mut self) {
         self.flush();
-        self.state = DecoderState::Normal;
+        self.state = CodecContextState::Normal;
     }
 
     fn flush(&mut self) {
@@ -805,8 +798,8 @@ impl Decoder {
                 //   （如 fps/setpts 等带延迟滤镜）。逐帧调用 `process_frame(None)`，
                 //   每帧返回一帧，直到 graph 进入 Flushed 状态。
                 match self.state {
-                    DecoderState::Normal | DecoderState::Drained => return Ok(None),
-                    DecoderState::Flushed => {
+                    CodecContextState::Normal | CodecContextState::Drained => return Ok(None),
+                    CodecContextState::Flushed => {
                         if let Some(graph) = self.filter_graph.as_mut()
                             && !graph.is_flushed()
                         {
@@ -923,7 +916,7 @@ impl Decoder {
             }
             Err(rsmpeg::error::RsmpegError::DecoderFlushedError) => {
                 log::debug!("Decoder flushed. EOF reached.");
-                self.state = DecoderState::Flushed;
+                self.state = CodecContextState::Flushed;
                 Ok(None)
             }
             Err(e) => {

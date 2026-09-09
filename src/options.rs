@@ -185,11 +185,10 @@ impl Options {
 
     /// Options for a libx264 encoder that are tuned for low-latency encoding such as for real-time streaming.
     pub fn preset_h264_realtime() -> Self {
-        let mut opts = Self::new();
+        // 基址复用 preset_h264()，只覆盖低延迟所需的差异键，避免重复定义公共键值。
+        let mut opts = Self::preset_h264();
         opts
-            // ultrafast,superfast,veryfast,faster,fast,medium,slow,slower,veryslow,placebo
-            .insert("preset", "medium")
-            // baseline,main,high
+            // baseline,main,high，低延迟用 main 而非 high
             .insert("profile", "main")
             // film,animation,grain,stillimage,psnr,ssim,fastdecode,zerolatency
             .insert("tune", "zerolatency")
@@ -201,8 +200,6 @@ impl Options {
             .insert("bufsize", "3000k")
             // 恒定质量因子
             .insert("crf", "23")
-            // 场景切换敏感度
-            .insert("scenecut", "0")
             // 周期内部刷新替代关键帧
             .insert("intra-refresh", "1")
             // 参考帧数量
@@ -327,15 +324,29 @@ impl std::fmt::Display for Options {
     }
 }
 
-/// Rate control strategy for video encoders, set via
+/// Video encoders whose FFmpeg wrapper exposes a `crf` private option.
+///
+/// Single source of truth: used by [`EncoderBuilder::with_quality`] /
+/// [`Quality::Crf`] (fall back to bit-rate control for other codecs) and the
+/// [`Quality::Crf`] capability documentation.
+pub const CRF_CAPABLE_CODECS: &[&str] = &[
+    "libx264",
+    "libx265",
+    "libvpx",
+    "libvpx-vp9",
+    "libaom-av1",
+    "libsvtav1",
+    "libopenh264",
+];
+
+/// Rate control strategy for video encode, set via
 /// [`crate::EncoderBuilder::with_quality`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
     /// Constant Rate Factor — quality-targeted, file size varies.
     /// Lower value = higher quality (x264 scale, sane range 0..=51,
-    /// defaults around 18-28). Supported by `libx264`, `libx265`,
-    /// `libvpx`, `libvpx-vp9`, `libaom-av1`, `libsvtav1` and
-    /// `libopenh264`; other encoders fall back to [`Quality::Bitrate`]
+    /// defaults around 18-28). Only supported by the encoders listed in
+    /// [`CRF_CAPABLE_CODECS`]; others fall back to [`Quality::Bitrate`]
     /// with a warning.
     Crf(u8),
     /// Explicit target bit rate in bits per second.

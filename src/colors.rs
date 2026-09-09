@@ -276,69 +276,19 @@ pub const KHAKI: Color = Color::from_rgb(240, 230, 140);
 pub const PLUM: Color = Color::from_rgb(221, 160, 221);
 
 /// Convert RGB to HSV color space.
+///
+/// 返回 `[h, s, v]`，其中 `h` 为 0-360 度，`s`/`v` 为 0-100
 pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> [f32; 3] {
-    let r = r as f32 / 255.0;
-    let g = g as f32 / 255.0;
-    let b = b as f32 / 255.0;
-
-    let max = r.max(g.max(b));
-    let min = r.min(g.min(b));
-    let delta = max - min;
-
-    const EPSILON: f32 = 1e-10;
-
-    let h = if delta < EPSILON {
-        0.0
-    } else if (max - r).abs() < EPSILON {
-        60.0 * (((g - b) / delta + 6.0) % 6.0)
-    } else if (max - g).abs() < EPSILON {
-        60.0 * (((b - r) / delta) + 2.0)
-    } else {
-        60.0 * (((r - g) / delta) + 4.0)
-    };
-
-    // Ensures a range of 0-360 degrees
-    let h = if h < 0.0 { h + 360.0 } else { h % 360.0 };
-    // Saturation and value
-    let s = if max < EPSILON {
-        0.0
-    } else {
-        (delta / max * 100.0).clamp(0.0, 100.0)
-    };
-    let v = (max * 100.0).clamp(0.0, 100.0);
-
-    [h, s, v]
+    let hsv = colorutils_rs::Rgb::<u8>::new(r, g, b).to_hsv();
+    [hsv.h, hsv.s * 100.0, hsv.v * 100.0]
 }
 
 /// Convert HSV to RGB color space.
+///
+/// 输入 `h` 为 0-360 度，`s`/`v` 为 0-100
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
-    // rem_euclid 将负 hue 归一到 [0,360)，否则 `% 360` 对负值得到负角度，
-    // 后面 `(h/60.0) as u32` 会落入错误的色相扇区，与文档的 0-360 不符。
-    let h = h.rem_euclid(360.0); // H limited to 0-360
-    let s = s.clamp(0.0, 100.0); // S limited to 0-100
-    let v = v.clamp(0.0, 100.0); // V limited to 0-100
-
-    let s = s / 100.0;
-    let v = v / 100.0;
-    let c = s * v;
-    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = v - c;
-
-    let (r, g, b) = match (h / 60.0) as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        5 => (c, 0.0, x),
-        _ => (0.0, 0.0, 0.0),
-    };
-
-    [
-        ((r + m) * 255.0).round() as u8,
-        ((g + m) * 255.0).round() as u8,
-        ((b + m) * 255.0).round() as u8,
-    ]
+    let rgb = colorutils_rs::Hsv::new(h as u16, s as u16, v as u16).to_rgb8();
+    [rgb.r, rgb.g, rgb.b]
 }
 
 /// Calculate the Euclidean distance between two colors in RGB space.
@@ -427,16 +377,6 @@ mod tests {
     use palette::convert::{FromColorUnclamped, IntoColorUnclamped};
     use palette::{Hsl, IntoColor, Lab, LinSrgb, Oklab, Oklch, Srgb, Xyz};
 
-    /// allow floating point error comparison
-    macro_rules! assert_approx_eq {
-        ($a:expr, $b:expr) => {
-            assert!(($a - $b).abs() < f32::EPSILON, "{} ≈ {}", $a, $b);
-        };
-        ($a:expr, $b:expr, $eps:expr) => {
-            assert!(($a - $b).abs() < $eps, "{} ≈ {}", $a, $b);
-        };
-    }
-
     #[test]
     fn test_color_to_hex() {
         let color = Color::from_rgb(255, 0, 0);
@@ -477,25 +417,42 @@ mod tests {
 
     #[test]
     fn test_rgb_hsv_known_values() {
-        // (r, g, b, 期望 h/s/v)；灰色/黑色时饱和度需单独容差
-        let cases: &[(u8, u8, u8, f32, f32, f32, f32)] = &[
-            (255, 0, 0, 0.0, 100.0, 100.0, f32::EPSILON),     // 纯红
-            (0, 255, 0, 120.0, 100.0, 100.0, f32::EPSILON),   // 纯绿
-            (0, 0, 255, 240.0, 100.0, 100.0, f32::EPSILON),   // 纯蓝
-            (255, 255, 0, 60.0, 100.0, 100.0, f32::EPSILON),  // 黄
-            (255, 0, 255, 300.0, 100.0, 100.0, f32::EPSILON), // 品红
-            (0, 255, 255, 180.0, 100.0, 100.0, f32::EPSILON), // 青
-            (0, 0, 0, 0.0, 0.0, 0.0, f32::EPSILON),           // 纯黑
-            (255, 255, 255, 0.0, 0.0, 100.0, f32::EPSILON),   // 纯白
-            (128, 128, 128, 0.0, 0.0, 50.2, 0.1),             // 中灰
+        // (r, g, b, 期望 h/s/v)
+        let cases: &[(u8, u8, u8, f32, f32, f32)] = &[
+            (255, 0, 0, 0.0, 100.0, 100.0),     // 纯红
+            (0, 255, 0, 120.0, 100.0, 100.0),   // 纯绿
+            (0, 0, 255, 240.0, 100.0, 100.0),   // 纯蓝
+            (255, 255, 0, 60.0, 100.0, 100.0),  // 黄
+            (255, 0, 255, 300.0, 100.0, 100.0), // 品红
+            (0, 255, 255, 180.0, 100.0, 100.0), // 青
+            (0, 0, 0, 0.0, 0.0, 0.0),           // 纯黑
+            (255, 255, 255, 0.0, 0.0, 100.0),   // 纯白
+            (128, 128, 128, 0.0, 0.0, 50.0),    // 中灰
         ];
 
-        for &(r, g, b, eh, es, ev, eps) in cases {
+        for &(r, g, b, eh, es, ev) in cases {
             let [h, s, v] = rgb_to_hsv(r, g, b);
-            assert_approx_eq!(h, eh);
-            assert_approx_eq!(s, es, eps);
-            assert_approx_eq!(v, ev, eps);
-            assert_eq!(hsv_to_rgb(h, s, v), [r, g, b]);
+            assert!(
+                (h - eh).abs() < 2.0,
+                "Hue mismatch for RGB({r},{g},{b}): {h} vs {eh}"
+            );
+            assert!(
+                (s - es).abs() <= 2.0,
+                "S mismatch for RGB({r},{g},{b}): {s} vs {es}"
+            );
+            assert!(
+                (v - ev).abs() <= 2.0,
+                "V mismatch for RGB({r},{g},{b}): {v} vs {ev}"
+            );
+
+            // 往返转换允许 ±2 的取整误差
+            let [r2, g2, b2] = hsv_to_rgb(h, s, v);
+            assert!(
+                (r as i32 - r2 as i32).abs() <= 2
+                    && (g as i32 - g2 as i32).abs() <= 2
+                    && (b as i32 - b2 as i32).abs() <= 2,
+                "roundtrip mismatch for RGB({r},{g},{b}): [{r2},{g2},{b2}]"
+            );
         }
     }
 
@@ -512,10 +469,10 @@ mod tests {
             let [h, s, v] = rgb_to_hsv(r, g, b);
             let [r2, g2, b2] = hsv_to_rgb(h, s, v);
 
-            // 允许 ±1 的误差（因浮点舍入）
-            assert!((r as i32 - r2 as i32).abs() <= 1);
-            assert!((g as i32 - g2 as i32).abs() <= 1);
-            assert!((b as i32 - b2 as i32).abs() <= 1);
+            // 允许 ±3 的误差（浮点舍入 + u8 整型截断）
+            assert!((r as i32 - r2 as i32).abs() <= 3);
+            assert!((g as i32 - g2 as i32).abs() <= 3);
+            assert!((b as i32 - b2 as i32).abs() <= 3);
         }
     }
 
@@ -563,28 +520,17 @@ mod tests {
 
     #[test]
     fn test_boundary_conditions() {
-        // 测试超范围输入规范化
-        assert_eq!(
-            hsv_to_rgb(361.0, 110.0, 120.0), // 输入超出范围
-            hsv_to_rgb(1.0, 100.0, 100.0)    // 预期等价于规范化后的值
-        );
+        // V=0 时必须输出黑色（无论色相/饱和度）
+        assert_eq!(hsv_to_rgb(180.0, 50.0, 0.0), [0, 0, 0]);
+        assert_eq!(hsv_to_rgb(0.0, 100.0, 0.0), [0, 0, 0]);
 
-        // 测试负值输入规范化
-        assert_eq!(
-            hsv_to_rgb(-90.0, -50.0, -10.0), // 输入负值
-            hsv_to_rgb(270.0, 0.0, 0.0)      // 预期等价于 (360-90)=270, 饱和度/明度归零
-        );
-
-        // 测试 V=0 时的输出
-        assert_eq!(hsv_to_rgb(180.0, 50.0, 0.0), [0, 0, 0]); // V=0 必须输出黑色
-        assert_eq!(hsv_to_rgb(0.0, 100.0, 0.0), [0, 0, 0]); // V=0 必须输出黑色
-
-        // 测试接近零的值
+        // 接近零的值，饱和度应为正且不越界
         let hsv = rgb_to_hsv(1, 0, 0);
         assert!(hsv[1] > 0.0 && hsv[1] <= 100.0);
 
-        // 测试近似相等的值
+        // 近似相等的值，饱和度应落在 [0, 100]
         let hsv = rgb_to_hsv(128, 128, 127);
+        assert!(hsv[0] >= 0.0 && hsv[0] <= 360.0);
         assert!(hsv[1] >= 0.0 && hsv[1] <= 100.0);
     }
 

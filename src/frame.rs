@@ -442,9 +442,27 @@ where
         self.check_video_format(FrameFormat::Pixel(PixelFormat::RGB24), "RGB24")
     }
 
-    /// 根据分辨率自动选择标准色彩矩阵：
-    /// SD -> BT.601 / HD -> BT.709 / UHD -> BT.2020。
-    fn auto_colorspace(height: usize) -> YuvStandardMatrix {
+    /// 选择标准色彩矩阵：优先读取帧携带的 `color_space` 元数据，未标记时
+    /// 回退到按分辨率启发式（SD -> BT.601 / HD -> BT.709 / UHD -> BT.2020）
+    fn auto_colorspace(&self) -> YuvStandardMatrix {
+        let colorspace = self.color_space;
+        if colorspace == ffi::AVCOL_SPC_BT709 {
+            return YuvStandardMatrix::Bt709;
+        }
+        if colorspace == ffi::AVCOL_SPC_BT2020_NCL || colorspace == ffi::AVCOL_SPC_BT2020_CL {
+            return YuvStandardMatrix::Bt2020;
+        }
+        // BT470BG/SMPTE170M/BT470_6/FCC/SMPTE240M 等标准 601 或 near-601
+        if colorspace == ffi::AVCOL_SPC_BT470BG
+            || colorspace == ffi::AVCOL_SPC_SMPTE170M
+            || colorspace == ffi::AVCOL_SPC_FCC
+            || colorspace == ffi::AVCOL_SPC_SMPTE240M
+        {
+            return YuvStandardMatrix::Bt601;
+        }
+
+        let _ = colorspace; // UNSPECIFIED / RGB / YCoCg / ICTCP 等无 YUV 矩阵意义，回落分辨率
+        let height = self.height;
         if height < 720 {
             YuvStandardMatrix::Bt601
         } else if height < 1080 {
@@ -481,7 +499,7 @@ where
 
     pub fn convert_rgb_to_yuv(&self) -> Result<Self> {
         self.check_rgb24_supported()?;
-        self.convert_rgb_to_yuv_with_matrix(Self::auto_colorspace(self.height))
+        self.convert_rgb_to_yuv_with_matrix(self.auto_colorspace())
     }
 
     /// 用**指定**的色彩矩阵将 RGB24 帧转换为 YUV420P。
@@ -501,6 +519,24 @@ where
     /// ```
     pub fn convert_rgb_to_yuv_with_matrix(&self, colorspace: YuvStandardMatrix) -> Result<Self> {
         self.check_rgb24_supported()?;
+
+        // 大精度（16bit+）路径：u8 的 `to_rgb_bytes` 会截断低位，改用 u16 满幅计算。
+        if std::mem::size_of::<T>() > 1 {
+            let (height, width, _) = self.data.dim();
+            let mut rgb16 = Vec::with_capacity(self.data.len());
+            for v in self.data.iter() {
+                rgb16.push(num_traits::cast::<T, u16>(*v).unwrap_or(0));
+            }
+            let yuv16 = rgb_to_yuv420_16bit(&rgb16, width, height, colorspace)?;
+            let mut res = self.clone();
+            res.format = FrameFormat::Pixel(PixelFormat::YUV420P);
+            // u16 平面转回 T（u16/u32/f32 等），保持与调用方类型一致
+            res.data = ndarray::Array3::from_shape_fn((height, width, 3), |idx| {
+                let v = yuv16[idx];
+                num_traits::cast::<u16, T>(v).unwrap_or(T::zero())
+            });
+            return Ok(res);
+        }
 
         let height = self.height;
         let width = self.width;
@@ -584,6 +620,23 @@ where
     pub fn convert_yuv_to_rgb(&self) -> Result<Self> {
         self.check_video_format(FrameFormat::Pixel(PixelFormat::YUV420P), "YUV420P")?;
 
+        // 大精度（16bit+）路径：直接以 u16 满幅做 YUV->RGB，避免经 u8 截断。
+        if std::mem::size_of::<T>() > 1 {
+            let (_height, width, _) = self.data.dim();
+            let colorspace = self.auto_colorspace();
+            let yuv16 = ndarray::Array3::from_shape_fn(self.data.dim(), |idx| {
+                num_traits::cast::<T, u16>(self.data[idx]).unwrap_or(0)
+            });
+            let rgb16 = yuv420_to_rgb_16bit(&yuv16, colorspace)?;
+            let data = ndarray::Array3::from_shape_fn(self.data.dim(), |(h, w, c)| {
+                num_traits::cast::<u16, T>(rgb16[(h * width + w) * 3 + c]).unwrap_or(T::zero())
+            });
+            let mut res = self.clone();
+            res.format = FrameFormat::Pixel(PixelFormat::RGB24);
+            res.data = data;
+            return Ok(res);
+        }
+
         let height = self.height;
         let width = self.width;
 
@@ -626,7 +679,7 @@ where
         let mut rgb_bytes = vec![0u8; width * height * 3];
 
         // 4. 选择转换参数
-        let colorspace = Self::auto_colorspace(height);
+        let colorspace = self.auto_colorspace();
 
         // 5. 使用Full Range进行转换
         yuv::yuv420_to_rgb(
@@ -691,6 +744,108 @@ impl MediaFrame<u8> {
             data,
         )
     }
+}
+
+/// 由色彩矩阵返回色相系数三元组 (Kr, Kg, Kb)。
+/// 供 u16 大精度 RGB<->YUV 路径使用（`yuv` crate 的公开转换仅支持 8bit）。
+fn yuv_primaries(matrix: YuvStandardMatrix) -> (f32, f32, f32) {
+    match matrix {
+        YuvStandardMatrix::Bt601 => (0.299, 0.587, 0.114),
+        YuvStandardMatrix::Bt709 => (0.2126, 0.7152, 0.0722),
+        YuvStandardMatrix::Bt2020 => (0.2627, 0.6780, 0.0593),
+        YuvStandardMatrix::Smpte240 => (0.212, 0.701, 0.087),
+        YuvStandardMatrix::Bt470_6 => (0.299, 0.587, 0.114),
+        YuvStandardMatrix::Fcc => (0.310, 0.589, 0.101),
+        YuvStandardMatrix::Custom(kr, kb) => (kr, 1.0 - kr - kb, kb),
+    }
+}
+
+/// 16bit RGB24 -> YUV420P（Full Range，2x2 间组抽样）。
+///
+/// `yuv` crate 的 `rgb_to_yuv420` 仅接受 u8，会对 u16 截断；此实现将色域矩阵在
+/// f32 中精确计算并按 16bit 保存，保留低 8 位精度（支持 10-bit/12-bit 内容）。
+fn rgb_to_yuv420_16bit(
+    rgb16: &[u16],
+    width: usize,
+    height: usize,
+    matrix: YuvStandardMatrix,
+) -> Result<ndarray::Array3<u16>> {
+    use ndarray::Array3;
+    if rgb16.len() < width * height * 3 {
+        return Err(RsmediaError::custom(
+            "RGB data too short for 16-bit conversion",
+        ));
+    }
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(RsmediaError::custom(format!(
+            "YUV420P requires even dimensions, got {width}x{height}"
+        )));
+    }
+
+    let (kr, _kg, kb) = yuv_primaries(matrix);
+    let kg = 1.0 - kr - kb;
+    let denom_y = 2.0 * (1.0 - kb);
+    let denom_v = 2.0 * (1.0 - kr);
+    let scale = 65535_f32;
+    let center = scale / 2.0;
+
+    // 先在 1x1 内计算 Y、半尺寸 U/V，再按块复制以保持代表值语义。
+    let mut y_plane = vec![0u16; width * height];
+    let (uv_w, uv_h) = (width / 2, height / 2);
+    let mut u_plane = vec![0u16; uv_w * uv_h];
+    let mut v_plane = vec![0u16; uv_w * uv_h];
+
+    for h in 0..height {
+        for w in 0..width {
+            let i = (h * width + w) * 3;
+            let r = rgb16[i] as f32 / scale;
+            let g = rgb16[i + 1] as f32 / scale;
+            let b = rgb16[i + 2] as f32 / scale;
+            let yv = kr.mul_add(r, kg.mul_add(g, kb * b));
+            y_plane[h * width + w] = (yv * scale).round() as u16;
+            if h % 2 == 0 && w % 2 == 0 {
+                let uv_idx = (h / 2) * uv_w + (w / 2);
+                u_plane[uv_idx] = (((b - yv) / denom_y) * scale + center).round() as u16;
+                v_plane[uv_idx] = (((r - yv) / denom_v) * scale + center).round() as u16;
+            }
+        }
+    }
+
+    // 重建 [H, W, 3] ndarray，Y 满分辨率、U/V 为 2x2 块代表值
+    let mut out = Array3::<u16>::zeros((height, width, 3));
+    for h in 0..height {
+        for w in 0..width {
+            out[[h, w, 0]] = y_plane[h * width + w];
+            out[[h, w, 1]] = u_plane[(h / 2) * uv_w + (w / 2)];
+            out[[h, w, 2]] = v_plane[(h / 2) * uv_w + (w / 2)];
+        }
+    }
+    Ok(out)
+}
+
+/// 将 16-bit YUV420P（[H,W,3] 的 u16 数据）转换为 RGB24 满幅平面。
+fn yuv420_to_rgb_16bit(yuv: &ndarray::Array3<u16>, matrix: YuvStandardMatrix) -> Result<Vec<u16>> {
+    let height = yuv.shape()[0];
+    let width = yuv.shape()[1];
+    let (kr, _kg, kb) = yuv_primaries(matrix);
+    let scale = 65535_f32;
+    let center = scale / 2.0;
+    let mut out = Vec::with_capacity(width * height * 3);
+
+    for h in 0..height {
+        for w in 0..width {
+            let y = yuv[[h, w, 0]] as f32 / scale;
+            let cb = (yuv[[h, w, 1]] as f32 - center) / scale;
+            let cr = (yuv[[h, w, 2]] as f32 - center) / scale;
+            let r = y + 2.0 * (1.0 - kr) * cr;
+            let b = y + 2.0 * (1.0 - kb) * cb;
+            let g = y - kr * r - kb * b;
+            out.push((r.clamp(0.0, 1.0) * scale).round() as u16);
+            out.push((g.clamp(0.0, 1.0) * scale).round() as u16);
+            out.push((b.clamp(0.0, 1.0) * scale).round() as u16);
+        }
+    }
+    Ok(out)
 }
 
 /// 验证帧格式和类型大小的匹配关系
