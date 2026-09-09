@@ -495,9 +495,13 @@ pub fn fill_black(frame: &mut AVFrame) -> Result<()> {
 /// 用指定 RGBA 颜色填充整幅图像（子矩形内的 padding 不会被触碰）。
 /// 颜色分量按 0..255 的整数值解释（见 `av_image_fill_color`）。
 ///
+/// 注意：底层 `av_image_fill_color` 自 FFmpeg 7.0 起才提供，故该函数仅在
+/// `ffmpeg7`/`ffmpeg8`/`ffmpeg9` feature 下可用。
+///
 /// # Arguments
 /// * `frame` - 目标 AVFrame（需已 alloc_buffer）
 /// * `r`/`g`/`b`/`a` - RGBA 分量（0..=255），`a` 为可选的 alpha
+#[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
 pub fn fill_color(frame: &mut AVFrame, r: u8, g: u8, b: u8, a: u8) -> Result<()> {
     if frame.data[0].is_null() {
         return Err(format_err!(
@@ -1367,6 +1371,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
     #[test]
     fn test_fill_color_gray() -> Result<()> {
         // GRAY8 用 fill_color 填灰 = 分量 r
