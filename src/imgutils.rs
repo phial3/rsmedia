@@ -1396,7 +1396,7 @@ mod tests {
             (*raw).crop_right = 4;
         }
         // AV_FRAME_CROP_UNALIGNED 在 Windows/vcpkg 绑定中已是 i32，而在
-        // Linux 上是 u32；`as i32` 在 Windows 会触发多余的 cast 警告。
+        // Linux 上是 u32；`as i32` 在 Windows 会触发多余的 cast 警告 unnecessary (`i32` -> `i32`)
         #[allow(clippy::unnecessary_cast)]
         apply_cropping(&mut frame, ffi::AV_FRAME_CROP_UNALIGNED as i32)?;
         // 裁剪后尺寸变小
