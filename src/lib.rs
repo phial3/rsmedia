@@ -29,7 +29,7 @@ pub mod swctx;
 pub mod time;
 
 pub use codec::{CodecConfig, FormatInfo, Profile};
-pub use decode::{Decoder, DecoderBuilder};
+pub use decode::{Decoder, DecoderBuilder, thumbnail};
 pub use encode::{Encoder, EncoderBuilder};
 pub use error::{Error, Result, RsmediaError};
 pub use filter::Filter;

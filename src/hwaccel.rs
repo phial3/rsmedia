@@ -5,12 +5,9 @@ use crate::{Options, imgutils, strutils};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
-use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
+use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVPixFmtDescriptorRef};
 use rsmpeg::{UnsafeDerefMut, ffi};
 
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 /// Hardware device configuration.
@@ -19,7 +16,7 @@ use std::sync::Arc;
 /// The sw / hw frames conversion process includes the following steps:
 ///
 /// CPU(NV12) -> GPU(CUDA) -> transform -> GPU(CUDA) -> CPU(NV12)
-#[derive(Clone)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct HWDeviceConfig {
     pub device_type: HWDeviceType,
     pub hw_pixel_format: PixelFormat,
@@ -57,12 +54,15 @@ impl HWDeviceConfig {
     }
 
     /// build CUDA HWDeviceConfig
-    pub fn cuda(id: Option<usize>) -> Self {
+    ///
+    /// `device_id` 为 GPU 编号字符串（如 `"0"`、`"1"`），与其他设备构造器
+    /// 的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。
+    pub fn cuda(device_id: Option<String>) -> Self {
         Self::new(
             HWDeviceType::CUDA,
             PixelFormat::CUDA,
             PixelFormat::NV12,
-            id.map(|id| format!("{id}")),
+            device_id,
             None,
         )
     }
@@ -127,60 +127,9 @@ impl HWDeviceConfig {
     }
 
     /// [`Self::auto_platform`] 的可定制版本：传入自定义候选顺序（如只想在
-    /// CUDA 与 QSV 之间选择）。`None` 使用平台默认优先级。
-    pub fn auto_platform_with(candidates: Option<Vec<HWDeviceType>>) -> Result<Self> {
-        HWDeviceType::auto_platform_config(candidates)
-    }
-}
-
-impl std::hash::Hash for HWDeviceConfig {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.device_type.hash(state);
-        self.device_id.hash(state);
-        self.hw_pixel_format.hash(state);
-        self.sw_pixel_format.hash(state);
-        if let Some(opts) = &self.options {
-            let pairs: HashMap<String, String> = opts.into();
-            for (key, value) in pairs {
-                key.hash(state);
-                value.hash(state);
-            }
-        }
-    }
-}
-
-impl PartialEq for HWDeviceConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.device_type == other.device_type
-            && self.device_id == other.device_id
-            && self.hw_pixel_format == other.hw_pixel_format
-            && self.sw_pixel_format == other.sw_pixel_format
-            && match (&self.options, &other.options) {
-                (Some(a), Some(b)) => {
-                    let pairs_a: HashMap<String, String> = a.into();
-                    let pairs_b: HashMap<String, String> = b.into();
-                    pairs_a.len() == pairs_b.len()
-                        && pairs_a.iter().all(|(k, v)| pairs_b.get(k) == Some(v))
-                }
-                (None, None) => true,
-                _ => false,
-            }
-    }
-}
-
-impl Eq for HWDeviceConfig {}
-
-impl std::fmt::Debug for HWDeviceConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "HWDeviceConfig {{ device_type: {:?}, device_id: {:?},  hw_pixel_format: {:?}, sw_pixel_format: {:?}, options: {:?} }}",
-            self.device_type,
-            self.device_id,
-            self.hw_pixel_format,
-            self.sw_pixel_format,
-            self.options,
-        )
+    /// CUDA 与 QSV 之间选择）；空切片返回错误（等价于无候选可探测）。
+    pub fn auto_platform_with(candidates: &[HWDeviceType]) -> Result<Self> {
+        HWDeviceType::auto_platform_config(Some(candidates))
     }
 }
 
@@ -194,13 +143,77 @@ impl std::fmt::Display for HWDeviceConfig {
 /// Uses DashMap for better concurrent read/write performance.
 static HW_CTX_CACHE: Lazy<DashMap<HWDeviceConfig, Arc<HWContext>>> = Lazy::new(DashMap::new);
 
+/// 缓存容量上限：超出时自动驱逐**未被使用**（引用计数为 1）的条目。
+///
+/// 硬件设备上下文持有 GPU 资源，长驻进程中持续切换配置（device_id / 选项 /
+/// 设备类型组合不同）会不断产生新条目；不设上限会导致 GPU 资源泄漏。
+/// 典型应用只使用 1~2 种配置，8 已留足余量。仍在使用的条目不会被驱逐，
+/// 全部在使用中时可超额容纳（等待 [`clear_hw_ctx_cache`] 后续清理）。
+const HW_CTX_CACHE_MAX_ENTRIES: usize = 8;
+
+/// 容量超限时驱逐未使用条目（保留使用中的与新创建的 `keep` 条目）。
+fn prune_hw_ctx_cache(keep: &HWDeviceConfig) {
+    if HW_CTX_CACHE.len() <= HW_CTX_CACHE_MAX_ENTRIES {
+        return;
+    }
+    let mut removed = 0;
+    HW_CTX_CACHE.retain(|config, ctx| {
+        if Arc::strong_count(ctx) > 1 || config == keep {
+            true
+        } else {
+            removed += 1;
+            false
+        }
+    });
+    if HW_CTX_CACHE.len() > HW_CTX_CACHE_MAX_ENTRIES {
+        log::warn!(
+            "HW context cache still holds {} entries (> {HW_CTX_CACHE_MAX_ENTRIES}) \
+             after pruning {removed}: all in use, will shrink once released.",
+            HW_CTX_CACHE.len()
+        );
+    } else if removed > 0 {
+        log::debug!("Pruned {removed} unused hardware device context(s) (cache over cap).");
+    }
+}
+
+/// 清理硬件上下文缓存。
+///
+/// 移除所有**当前未被使用**（引用计数为 1，仅缓存自身持有）的硬件设备上下文，
+/// 释放对应的 GPU 资源。仍在被解码器/编码器使用的上下文会保留，待其释放后
+/// 可再次调用清理。
+///
+/// 除本手动 API 外，缓存超过 [`HW_CTX_CACHE_MAX_ENTRIES`] 时会在新建条目时
+/// 自动驱逐未使用条目。
+///
+/// 返回被移除的条目数。
+pub fn clear_hw_ctx_cache() -> usize {
+    let mut removed = 0;
+    // retain 逐条检查：仅保留仍在使用或为当前 config 未缓存的条目。
+    HW_CTX_CACHE.retain(|_config, ctx| {
+        if Arc::strong_count(ctx) > 1 {
+            true
+        } else {
+            removed += 1;
+            false
+        }
+    });
+    if removed > 0 {
+        log::debug!("Cleared {removed} unused hardware device context(s).");
+    }
+    removed
+}
+
 /// `HWContext` represents a hardware context.
 ///
 /// It includes methods for setting up hardware frames, downloading frames from hardware to system memory,
 /// and uploading frames from system memory to hardware.
+///
+/// 所有方法只做共享访问（`&self`）：底层 `av_hwframe_ctx_alloc` / `av_buffer_ref`
+/// 均为 FFmpeg 保证的线程安全原子操作，因此 [`Send`]/[`Sync`] 实现成立，
+/// 相同配置的多个解码器/编码器可跨线程共享同一 `Arc<HWContext>`。
 pub struct HWContext {
     config: HWDeviceConfig,
-    device_ctx: UnsafeCell<AVHWDeviceContext>,
+    device_ctx: AVHWDeviceContext,
 }
 
 impl HWContext {
@@ -229,31 +242,89 @@ impl HWContext {
 
         let ctx = Arc::new(Self {
             config: config.clone(),
-            device_ctx: UnsafeCell::new(hw_device_ctx),
+            device_ctx: hw_device_ctx,
         });
         // Insert into cache (lock-free write)
         HW_CTX_CACHE.insert(config, ctx.clone());
+        // 超过容量上限时自动驱逐未使用的旧条目（本条目刚插入、且被局部
+        // `ctx` 持有，不会被驱逐）
+        prune_hw_ctx_cache(&ctx.config);
 
         Ok(ctx)
     }
 
-    /// initialize HWFramesContext for the given codec context
+    /// Initialize the hardware frames context for a **decoder**.
+    ///
+    /// Besides creating and attaching the `AVHWFramesContext`, this also:
+    /// - installs the [`hwaccel_get_format`] callback so the decoder picks the
+    ///   hardware surface format during `avcodec_open2`;
+    /// - sets `sw_pix_fmt` to the configured software format;
+    /// - holds an independent reference (`av_buffer_ref`) to the hardware
+    ///   device context, so the decoder owns its own ref and unrefs it on
+    ///   close — no manual teardown needed in `Decoder::Drop`.
     ///
     /// # Arguments
     ///
-    /// * `is_decoder` - Whether the codec context is for decoding or encoding
-    /// * `codec_ctx` - The codec context to initialize
-    /// * `width` - The width of the input/output frames
-    /// * `height` - The height of the input/output frames
-    pub fn setup_hw_frames(
+    /// * `codec_ctx` - The decoder codec context to initialize
+    /// * `width` - The width of the decoded frames
+    /// * `height` - The height of the decoded frames
+    pub fn setup_decoder_frames(
         &self,
-        is_decoder: bool,
         codec_ctx: &mut AVCodecContext,
         width: i32,
         height: i32,
     ) -> Result<()> {
-        let hw_device_ctx_ref = unsafe { &mut *self.device_ctx.get() };
-        let mut hw_frames_ctx = hw_device_ctx_ref.hwframe_ctx_alloc();
+        let hw_frames_ctx = self.create_hw_frames_ctx(width, height)?;
+        codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
+        codec_ctx.set_pix_fmt(self.get_format(true));
+
+        unsafe {
+            let ctx_mut_ptr = codec_ctx.deref_mut();
+            ctx_mut_ptr.get_format = Some(hwaccel_get_format);
+            ctx_mut_ptr.sw_pix_fmt = self.get_format(false);
+        }
+        // clone 即 av_buffer_ref：codec_ctx 拥有独立引用，析构时正确 unref，
+        // 无需 Decoder::Drop 手动置空防 double-free。
+        codec_ctx.set_hw_device_ctx(self.device_ctx.clone());
+
+        Ok(())
+    }
+
+    /// Initialize the hardware frames context for an **encoder**.
+    ///
+    /// Encoders upload software frames into surfaces allocated from this
+    /// frames context (see [`HWContext::hw_upload`]); they do not need a
+    /// `get_format` callback or a separate device ref (the frames context
+    /// already references the device).
+    ///
+    /// # Arguments
+    ///
+    /// * `codec_ctx` - The encoder codec context to initialize
+    /// * `width` - The width of the frames to encode
+    /// * `height` - The height of the frames to encode
+    pub fn setup_encoder_frames(
+        &self,
+        codec_ctx: &mut AVCodecContext,
+        width: i32,
+        height: i32,
+    ) -> Result<()> {
+        let hw_frames_ctx = self.create_hw_frames_ctx(width, height)?;
+        codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
+        codec_ctx.set_pix_fmt(self.get_format(true));
+
+        Ok(())
+    }
+
+    /// Allocate and initialize an `AVHWFramesContext` bound to this device.
+    ///
+    /// 仅共享访问 device_ctx：`hwframe_ctx_alloc` 内部只做 av_buffer_ref（原子），
+    /// 每次调用都新建独立的 AVHWFramesContext，由调用方（codec_ctx）独占持有。
+    fn create_hw_frames_ctx(
+        &self,
+        width: i32,
+        height: i32,
+    ) -> Result<rsmpeg::avutil::AVHWFramesContext> {
+        let mut hw_frames_ctx = self.device_ctx.hwframe_ctx_alloc();
         hw_frames_ctx.data().format = self.get_format(true);
         hw_frames_ctx.data().sw_format = self.get_format(false);
         hw_frames_ctx.data().width = width;
@@ -263,28 +334,16 @@ impl HWContext {
         hw_frames_ctx
             .init()
             .context("Failed to initialize hardware frame context")?;
-
-        codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
-        codec_ctx.set_pix_fmt(self.get_format(true));
-
-        // only used by decoders
-        if is_decoder {
-            unsafe {
-                let ctx_mut_ptr = codec_ctx.deref_mut();
-                ctx_mut_ptr.opaque = self.get_format(true) as *mut std::os::raw::c_void;
-                ctx_mut_ptr.get_format = Some(hwaccel_get_format);
-                ctx_mut_ptr.sw_pix_fmt = self.get_format(false);
-                ctx_mut_ptr.hw_device_ctx = hw_device_ctx_ref.as_mut_ptr();
-            }
-        }
-
-        Ok(())
+        Ok(hw_frames_ctx)
     }
 
     /// Download frame from hardware acceleration device to system memory.
     ///
     /// This method transfers the frame data from GPU memory to CPU memory,
     /// converting from hardware pixel format to software pixel format.
+    ///
+    /// 纯函数：transfer 使用的 `AVHWFramesContext` 取自 `hw_frame` 自身的
+    /// `hw_frames_ctx`（解码器输出帧自带），无需解码器上下文参与。
     ///
     /// # Arguments
     /// * `hw_frame` - The source frame in hardware memory
@@ -298,37 +357,15 @@ impl HWContext {
     /// let sw_frame = hw_context.hw_download(&hw_frame)?;
     /// // Now sw_frame contains the data in CPU memory
     /// ```
-    pub fn hw_download(&self, decoder: &mut AVCodecContext, hw_frame: &AVFrame) -> Result<AVFrame> {
+    pub fn hw_download(&self, hw_frame: &AVFrame) -> Result<AVFrame> {
         let hw_down_start = std::time::Instant::now();
 
         // Check if input frame is actually in hardware memory
         if !self.is_hw_frame(hw_frame) {
             return Err(RsmediaError::custom(format!(
-                "Input frame is not a valid hardware frame: format={:?}, expected={:?}, hw_frames_ctx={:?}",
-                hw_frame.format,
-                self.config.hw_pixel_format,
-                hw_frame.hw_frames_ctx.is_null()
+                "Input frame is not a valid hardware frame: format={:?}, expected={:?}, hw_frames_ctx={:p}",
+                hw_frame.format, self.config.hw_pixel_format, hw_frame.hw_frames_ctx
             )));
-        }
-
-        unsafe {
-            if decoder.hw_frames_ctx().is_none() {
-                log::debug!(
-                    "decoder hw_frames_ctx is null, is_hwaccel:{}",
-                    decoder.is_hwaccel()
-                );
-                // 通过 av_buffer_ref 为解码器申请一份独立引用，
-                // 而不是把 hw_frame 自身的 hw_frames_ctx 指针直接搬走（from_raw 会转移所有权）。
-                // 否则 hw_frame 析构（unref）后 decoder->hw_frames_ctx 变成悬空指针 → double-free/UAF。
-                let ref_counter = ffi::av_buffer_ref(hw_frame.hw_frames_ctx);
-                if ref_counter.is_null() {
-                    return Err(RsmediaError::custom(
-                        "Failed to av_buffer_ref hw_frames_ctx for decoder",
-                    ));
-                }
-                let frames_ctx = AVHWFramesContext::from_raw(NonNull::new_unchecked(ref_counter));
-                decoder.set_hw_frames_ctx(frames_ctx);
-            }
         }
 
         // 创建软件帧
@@ -339,11 +376,6 @@ impl HWContext {
         sw_frame
             .alloc_buffer()
             .context("Failed to allocate software frame buffer")?;
-
-        // 该方法分配硬件帧缓冲区，这里是从硬件帧转换为软件帧，所以需要分配软件帧缓冲区
-        // hw_frames_ctx
-        //     .get_buffer(&mut sw_frame)
-        //     .context("Failed to allocate software frame buffer")?;
 
         // 从硬件帧传输数据到软件帧
         sw_frame
@@ -435,7 +467,7 @@ impl HWContext {
         Ok(hw_frame)
     }
 
-    /// 复制帧属性
+    /// 复制视频帧属性（时间戳/画面类型/宽高比等）与 side-data 元数据。
     ///
     /// # Arguments
     /// * `dst` - The destination frame to which properties will be copied.
@@ -444,9 +476,6 @@ impl HWContext {
         dst.set_pts(src.pts);
         dst.set_time_base(src.time_base);
         dst.set_pict_type(src.pict_type);
-        dst.set_ch_layout(src.ch_layout);
-        dst.set_nb_samples(src.nb_samples);
-        dst.set_sample_rate(src.sample_rate);
 
         unsafe {
             let dst_ptr = dst.as_mut_ptr();
@@ -457,7 +486,7 @@ impl HWContext {
             (*dst_ptr).sample_aspect_ratio = src.sample_aspect_ratio;
         }
 
-        // 复制帧属性
+        // 复制 side-data 与帧级元数据
         imgutils::copy_frame_metadata(src, dst, false)
     }
 
@@ -494,6 +523,13 @@ impl HWContext {
     }
 }
 
+/// SAFETY:
+/// - `AVHWDeviceContext` 底层是引用计数的 `AVBufferRef`；本类型的所有方法
+///   （`setup_decoder_frames`/`setup_encoder_frames`/`hw_download`/`hw_upload`）
+///   只做共享访问，涉及的
+///   FFI 调用（`av_buffer_ref`/`av_hwframe_ctx_alloc`/`av_hwframe_get_buffer`/
+///   `av_hwframe_transfer_data`）均为 FFmpeg 保证的线程安全操作。
+/// - 硬件设备本身由驱动保证并发使用安全。
 unsafe impl Send for HWContext {}
 unsafe impl Sync for HWContext {}
 
@@ -542,7 +578,7 @@ ffi_enum_wrap_from!(
 impl HWDeviceType {
     /// Whether or not the device type is available on this system.
     pub fn is_available(self) -> bool {
-        self.list_available().contains(&self)
+        Self::list_available().contains(&self)
     }
 
     /// 当前平台的硬件加速优先级（从高到低）。
@@ -580,9 +616,12 @@ impl HWDeviceType {
     ///
     /// # Arguments
     ///
-    /// * `candidates` - 自定义候选顺序；`None` 使用平台默认优先级。
-    pub fn auto_platform_config(candidates: Option<Vec<HWDeviceType>>) -> Result<HWDeviceConfig> {
-        let preference = candidates.unwrap_or_else(Self::platform_preference);
+    /// * `candidates` - 自定义候选顺序（空切片必报错）；`None` 使用平台默认优先级。
+    pub fn auto_platform_config(candidates: Option<&[HWDeviceType]>) -> Result<HWDeviceConfig> {
+        let preference: Vec<HWDeviceType> = match candidates {
+            Some(list) => list.to_vec(),
+            None => Self::platform_preference(),
+        };
         if preference.is_empty() {
             return Err(RsmediaError::custom(format!(
                 "No hardware acceleration preference defined for platform: {}",
@@ -614,7 +653,7 @@ impl HWDeviceType {
     /// List available hardware acceleration device types on this system.
     ///
     /// Uses `av_hwdevice_iterate_types` internally.
-    pub fn list_available(self) -> Vec<HWDeviceType> {
+    pub fn list_available() -> Vec<HWDeviceType> {
         let mut hw_device_types = Vec::new();
         unsafe {
             let mut hwdevice_type = ffi::av_hwdevice_iterate_types(ffi::AV_HWDEVICE_TYPE_NONE);
@@ -623,34 +662,6 @@ impl HWDeviceType {
                 hwdevice_type = ffi::av_hwdevice_iterate_types(hwdevice_type);
             }
             hw_device_types
-        }
-    }
-
-    /// Find the best available hardware acceleration device config on this system.
-    pub fn auto_best_config(self) -> Result<HWDeviceConfig> {
-        if self.is_available() {
-            Ok(HWDeviceConfig::new(
-                self,
-                self.default_hw_pixel_format(),
-                self.default_sw_pixel_format(),
-                None,
-                None,
-            ))
-        } else {
-            let devices = self.list_available();
-            if devices.is_empty() {
-                return Err(RsmediaError::custom(
-                    "No suitable hardware acceleration device found",
-                ));
-            }
-            let device = devices[0];
-            Ok(HWDeviceConfig::new(
-                device,
-                device.default_hw_pixel_format(),
-                device.default_sw_pixel_format(),
-                None,
-                None,
-            ))
         }
     }
 
@@ -712,16 +723,27 @@ impl HWDeviceType {
     }
 }
 
-#[unsafe(no_mangle)]
+/// `get_format` 回调：在解码器给出的候选像素格式列表中选择硬件表面格式。
+///
+/// 采用 FFmpeg 官方 `hw_decode` 示例的做法 —— 候选列表中带
+/// `AV_PIX_FMT_FLAG_HWACCEL` 标志的格式即为本设备可用的硬件格式
+/// （列表由解码器结合已设置的 `hw_device_ctx` / `hw_frames_ctx` 在
+/// `avcodec_open2` 阶段生成）。因此**不需要**通过 `AVCodecContext.opaque`
+/// 传递每实例数据：`opaque` 是 FFmpeg 留给应用层的私有字段，库占用会与
+/// 用户代码互相破坏。
+///
+/// 该函数仅以函数指针形式安装到 codec context，无需导出符号，故不使用
+/// `#[no_mangle]`，避免污染全局符号表。
 unsafe extern "C" fn hwaccel_get_format(
-    ctx: *mut ffi::AVCodecContext,
+    _ctx: *mut ffi::AVCodecContext,
     pix_fmts: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
     unsafe {
         let mut p = pix_fmts;
-        let hw_format = (*ctx).opaque as ffi::AVPixelFormat;
         while *p != ffi::AV_PIX_FMT_NONE {
-            if *p == hw_format {
+            if let Some(desc) = AVPixFmtDescriptorRef::get(*p)
+                && (desc.flags & ffi::AV_PIX_FMT_FLAG_HWACCEL as u64) != 0
+            {
                 return *p;
             }
             p = p.add(1);
@@ -733,6 +755,74 @@ unsafe extern "C" fn hwaccel_get_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 串行化所有触碰 `HW_CTX_CACHE` 的测试：缓存为进程级静态，lib 测试
+    /// 共享同一进程，并行运行会破坏彼此的计数断言。
+    static HW_CACHE_TEST_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
+
+    /// 自动探测并创建硬件上下文。设备探测（`av_hwdevice_iterate_types`）
+    /// 只覆盖 FFmpeg 的**编译期**支持，运行时可能仍打不开设备（如 CI 虚机
+    /// 无 `/dev/dri` 渲染节点或 D3D11 适配器），创建失败视为"本机无可用
+    /// GPU"，打印原因并返回 `None` 让调用方跳过而非 panic。
+    fn try_auto_hw_context() -> Option<Arc<HWContext>> {
+        let config = match HWDeviceConfig::auto_platform() {
+            Ok(config) => config,
+            Err(e) => {
+                println!("skip: no hardware acceleration device probed: {e}");
+                return None;
+            }
+        };
+        println!("config: {config}");
+        match HWContext::new(config) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                println!("skip: hardware device not usable on this machine: {e}");
+                None
+            }
+        }
+    }
+
+    /// 空缓存清理应返回 0 且不 panic（CI / 无 GPU 环境）。
+    /// 有 GPU 时：创建 context → 释放引用 → 清理应移除该条目。
+    #[test]
+    fn test_clear_hw_ctx_cache() {
+        let _guard = HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 基线：先清理其它测试可能遗留的条目，再验证空缓存清理返回 0
+        let _leftovers = clear_hw_ctx_cache();
+        let removed = clear_hw_ctx_cache();
+        assert_eq!(removed, 0, "empty cache should remove nothing");
+
+        // 若本机有可用 GPU 设备：创建后释放，缓存条目应可被清理
+        let Some(ctx) = try_auto_hw_context() else {
+            return;
+        };
+        // 持有期间清理不应移除
+        assert_eq!(clear_hw_ctx_cache(), 0);
+        drop(ctx);
+        // 引用释放后（仅缓存持有），清理应移除该条目
+        assert_eq!(clear_hw_ctx_cache(), 1);
+        // 再次清理：缓存已空
+        assert_eq!(clear_hw_ctx_cache(), 0);
+    }
+
+    /// `HWContext` 跨线程共享同一 Arc 不应触发数据竞争（回归测试：
+    /// setup_decoder_frames 并发调用曾通过 UnsafeCell 做可变访问）。
+    #[test]
+    fn test_hw_context_shared_across_threads() {
+        let _guard = HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(ctx) = try_auto_hw_context() else {
+            return; // 无 GPU 环境跳过
+        };
+        let ctx2 = Arc::clone(&ctx);
+        let handle = std::thread::spawn(move || {
+            // 共享引用上的只读方法跨线程调用
+            let _ = ctx2.get_format(true);
+        });
+        let _ = ctx.get_format(false);
+        handle.join().expect("thread should not panic");
+    }
 
     /// 所有变体与 ffi 值双向映射后应保持自身（编译期常量，跨平台一致）。
     #[test]
@@ -795,7 +885,10 @@ mod tests {
             HWDeviceType::VULKAN,
         ];
         for v in variants {
-            assert_eq!(v.is_available(), v.list_available().contains(&v));
+            assert_eq!(
+                v.is_available(),
+                HWDeviceType::list_available().contains(&v)
+            );
         }
     }
 
@@ -825,7 +918,7 @@ mod tests {
     /// 可用时应给出 D3D11 硬件格式 + NV12 软件格式；不可用时应优雅报错。
     #[test]
     fn test_auto_platform_amf_candidate() {
-        match HWDeviceConfig::auto_platform_with(Some(vec![HWDeviceType::D3D11VA])) {
+        match HWDeviceConfig::auto_platform_with(&[HWDeviceType::D3D11VA]) {
             Ok(config) => {
                 assert_eq!(config.device_type, HWDeviceType::D3D11VA);
                 assert_eq!(config.hw_pixel_format, PixelFormat::D3D11);
@@ -841,10 +934,10 @@ mod tests {
         }
     }
 
-    /// 空候选列表应报错而不是 panic（未知平台 / 显式空 vec）。
+    /// 空候选列表应报错而不是 panic（未知平台 / 显式空列表）。
     #[test]
     fn test_auto_platform_empty_candidates() {
-        let result = HWDeviceConfig::auto_platform_with(Some(Vec::new()));
+        let result = HWDeviceConfig::auto_platform_with(&[]);
         assert!(result.is_err());
     }
 

@@ -27,7 +27,7 @@ fn main() -> Result<()> {
     println!("codec_id: {}", info.codec_id);
     println!("width x height: {}x{}", info.width, info.height);
     println!("bit_rate: {}", info.bit_rate);
-    println!("format: {}", info.format);
+    println!("format: {:?}", info.format);
     println!("time_base: {}/{}", info.time_base.num, info.time_base.den);
     println!(
         "frame_rate: {}/{}",

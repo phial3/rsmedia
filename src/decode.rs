@@ -9,10 +9,11 @@ use crate::options::Options;
 use crate::resize::Resize;
 use crate::stream::StreamInfo;
 use crate::strutils;
+use crate::subtitle::SubtitleSegment;
 use crate::swctx::{self, SwsFlags};
 use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
 
-use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
+use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket, AVSubtitle};
 use rsmpeg::avformat::AVStream;
 use rsmpeg::avutil::{self, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
@@ -31,6 +32,8 @@ pub struct DecoderBuilder {
     hw_device_config: Option<HWDeviceConfig>,
     scale_algorithm: SwsFlags,
     resize: Option<Resize>,
+    /// 解码输出目标像素格式（仅视频），默认 [`PixelFormat::YUV420P`]。
+    pix_fmt: Option<PixelFormat>,
 }
 
 impl DecoderBuilder {
@@ -50,6 +53,7 @@ impl DecoderBuilder {
             flags: AVCodecFlag::LOW_DELAY,
             scale_algorithm: SwsFlags::default(),
             resize: None,
+            pix_fmt: None,
         }
     }
 
@@ -113,6 +117,27 @@ impl DecoderBuilder {
         self
     }
 
+    /// Set the output pixel format of decoded video frames.
+    ///
+    /// 默认 [`PixelFormat::YUV420P`]。支持：
+    /// - [`PixelFormat::YUV420P`]（专用分支，U/V 以 2x2 块代表值存入 `[H, W, 3]`）
+    /// - 全部 packed 8bit 格式（见 [`PixelFormat::packed_channels`]）：
+    ///   GRAY8 `[H,W,1]` / YUYV422、UYVY422 `[H,W,2]` / RGB24、BGR24 `[H,W,3]` /
+    ///   RGBA、BGRA、ARGB、ABGR `[H,W,4]`（无损往返）
+    ///
+    /// 源格式与目标不一致时由 swscale 自动转换（如 NV12 → RGBA）。
+    /// 其他格式请用 [`decode_raw`](Decoder::decode_raw) 获取原始 `AVFrame`，
+    /// 或通过滤镜 `format` 转换。
+    ///
+    /// 仅对视频解码器有效；其他媒体类型构建时返回错误（fail-fast）。
+    ///
+    /// 注意：[`PixelFormat::YUV420P`] 要求输出宽高为偶数（色度平面下采样），
+    /// 建议搭配 [`Resize::FitEven`] 保证尺寸约束。
+    pub fn with_pix_fmt(mut self, pix_fmt: PixelFormat) -> Self {
+        self.pix_fmt = Some(pix_fmt);
+        self
+    }
+
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
@@ -167,7 +192,7 @@ impl DecoderBuilder {
     /// [`build_wrapped`](DecoderBuilder::build_wrapped) 一致。
     pub fn build_wrapped_with_reader<R: Reader>(self, reader: R) -> Result<DecoderWrapper<R>> {
         let decoder = self.build_from_reader(&reader)?;
-        Ok(DecoderWrapper::new(decoder, reader))
+        DecoderWrapper::new(decoder, reader)
     }
 
     /// 用给定的 reader 构建**裸** [`Decoder`]（不持有 reader）。
@@ -238,8 +263,8 @@ impl DecoderBuilder {
                 // create hardware context
                 HWContext::new(cfg)
                     .and_then(|ctx| {
-                        // 注意：setup_hw_frames 可能会改变 decode_ctx.pix_fmt
-                        ctx.setup_hw_frames(true, &mut decode_ctx, init_width, init_height)?;
+                        // 注意：setup_decoder_frames 可能会改变 decode_ctx.pix_fmt
+                        ctx.setup_decoder_frames(&mut decode_ctx, init_width, init_height)?;
                         Ok(ctx)
                     })
                     .context("Hardware acceleration context initialization failed")
@@ -254,20 +279,41 @@ impl DecoderBuilder {
         let stream_info = StreamInfo::from_stream(input_stream)?;
         log::info!("{stream_info}");
 
+        // 输出像素格式：仅视频有效。支持 YUV420P 专用分支 + 全部 packed 8bit
+        // 格式（GRAY8/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR，见
+        // `PixelFormat::packed_channels`）；解码输出经 swscale 统一转换到目标格式。
+        // 非视频类型配置了 pix_fmt 视为调用方错误，快速失败而非静默忽略。
+        let output_pix_fmt = match (media_type, self.pix_fmt) {
+            (MediaType::VIDEO, Some(fmt)) => {
+                if fmt != PixelFormat::YUV420P && fmt.packed_channels().is_none() {
+                    return Err(RsmediaError::custom(format!(
+                        "Unsupported output pixel format: {fmt:?}, only YUV420P and packed 8-bit \
+                         formats (GRAY8/YUYV422/UYVY422/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR) are \
+                         supported"
+                    )));
+                }
+                fmt
+            }
+            (MediaType::VIDEO, None) => PixelFormat::YUV420P,
+            (media_type, Some(fmt)) => {
+                return Err(RsmediaError::custom(format!(
+                    "with_pix_fmt({fmt:?}) is only valid for video decoders, got media type: {media_type:?}"
+                )));
+            }
+            (_, None) => PixelFormat::YUV420P,
+        };
+
         let filter_graph = if let Some(filters) = self.filters {
             let filter_params = match media_type {
-                MediaType::VIDEO => {
-                    FilterParams::Video(VideoParams {
-                        width: init_width,
-                        height: init_height,
-                        // 解码器输出已统一为 YUV420P，滤镜图 src/sink 同格式
-                        src_format: PixelFormat::YUV420P,
-                        format: PixelFormat::YUV420P, // 确保视频帧 filter 的输入格式是 YUV420P
-                        time_base: decode_ctx.time_base,
-                        frame_rate: decode_ctx.framerate,
-                        pixel_aspect: decode_ctx.sample_aspect_ratio,
-                    })
-                }
+                MediaType::VIDEO => FilterParams::Video(VideoParams {
+                    width: init_width,
+                    height: init_height,
+                    src_format: output_pix_fmt,
+                    format: output_pix_fmt,
+                    time_base: decode_ctx.time_base,
+                    frame_rate: decode_ctx.framerate,
+                    pixel_aspect: decode_ctx.sample_aspect_ratio,
+                }),
                 MediaType::AUDIO => FilterParams::Audio(AudioParams {
                     nb_channels: decode_ctx.ch_layout.nb_channels,
                     sample_rate: decode_ctx.sample_rate,
@@ -275,7 +321,11 @@ impl DecoderBuilder {
                     src_format: SampleFormat::from(decode_ctx.sample_fmt),
                     time_base: decode_ctx.time_base,
                 }),
-                _ => panic!("Unsupported filter for media type: {media_type:?}"),
+                _ => {
+                    return Err(RsmediaError::custom(format!(
+                        "Unsupported filter for media type: {media_type:?}"
+                    )));
+                }
             };
 
             let mut graph = FilterGraph::new();
@@ -306,6 +356,7 @@ impl DecoderBuilder {
             state: DecoderState::Normal,
             scale_algorithm: self.scale_algorithm,
             resize: self.resize,
+            output_pix_fmt,
         })
     }
 }
@@ -342,6 +393,8 @@ pub struct Decoder {
     state: DecoderState,
     scale_algorithm: SwsFlags,
     resize: Option<Resize>,
+    /// 解码输出目标像素格式（仅视频）
+    output_pix_fmt: PixelFormat,
 }
 
 impl Decoder {
@@ -363,6 +416,19 @@ impl Decoder {
     #[inline]
     pub fn new_audio(source: impl Into<Location>) -> Result<Decoder> {
         DecoderBuilder::new(MediaType::AUDIO).build(source)
+    }
+
+    /// Create a decoder to decode the subtitle stream of the specified source.
+    ///
+    /// 字幕解码走独立的 [`decode_subtitle_segment`](Self::decode_subtitle_segment)
+    /// 通道（输出 [`SubtitleSegment`]，与音视频的 AVFrame 通道并行）。
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - A [`Reader`] to read the source from.
+    #[inline]
+    pub fn new_subtitle(source: impl Into<Location>) -> Result<Decoder> {
+        DecoderBuilder::new(MediaType::SUBTITLE).build(source)
     }
 
     /// Get the decoders input size width
@@ -518,6 +584,98 @@ impl Decoder {
         decode_stream(self, reader, Decoder::decode_raw_packet, Decoder::drain_raw)
     }
 
+    /// 解码单个 packet 为字幕（仅字幕解码器，低层手动解码 API）。
+    ///
+    /// 字幕解码走 rsmpeg 的 [`AVCodecContext::decode_subtitle`]（同步 API，
+    /// 与音视频的 send_packet/receive_packet 帧通道并行）：每个 packet 直接
+    /// 产出 0 或 1 条字幕，无需排空帧队列。传 [`None`] 表示 flush（排空带
+    /// `AV_CODEC_CAP_DELAY` 的解码器；无缓冲的解码器直接返回 [`None`]）。
+    ///
+    /// 返回的 [`AVSubtitle`] 可通过
+    /// [`SubtitleSegment::from_avsubtitle`](crate::subtitle::SubtitleSegment::from_avsubtitle)
+    /// 转换为纯文本段落，或经 `rect_iter` 自行处理。
+    pub fn decode_subtitle_packet(
+        &mut self,
+        packet: Option<&mut AVPacket>,
+    ) -> Result<Option<AVSubtitle>> {
+        self.context
+            .decode_subtitle(packet)
+            .context("Failed to decode subtitle packet")
+    }
+
+    /// 解码下一条字幕段落（仅字幕解码器，推荐入口）。
+    ///
+    /// 驱动「读 packet → 解码 → EOF 排空」状态机：跳过非目标流的 packet，
+    /// 目标流 packet 经 [`Self::decode_subtitle_packet`] 解码；reader 耗尽后
+    /// 以空包 flush 字幕解码器（处理 `AV_CODEC_CAP_DELAY` 的尾部缓冲）。
+    /// 无文本 rect 的字幕（如位图字幕）会被跳过。
+    ///
+    /// # Return value
+    ///
+    /// The decoded [`SubtitleSegment`], or [`None`] at end of stream.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut decoder = Decoder::new_subtitle(Path::new("video.mp4"))?;
+    /// while let Some(segment) = decoder.decode_subtitle_segment(&mut reader)? {
+    ///     println!("{}-{}ms: {}", segment.start_ms, segment.end_ms, segment.text);
+    /// }
+    /// ```
+    pub fn decode_subtitle_segment<R>(&mut self, reader: &mut R) -> Result<Option<SubtitleSegment>>
+    where
+        R: Reader,
+    {
+        if self.media_type != MediaType::SUBTITLE {
+            return Err(RsmediaError::custom(format!(
+                "decode_subtitle_segment requires a subtitle decoder, got media type: {:?}",
+                self.media_type
+            )));
+        }
+        if self.is_flushed() {
+            return Err(RsmediaError::custom(
+                "Decoder cannot decode after flushed. Call reset().",
+            ));
+        }
+
+        let mut read_exhausted = false;
+        loop {
+            if !read_exhausted {
+                match reader.read_packet()? {
+                    Some((stream_index, mut packet)) => {
+                        if stream_index != self.stream_index {
+                            log::trace!("skip stream index: {stream_index}");
+                            continue;
+                        }
+                        if let Some(subtitle) = self.decode_subtitle_packet(Some(&mut packet))?
+                            && let Some(segment) = SubtitleSegment::from_avsubtitle(&subtitle)
+                        {
+                            return Ok(Some(segment));
+                        }
+                    }
+                    None => {
+                        log::debug!("No more packets, Reader exhausted.");
+                        read_exhausted = true;
+                    }
+                }
+            } else {
+                // EOF：空包 flush 字幕解码器（CAP_DELAY 解码器可能仍有缓冲字幕）
+                match self.decode_subtitle_packet(None)? {
+                    Some(subtitle) => {
+                        if let Some(segment) = SubtitleSegment::from_avsubtitle(&subtitle) {
+                            return Ok(Some(segment));
+                        }
+                    }
+                    None => {
+                        self.state = DecoderState::Flushed;
+                        log::debug!("Subtitle decoder flushed. EOF reached.");
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
     /// Decode a [`Packet`].
     ///
     /// Feeds the packet to the decoder and returns a frame if there is one available. The caller
@@ -586,7 +744,7 @@ impl Decoder {
     where
         T: MediaFrameType,
     {
-        // Video Frame pixel YUV420P, RGB24 is supported
+        // Video Frame: YUV420P 专用分支 + packed 8bit 格式（GRAY8/YUYV422/UYVY422/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）
         MediaFrame::<T>::from_avframe(&frame)
     }
 
@@ -672,7 +830,7 @@ impl Decoder {
             Some(hw_ctx) if hw_ctx.is_hw_frame(&decoded_frame) => {
                 // hw_frame -> sw_frame
                 hw_ctx
-                    .hw_download(&mut self.context, &decoded_frame)
+                    .hw_download(&decoded_frame)
                     .context("Failed HW frame download")?
             }
             _ => {
@@ -681,16 +839,16 @@ impl Decoder {
             }
         };
 
-        // 3. 确保输入Filter的视频帧的格式为 YUV420P
+        // 3. 统一视频输出格式（如 YUV420P / RGB24，由 `with_pix_fmt` 配置）
         // 例如：
         // 无硬件加速，默认解码格式 YUV420P
-        // 存在硬件加速帧，则转换 NV12 -> YUV420P
-        // 注意：这里无论是否有 Filter，都会统一转成 YUV420P（因为
+        // 存在硬件加速帧，则转换 NV12 -> 目标格式
+        // 注意：这里无论是否有 Filter，都会统一转成目标格式（因为
         // `MediaFrame` 视频目前主要支持 YUV420P/RGB24）。因此即使源是
-        // yuv444p / nv12 / 10-bit，解码输出也会被转成 YUV420P，不会颜色错乱。
+        // yuv444p / nv12 / 10-bit，解码输出也会被转成目标格式，不会颜色错乱。
         let raw_frame = match self.media_type {
             MediaType::VIDEO => {
-                let target_sw_pix_fmt = PixelFormat::YUV420P;
+                let target_sw_pix_fmt = self.output_pix_fmt;
                 // 计算目标尺寸：无 resize 时保持源尺寸，有 resize 时按策略计算
                 let (out_w, out_h) = match self.resize {
                     Some(resize) => resize
@@ -848,6 +1006,12 @@ where
 /// contain frames. Run `drain_raw()` or `drain()` in a loop until no more frames are produced.
 impl Drop for Decoder {
     fn drop(&mut self) {
+        // 字幕解码走同步的 avcodec_decode_subtitle2，无 send/receive 帧队列
+        // 需要排空（且字幕解码器不支持 send_packet flush）
+        if self.media_type == MediaType::SUBTITLE {
+            return;
+        }
+
         // 1. Flush Filter Graph if exists.
         if let Some(graph) = self.filter_graph.as_mut() {
             match graph.flush() {
@@ -905,32 +1069,15 @@ impl Drop for Decoder {
                 log::warn!("Failed to send flush packet to decoder: {e}")
             }
         }
-
-        unsafe {
-            // explicitly drop the hw_context to release the hardware resources
-            // 1. malloc(): unsorted double linked list corrupted
-            // 2. malloc(): mismatching next->prev_size (unsorted)
-            // 3. free(): invalid pointer
-            // 4. double free or corruption (!prev)
-            // 5. corrupted double-linked list Aborted (core dumped)
-            let codec_ctx_ptr = self.context.as_mut_ptr();
-            if !codec_ctx_ptr.is_null() {
-                if !(*codec_ctx_ptr).hw_frames_ctx.is_null() {
-                    let _hw_frames = (*codec_ctx_ptr).hw_frames_ctx;
-                    (*codec_ctx_ptr).hw_frames_ctx = std::ptr::null_mut();
-                }
-
-                if !(*codec_ctx_ptr).hw_device_ctx.is_null() {
-                    let _hw_device = (*codec_ctx_ptr).hw_device_ctx;
-                    (*codec_ctx_ptr).hw_device_ctx = std::ptr::null_mut();
-                }
-            }
-        }
     }
 }
 
+/// SAFETY:
+/// - `Decoder` 内含 `AVCodecContext` / filter graph，FFmpeg 不保证其线程安全，
+///   `&Decoder` 跨线程共享（`Sync`）无法成立，故不实现 `Sync`。
+/// - `Send`（move 到另一线程独占使用）是安全的：所有资源随对象移动，
+///   无线程局部句柄。
 unsafe impl Send for Decoder {}
-unsafe impl Sync for Decoder {}
 
 /// 解码器包装器，持有 Decoder 和 Reader
 pub struct DecoderWrapper<R: Reader> {
@@ -941,13 +1088,14 @@ pub struct DecoderWrapper<R: Reader> {
 
 impl<R: Reader> DecoderWrapper<R> {
     /// 创建一个新的解码器包装器
-    pub fn new(decoder: Decoder, reader: R) -> Self {
-        let stream_info = StreamInfo::from_reader(&reader, decoder.stream_index()).unwrap();
-        Self {
+    pub fn new(decoder: Decoder, reader: R) -> Result<Self> {
+        let stream_info = StreamInfo::from_reader(&reader, decoder.stream_index())
+            .context("Failed to create stream info from reader")?;
+        Ok(Self {
             reader,
             decoder,
             stream_info,
-        }
+        })
     }
 
     /// 解码下一帧（媒体帧）
@@ -965,6 +1113,27 @@ impl<R: Reader> DecoderWrapper<R> {
     /// 解码下一帧（原始帧）
     pub fn decode_raw(&mut self) -> Result<Option<AVFrame>> {
         self.decoder.decode_raw(&mut self.reader)
+    }
+
+    /// 解码下一条字幕段落（仅字幕解码器）
+    pub fn decode_subtitle_segment(&mut self) -> Result<Option<SubtitleSegment>> {
+        self.decoder.decode_subtitle_segment(&mut self.reader)
+    }
+
+    /// Seek 到指定时间点并解码一帧原始 `AVFrame`（视频）。
+    ///
+    /// 缩略图/封面提取的核心路径：seek 定位到目标时间之前最近的关键帧
+    /// （`AVSEEK_FLAG_BACKWARD` 语义），从该帧开始解码。若 reader 不支持
+    /// seek（如内存缓冲），静默从头解码第一帧。
+    ///
+    /// 返回 `Ok(None)` 表示到达流末尾且无帧可解。转换为图片请用
+    /// [`imgutils::to_dynamic_image`](crate::imgutils::to_dynamic_image)。
+    pub fn decode_raw_at(&mut self, timestamp_ms: i64) -> Result<Option<AVFrame>> {
+        // seek 失败（不支持 seek 的 reader）不视为错误：退化为解码第一帧
+        if self.seek_to_timestamp(timestamp_ms).is_err() {
+            log::debug!("seek to {timestamp_ms}ms failed, decoding from the current position");
+        }
+        self.decode_raw()
     }
 
     pub fn stream_info(&self) -> &StreamInfo {
@@ -1039,11 +1208,81 @@ impl<R: Reader> DecoderWrapper<R> {
     }
 }
 
+/// 一站式从输入获取一帧视频缩略图，返回 `image::DynamicImage`。
+///
+/// 内部流程：构建视频解码器（RGB24 输出 + [`Resize::Fit`] 保持纵横比缩放）
+/// → seek 到目标时间 → 解码一帧原始 `AVFrame` → 转为
+/// [`image::DynamicImage`](imgutils::to_dynamic_image)。
+/// 不依赖 `ndarray` feature，适合生成封面图 / 视频预览等场景。
+///
+/// # Arguments
+///
+/// * `source` - 输入（文件路径 / URL 等，见 [`Location`]）
+/// * `timestamp_milliseconds` - 取帧时间点；`None` 时取**流中点**
+///   （视频开头往往是黑帧/淡入，中点更容易取到有代表性的画面；
+///   时长未知的流退化为取第一帧）
+/// * `max_dims` - 缩略图最大 (宽, 高)；实际尺寸按纵横比缩放，
+///   源小于该尺寸时不放大
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use rsmedia::thumbnail;
+/// # use std::path::Path;
+/// let img = thumbnail(Path::new("assets/mp4.mp4"), None, (320, 240)).unwrap();
+/// println!("thumbnail: {}x{}", img.width(), img.height());
+/// img.save("thumbnail.png").unwrap();
+/// ```
+pub fn thumbnail(
+    source: impl Into<Location>,
+    timestamp_ms: Option<i64>,
+    max_dims: (u32, u32),
+) -> Result<image::DynamicImage> {
+    let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+        .with_pix_fmt(PixelFormat::RGB24)
+        .with_resize(Resize::Fit(max_dims.0, max_dims.1))
+        .build_wrapped(source)
+        .context("Failed to build thumbnail decoder")?;
+
+    // None → 流中点；时长未知（0）→ 第一帧
+    let ts = timestamp_ms.unwrap_or_else(|| {
+        let info = decoder.stream_info();
+        let mid_secs = info.duration as f64 * avutil::av_q2d(info.time_base) / 2.0;
+        (mid_secs * 1000.0).round().max(0.0) as i64
+    });
+
+    let frame = decoder
+        .decode_raw_at(ts)?
+        .ok_or_else(|| RsmediaError::custom("No video frame decoded for thumbnail"))?;
+
+    crate::imgutils::to_dynamic_image(&frame).context("Failed to convert AVFrame to image")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::filter;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_thumbnail() -> Result<()> {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+        // 默认取流中点，Fit 缩放保持纵横比
+        let img = thumbnail(video_path, None, (320, 240))?;
+        assert!(img.width() > 0 && img.height() > 0);
+        assert!(
+            img.width() <= 320 && img.height() <= 240,
+            "thumbnail dims {}x{} exceed 320x240",
+            img.width(),
+            img.height()
+        );
+        assert_eq!(img.color().channel_count(), 3, "expected RGB output");
+
+        // 指定时间点
+        let img = thumbnail(video_path, Some(1000), (64, 64))?;
+        assert!(img.width() > 0 && img.height() > 0);
+        Ok(())
+    }
 
     #[test]
     fn test_decode_video() -> Result<()> {
@@ -1139,6 +1378,46 @@ mod tests {
         assert!(frames > 0, "expected at least one decoded frame");
 
         Ok(())
+    }
+
+    /// 验证 `with_pix_fmt(RGB24)`：解码输出应为 RGB24；同时 MediaFrame 路径
+    /// 可正常转换。
+    #[test]
+    fn test_decode_video_with_pix_fmt_rgb24() -> Result<()> {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_pix_fmt(PixelFormat::RGB24)
+            .build_wrapped(video_path)?;
+
+        let mut frames = 0usize;
+        while let Some(frame) = decoder.decode_raw()? {
+            assert_eq!(frame.format, PixelFormat::RGB24.into());
+            frames += 1;
+        }
+        assert!(frames > 0, "expected at least one decoded frame");
+
+        Ok(())
+    }
+
+    /// `with_pix_fmt` 不支持的格式应在构建时返回错误而非 panic。
+    #[test]
+    fn test_decode_video_with_pix_fmt_unsupported() {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+        let result = DecoderBuilder::new(MediaType::VIDEO)
+            .with_pix_fmt(PixelFormat::NV12)
+            .build_wrapped(video_path);
+        assert!(result.is_err());
+    }
+
+    /// `with_pix_fmt` 对音频解码器应快速失败，而非静默忽略。
+    #[test]
+    fn test_decode_audio_with_pix_fmt_fails() {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+        let result = DecoderBuilder::new(MediaType::AUDIO)
+            .with_pix_fmt(PixelFormat::YUV420P)
+            .build_wrapped(video_path);
+        assert!(result.is_err());
     }
 
     /// 验证 `with_resize` 与 `scale` filter 两种缩放方式结果一致，且同时使用时

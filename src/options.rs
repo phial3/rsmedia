@@ -2,12 +2,13 @@ use crate::strutils;
 
 use rsmpeg::avutil::AVDictionary;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A wrapper type for ffmpeg options.
 ///
-/// Internally backed by a [`HashMap<String, String>`] and lazily materialized
-/// into an [`AVDictionary`] at the FFI boundary
+/// Internally backed by a [`BTreeMap<String, String>`] (key-sorted, so the
+/// type derives a deterministic `Hash`) and lazily materialized into an
+/// [`AVDictionary`] at the FFI boundary
 /// ([`Options::into_dict`]/[`Options::to_dict`]).
 ///
 /// This avoids a subtle defect of building AVDictionary directly: rsmpeg
@@ -28,13 +29,13 @@ use std::collections::HashMap;
 /// opts.insert("threads", "4");
 /// opts.merge(Options::preset_h264()); // preset keys win
 /// ```
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct Options(HashMap<String, String>);
+#[derive(Clone, Default, Hash, PartialEq, Eq)]
+pub struct Options(BTreeMap<String, String>);
 
 impl Options {
     /// Creates an empty options set.
     pub fn new() -> Self {
-        Self(HashMap::new())
+        Self(BTreeMap::new())
     }
 
     /// Inserts a key-value pair, replacing any existing entry (same
@@ -69,8 +70,7 @@ impl Options {
         self.0.is_empty()
     }
 
-    /// Iterates over key-value pairs (unordered, like the underlying
-    /// AVDictionary).
+    /// Iterates over key-value pairs in key order.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
         self.0.iter()
     }
@@ -291,21 +291,21 @@ impl Options {
 /// `HashMap<String, String>` -> `Options`
 impl From<HashMap<String, String>> for Options {
     fn from(item: HashMap<String, String>) -> Self {
-        Self(item)
+        Self(item.into_iter().collect())
     }
 }
 
 /// `Options` -> `HashMap<String, String>`
 impl From<Options> for HashMap<String, String> {
     fn from(item: Options) -> Self {
-        item.0
+        item.0.into_iter().collect()
     }
 }
 
 /// Borrowing conversion (clones the entries).
 impl From<&Options> for HashMap<String, String> {
     fn from(item: &Options) -> Self {
-        item.0.clone()
+        item.0.clone().into_iter().collect()
     }
 }
 

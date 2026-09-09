@@ -1,6 +1,8 @@
 use rsmedia::{
-    DecoderBuilder, EncoderBuilder, MediaType, PixelFormat, colors, frame::MediaFrame,
-    hwaccel::HWDeviceType, time,
+    DecoderBuilder, EncoderBuilder, MediaType, PixelFormat, colors,
+    frame::MediaFrame,
+    hwaccel::{HWDeviceConfig, HWDeviceType},
+    time,
 };
 use std::path::PathBuf;
 
@@ -28,7 +30,7 @@ fn check(codec: &'static str, ext: &str) -> anyhow::Result<()> {
     let path = PathBuf::from(format!("/tmp/hw_vt_{codec}.{ext}"));
     let _ = std::fs::remove_file(&path);
 
-    let dev = HWDeviceType::VIDEOTOOLBOX.auto_best_config()?;
+    let dev = HWDeviceConfig::auto_platform_with(&[HWDeviceType::VIDEOTOOLBOX])?;
     let mut enc = EncoderBuilder::new_video(w, h)
         .with_fps(30.0)
         .with_codec_name(codec.to_string())

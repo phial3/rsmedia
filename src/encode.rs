@@ -467,7 +467,7 @@ impl EncoderBuilder {
     ///
     /// * 显式指定（[`Self::with_pixel_format`]]）：软件路径立即校验编码器
     ///   是否支持，不支持时 `build()` 报错（fail fast）；硬件路径跳过校验
-    ///   （`setup_hw_frames` 会按 HW 要求重设 pix_fmt，HW 私有格式不在
+    ///   （`setup_encoder_frames` 会按 HW 要求重设 pix_fmt，HW 私有格式不在
     ///   软件支持列表内）。
     /// * 未指定：优先 [`PixelFormat::YUV420P`]（兼容性最好）；编码器不支持
     ///   时（如 mjpeg 仅接受 YUVJ 系）取支持列表首个格式；列表为 `None`
@@ -551,7 +551,7 @@ impl EncoderBuilder {
         self.ofmt_flag = writer.output().oformat().flags as u32;
         let encoder = self.build()?;
         let index = writer.add_stream(encoder.codecpar(), encoder.time_base());
-        Ok(EncoderWrapper::new(encoder, writer, index, interleaved))
+        EncoderWrapper::new(encoder, writer, index, interleaved)
     }
 
     /// Build an [`Encoder`].
@@ -732,10 +732,8 @@ impl EncoderBuilder {
                 let (width, height) = (encode_ctx.width, encode_ctx.height);
                 HWContext::new(cfg)
                     .and_then(|ctx| {
-                        // *注意*: setup_hw_frames 会根据 HW 能力修改 encode_ctx.pix_fmt
-                        ctx.setup_hw_frames(false, &mut encode_ctx, width, height)?;
-                        // 更新 Builder 中记录的目标格式，以反映 HW 的要求
-                        // self.pixel_format = PixelFormat::from(encode_ctx.pix_fmt);
+                        // *注意*: setup_encoder_frames 会根据 HW 能力修改 encode_ctx.pix_fmt
+                        ctx.setup_encoder_frames(&mut encode_ctx, width, height)?;
                         Ok(ctx)
                     })
                     .context("Hardware acceleration context initialization failed")
@@ -1589,11 +1587,10 @@ impl Drop for Encoder {
 
 /// SAFETY:
 /// - Encoder contains `AVCodecContext`, which is not inherently thread-safe.
-/// - We implement `Send`/`Sync` only because `Encoder` is guaranteed to be used
-///   in a single-threaded context or externally synchronized by the caller.
-/// - If used across threads, caller must ensure no concurrent access.
+///   Sharing `&Encoder` across threads (`Sync`) cannot be guaranteed, so only
+///   `Send` is implemented: moving an Encoder to another thread for exclusive
+///   use is safe, as all resources move with the object.
 unsafe impl Send for Encoder {}
-unsafe impl Sync for Encoder {}
 
 /// 编码器包装器，持有编码器和写入器
 pub struct EncoderWrapper<W: Writer> {
@@ -1611,8 +1608,14 @@ pub struct EncoderWrapper<W: Writer> {
 
 impl<W: Writer> EncoderWrapper<W> {
     /// 创建一个新的编码器包装器
-    pub fn new(encoder: Encoder, writer: W, stream_index: usize, interleaved: bool) -> Self {
-        let stream_info = StreamInfo::from_writer(&writer, stream_index).unwrap();
+    pub fn new(
+        encoder: Encoder,
+        writer: W,
+        stream_index: usize,
+        interleaved: bool,
+    ) -> Result<Self> {
+        let stream_info = StreamInfo::from_writer(&writer, stream_index)
+            .context("Failed to create stream info from writer")?;
         // 当前帧时长：视频按帧率，音频按采样数/采样率；字幕时间戳由段落自带
         // （start_ms/end_ms），不使用自动递增 pts，帧时长置 0。
         let duration = match encoder.media_type {
@@ -1627,9 +1630,14 @@ impl<W: Writer> EncoderWrapper<W> {
                 time::new_rational(1, encoder.sample_rate().max(1)),
             ),
             MediaType::SUBTITLE => time::Time::zero(),
-            _ => panic!("No supported encoder for media_type."),
+            _ => {
+                return Err(RsmediaError::custom(format!(
+                    "No supported encoder for media_type: {:?}",
+                    encoder.media_type
+                )));
+            }
         };
-        Self {
+        Ok(Self {
             writer,
             encoder,
             interleaved,
@@ -1639,7 +1647,7 @@ impl<W: Writer> EncoderWrapper<W> {
             have_written_trailer: false,
             position: time::Time::zero(),
             frame_duration: duration,
-        }
+        })
     }
 
     #[cfg(feature = "ndarray")]

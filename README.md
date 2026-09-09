@@ -4,7 +4,7 @@
 
 Low / High-level video toolkit based on [rsmpeg](https://github.com/larksuite/rsmpeg).
 
-ffmpeg 6.x, 7.x is supported based [rusty_ffmpeg](https://github.com/CCExtractor/rusty_ffmpeg)
+ffmpeg 6.x / 7.x / 8.x / 9.x is supported based [rusty_ffmpeg](https://github.com/CCExtractor/rusty_ffmpeg)
 
 ## 🎬 Introduction
 
@@ -16,55 +16,11 @@ such as reading, writing, muxing, encoding, decoding, Picture Quality Enhancemen
 
 ## 🛠 S️️tatus
 
-⚠️ This project is still a work-in-progress, and will contain bugs. Some parts
-of the API have not been flushed out yet. Use with caution.
+please use latest release version.
 
-Supported Platforms:
+Currently supported: 
 
-| Platform | Arch    | Linking  | Toolchain   | Build Options | pkg Manager | Support | Notes                          |
-|----------|---------|----------|-------------|---------------|-------------|---------|--------------------------------|
-| Linux    | x86_64  | Static   | GCC/Clang   | Default       | apt, yum    | ✅       | `pkg-config` + `glibc`        |
-|          | x86_64  | Dynamic  | GCC/Clang   | Default       | apt, yum    | ✅       | `pkg-config` + `glibc`        |
-|          | aarch64 | Static   | GCC/Clang   | Default       | apt, yum    | ⚠️      | `pkg-config` + `glibc`        |
-|          | aarch64 | Dynamic  | GCC/Clang   | Default       | apt, yum    | ⚠️      | `pkg-config` + `glibc`        |
-| macOS    | x86_64  | Static   | Apple Clang | ⚠️            | Homebrew    | ❌       | `pkg-config`                  |
-|          | x86_64  | Dynamic  | Apple Clang | Default       | Homebrew    | ✅       | `pkg-config`                  |
-|          | aarch64 | Static   | Apple Clang | ⚠️            | Homebrew    | ❌       | `pkg-config`                  |
-|          | aarch64 | Dynamic  | Apple Clang | Default       | Homebrew    | ✅       | `pkg-config`                  |
-| Windows  | x86_64  | Static   | MSVC/MinGW  | `+crt-static` | vcpkg       | ✅       | `vs-2022` + `llvm` + `clang`  |
-|          | x86_64  | Dynamic  | MSVC/MinGW  | Default       | vcpkg       | ✅       | `vs-2022` + `llvm` + `clang`  |
-|          | aarch64 | Static   | MSVC        | `+crt-static` | vcpkg       | ✅       | `vs-2022` + `llvm` + `clang`  |
-|          | aarch64 | Dynamic  | MSVC        | Default       | vcpkg       | ✅       | `vs-2022` + `llvm` + `clang`  |
-
-Hardware acceleration:
-
-| API        | Platform  | Arch    | Hardware Requirements          | Support         | Notes                    |
-|------------|-----------|---------|--------------------------------|-----------------|--------------------------|
-| VDPAU      | Linux     | x86_64  | NVIDIA GPU                     | ⚠️ Full         | `nvidia-vdpau-driver`    |
-|            | Linux     | aarch64 | NVIDIA GPU                     | ⚠️ Full         | Jetson AGX support       |
-| CUDA       | Linux     | x86_64  | NVIDIA GPU (Compute ≥3.5)      | ✅ Full          | Container-ready          |
-|            | Linux     | aarch64 | NVIDIA GPU (Compute ≥3.5)      | ✅ Full          | Jetson/Orin              |
-|            | Windows   | x86_64  | NVIDIA GPU (Compute ≥3.5)      | ✅ Full          |                          |
-|            | Windows   | aarch64 | NVIDIA GPU (Compute ≥3.5)      | ⚠️ Partial      | Limited driver support   |
-| VAAPI      | Linux     | x86_64  | Intel/AMD/Integrated GPU       | ⚠️ Full         | `intel-media-driver`     |
-|            | Linux     | aarch64 | Mali/AMD GPU                   | ⚠️ Partial      | Kernel 5.15+ required    |
-| DXVA2      | Windows   | x86_64  | DX11-compatible GPU            | ⚠️ Full         | WDDM 2.0+                |
-| QSV        | Linux     | x86_64  | Intel iGPU (≥6th Gen)          | ⚠️ Full         | `intel-media-va-driver`  |
-|            | Windows   | x86_64  | Intel iGPU (≥6th Gen)          | ⚠️ Full         | Intel Media SDK          |
-| TOOLBOX    | macOS     | x86_64  | Intel GPU                      | ✅ Native        | macOS 10.13+             |
-|            | macOS     | aarch64 | Apple Silicon GPU (M series)   | ✅ Native        |                          |
-| D3D11VA    | Windows   | x86_64  | DX11-compatible GPU            | ⚠️ Full         |                          |
-|            | Windows   | aarch64 | DX11-compatible GPU            | ⚠️ Partial      | ARM64 Windows 11         |
-| DRM        | Linux     | x86_64  | AMD/NVIDIA GPU                 | ⚠️ Partial      | `libdrm` + KMS           |
-|            | Linux     | aarch64 | Mali GPU                       | ⚠️ Partial      |                          |
-| MEDIACODEC | Android   | arm64   | Hardware decoder               | ⚠️ Full         | Android 12+              |
-| D3D12VA    | Windows   | x86_64  | DX12-compatible GPU            | ⚠️ Experimental | FFmpeg 7.0+              |
-|            | Windows   | aarch64 | DX12-compatible GPU            | ⚠️ Experimental | FFmpeg 7.0+              |
-
-> **Note:**
-- ✅ Full support / Successful
-- ❌ Not support / Failed
-- ⚠️ Partially supported / Not clear
+**FFmpeg 6 / 7 / 8 / 9** on **macOS, Linux, Windows** (x86_64 / arm64).
 
 ## Wiki
 
@@ -201,7 +157,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
           // decoder with CUDA acceleration
-          // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
+          // .with_hardware_device(HWDeviceConfig::auto_platform_with(&[HWDeviceType::CUDA]).ok())
           // .with_codec_name("h264_cuvid".to_string())
           .build_wrapped(source)
           .context("failed to create decoder")?;
@@ -246,7 +202,7 @@ fn main() -> Result<(), Box<dyn Error>> {
   let output_path = Path::new("/tmp/rainbow.mp4");
   let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
           // encoder with CUDA acceleration
-          // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
+          // .with_hardware_device(HWDeviceConfig::auto_platform_with(&[HWDeviceType::CUDA]).ok())
           // libx264, libx265, h264_nvenc, h264_vaapi
           // .with_codec_name("h264_nvenc".to_string())
           // .with_options(Options::preset_h264_nvenc())

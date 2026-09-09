@@ -152,6 +152,10 @@ where
     T: MediaFrameType,
 {
     /// 创建视频帧
+    ///
+    /// `data` 的 C 维度必须与格式的分量数一致：packed 8bit 格式为
+    /// `packed_channels()`（GRAY8=1 / YUYV422、UYVY422=2 / RGB24、BGR24=3 /
+    /// RGBA 族=4），YUV420P 为 3（U/V 以 2x2 块代表值存储）。
     pub fn new_video(
         width: usize,
         height: usize,
@@ -160,9 +164,19 @@ where
         data: ndarray::Array3<T>,
     ) -> Result<Self> {
         let (h, w, c) = data.dim();
-        if h != height || w != width || c != 3 {
+        let expected_c = if format == PixelFormat::YUV420P {
+            3
+        } else {
+            format.packed_channels().ok_or_else(|| {
+                RsmediaError::custom(format!(
+                    "Unsupported pixel format for ndarray: {format:?}, only YUV420P and \
+                         packed 8-bit formats are supported"
+                ))
+            })?
+        };
+        if h != height || w != width || c != expected_c {
             return Err(RsmediaError::custom(format!(
-                "Invalid dimensions: expected ({height}, {width}, 3), got ({h}, {w}, {c})"
+                "Invalid dimensions: expected ({height}, {width}, {expected_c}), got ({h}, {w}, {c})"
             )));
         }
 
@@ -177,6 +191,7 @@ where
         })
     }
 
+    /// 创建视频帧（零初始化）
     pub fn new_video_frame(
         width: usize,
         height: usize,
@@ -186,7 +201,17 @@ where
     where
         T: num_traits::Zero,
     {
-        let data = ndarray::Array3::<T>::zeros((height, width, 3));
+        let expected_c = if format == PixelFormat::YUV420P {
+            3
+        } else {
+            format.packed_channels().ok_or_else(|| {
+                RsmediaError::custom(format!(
+                    "Unsupported pixel format for ndarray: {format:?}, only YUV420P and \
+                         packed 8-bit formats are supported"
+                ))
+            })?
+        };
+        let data = ndarray::Array3::<T>::zeros((height, width, expected_c));
         Self::new_video(width, height, format, time_base, data)
     }
 
@@ -692,6 +717,15 @@ fn audio_sample_size(format: i32) -> Result<usize> {
     }
 }
 
+/// packed（单平面、8bit/分量）像素格式的每像素分量数（ndarray 的 C 维度）。
+///
+/// 语义与判定见 [`PixelFormat::packed_channels`]（单一事实来源）；
+/// 返回 `None` 表示非 packed 8bit 格式（planar / 半平面 / 位流 / 硬件格式等），
+/// 需走 YUV420P 专用分支或经 swscale 转换后再入 ndarray。
+fn packed_channels(format: i32) -> Option<usize> {
+    PixelFormat::from(format).packed_channels()
+}
+
 /// ndarray => AVFrame:
 /// 对 U 和 V 进行下采样，恢复到 YUV420P 格式所需的较低分辨率
 /// 减少数据的采样率，降低分辨率或数据量。
@@ -702,15 +736,25 @@ where
 {
     let (height, width, channel) = data.dim();
 
-    if channel != 3 {
+    // packed 8bit 格式：channel 必须与该格式的每像素分量数一致
+    let expected_channels = packed_channels(frame.format);
+    if let Some(ch) = expected_channels {
+        if channel != ch {
+            return Err(RsmediaError::custom(format!(
+                "Pixel format expects {ch} channels, data has {channel}"
+            )));
+        }
+    } else if channel != 3 {
+        // YUV420P 专用分支以 [H, W, 3] 存储（U/V 为 2x2 块代表值）
         return Err(RsmediaError::custom("Only support 3-channel video"));
     }
 
-    // RGB24 / YUV420P 的样本均为 8bit；类型大小不匹配时，下面的 to_u8() 会越界/溢出。
+    // packed 8bit / YUV420P 的样本均为 8bit；类型大小不匹配时，下面的 to_u8() 会越界/溢出。
     if matches!(
         frame.format,
         ffi::AV_PIX_FMT_RGB24 | ffi::AV_PIX_FMT_YUV420P
-    ) {
+    ) || expected_channels.is_some()
+    {
         validate_format_type_size::<T>(frame.format, 1)?;
     }
 
@@ -719,38 +763,39 @@ where
         .alloc_buffer()
         .context("Failed to allocate video buffer")?;
 
-    match frame.format {
-        ffi::AV_PIX_FMT_RGB24 => {
-            let line_size = frame.linesize[0] as usize;
-            let width_bytes = width * 3;
-            if line_size < width_bytes {
-                return Err(RsmediaError::custom(format!(
-                    "Insufficient linesize for RGB24: {line_size} < {width_bytes}"
-                )));
-            }
-            unsafe {
-                let dst_ptr = frame.data[0];
-                if let Some(buffer) = data.as_standard_layout().as_slice() {
-                    // 按行拷贝，ceil 到 linesize（可能有对齐 padding）
-                    for y in 0..height {
-                        let src = buffer.as_ptr().cast::<u8>().add(y * width_bytes);
-                        std::ptr::copy_nonoverlapping(src, dst_ptr.add(y * line_size), width_bytes);
-                    }
-                } else {
-                    // 非连续数据：逐元素放置到每行 linesize 布局
-                    for y in 0..height {
-                        let row = dst_ptr.add(y * line_size);
-                        for x in 0..width {
-                            let o = x * 3;
-                            *row.add(o) = data[[y, x, 0]].to_u8().unwrap();
-                            *row.add(o + 1) = data[[y, x, 1]].to_u8().unwrap();
-                            *row.add(o + 2) = data[[y, x, 2]].to_u8().unwrap();
+    if let Some(ch) = expected_channels {
+        // packed 单平面通用填充：逐行拷贝 width*ch 字节（linesize 可能有对齐 padding）
+        let line_size = frame.linesize[0] as usize;
+        let width_bytes = width * ch;
+        if line_size < width_bytes {
+            return Err(RsmediaError::custom(format!(
+                "Insufficient linesize for packed format: {line_size} < {width_bytes}"
+            )));
+        }
+        unsafe {
+            let dst_ptr = frame.data[0];
+            if let Some(buffer) = data.as_standard_layout().as_slice() {
+                // 按行拷贝，ceil 到 linesize（可能有对齐 padding）
+                for y in 0..height {
+                    let src = buffer.as_ptr().cast::<u8>().add(y * width_bytes);
+                    std::ptr::copy_nonoverlapping(src, dst_ptr.add(y * line_size), width_bytes);
+                }
+            } else {
+                // 非连续数据：逐元素放置到每行 linesize 布局
+                for y in 0..height {
+                    let row = dst_ptr.add(y * line_size);
+                    for x in 0..width {
+                        for c in 0..ch {
+                            *row.add(x * ch + c) = data[[y, x, c]].to_u8().unwrap();
                         }
                     }
                 }
             }
-            Ok(())
         }
+        return Ok(());
+    }
+
+    match frame.format {
         ffi::AV_PIX_FMT_YUV420P => {
             if width % 2 != 0 || height % 2 != 0 {
                 return Err(RsmediaError::custom(format!(
@@ -853,33 +898,41 @@ where
 {
     let (height, width) = (frame.height as usize, frame.width as usize);
 
-    match frame.format {
-        ffi::AV_PIX_FMT_RGB24 => {
-            validate_format_type_size::<T>(frame.format, 1)?;
+    // packed 单平面通用读取：[H, W, C]，逐行按 linesize 布局拷贝
+    //（validate 已确保 T 为 8bit，linesize 单位与字节一致）
+    if let Some(ch) = packed_channels(frame.format) {
+        validate_format_type_size::<T>(frame.format, 1)?;
 
-            let line_size = frame.linesize[0] as usize;
-            let mut array = ndarray::Array3::<T>::default((height, width, 3));
+        let line_size = frame.linesize[0] as usize;
+        let width_bytes = width * ch;
+        if line_size < width_bytes {
+            return Err(RsmediaError::custom(format!(
+                "Insufficient linesize for packed format: {line_size} < {width_bytes}"
+            )));
+        }
+        let mut array = ndarray::Array3::<T>::default((height, width, ch));
 
-            unsafe {
-                let data_ptr = frame.data[0] as *const T;
-                if data_ptr.is_null() {
-                    return Err(RsmediaError::custom("RGB frame data is null"));
-                }
+        unsafe {
+            let data_ptr = frame.data[0] as *const T;
+            if data_ptr.is_null() {
+                return Err(RsmediaError::custom("Frame data is null"));
+            }
 
-                // 逐行复制RGB数据
-                for y in 0..height {
-                    let src_row =
-                        std::slice::from_raw_parts(data_ptr.add(y * line_size), width * 3);
-                    for x in 0..width {
-                        array[[y, x, 0]] = src_row[x * 3]; // R
-                        array[[y, x, 1]] = src_row[x * 3 + 1]; // G
-                        array[[y, x, 2]] = src_row[x * 3 + 2]; // B
+            for y in 0..height {
+                let src_row = std::slice::from_raw_parts(data_ptr.add(y * line_size), width * ch);
+                let mut offset = 0;
+                for x in 0..width {
+                    for c in 0..ch {
+                        array[[y, x, c]] = src_row[offset + c];
                     }
+                    offset += ch;
                 }
             }
-            Ok(array)
         }
+        return Ok(array);
+    }
 
+    match frame.format {
         ffi::AV_PIX_FMT_YUV420P => {
             validate_format_type_size::<T>(frame.format, 1)?;
             // YUV420P 的色度是亮度采样的 1/4，宽高必须为偶数，否则 UV 平面无法完整上采样
@@ -1045,6 +1098,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 创建测试用的 packed 8bit AVFrame（按 (x*ch+c+y) 生成确定性数据）
+    fn create_test_packed_frame(fmt: PixelFormat, width: usize, height: usize) -> AVFrame {
+        let ch = fmt.packed_channels().expect("packed format");
+        let mut frame = AVFrame::new();
+        frame.set_format(fmt.into());
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
+        frame.alloc_buffer().unwrap();
+
+        unsafe {
+            let data = frame.data[0];
+            let linesize = frame.linesize[0] as usize;
+            for y in 0..height {
+                for x in 0..width {
+                    for c in 0..ch {
+                        *data.add(y * linesize + x * ch + c) = ((x + y * 3 + c * 7) % 256) as u8;
+                    }
+                }
+            }
+        }
+        frame
     }
 
     /// 创建测试用的 RGB AVFrame
@@ -1974,6 +2050,57 @@ mod tests {
             other => panic!("audio format = {other:?}"),
         }
 
+        Ok(())
+    }
+
+    /// 全部 packed 8bit 格式（GRAY8/YUYV422/UYVY422/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）的
+    /// `AVFrame → MediaFrame → AVFrame` 无损往返：构造确定数据 → ndarray →
+    /// 逐字节比对。C 维度必须等于 `packed_channels`（1/2/3/4）。
+    #[test]
+    fn test_packed_formats_lossless_roundtrip() -> Result<()> {
+        let (width, height) = (65usize, 49usize); // 非 32 对齐，考察 linesize padding
+        for fmt in [
+            PixelFormat::GRAY8,
+            PixelFormat::RGB24,
+            PixelFormat::BGR24,
+            PixelFormat::RGBA,
+            PixelFormat::BGRA,
+            PixelFormat::ARGB,
+            PixelFormat::ABGR,
+            PixelFormat::YUYV422,
+            PixelFormat::UYVY422,
+        ] {
+            let ch = fmt.packed_channels().expect("packed format");
+
+            let av = create_test_packed_frame(fmt, width, height);
+            let media = MediaFrame::<u8>::from_avframe(&av)?;
+            assert_eq!(
+                media.data.dim(),
+                (height, width, ch),
+                "{fmt:?}: ndarray shape mismatch"
+            );
+            assert_eq!(media.format, FrameFormat::Pixel(fmt));
+
+            let back = media.to_avframe()?;
+            assert_eq!(back.format, fmt.into());
+            assert_eq!(back.width as usize, width);
+            assert_eq!(back.height as usize, height);
+
+            // 逐字节比对（按行 linesize 布局）
+            unsafe {
+                let (src, dst) = (av.data[0], back.data[0]);
+                let linesize = av.linesize[0] as usize;
+                for y in 0..height {
+                    for i in 0..width * ch {
+                        assert_eq!(
+                            *src.add(y * linesize + i),
+                            *dst.add(y * linesize + i),
+                            "{fmt:?}: byte mismatch at row {y} offset {i}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
