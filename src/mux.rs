@@ -58,32 +58,26 @@ impl Chapter {
 ///
 /// Mux to an MKV file:
 ///
-/// ```rust,ignore
-/// let reader = Reader::new(Path::new("from_file.mp4")).unwrap();
-/// let writer = Writer::new(Path::new("to_file.mkv")).unwrap();
-/// let muxer = MuxerBuilder::new(writer)
-///     .with_streams(&reader)
-///     .unwrap()
-///     .build();
-/// while let Ok(packet) = reader.read() {
-///     muxer.mux(packet).unwrap();
-/// }
+/// ```no_run
+/// use std::path::Path;
+/// use rsmedia::mux::Muxer;
+/// let mut muxer = Muxer::new(Path::new("to_file.mkv")).unwrap();
+/// // Add streams and mux packets...
 /// muxer.finish().unwrap();
 /// ```
 ///
 /// Mux from file to MP4 and print length of first 100 buffer segments:
 ///
-/// ```rust,ignore
-/// let reader = Reader::new(Path::new("my_file.mp4")).unwrap();
-/// let writer = BufferWriter::new("mp4").unwrap();
-/// let mut muxer = MuxerBuilder::new(writer)
-///     .with_streams(&reader)
-///     .build()
-///     .unwrap();
-/// for _ in 0..100 {
-///     println!("len: {}", muxer.mux().unwrap().len());
+/// ```no_run
+/// use std::path::Path;
+/// use rsmedia::mux::Muxer;
+/// use rsmedia::error::Result;
+/// fn main() -> Result<()> {
+///     let mut muxer = Muxer::new(Path::new("output.mp4"))?;
+///     // Add streams and mux packets...
+///     muxer.finish()?;
+///     Ok(())
 /// }
-/// muxer.finish()?;
 /// ```
 pub struct Muxer<W: Writer> {
     pub writer: W,
@@ -820,10 +814,17 @@ impl<R: Reader> Demuxer<R> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// let mut demuxer = Demuxer::from_reader(StreamReader::new(Path::new("my_file.mp4"))?)?;
-/// for (stream_index, frame) in demuxer {
-///     println!("stream_index: {}, frame: {}", stream_index, frame.width());
+/// ```no_run
+/// use std::path::Path;
+/// use rsmedia::mux::Demuxer;
+/// use rsmedia::error::Result;
+/// fn main() -> Result<()> {
+///     let mut demuxer = Demuxer::new(Path::new("my_file.mp4"))?;
+///     for result in demuxer {
+///         let (stream_index, frame) = result?;
+///         println!("stream_index: {}, frame: {}", stream_index, frame.width);
+///     }
+///     Ok(())
 /// }
 /// ```
 impl<R: Reader> Iterator for Demuxer<R> {
@@ -1354,7 +1355,7 @@ mod tests {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// transcode("input.mp4", "output.mov").unwrap();
     /// ```
     fn transcode(input_path: &str, output_path: &str) -> Result<()> {

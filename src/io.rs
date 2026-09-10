@@ -50,15 +50,15 @@ pub trait Reader {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let mut options = HashMap::new();
-/// options.insert(
-///     "rtsp_transport".to_string(),
-///     "tcp".to_string(),
-/// );
+/// ```no_run
+/// use std::path::Path;
+/// use rsmedia::io::StreamReaderBuilder;
+/// use rsmedia::Options;
+/// let mut options = Options::new();
+/// options.insert("rtsp_transport", "tcp");
 ///
 /// let mut reader = StreamReaderBuilder::new(Path::new("my_file.mp4"))
-///    .with_options(&options.into())
+///    .with_options(Some(options))
 ///    .build()
 ///    .unwrap();
 /// ```

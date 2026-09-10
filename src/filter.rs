@@ -3,17 +3,6 @@
 //! The filters are implemented using the ffmpeg library.
 //!
 //! See: <https://ffmpeg.org/ffmpeg-filters.html>
-//!
-//!```rust,ignore
-//! /// 水印 + 缩放 + 淡入淡出组合
-//! /// [buffer] -> scale -> drawtext -> [buffersink]
-//! let video_watermark_preset_filters = vec![
-//!     scale(1280, 720, None),
-//!     DrawText::new("Hello Text", 20, 20, 24, "white").build(),
-//!     fade_in(30),
-//!     fade_out(270, 30),
-//! ];
-//! ```
 use crate::MediaType;
 use crate::error::{Context, Result, RsmediaError};
 use crate::fmt::{FrameFormat, SampleFormat};

@@ -19,7 +19,8 @@
 /// 不必与常量的实际类型别名逐字匹配。若符号性声明错误导致判别值冲突，编译期报错。
 ///
 /// panic 语法：
-/// ```rust,ignore
+///
+/// ```ignore
 /// ffi_enum_wrap_from!(
 ///     /// Pixel format definitions in bindings.
 ///     #[allow(non_camel_case_types)]
@@ -34,7 +35,8 @@
 /// ```
 ///
 /// 自定义 fallback 示例（回退到 Self::NONE）
-/// ```rust,ignore
+///
+/// ```ignore
 /// ffi_enum_wrap_from!(
 ///     /// Pixel format definitions in bindings.
 ///     #[allow(non_camel_case_types)]
@@ -175,7 +177,8 @@ macro_rules! ffi_enum_wrap_from {
 /// `repr` 只需按语义声明符号性，32 位整型间 `as` 转换位模式无损。
 ///
 /// # Example
-/// ```rust,ignore
+///
+/// ```ignore
 /// ffi_enum_wrap!(
 ///     /// Sws scale filter flags (SWS_*)
 ///     #[allow(non_camel_case_types)]
@@ -233,7 +236,8 @@ macro_rules! ffi_enum_wrap {
 /// ReprType: i32 / u32
 ///
 /// # Example
-/// ```rust,ignore
+///
+/// ```ignore
 /// // u32 标志位
 /// ffi_enum!(AvPixFmtFlag, u32 {
 ///     BE => ffi::AV_PIX_FMT_FLAG_BE;

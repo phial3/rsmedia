@@ -62,12 +62,17 @@ impl Color {
 
     /// Create a palette from a slice of colors.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rsmedia::Color;
     /// // 从 u32 数组创建
-    /// ```rust,ignore
     /// let colors = Color::create_palette(&[0xFF0000FF, 0x00FF00FF, 0x0000FFFF]);
     /// ```
+    ///
+    /// ```
+    /// # use rsmedia::Color;
     /// // 从 RGB 元组数组创建
-    /// ```rust,ignore
     /// let rgb_colors = Color::create_palette(&[
     ///     (255, 0, 0),
     ///     (0, 255, 0),
@@ -75,8 +80,9 @@ impl Color {
     /// ]);
     /// ```
     ///
+    /// ```
+    /// # use rsmedia::Color;
     /// // 从 RGB 数组创建
-    /// ```rust,ignore
     /// let array_colors = Color::create_palette(&[
     ///     [255, 128, 0],
     ///     [128, 0, 128],
@@ -89,19 +95,23 @@ impl Color {
 
     /// Create a palette from a slice of colors, with error handling.
     ///
-    /// usage:
-    /// ```rust,ignore
-    /// let colors = Color::try_create_palette(&[0xFF0000FF, 0x00FF00FF, 0x0000FFFF]);
+    /// # Examples
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// let colors = Color::try_create_palette(&[0xFF0000FF, 0x00FF00FF, 0x0000FFFF]).unwrap();
     /// ```
     ///
+    /// ```
+    /// # use rsmedia::Color;
     /// // 从十六进制字符串数组创建（可能失败）
-    /// ```rust,ignore
     /// let hex_colors = Color::try_create_palette(&["#FF0000", "#00FF00", "#0000FF"])
     ///     .expect("Invalid hex color");
     /// ```
     ///
+    /// ```
+    /// # use rsmedia::Color;
     /// // 混合有效和无效的字符串会返回错误
-    /// ```rust,ignore
     /// let result = Color::try_create_palette(&["#FF0000", "invalid", "#0000FF"]);
     /// assert!(result.is_err());
     /// ```
@@ -118,16 +128,27 @@ impl Color {
             .collect()
     }
 
+    /// Generate visually distinct colors by evenly distributing hues in HSL space.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rsmedia::Color;
     /// // 生成 5 个在 HSL 空间中均匀分布的颜色（色相 0-360 度）
-    /// ```rust,ignore
     /// let distinct_colors = Color::palette_distinct(5);
+    /// assert_eq!(distinct_colors.len(), 5);
     /// ```
+    ///
+    /// ```
+    /// # use rsmedia::Color;
     /// // 生成 10 个不同的颜色
-    /// ```rust,ignore
     /// let palette = Color::palette_distinct(10);
+    /// assert_eq!(palette.len(), 10);
     /// ```
+    ///
+    /// ```
+    /// # use rsmedia::Color;
     /// // 生成 0 个颜色返回空数组
-    /// ```rust,ignore
     /// let empty = Color::palette_distinct(0);
     /// assert!(empty.is_empty());
     /// ```
