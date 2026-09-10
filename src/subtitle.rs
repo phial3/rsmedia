@@ -181,7 +181,6 @@ mod tests {
     use crate::encode::EncoderBuilder;
     use crate::error::RsmediaError;
     use crate::io::StreamReader;
-    use crate::io::private::{Output, Write};
     use crate::test_support;
     use crate::time::Rescale;
 

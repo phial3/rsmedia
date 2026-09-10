@@ -4,7 +4,7 @@ use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams}
 #[cfg(feature = "ndarray")]
 use crate::frame::{MediaFrame, MediaFrameType};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
-use crate::io::Reader;
+use crate::io::{Reader, Seekable};
 use crate::options::Options;
 use crate::resize::Resize;
 use crate::stream::StreamInfo;
@@ -1113,22 +1113,6 @@ impl<R: Reader> DecoderWrapper<R> {
         self.decoder.decode_subtitle_segment(&mut self.reader)
     }
 
-    /// Seek 到指定时间点并解码一帧原始 `AVFrame`（视频）。
-    ///
-    /// 缩略图/封面提取的核心路径：seek 定位到目标时间之前最近的关键帧
-    /// （`AVSEEK_FLAG_BACKWARD` 语义），从该帧开始解码。若 reader 不支持
-    /// seek（如内存缓冲），静默从头解码第一帧。
-    ///
-    /// 返回 `Ok(None)` 表示到达流末尾且无帧可解。转换为图片请用
-    /// [`imgutils::to_dynamic_image`](crate::imgutils::to_dynamic_image)。
-    pub fn decode_raw_at(&mut self, timestamp_ms: i64) -> Result<Option<AVFrame>> {
-        // seek 失败（不支持 seek 的 reader）不视为错误：退化为解码第一帧
-        if self.seek_to_timestamp(timestamp_ms).is_err() {
-            log::debug!("seek to {timestamp_ms}ms failed, decoding from the current position");
-        }
-        self.decode_raw()
-    }
-
     pub fn stream_info(&self) -> &StreamInfo {
         &self.stream_info
     }
@@ -1147,57 +1131,57 @@ impl<R: Reader> DecoderWrapper<R> {
     pub fn into_parts(self) -> (Decoder, R) {
         (self.decoder, self.reader)
     }
+}
 
+impl<R: Reader + Seekable> DecoderWrapper<R> {
     /// Seek in reader.
     ///
-    /// See [`StreamReader::seek_to_time`](crate::io::StreamReader::seek_to_timestamp) for more information.
+    /// See [`Seekable::seek_to_timestamp`](crate::io::Seekable::seek_to_timestamp) for more information.
     #[inline]
     pub fn seek_to_timestamp(&mut self, timestamp_milliseconds: i64) -> Result<()> {
-        if let Some(stream_reader) = self.reader.as_any_mut().downcast_mut::<StreamReader>() {
-            stream_reader
-                .seek_to_timestamp(timestamp_milliseconds)
-                .inspect(|_| self.decoder.flush())
-        } else {
-            Err(RsmediaError::custom(
-                "Seek is only supported for StreamReader",
-            ))
-        }
+        self.reader
+            .seek_to_timestamp(timestamp_milliseconds)
+            .inspect(|_| self.decoder.flush())
     }
 
     /// Seek to specific frame in reader.
     ///
-    /// See [`StreamReader::seek_to_frame`](crate::io::StreamReader::seek_to_frame) for more information.
+    /// See [`Seekable::seek_to_frame`](crate::io::Seekable::seek_to_frame) for more information.
     #[inline]
     pub fn seek_to_frame(&mut self, frame_number: i64) -> Result<()> {
-        if let Some(stream_reader) = self.reader.as_any_mut().downcast_mut::<StreamReader>() {
-            stream_reader
-                .seek_to_frame(
-                    self.decoder.stream_index(),
-                    frame_number,
-                    ffi::AVSEEK_FLAG_ANY as i32,
-                )
-                .inspect(|_| self.decoder.flush())
-        } else {
-            Err(RsmediaError::custom(
-                "Seek to frame is only supported for StreamReader",
-            ))
-        }
+        self.reader
+            .seek_to_frame(
+                self.decoder.stream_index(),
+                frame_number,
+                ffi::AVSEEK_FLAG_ANY as i32,
+            )
+            .inspect(|_| self.decoder.flush())
     }
 
     /// Seek to start of reader.
     ///
-    /// See [`StreamReader::seek_to_start`](crate::io::StreamReader::seek_to_start) for more information.
+    /// See [`Seekable::seek_to_start`](crate::io::Seekable::seek_to_start) for more information.
     #[inline]
     pub fn seek_to_start(&mut self) -> Result<()> {
-        if let Some(stream_reader) = self.reader.as_any_mut().downcast_mut::<StreamReader>() {
-            stream_reader
-                .seek_to_start()
-                .inspect(|_| self.decoder.flush())
-        } else {
-            Err(RsmediaError::custom(
-                "Seek to start is only supported for StreamReader",
-            ))
+        self.reader
+            .seek_to_start()
+            .inspect(|_| self.decoder.flush())
+    }
+
+    /// Seek 到指定时间点并解码一帧原始 `AVFrame`（视频）。
+    ///
+    /// 缩略图/封面提取的核心路径：seek 定位到目标时间之前最近的关键帧
+    /// （`AVSEEK_FLAG_BACKWARD` 语义），从该帧开始解码。seek 失败不视为
+    /// 错误：退化为从当前位置解码第一帧。
+    ///
+    /// 返回 `Ok(None)` 表示到达流末尾且无帧可解。转换为图片请用
+    /// [`imgutils::to_dynamic_image`](crate::imgutils::to_dynamic_image)。
+    pub fn decode_raw_at(&mut self, timestamp_ms: i64) -> Result<Option<AVFrame>> {
+        // seek 失败不视为错误：退化为解码第一帧
+        if self.seek_to_timestamp(timestamp_ms).is_err() {
+            log::debug!("seek to {timestamp_ms}ms failed, decoding from the current position");
         }
+        self.decode_raw()
     }
 }
 

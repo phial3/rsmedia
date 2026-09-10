@@ -539,10 +539,39 @@ impl<W: Writer> Muxer<W> {
             Ok(None)
         }
     }
+
+    /// Consumes the muxer and returns the underlying writer.
+    ///
+    /// 应在 [`Self::finish`] 之后调用；此时 trailer 已写出，可从 writer 中
+    /// 取回最终输出（如 [`crate::io::BufferWriter::into_bytes`] 或
+    /// [`crate::io::CustomIoWriter::into_inner`]）。若忘记调用 `finish()`，
+    /// 此处会自动补写 trailer（与 `Drop` 的兜底行为一致）。
+    pub fn into_writer(mut self) -> W {
+        // 先补写 trailer，使 Drop 的自动 flush 逻辑成为空操作。
+        if self.have_written_header
+            && !self.have_written_trailer
+            && let Err(err) = self.finish()
+        {
+            log::error!("Failed to auto-flush muxer on into_writer: {err:#}");
+        }
+        // SAFETY: `Muxer` 实现了 `Drop`，不能直接 move 字段。此处用
+        // `ManuallyDrop` 跳过 `Muxer::Drop`（此时其逻辑已是空操作），
+        // 取走 writer 后手动析构其余字段，保证 encoder 等资源正常释放。
+        unsafe {
+            let mut this = std::mem::ManuallyDrop::new(self);
+            let writer = std::ptr::read(&this.writer);
+            std::ptr::drop_in_place(&mut this.streams);
+            std::ptr::drop_in_place(&mut this.metadata);
+            std::ptr::drop_in_place(&mut this.stream_metadata);
+            std::ptr::drop_in_place(&mut this.chapters);
+            writer
+        }
+    }
 }
 
-unsafe impl<W: Writer> Send for Muxer<W> {}
-unsafe impl<W: Writer> Sync for Muxer<W> {}
+/// SAFETY: 仅承诺可移动到其他线程独占使用（`Send`）。`AVFormatContext` 及
+/// 内部 encoder 均非线程安全，`&Self` 跨线程共享（`Sync`）不成立，故不实现。
+unsafe impl<W: Writer + Send> Send for Muxer<W> {}
 
 /// Validates a metadata key/value pair: rejects interior NUL bytes, which
 /// cannot be represented in the C strings handed to `av_dict_set`.
@@ -839,8 +868,10 @@ impl<R: Reader> Iterator for Demuxer<R> {
     }
 }
 
+/// 仅承诺可移动到其他线程独占使用：内部的 AVFormatContextInput /
+/// AVCodecContext 均为 FFmpeg 非线程安全句柄，`&Demuxer` 不可跨线程共享，
+/// 故只实现 `Send`、不实现 `Sync`。
 unsafe impl<R: Reader> Send for Demuxer<R> {}
-unsafe impl<R: Reader> Sync for Demuxer<R> {}
 
 #[cfg(test)]
 mod tests {
@@ -1363,7 +1394,7 @@ mod tests {
         let input = input_reader.input();
 
         // inner output
-        use crate::io::private::Output;
+        use crate::io::Writer as _;
         let mut output_writer = StreamWriter::new(Path::new(output_path))?;
         let output = output_writer.output_mut();
 
