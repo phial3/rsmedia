@@ -9,6 +9,7 @@ use crate::{
 };
 
 use dashmap::DashMap;
+use rsmpeg::avcodec::AVPacket;
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 
@@ -605,10 +606,44 @@ impl<W: Writer> Drop for Muxer<W> {
 }
 
 /// Demuxer
+///
+/// 两种构造模式：
+/// - **解码模式**（[`new`](Demuxer::new) / [`new_from_reader`](Demuxer::new_from_reader) /
+///   [`new_single_stream`](Demuxer::new_single_stream)）：迭代产出解码后的
+///   `AVFrame`；
+/// - **透传模式**（[`new_passthrough`](Demuxer::new_passthrough)）：不构建任何
+///   解码器，通过 [`demux_packet`](Demuxer::demux_packet) /
+///   [`packets`](Demuxer::packets) 产出原始 `AVPacket`，用于 remux
+///   （转封装，不解码不重编码）。
 pub struct Demuxer<R: Reader> {
     pub reader: R,
-    streams: Vec<DemuxerStream>,
+    inner: DemuxerInner,
     states: Arc<DashMap<usize, i32>>,
+}
+
+/// Demuxer 工作模式。
+enum DemuxerInner {
+    /// 透传：不解码，仅迭代原始 packet。
+    Passthrough,
+    /// 解码：每个被选中的流持有一个 decoder。
+    Decode { streams: Vec<DemuxerStream> },
+}
+
+impl<R: Reader> Demuxer<R> {
+    /// 透传模式下的解码流列表（空）。
+    fn decode_streams(&self) -> &[DemuxerStream] {
+        match &self.inner {
+            DemuxerInner::Decode { streams } => streams,
+            DemuxerInner::Passthrough => &[],
+        }
+    }
+
+    fn decode_streams_mut(&mut self) -> &mut [DemuxerStream] {
+        match &mut self.inner {
+            DemuxerInner::Decode { streams } => streams,
+            DemuxerInner::Passthrough => &mut [],
+        }
+    }
 }
 
 /// stream definition for demuxer
@@ -640,13 +675,57 @@ impl Demuxer<StreamReader> {
 }
 
 impl<R: Reader> Demuxer<R> {
+    /// 为单个流构建解码器（含硬件失败回退软件的逻辑）。
+    fn build_decoder(
+        reader: &R,
+        stream_info: &StreamInfo,
+        device_config: &Option<HWDeviceConfig>,
+        filters: &HashMap<MediaType, Vec<Filter>>,
+    ) -> Result<Decoder> {
+        let media_type = stream_info.media_type;
+        let device_type = device_config.as_ref().map(|c| c.device_type);
+        let Some(codec_name) = stream_info.find_decoder_name(device_type) else {
+            return Err(RsmediaError::custom(format!(
+                "No decoder found for codec_id {:#x} (stream {})",
+                stream_info.codec_id, stream_info.index
+            )));
+        };
+        match DecoderBuilder::new(media_type)
+            .with_codec_name(codec_name.clone())
+            .with_hardware_device(device_config.clone())
+            .with_filters(filters.get(&media_type).cloned())
+            .build_from_reader(reader)
+        {
+            Ok(decoder) => Ok(decoder),
+            Err(e) if device_type.is_some() => {
+                // 硬件解码器构建失败（如 hw 初始化失败）：回退软件解码器重试，
+                // 与 find_decoder_name 的回退语义对齐；再失败才让错误上抛。
+                log::warn!(
+                    "HW decoder '{codec_name}' failed to build: {e:#}; \
+                     falling back to software decoder"
+                );
+                let software_name = stream_info
+                    .find_decoder_name(None)
+                    .unwrap_or_else(|| codec_name.clone());
+                DecoderBuilder::new(media_type)
+                    .with_codec_name(software_name)
+                    .with_filters(filters.get(&media_type).cloned())
+                    .build_from_reader(reader)
+                    .context("Failed to build decoder (hw and software both failed)")
+            }
+            Err(e) => Err(RsmediaError::custom(format!(
+                "Failed to build decoder: {e:#}"
+            ))),
+        }
+    }
+
+    /// 全流解码模式：为容器中所有可解码的流构建解码器。
     pub fn new_from_reader(
         reader: R,
         filters: Option<Vec<Filter>>,
         device_config: Option<HWDeviceConfig>,
     ) -> Result<Demuxer<R>> {
         let nb_streams = reader.input().nb_streams as usize;
-        let device_type = device_config.as_ref().map(|c| c.device_type);
         let filter_map = filters.unwrap_or_default().into_iter().fold(
             HashMap::<MediaType, Vec<Filter>>::new(),
             |mut map, f| {
@@ -658,9 +737,9 @@ impl<R: Reader> Demuxer<R> {
         let mut streams = Vec::new();
         for stream_idx in 0..nb_streams {
             let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
-            let media_type = stream_info.media_type;
             // auto detect hardware acceleration decoder codec
-            let Some(codec_name) = stream_info.find_decoder_name(device_type) else {
+            let device_type = device_config.as_ref().map(|c| c.device_type);
+            if stream_info.find_decoder_name(device_type).is_none() {
                 // Streams without a registered decoder (chapter tracks,
                 // attached pictures, binary data, ...) are skipped instead of
                 // failing the whole demuxer.
@@ -669,49 +748,79 @@ impl<R: Reader> Demuxer<R> {
                     stream_info.codec_id
                 );
                 continue;
-            };
-            let decoder = match DecoderBuilder::new(media_type)
-                .with_codec_name(codec_name.clone())
-                .with_hardware_device(device_config.clone())
-                .with_filters(filter_map.get(&media_type).cloned())
-                .build_from_reader(&reader)
-            {
-                Ok(decoder) => decoder,
-                Err(e) if device_type.is_some() => {
-                    // 硬件解码器构建失败（如 hw 初始化失败）：回退软件解码器重试，
-                    // 与 find_decoder_name 的回退语义对齐；再失败才让错误上抛。
-                    log::warn!(
-                        "HW decoder '{codec_name}' failed to build: {e:#}; \
-                         falling back to software decoder"
-                    );
-                    let software_name = stream_info
-                        .find_decoder_name(None)
-                        .unwrap_or_else(|| codec_name.clone());
-                    DecoderBuilder::new(media_type)
-                        .with_codec_name(software_name)
-                        .with_filters(filter_map.get(&media_type).cloned())
-                        .build_from_reader(&reader)
-                        .context("Failed to build decoder (hw and software both failed)")?
-                }
-                Err(e) => {
-                    return Err(RsmediaError::custom(format!(
-                        "Failed to build decoder: {e:#}"
-                    )));
-                }
-            };
-
+            }
+            let decoder = Self::build_decoder(&reader, &stream_info, &device_config, &filter_map)?;
             streams.push(DemuxerStream::new(decoder, stream_info));
         }
 
         Ok(Self {
             reader,
-            streams,
+            inner: DemuxerInner::Decode { streams },
             states: Arc::new(DashMap::new()),
         })
     }
 
+    /// 单流解码模式：只为 `media_type` 的最佳流（ffmpeg `find_best_stream`
+    /// 语义，由 [`StreamInfo`] 选择）构建解码器，其余流的 packet 在迭代时
+    /// 丢弃。适合"只抽视频帧/只取音频"的单流场景。
+    ///
+    /// 找不到该类型的流时返回错误。
+    pub fn new_single_stream(
+        reader: R,
+        media_type: MediaType,
+        filters: Option<Vec<Filter>>,
+        device_config: Option<HWDeviceConfig>,
+    ) -> Result<Demuxer<R>> {
+        let nb_streams = reader.input().nb_streams as usize;
+        let filter_map = filters.unwrap_or_default().into_iter().fold(
+            HashMap::<MediaType, Vec<Filter>>::new(),
+            |mut map, f| {
+                map.entry(f.media_type()).or_default().push(f);
+                map
+            },
+        );
+
+        // 选择该类型的第一个流（best stream 已在 probe 阶段由 ffmpeg 排序）。
+        let mut selected: Option<StreamInfo> = None;
+        for stream_idx in 0..nb_streams {
+            let info = StreamInfo::from_reader(&reader, stream_idx)?;
+            if info.media_type == media_type {
+                selected = Some(info);
+                break;
+            }
+        }
+        let stream_info = selected.ok_or_else(|| {
+            RsmediaError::custom(format!("No stream of type {media_type:?} found in input"))
+        })?;
+        let decoder = Self::build_decoder(&reader, &stream_info, &device_config, &filter_map)?;
+
+        Ok(Self {
+            reader,
+            inner: DemuxerInner::Decode {
+                streams: vec![DemuxerStream::new(decoder, stream_info)],
+            },
+            states: Arc::new(DashMap::new()),
+        })
+    }
+
+    /// 透传模式（remux）：不构建任何解码器，仅通过
+    /// [`demux_packet`](Self::demux_packet) / [`packets`](Self::packets)
+    /// 迭代原始 `AVPacket`。
+    ///
+    /// 开销最小（无 codec 初始化、无解码），用于转封装：配合
+    /// [`Muxer::add_copy_stream`](crate::mux::Muxer::add_copy_stream) 和
+    /// [`Muxer::mux_packet`](crate::mux::Muxer::mux_packet) 可原样搬运码流。
+    pub fn new_passthrough(reader: R) -> Result<Demuxer<R>> {
+        Ok(Self {
+            reader,
+            inner: DemuxerInner::Passthrough,
+            states: Arc::new(DashMap::new()),
+        })
+    }
+
+    /// 当前为解码模式时返回解码流列表；透传模式返回空切片。
     pub fn streams(&self) -> &[DemuxerStream] {
-        &self.streams
+        self.decode_streams()
     }
 
     /// Reads back the container chapters (title/start/end in seconds).
@@ -752,14 +861,14 @@ impl<R: Reader> Demuxer<R> {
     }
 
     pub fn get_stream(&self, index: usize) -> Result<&DemuxerStream> {
-        self.streams
+        self.decode_streams()
             .iter()
             .find(|s| s.stream_index == index)
             .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut DemuxerStream> {
-        self.streams
+        self.decode_streams_mut()
             .iter_mut()
             .find(|s| s.stream_index == index)
             .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
@@ -776,18 +885,69 @@ impl<R: Reader> Demuxer<R> {
             .unwrap_or(false)
     }
 
+    /// 是否为透传（remux）模式。
+    pub fn is_passthrough(&self) -> bool {
+        matches!(self.inner, DemuxerInner::Passthrough)
+    }
+
+    /// 读取下一个**原始 packet**（不解码）。
+    ///
+    /// 透传模式（[`new_passthrough`](Self::new_passthrough)）的主迭代入口，
+    /// 也可在解码模式下用于高级场景（如混合 remux）。注意：解码模式下调用
+    /// 本方法会"消耗" packet，对应的帧将不会出现在 [`demux`](Self::demux)
+    /// 的迭代中——两种迭代方式不要对同一流混用。
+    ///
+    /// 返回 `Ok(None)` 表示输入结束。
+    pub fn demux_packet(&mut self) -> Result<Option<(usize, AVPacket)>> {
+        self.reader.read_packet()
+    }
+
+    /// 原始 packet 迭代器（透传模式专用入口，等价于循环调用
+    /// [`demux_packet`](Self::demux_packet)）。
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use rsmedia::mux::Demuxer;
+    /// use rsmedia::io::StreamReader;
+    /// use rsmedia::error::Result;
+    /// fn main() -> Result<()> {
+    ///     let reader = StreamReader::new(Path::new("my_file.mp4"))?;
+    ///     let mut demuxer = Demuxer::new_passthrough(reader)?;
+    ///     for result in demuxer.packets() {
+    ///         let (stream_index, packet) = result?;
+    ///         println!("packet from stream {stream_index}");
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn packets(&mut self) -> impl Iterator<Item = Result<(usize, AVPacket)>> + '_ {
+        std::iter::from_fn(|| match self.demux_packet() {
+            Ok(Some(item)) => Some(Ok(item)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        })
+    }
+
     pub fn demux(&mut self) -> Result<Option<(usize, AVFrame)>> {
+        if self.is_passthrough() {
+            return Err(RsmediaError::invalid_config(
+                "Demuxer is in passthrough mode: use demux_packet()/packets() instead of demux()"
+                    .to_string(),
+            ));
+        }
         let mut read_exhausted = false;
         loop {
             if !read_exhausted {
                 match self.reader.read_packet() {
                     Ok(Some((stream_idx, packet))) => {
-                        let Some(demux_stream) = self
-                            .streams
-                            .iter_mut()
-                            .find(|s| s.stream_index == stream_idx)
+                        let streams = self.decode_streams_mut();
+                        let Some(demux_stream) =
+                            streams.iter_mut().find(|s| s.stream_index == stream_idx)
                         else {
-                            // Packets of skipped streams (chapter tracks, ...)
+                            // Packets of skipped streams (chapter tracks,
+                            // unselected streams in single-stream mode, ...)
                             // are dropped.
                             log::debug!("Dropping packet of undecodable stream {stream_idx}");
                             continue;
@@ -807,9 +967,10 @@ impl<R: Reader> Demuxer<R> {
                     }
                 }
             } else {
-                for i in 0..self.streams.len() {
+                let stream_count = self.decode_streams().len();
+                for i in 0..stream_count {
                     // 先获取 stream_idx，避免后面重复借用
-                    let stream_idx = self.streams[i].stream_index;
+                    let stream_idx = self.decode_streams()[i].stream_index;
 
                     // 使用实际的 stream_idx 检查状态
                     if self.is_flushed(stream_idx) {
@@ -817,7 +978,7 @@ impl<R: Reader> Demuxer<R> {
                     }
 
                     // 然后获取stream的可变引用
-                    let demuxer_stream = &mut self.streams[i];
+                    let demuxer_stream = &mut self.decode_streams_mut()[i];
                     match demuxer_stream.decoder.drain_raw() {
                         Ok(Some(frame)) => {
                             return Ok(Some((demuxer_stream.stream_index, frame)));
@@ -1013,7 +1174,7 @@ mod tests {
 
         // Demuxer 测试视频解码
         let demuxer = Demuxer::new(output_path)?;
-        for des in &demuxer.streams {
+        for des in demuxer.streams() {
             println!("{:?}, {:?}", des.stream_index, des.media_type)
         }
 
@@ -1083,7 +1244,7 @@ mod tests {
 
         // Demuxer 测试音频解码
         let demuxer = Demuxer::new(output_path)?;
-        for des in &demuxer.streams {
+        for des in demuxer.streams() {
             println!("{:?}, {:?}", des.stream_index, des.media_type)
         }
 
@@ -1364,7 +1525,7 @@ mod tests {
 
         // 解封装验证
         let demuxer = Demuxer::new(output_path)?;
-        for stream in &demuxer.streams {
+        for stream in demuxer.streams() {
             println!("{:?}, {:?}", stream.stream_index, stream.media_type)
         }
 

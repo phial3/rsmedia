@@ -12,7 +12,7 @@ use rsmpeg::avformat::{
 use rsmpeg::avutil::{AVDictionary, AVMem};
 use rsmpeg::ffi;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// `AVERROR(EIO)`：FFmpeg 以负 errno 报错，即 `AVERROR(e) = -e`。
@@ -173,10 +173,14 @@ fn memory_seek(pos: &AtomicUsize, len: usize, offset: i64, whence: i32) -> i64 {
 /// 文件/URL 输入不走这里：应使用 `AVFormatContextInput::builder().url()`，
 /// 由 FFmpeg 协议层（file/http/rtmp...）处理。本函数只服务于
 /// `BufferReader`、`IoReader` 等非路径源。
+///
+/// 返回的 context 已安装 `interrupt`（若有）；调用方须保证 `interrupt`
+/// 存活至 context drop。
 fn open_input_custom(
     io_context: AVIOContextCustom,
     format: Option<&str>,
     options: Option<Options>,
+    interrupt: Option<&Interrupt>,
     dump_name: &std::ffi::CStr,
 ) -> Result<AVFormatContextInput> {
     let fmt_opt = format.and_then(|name| AVInputFormat::find(&strutils::str_to_cstring(name)));
@@ -187,6 +191,9 @@ fn open_input_custom(
         .io_context(AVIOContextContainer::Custom(io_context))
         .open()
         .context("Create input format context with custom IO failed.")?;
+    if let Some(interrupt) = interrupt {
+        install_interrupt(&mut ctx, interrupt);
+    }
     ctx.dump(0, dump_name)
         .context("Dump input format context failed.")?;
     Ok(ctx)
@@ -207,6 +214,102 @@ fn build_output_custom(
         .io_context(AVIOContextContainer::Custom(io_context))
         .build()
         .context("Create output format context with custom IO failed.")
+}
+
+////////////////////////////////////////
+// Interrupt（阻塞操作取消/超时）
+////////////////////////////////////////
+
+/// FFmpeg 阻塞操作（网络读、seek 等）的中断控制。
+///
+/// FFmpeg 在每次可能阻塞的操作前调用 `AVFormatContext.interrupt_callback`；
+/// 回调返回非 0 时操作立即中止并返回错误。将同一个句柄传给
+/// `ReaderBuilder::with_interrupt` 后，可从任意线程 [`abort`](Interrupt::abort)
+/// 或设置 [`timeout`](Interrupt::set_timeout) 来取消卡住的读取。
+///
+/// 注意：中断回调在 `avformat_open_input` 之后安装，因此打开/探测阶段的
+/// 阻塞不受保护；运行时读包、seek 的阻塞可以取消（网络流的主要场景）。
+#[derive(Clone)]
+pub struct Interrupt {
+    data: Arc<InterruptData>,
+}
+
+struct InterruptData {
+    abort: AtomicBool,
+    deadline: Mutex<Option<std::time::Instant>>,
+}
+
+impl Interrupt {
+    /// 创建一个未触发、无超时的中断句柄。
+    pub fn new() -> Self {
+        Self {
+            data: Arc::new(InterruptData {
+                abort: AtomicBool::new(false),
+                deadline: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// 立即中止所有阻塞操作（可跨线程调用）。
+    pub fn abort(&self) {
+        self.data.abort.store(true, Ordering::Relaxed);
+    }
+
+    /// 设置超时：从现在起 `timeout` 后自动触发中断。
+    /// 对每次"打开 reader → 读取"的生命周期只生效一次，需要复用时重新设置。
+    pub fn set_timeout(&self, timeout: std::time::Duration) {
+        *self.data.deadline.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now() + timeout);
+    }
+
+    /// 是否已触发（abort 或超时到期）。
+    pub fn triggered(&self) -> bool {
+        if self.data.abort.load(Ordering::Relaxed) {
+            return true;
+        }
+        self.data
+            .deadline
+            .lock()
+            .map(|d| d.is_some_and(|t| std::time::Instant::now() >= t))
+            .unwrap_or(false)
+    }
+}
+
+impl Default for Interrupt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 中断回调：返回 1 通知 FFmpeg 中止当前阻塞操作。
+///
+/// SAFETY: `opaque` 指向由 Reader 持有的 `InterruptData`，其生命周期
+/// 覆盖整个 format context（context 先于数据 drop），回调期间指针有效。
+unsafe extern "C" fn interrupt_callback(opaque: *mut std::ffi::c_void) -> std::ffi::c_int {
+    let data = unsafe { &*(opaque as *const InterruptData) };
+    let aborted = data.abort.load(Ordering::Relaxed);
+    let timed_out = data
+        .deadline
+        .lock()
+        .map(|d| d.is_some_and(|t| std::time::Instant::now() >= t))
+        .unwrap_or(false);
+    i32::from(aborted || timed_out)
+}
+
+/// 将中断回调安装到已打开的输入上下文。
+///
+/// 回调的 `opaque` 指向 `interrupt` 内部 `Arc<InterruptData>` 的堆内容；
+/// 调用方必须让该 `Interrupt` 存活至 context drop（Reader 将其作为字段
+/// 持有，且 context 字段先于 interrupt 字段 drop）。
+fn install_interrupt(ctx: &mut AVFormatContextInput, interrupt: &Interrupt) {
+    // SAFETY: context 独占；opaque 指向的 Arc 目标由 Reader 的
+    // `interrupt` 字段保活，context drop 后不会再有回调。
+    unsafe {
+        (*ctx.as_mut_ptr()).interrupt_callback = ffi::AVIOInterruptCB {
+            callback: Some(interrupt_callback),
+            opaque: Arc::as_ptr(&interrupt.data) as *mut std::ffi::c_void,
+        };
+    }
 }
 
 ////////////////////////////////////////
@@ -233,6 +336,7 @@ pub struct StreamReaderBuilder<'a> {
     source: Location,
     format: Option<&'a str>,
     options: Option<Options>,
+    interrupt: Option<Interrupt>,
 }
 
 impl<'a> StreamReaderBuilder<'a> {
@@ -246,6 +350,7 @@ impl<'a> StreamReaderBuilder<'a> {
             source: source.into(),
             format: None,
             options: None,
+            interrupt: None,
         }
     }
 
@@ -266,6 +371,13 @@ impl<'a> StreamReaderBuilder<'a> {
     /// * `options` - Options to pass on to input.
     pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
         self.options = options.into();
+        self
+    }
+
+    /// Attach an [`Interrupt`] handle for cancelling blocked reads/seeks
+    /// (network streams). See [`Interrupt`] for coverage limits.
+    pub fn with_interrupt(mut self, interrupt: impl Into<Option<Interrupt>>) -> Self {
+        self.interrupt = interrupt.into();
         self
     }
 
@@ -295,12 +407,16 @@ impl<'a> StreamReaderBuilder<'a> {
             .options(&mut dict)
             .open()
             .context("Create input format context failed.")?;
+        if let Some(interrupt) = &self.interrupt {
+            install_interrupt(&mut ctx_input, interrupt);
+        }
         ctx_input
             .dump(0, &filename)
             .context("Dump input format context failed.")?;
         Ok(StreamReader {
             source: self.source,
             input: ctx_input,
+            interrupt: self.interrupt,
         })
     }
 }
@@ -309,6 +425,11 @@ impl<'a> StreamReaderBuilder<'a> {
 pub struct StreamReader {
     pub source: Location,
     pub input: AVFormatContextInput,
+    // 仅在构建期安装到 context 的 interrupt_callback，其 `opaque` 指向 Arc
+    // 堆内容；本字段负责在 context 存活期间保活该 Arc（只持有、不读取）。
+    // 不能提前 drop，否则后续阻塞操作触发回调时会悬挂指针（use-after-free）。
+    #[allow(dead_code)]
+    interrupt: Option<Interrupt>,
 }
 
 impl StreamReader {
@@ -356,6 +477,7 @@ pub struct BufferReaderBuilder<'a> {
     data: Vec<u8>,
     format: Option<&'a str>,
     options: Option<Options>,
+    interrupt: Option<Interrupt>,
 }
 
 impl<'a> BufferReaderBuilder<'a> {
@@ -369,6 +491,7 @@ impl<'a> BufferReaderBuilder<'a> {
             data,
             format: None,
             options: None,
+            interrupt: None,
         }
     }
 
@@ -389,6 +512,13 @@ impl<'a> BufferReaderBuilder<'a> {
     /// * `options` - Options to pass on to input.
     pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
         self.options = options.into();
+        self
+    }
+
+    /// Attach an [`Interrupt`] handle. Mainly useful when the buffer backs
+    /// a blocking custom source; pure in-memory reads never block.
+    pub fn with_interrupt(mut self, interrupt: impl Into<Option<Interrupt>>) -> Self {
+        self.interrupt = interrupt.into();
         self
     }
 
@@ -421,8 +551,17 @@ impl<'a> BufferReaderBuilder<'a> {
             None,
             Some(seek),
         );
-        let ctx_input = open_input_custom(io_context, self.format, self.options, c"memory")?;
-        Ok(BufferReader { input: ctx_input })
+        let ctx_input = open_input_custom(
+            io_context,
+            self.format,
+            self.options,
+            self.interrupt.as_ref(),
+            c"memory",
+        )?;
+        Ok(BufferReader {
+            input: ctx_input,
+            interrupt: self.interrupt,
+        })
     }
 }
 
@@ -431,6 +570,9 @@ impl<'a> BufferReaderBuilder<'a> {
 /// 支持随机定位（实现了 [`Seekable`]），因为整个输入都在内存中。
 pub struct BufferReader {
     input: AVFormatContextInput,
+    // 保活 interrupt_callback 的 opaque 数据，见 [`StreamReader::interrupt`]。
+    #[allow(dead_code)]
+    interrupt: Option<Interrupt>,
 }
 
 impl BufferReader {
@@ -469,6 +611,7 @@ pub struct IoReaderBuilder<'a, R> {
     reader: R,
     format: Option<&'a str>,
     options: Option<Options>,
+    interrupt: Option<Interrupt>,
 }
 
 impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
@@ -482,6 +625,7 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
             reader,
             format: None,
             options: None,
+            interrupt: None,
         }
     }
 
@@ -502,6 +646,13 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
     /// * `options` - Options to pass on to input.
     pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
         self.options = options.into();
+        self
+    }
+
+    /// Attach an [`Interrupt`] handle for cancelling blocked reads on the
+    /// underlying stream (sockets, pipes, ...).
+    pub fn with_interrupt(mut self, interrupt: impl Into<Option<Interrupt>>) -> Self {
+        self.interrupt = interrupt.into();
         self
     }
 
@@ -530,8 +681,17 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
             None,
             None,
         );
-        let ctx_input = open_input_custom(io_context, self.format, self.options, c"stream")?;
-        Ok(IoReader { input: ctx_input })
+        let ctx_input = open_input_custom(
+            io_context,
+            self.format,
+            self.options,
+            self.interrupt.as_ref(),
+            c"stream",
+        )?;
+        Ok(IoReader {
+            input: ctx_input,
+            interrupt: self.interrupt,
+        })
     }
 }
 
@@ -542,6 +702,9 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
 /// probe 只前进不回退）。
 pub struct IoReader {
     input: AVFormatContextInput,
+    // 保活 interrupt_callback 的 opaque 数据，见 [`StreamReader::interrupt`]。
+    #[allow(dead_code)]
+    interrupt: Option<Interrupt>,
 }
 
 impl IoReader {
