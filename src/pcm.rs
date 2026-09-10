@@ -129,7 +129,11 @@ impl<W: Writer> PcmSink<W> {
                     mux_stream.media_type
                 )));
             }
-            let encoder = &mux_stream.encoder;
+            let encoder = mux_stream.encoder.as_ref().ok_or_else(|| {
+                RsmediaError::custom(format!(
+                    "stream {stream_index} is a copy stream; PCM playback requires an encoder stream"
+                ))
+            })?;
             if encoder.sample_rate() <= 0 {
                 return Err(RsmediaError::invalid_config(
                     "audio encoder has invalid sample rate",

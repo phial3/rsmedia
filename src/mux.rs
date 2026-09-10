@@ -97,23 +97,48 @@ pub struct Muxer<W: Writer> {
     chapters: Vec<Chapter>,
 }
 
+/// 单个输出流。既可以是编码流（持有 [`Encoder`]，由 [`Muxer::add_stream`]
+/// 创建，输入 `AVFrame`），也可以是**透传流**（`encoder` 为 `None`，由
+/// [`Muxer::add_copy_stream`] 创建，直接写入原始 `AVPacket`）。
 pub struct MuxerStream {
-    pub encoder: Encoder,
+    pub encoder: Option<Encoder>,
     pub stream_info: StreamInfo,
     pub media_type: MediaType,
     pub stream_index: usize,
+    /// 透传/remux 模式下源流的时间基，用于把 `mux_packet` 的 pts/dts
+    /// 从源流时间基换算到输出流时间基。
+    pub src_time_base: Option<ffi::AVRational>,
 }
 
 impl MuxerStream {
-    pub fn new(encoder: Encoder, stream_info: StreamInfo) -> Self {
+    pub fn new_encoded(encoder: Encoder, stream_info: StreamInfo) -> Self {
         let media_type = encoder.media_type();
         let stream_index = stream_info.index;
         Self {
-            encoder,
+            encoder: Some(encoder),
             media_type,
             stream_info,
             stream_index,
+            src_time_base: None,
         }
+    }
+
+    /// 透传流：直接拷贝源的编解码参数，`src_time_base` 用于时间戳换算。
+    pub fn new_copy(stream_info: StreamInfo, src_time_base: ffi::AVRational) -> Self {
+        let media_type = stream_info.media_type;
+        let stream_index = stream_info.index;
+        Self {
+            encoder: None,
+            media_type,
+            stream_info,
+            stream_index,
+            src_time_base: Some(src_time_base),
+        }
+    }
+
+    /// 是否为透传（copy/remux）流。
+    pub fn is_copy(&self) -> bool {
+        self.encoder.is_none()
     }
 }
 
@@ -144,12 +169,52 @@ impl<W: Writer> Muxer<W> {
         Ok(())
     }
 
+    /// 开关交错写入（interleaved）。
+    ///
+    /// 部分容器（如 MP4/MOV）要求以交错方式写包（等价于
+    /// `av_interleaved_write_frame`），并将写入推迟到输出流时间基/时长可用
+    /// 时。透传（remux）MP4 时通常需要开启。默认关闭，与编码流挨个
+    /// [`Self::mux`] 逐帧写包的旧行为保持一致。
+    pub fn set_interleaved(&mut self, interleaved: bool) -> &mut Self {
+        self.interleaved = interleaved;
+        self
+    }
+
     pub fn add_stream(&mut self, encoder: Encoder) -> Result<usize> {
         let stream_idx = self
             .writer
             .add_stream(encoder.codecpar(), encoder.time_base());
         let stream_info = StreamInfo::from_writer(&self.writer, stream_idx)?;
-        self.streams.push(MuxerStream::new(encoder, stream_info));
+        self.streams
+            .push(MuxerStream::new_encoded(encoder, stream_info));
+        Ok(stream_idx)
+    }
+
+    /// 添加一个**透传（copy）流**用于 remux（转封装，不解码不重编码）。
+    ///
+    /// 从源 demuxer 的某个流拷贝编解码参数到输出容器，并记录源流时间基
+    /// 供 [`Self::mux_packet`] 做时间戳换算。返回输出流的 index（传给
+    /// [`Self::mux_packet`]）。
+    ///
+    /// 典型用法：`Demuxer::new_passthrough` 迭代的 packet（保留原流 index）
+    /// 与 `Muxer::add_copy_stream` 输入的源流一一对应。
+    pub fn add_copy_stream(&mut self, src_info: &StreamInfo) -> Result<usize> {
+        let src_time_base = src_info.time_base;
+        let stream_idx = self
+            .writer
+            .add_stream(src_info.codec_parameters.clone(), src_info.time_base);
+        // 拷贝的 codec_parameters 携带源容器专属的 codec_tag（如 `mp4a`
+        // /`avc1`）。跨容器 remux（mp4→mkv 等）时这些 tag 与目标 muxer 不
+        // 兼容，清空后由目标 muxer 在 write_header 时自行指派正确 tag。
+        // 与 ffmpeg remux 的 `codec_tag = 0` 语义一致。
+        unsafe {
+            let ctx = self.writer.output_mut().as_mut_ptr();
+            let stream = *(*ctx).streams.add(stream_idx);
+            (*(*stream).codecpar).codec_tag = 0;
+        }
+        let stream_info = StreamInfo::from_writer(&self.writer, stream_idx)?;
+        self.streams
+            .push(MuxerStream::new_copy(stream_info, src_time_base));
         Ok(stream_idx)
     }
 
@@ -471,42 +536,102 @@ impl<W: Writer> Muxer<W> {
         Ok(())
     }
 
-    /// Mux a single packet. This will mux a single packet.
+    /// 写入 container header（并应用 metadata/chapters），带幂等判断。
+    ///
+    /// header 一旦写出，后续所有 `mux`/`mux_packet` 直接写包；本函数在首个
+    /// 包之前被主动调用，避免每个包路径各自重复 header 逻辑。
+    fn ensure_header_written(&mut self) -> Result<()> {
+        if self.have_written_header {
+            return Ok(());
+        }
+        self.have_written_header = true;
+        self.apply_metadata();
+        self.apply_chapters();
+        self.writer.write_header()?;
+        self.refresh_stream_info()
+    }
+
+    /// Mux a single frame through an encoder stream.
+    ///
+    /// 只适用于通过 [`Self::add_stream`] 添加的编码流；若目标是透传流
+    /// （[`Self::add_copy_stream`]），应改用 [`Self::mux_packet`]。
     ///
     /// # Arguments
     ///
-    /// * `packet` - [`Packet`] to mux.
+    /// * `frame` - [`AVFrame`] to encode and mux.
+    /// * `stream_idx` - Index of the target output stream.
     pub fn mux(&mut self, frame: AVFrame, stream_idx: usize) -> Result<Option<W::Out>> {
-        if self.have_written_header {
-            let interleaved = self.interleaved;
-            let mux_stream = self.get_stream_mut(stream_idx)?;
-            let enc_time_base = mux_stream.encoder.time_base();
-            let out_time_base = mux_stream.stream_info.time_base;
-            let packets = mux_stream.encoder.encode_raw(frame)?;
-            // mux_stream 对 self.streams 的借用至此结束，之后可独占使用 self.writer
+        self.ensure_header_written()?;
 
-            let mut last_out = None;
-            for mut packet in packets {
-                packet.set_pos(-1);
-                packet.set_stream_index(stream_idx as i32);
-                // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
-                // encode_ctx_timebase => out_stream_time_base
-                packet.rescale_ts(enc_time_base, out_time_base);
+        let interleaved = self.interleaved;
+        let mux_stream = self.get_stream_mut(stream_idx)?;
+        let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
+            RsmediaError::custom(format!(
+                "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
+            ))
+        })?;
+        let enc_time_base = encoder.time_base();
+        let out_time_base = mux_stream.stream_info.time_base;
+        let packets = encoder.encode_raw(frame)?;
+        // mux_stream 对 self.streams 的借用至此结束，之后可独占使用 self.writer
 
-                last_out = if interleaved {
-                    Some(self.writer.write_interleaved(&mut packet)?)
-                } else {
-                    Some(self.writer.write_frame(&mut packet)?)
-                };
-            }
-            Ok(last_out)
+        let mut last_out = None;
+        for mut packet in packets {
+            packet.set_pos(-1);
+            packet.set_stream_index(stream_idx as i32);
+            // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
+            // encode_ctx_timebase => out_stream_time_base
+            packet.rescale_ts(enc_time_base, out_time_base);
+
+            last_out = if interleaved {
+                Some(self.writer.write_interleaved(&mut packet)?)
+            } else {
+                Some(self.writer.write_frame(&mut packet)?)
+            };
+        }
+        Ok(last_out)
+    }
+
+    /// Mux a raw (decoded_source / remux) packet through a **copy stream**.
+    ///
+    /// 用于 remux（转封装）：直接把 demuxer 读到的原始 `AVPacket` 写入输出
+    /// 容器，不解码、不重编码。pts/dts 从源流时间基（`add_copy_stream` 记录）
+    /// 换算到输出流时间基。
+    ///
+    /// # Arguments
+    ///
+    /// * `packet`   - 来自 [`Demuxer::demux_packet`] 的原始包；其 `stream_index`
+    ///   会在写入前被改写为输出流 index。
+    /// * `stream_idx` - [`Self::add_copy_stream`] 返回的输出流 index。
+    pub fn mux_packet(
+        &mut self,
+        packet: &mut AVPacket,
+        stream_idx: usize,
+    ) -> Result<Option<W::Out>> {
+        self.ensure_header_written()?;
+
+        let (src_time_base, out_time_base) = {
+            let mux_stream = self.get_stream(stream_idx)?;
+            let src_time_base = mux_stream.src_time_base.ok_or_else(|| {
+                RsmediaError::custom(format!(
+                    "Stream {stream_idx} is not a copy stream: use mux() instead of mux_packet()"
+                ))
+            })?;
+            // 输出流头写出后 muxer 可能重设 time_base（如 MP4），必须实时取。
+            let out_time_base = self.writer.stream_time_base(stream_idx);
+            (src_time_base, out_time_base)
+        };
+
+        packet.set_pos(-1);
+        packet.set_stream_index(stream_idx as i32);
+        // src_stream_time_base => out_stream_time_base（重复调用会重复换算，
+        // 因此只在我们自己保存的源时间基与输出时间基之间进行一次换算）
+        packet.rescale_ts(src_time_base, out_time_base);
+
+        if self.interleaved {
+            self.writer.write_interleaved(packet).map(Some)
         } else {
-            self.have_written_header = true;
-            self.apply_metadata();
-            self.apply_chapters();
-            self.writer.write_header()?;
-            self.refresh_stream_info()?;
-            self.mux(frame, stream_idx)
+            self.writer.write_frame(packet).map(Some)
         }
     }
 
@@ -521,9 +646,13 @@ impl<W: Writer> Muxer<W> {
 
         for mux_stream in self.streams.iter_mut() {
             // flush the encoder to ensure all packets are sent to the muxer.
+            // 透传流没有编码器延迟缓冲，无需 flush。
+            let Some(encoder) = mux_stream.encoder.as_mut() else {
+                continue;
+            };
             let out_stream_index = mux_stream.stream_index;
             let out_stream_time_base = mux_stream.stream_info.time_base;
-            mux_stream.encoder.flush(
+            encoder.flush(
                 &mut self.writer,
                 self.interleaved,
                 out_stream_index,
@@ -872,6 +1001,19 @@ impl<R: Reader> Demuxer<R> {
             .iter_mut()
             .find(|s| s.stream_index == index)
             .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
+    }
+
+    /// 返回输入容器第 `index` 个流的 [`StreamInfo`]（从 reader 实时读取）。
+    ///
+    /// 在透传模式（remux）下同样可用，用于把某条输入流喂给
+    /// [`Muxer::add_copy_stream`] 建立对应的输出透传流。
+    pub fn stream_info(&self, index: usize) -> Result<StreamInfo> {
+        StreamInfo::from_reader(&self.reader, index)
+    }
+
+    /// 输入流总数。
+    pub fn nb_streams(&self) -> usize {
+        self.reader.input().nb_streams as usize
     }
 
     fn set_flushed(&self, stream_index: usize) {
