@@ -1,6 +1,7 @@
 use image::{ImageBuffer, Rgb};
 
-use rsmedia::{DecoderBuilder, FrameFormat, MediaFrame, MediaType, filter};
+use rsmedia::io::Seekable;
+use rsmedia::{DecoderBuilder, FrameFormat, MediaFrame, MediaType, StreamReader, filter};
 
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -38,21 +39,28 @@ async fn main() -> Result<()> {
         filter::video::fps(30.0),
     ];
 
+    let mut reader = StreamReader::new(source)?;
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
         // decoder with CUDA acceleration
         // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
         // .with_codec_name("h264_cuvid".to_string())
         .with_filters(filters)
-        .build_wrapped(source)
+        .build_from_reader(&reader)
         .context("failed to create decoder")?;
 
     std::fs::create_dir_all(OUTPUT_DIR).context("failed to create output directory")?;
 
     // seek to the 20th frame
-    decoder.seek_to_frame(20).unwrap();
+    reader
+        .seek_to_frame(
+            decoder.stream_index(),
+            20,
+            rsmpeg::ffi::AVSEEK_FLAG_FRAME as i32,
+        )
+        .unwrap();
 
     loop {
-        match decoder.decode_frame() {
+        match decoder.decode_frame(&mut reader) {
             Ok(Some(yuv_frame)) => {
                 println!(
                     "decoded frame pts: {}, type: {:?}, format:{:?}",

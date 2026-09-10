@@ -164,41 +164,18 @@ impl DecoderBuilder {
 
     /// 构建一个**裸** [`Decoder`]（不持有 reader）。
     ///
-    /// 适合需要精细控制 reader 生命周期的高级场景：解码时需每帧传入 reader
-    /// （`decoder.decode(&mut reader)`），且**不支持 seek**（seek 需要 reader，
-    /// 请改用 [`build_wrapped`](DecoderBuilder::build_wrapped)）。
+    /// 适合需要精细控制 reader 生命周期的高级场景：构建时会在内部创建并持有
+    /// 一个 reader，解码时需每帧传入该 reader（`decoder.decode(&mut reader)`），
+    /// 且 seek 需要显式操作 reader。
     pub fn build(self, source: impl Into<Location>) -> Result<Decoder> {
         let reader = StreamReader::new(source)?;
         self.build_from_reader(&reader)
     }
 
-    /// 构建一个持有 reader 的 [`DecoderWrapper`]（**推荐入口**）。
-    ///
-    /// 返回的 [`DecoderWrapper`] 封装了 reader，解码无需每帧传参
-    /// （`decoder.decode()` / `decoder.decode_frame()`），并支持直接
-    /// [`seek_to_frame`](DecoderWrapper::seek_to_frame) /
-    /// [`seek_to_timestamp`](DecoderWrapper::seek_to_timestamp)。
-    pub fn build_wrapped(
-        self,
-        source: impl Into<Location>,
-    ) -> Result<DecoderWrapper<StreamReader>> {
-        let reader = StreamReader::new(source)?;
-        self.build_wrapped_with_reader(reader)
-    }
-
-    /// 用自定义 reader 构建持有 reader 的 [`DecoderWrapper`]。
-    ///
-    /// 当需要从自定义 [`Reader`]（如网络流、内存缓冲）解码时使用，行为与
-    /// [`build_wrapped`](DecoderBuilder::build_wrapped) 一致。
-    pub fn build_wrapped_with_reader<R: Reader>(self, reader: R) -> Result<DecoderWrapper<R>> {
-        let decoder = self.build_from_reader(&reader)?;
-        DecoderWrapper::new(decoder, reader)
-    }
-
     /// 用给定的 reader 构建**裸** [`Decoder`]（不持有 reader）。
     ///
     /// 高级/内部场景使用（如 mux 多流共享同一 reader）。解码时需每帧传入
-    /// reader，且不支持 seek。日常使用请优先 [`build_wrapped`](DecoderBuilder::build_wrapped)。
+    /// reader，且不支持 seek。
     pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
@@ -769,7 +746,11 @@ impl Decoder {
         self.state = CodecContextState::Normal;
     }
 
-    fn flush(&mut self) {
+    /// Flush the decoder's internal decoding buffers.
+    ///
+    /// Called after a seek so the decoder discards stale buffered frames and
+    /// starts cleanly from the newly positioned point.
+    pub fn flush(&mut self) {
         unsafe {
             ffi::avcodec_flush_buffers(self.context.as_mut_ptr());
         }
@@ -1072,119 +1053,6 @@ impl Drop for Decoder {
 ///   无线程局部句柄。
 unsafe impl Send for Decoder {}
 
-/// 解码器包装器，持有 Decoder 和 Reader
-pub struct DecoderWrapper<R: Reader> {
-    reader: R,
-    decoder: Decoder,
-    stream_info: StreamInfo,
-}
-
-impl<R: Reader> DecoderWrapper<R> {
-    /// 创建一个新的解码器包装器
-    pub fn new(decoder: Decoder, reader: R) -> Result<Self> {
-        let stream_info = StreamInfo::from_reader(&reader, decoder.stream_index())
-            .context("Failed to create stream info from reader")?;
-        Ok(Self {
-            reader,
-            decoder,
-            stream_info,
-        })
-    }
-
-    /// 解码下一帧（媒体帧）
-    #[cfg(feature = "ndarray")]
-    pub fn decode<T: MediaFrameType>(&mut self) -> Result<Option<MediaFrame<T>>> {
-        self.decoder.decode(&mut self.reader)
-    }
-
-    /// 解码下一帧（`MediaFrame<u8>` 便捷方法，等价于 `decode::<u8>()`）
-    #[cfg(feature = "ndarray")]
-    pub fn decode_frame(&mut self) -> Result<Option<MediaFrame<u8>>> {
-        self.decoder.decode(&mut self.reader)
-    }
-
-    /// 解码下一帧（原始帧）
-    pub fn decode_raw(&mut self) -> Result<Option<AVFrame>> {
-        self.decoder.decode_raw(&mut self.reader)
-    }
-
-    /// 解码下一条字幕段落（仅字幕解码器）
-    pub fn decode_subtitle_segment(&mut self) -> Result<Option<SubtitleSegment>> {
-        self.decoder.decode_subtitle_segment(&mut self.reader)
-    }
-
-    pub fn stream_info(&self) -> &StreamInfo {
-        &self.stream_info
-    }
-
-    /// 获取内部解码器的可变引用
-    pub fn decoder_mut(&mut self) -> &mut Decoder {
-        &mut self.decoder
-    }
-
-    /// 获取内部读取器的可变引用
-    pub fn reader_mut(&mut self) -> &mut R {
-        &mut self.reader
-    }
-
-    /// 解构并返回内部组件
-    pub fn into_parts(self) -> (Decoder, R) {
-        (self.decoder, self.reader)
-    }
-}
-
-impl<R: Reader + Seekable> DecoderWrapper<R> {
-    /// Seek in reader.
-    ///
-    /// See [`Seekable::seek_to_timestamp`](crate::io::Seekable::seek_to_timestamp) for more information.
-    #[inline]
-    pub fn seek_to_timestamp(&mut self, timestamp_milliseconds: i64) -> Result<()> {
-        self.reader
-            .seek_to_timestamp(timestamp_milliseconds)
-            .inspect(|_| self.decoder.flush())
-    }
-
-    /// Seek to specific frame in reader.
-    ///
-    /// See [`Seekable::seek_to_frame`](crate::io::Seekable::seek_to_frame) for more information.
-    #[inline]
-    pub fn seek_to_frame(&mut self, frame_number: i64) -> Result<()> {
-        self.reader
-            .seek_to_frame(
-                self.decoder.stream_index(),
-                frame_number,
-                ffi::AVSEEK_FLAG_ANY as i32,
-            )
-            .inspect(|_| self.decoder.flush())
-    }
-
-    /// Seek to start of reader.
-    ///
-    /// See [`Seekable::seek_to_start`](crate::io::Seekable::seek_to_start) for more information.
-    #[inline]
-    pub fn seek_to_start(&mut self) -> Result<()> {
-        self.reader
-            .seek_to_start()
-            .inspect(|_| self.decoder.flush())
-    }
-
-    /// Seek 到指定时间点并解码一帧原始 `AVFrame`（视频）。
-    ///
-    /// 缩略图/封面提取的核心路径：seek 定位到目标时间之前最近的关键帧
-    /// （`AVSEEK_FLAG_BACKWARD` 语义），从该帧开始解码。seek 失败不视为
-    /// 错误：退化为从当前位置解码第一帧。
-    ///
-    /// 返回 `Ok(None)` 表示到达流末尾且无帧可解。转换为图片请用
-    /// [`imgutils::to_dynamic_image`](crate::imgutils::to_dynamic_image)。
-    pub fn decode_raw_at(&mut self, timestamp_ms: i64) -> Result<Option<AVFrame>> {
-        // seek 失败不视为错误：退化为解码第一帧
-        if self.seek_to_timestamp(timestamp_ms).is_err() {
-            log::debug!("seek to {timestamp_ms}ms failed, decoding from the current position");
-        }
-        self.decode_raw()
-    }
-}
-
 /// 一站式从输入获取一帧视频缩略图，返回 `image::DynamicImage`。
 ///
 /// 内部流程：构建视频解码器（RGB24 输出 + [`Resize::Fit`] 保持纵横比缩放）
@@ -1215,22 +1083,34 @@ pub fn thumbnail(
     timestamp_ms: Option<i64>,
     max_dims: (u32, u32),
 ) -> Result<image::DynamicImage> {
+    let mut reader = StreamReader::new(source).context("Failed to open thumbnail source")?;
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
         .with_pix_fmt(PixelFormat::RGB24)
         .with_resize(Resize::Fit(max_dims.0, max_dims.1))
-        .build_wrapped(source)
+        .build_from_reader(&reader)
         .context("Failed to build thumbnail decoder")?;
 
     // None → 流中点；时长未知（0）→ 第一帧
-    let ts = timestamp_ms.unwrap_or_else(|| {
-        let info = decoder.stream_info();
-        let mid_secs = info.duration as f64 * avutil::av_q2d(info.time_base) / 2.0;
-        (mid_secs * 1000.0).round().max(0.0) as i64
-    });
+    let ts = match timestamp_ms {
+        Some(ts) => ts,
+        None => {
+            let info = StreamInfo::from_reader(&reader, decoder.stream_index())?;
+            let mid_secs = info.duration as f64 * avutil::av_q2d(info.time_base) / 2.0;
+            (mid_secs * 1000.0).round().max(0.0) as i64
+        }
+    };
 
-    let frame = decoder
-        .decode_raw_at(ts)?
-        .ok_or_else(|| RsmediaError::custom("No video frame decoded for thumbnail"))?;
+    let frame = {
+        // 定位到目标时间之前最近的关键帧，并刷新解码器以丢弃旧缓冲。
+        // seek 失败不视为错误：退化为从当前位置解码第一帧。
+        if reader.seek_to_timestamp(ts).is_err() {
+            log::debug!("seek to {ts}ms failed, decoding from the current position");
+        } else {
+            decoder.flush();
+        }
+        decoder.decode_raw(&mut reader)?
+    }
+    .ok_or_else(|| RsmediaError::custom("No video frame decoded for thumbnail"))?;
 
     crate::imgutils::to_dynamic_image(&frame).context("Failed to convert AVFrame to image")
 }
@@ -1268,10 +1148,11 @@ mod tests {
         // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用，失败时降级为仅 scale。
         let scale = filter::video::scale(1280, 720, None);
         let drawtext = filter::video::DrawText::new("Hello", 10, 10, 24, "white").build();
-        let build_decoder = |filters| {
+        let mut reader = StreamReader::new(video_path)?;
+        let build_decoder = |filters: Vec<Filter>| -> Result<Decoder> {
             DecoderBuilder::new(MediaType::VIDEO)
                 .with_filters(filters)
-                .build_wrapped(video_path)
+                .build_from_reader(&reader)
         };
         let mut decoder = match build_decoder(vec![scale, drawtext]) {
             Ok(d) => d,
@@ -1286,7 +1167,7 @@ mod tests {
         };
 
         loop {
-            match decoder.decode_raw() {
+            match decoder.decode_raw(&mut reader) {
                 Ok(Some(frame)) => {
                     println!("video frame: {:?}, timebase:{:?}", frame, frame.time_base);
                 }
@@ -1313,12 +1194,13 @@ mod tests {
             filter::audio::volume(1.5),
         ];
 
+        let mut reader = StreamReader::new(audio_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::AUDIO)
             .with_filters(filters)
-            .build_wrapped(audio_path)?;
+            .build_from_reader(&reader)?;
 
         loop {
-            match decoder.decode_raw() {
+            match decoder.decode_raw(&mut reader) {
                 Ok(Some(frame)) => {
                     println!("audio frame: {:?}, timebase:{:?}", frame, frame.time_base);
                 }
@@ -1342,12 +1224,13 @@ mod tests {
 
         let video_path = std::path::Path::new("assets/mp4.mp4");
 
+        let mut reader = StreamReader::new(video_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
             .with_resize(Resize::Exact(320, 240))
-            .build_wrapped(video_path)?;
+            .build_from_reader(&reader)?;
 
         let mut frames = 0usize;
-        while let Some(frame) = decoder.decode_raw()? {
+        while let Some(frame) = decoder.decode_raw(&mut reader)? {
             assert_eq!(frame.width, 320);
             assert_eq!(frame.height, 240);
             frames += 1;
@@ -1363,12 +1246,13 @@ mod tests {
     fn test_decode_video_with_pix_fmt_rgb24() -> Result<()> {
         let video_path = std::path::Path::new("assets/mp4.mp4");
 
+        let mut reader = StreamReader::new(video_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
             .with_pix_fmt(PixelFormat::RGB24)
-            .build_wrapped(video_path)?;
+            .build_from_reader(&reader)?;
 
         let mut frames = 0usize;
-        while let Some(frame) = decoder.decode_raw()? {
+        while let Some(frame) = decoder.decode_raw(&mut reader)? {
             assert_eq!(frame.format, PixelFormat::RGB24.into());
             frames += 1;
         }
@@ -1381,9 +1265,10 @@ mod tests {
     #[test]
     fn test_decode_video_with_pix_fmt_unsupported() {
         let video_path = std::path::Path::new("assets/mp4.mp4");
+        let reader = StreamReader::new(video_path).unwrap();
         let result = DecoderBuilder::new(MediaType::VIDEO)
             .with_pix_fmt(PixelFormat::NV12)
-            .build_wrapped(video_path);
+            .build_from_reader(&reader);
         assert!(result.is_err());
     }
 
@@ -1391,9 +1276,10 @@ mod tests {
     #[test]
     fn test_decode_audio_with_pix_fmt_fails() {
         let video_path = std::path::Path::new("assets/mp4.mp4");
+        let reader = StreamReader::new(video_path).unwrap();
         let result = DecoderBuilder::new(MediaType::AUDIO)
             .with_pix_fmt(PixelFormat::YUV420P)
-            .build_wrapped(video_path);
+            .build_from_reader(&reader);
         assert!(result.is_err());
     }
 
@@ -1407,21 +1293,23 @@ mod tests {
 
         // A) 仅 with_resize
         eprintln!("[A] with_resize only");
+        let mut reader_a = StreamReader::new(video_path)?;
         let mut dec_a = DecoderBuilder::new(MediaType::VIDEO)
             .with_resize(Resize::Exact(320, 240))
-            .build_wrapped(video_path)?;
+            .build_from_reader(&reader_a)?;
         let mut a_dims = HashSet::new();
-        while let Some(f) = dec_a.decode_raw()? {
+        while let Some(f) = dec_a.decode_raw(&mut reader_a)? {
             a_dims.insert((f.width, f.height));
         }
 
         // B) 仅 scale filter
         eprintln!("[B] filter only");
+        let mut reader_b = StreamReader::new(video_path)?;
         let mut dec_b = DecoderBuilder::new(MediaType::VIDEO)
             .with_filters(vec![filter::video::scale(320, 240, None)])
-            .build_wrapped(video_path)?;
+            .build_from_reader(&reader_b)?;
         let mut b_dims = HashSet::new();
-        while let Some(f) = dec_b.decode_raw()? {
+        while let Some(f) = dec_b.decode_raw(&mut reader_b)? {
             b_dims.insert((f.width, f.height));
         }
 
@@ -1434,12 +1322,13 @@ mod tests {
 
         // C) 同时使用：resize(320x240) -> filter scale(640x480)，输出应为 filter 尺寸
         eprintln!("[C] resize + filter");
+        let mut reader_c = StreamReader::new(video_path)?;
         let mut dec_c = DecoderBuilder::new(MediaType::VIDEO)
             .with_resize(Resize::Exact(320, 240))
             .with_filters(vec![filter::video::scale(640, 480, None)])
-            .build_wrapped(video_path)?;
+            .build_from_reader(&reader_c)?;
         let mut c_dims = HashSet::new();
-        while let Some(f) = dec_c.decode_raw()? {
+        while let Some(f) = dec_c.decode_raw(&mut reader_c)? {
             c_dims.insert((f.width, f.height));
         }
         assert_eq!(
@@ -1451,7 +1340,12 @@ mod tests {
         Ok(())
     }
 
+    use crate::{colors, encode::EncoderBuilder, mux::Muxer};
+
     /// 生成 `n_frames` 帧、`fps` 帧率的纯色小视频（不含 B 帧），供延迟滤镜 EOF 回归测试使用。
+    ///
+    /// 使用裸 [`Encoder`](crate::encode::Encoder) + [`Muxer`] 写入：需要手动维护
+    /// 每帧的 pts（`Muxer::mux` 不会像旧的 EncoderWrapper 那样自动设置）。
     #[cfg(feature = "ndarray")]
     fn make_test_video(
         path: &std::path::Path,
@@ -1460,11 +1354,12 @@ mod tests {
         n_frames: usize,
         fps: f32,
     ) -> Result<()> {
-        use crate::{colors, encode::EncoderBuilder};
-
-        let mut encoder = EncoderBuilder::new_video(width, height)
+        let video_encoder = EncoderBuilder::new_video(width, height)
             .with_fps(fps)
-            .build_wrapped(path)?;
+            .build()?;
+        let encoder_time_base = video_encoder.time_base();
+        let mut muxer = Muxer::new(path)?;
+        let video_index = muxer.add_stream(video_encoder)?;
         for i in 0..n_frames {
             let rgb = colors::hsv_to_rgb(i as f32 / n_frames as f32 * 360.0, 100.0, 100.0);
             let mut frame = MediaFrame::<u8>::new_video_frame(
@@ -1480,9 +1375,13 @@ mod tests {
                     frame.data[[y, x, 2]] = rgb[2];
                 }
             }
-            encoder.write_frame(frame)?;
+            let mut avframe = frame.to_avframe()?;
+            // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick = 1/fps 秒）
+            avframe.set_pts(i as i64);
+            avframe.set_time_base(encoder_time_base);
+            muxer.mux(avframe, video_index)?;
         }
-        encoder.finish()?;
+        muxer.finish()?;
         Ok(())
     }
 
@@ -1510,11 +1409,12 @@ mod tests {
             make_test_video(&path, width, height, *n_frames, *fps)?;
 
             let filters = vec![Filter::new(name, MediaType::VIDEO, spec.to_string())];
+            let mut reader = StreamReader::new(path.as_path())?;
             let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
                 .with_filters(filters)
-                .build_wrapped(path.as_path())?;
+                .build_from_reader(&reader)?;
             let mut count = 0usize;
-            while let Some(_f) = decoder.decode_raw()? {
+            while let Some(_f) = decoder.decode_raw(&mut reader)? {
                 count += 1;
             }
             assert!(

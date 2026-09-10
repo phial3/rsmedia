@@ -573,12 +573,19 @@ impl<W: Writer> Muxer<W> {
         let enc_time_base = encoder.time_base();
         let out_time_base = mux_stream.stream_info.time_base;
         let packets = encoder.encode_raw(frame)?;
+        // 编码器输出的 packet 常不带 duration（mpeg4 等），若缺失则按
+        // 帧率/采样率补上，否则 MP4 等交错 muxer 无法推导**最后一帧**的
+        // 时长，导致末帧被丢弃（与 Encoder::flush 的补全逻辑保持一致）。
+        let duration_fallback = encoder.packet_duration();
         // mux_stream 对 self.streams 的借用至此结束，之后可独占使用 self.writer
 
         let mut last_out = None;
         for mut packet in packets {
             packet.set_pos(-1);
             packet.set_stream_index(stream_idx as i32);
+            if packet.duration <= 0 {
+                packet.set_duration(duration_fallback);
+            }
             // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
             // encode_ctx_timebase => out_stream_time_base
             packet.rescale_ts(enc_time_base, out_time_base);

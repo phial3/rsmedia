@@ -1727,7 +1727,7 @@ mod tests {
         let mut total = 0usize;
         for i in 0..8 {
             let mut frame = generate_rgb_frame(64, 48, i);
-            frame.set_pts(i * tb.den as i64);
+            frame.set_pts(i);
             frame.set_time_base(tb);
             if let Some(chunk) = muxer.mux(frame, video_index)? {
                 total += chunk.len();
@@ -1742,11 +1742,10 @@ mod tests {
         );
 
         // 2. BufferReader 读回并解码全部帧
-        let reader = BufferReader::new(bytes)?;
-        let mut decoder =
-            DecoderBuilder::new(MediaType::VIDEO).build_wrapped_with_reader(reader)?;
+        let mut reader = BufferReader::new(bytes)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
         let mut frames = 0;
-        while decoder.decode_raw()?.is_some() {
+        while decoder.decode_raw(&mut reader)?.is_some() {
             frames += 1;
         }
         assert_eq!(frames, 8, "expected 8 decoded frames from buffer reader");
@@ -1760,18 +1759,18 @@ mod tests {
             let video_index = muxer.add_stream(encoder)?;
             for i in 0..8 {
                 let mut frame = generate_rgb_frame(64, 48, i);
-                frame.set_pts(i * tb.den as i64);
+                frame.set_pts(i);
                 frame.set_time_base(tb);
                 muxer.mux(frame, video_index)?;
             }
             muxer.finish()?;
             muxer.into_writer().into_bytes()
         };
-        let reader = BufferReader::new(source)?;
-        let mut decoder =
-            DecoderBuilder::new(MediaType::VIDEO).build_wrapped_with_reader(reader)?;
+        let mut reader = BufferReader::new(source)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        reader.seek_to_start()?;
         let frame = decoder
-            .decode_raw_at(0)?
+            .decode_raw(&mut reader)?
             .expect("expected a frame after seek to start");
         assert!(frame.width > 0 && frame.height > 0);
 
@@ -1794,7 +1793,7 @@ mod tests {
             let video_index = muxer.add_stream(encoder)?;
             for i in 0..4 {
                 let mut frame = generate_rgb_frame(64, 48, i);
-                frame.set_pts(i * tb.den as i64);
+                frame.set_pts(i);
                 frame.set_time_base(tb);
                 muxer.mux(frame, video_index)?;
             }
@@ -1821,7 +1820,7 @@ mod tests {
         let video_index = muxer.add_stream(encoder)?;
         for i in 0..4 {
             let mut frame = generate_rgb_frame(64, 48, i);
-            frame.set_pts(i * tb.den as i64);
+            frame.set_pts(i);
             frame.set_time_base(tb);
             muxer.mux(frame, video_index)?;
         }
