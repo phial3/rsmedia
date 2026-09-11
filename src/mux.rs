@@ -2,6 +2,7 @@ use crate::error::{Context, Result, RsmediaError};
 use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, Writer};
+use crate::options::Metadata;
 use crate::stream::MediaType;
 use crate::stream::StreamInfo;
 use crate::{
@@ -13,8 +14,6 @@ use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 
 use std::collections::HashMap;
-use std::ffi::CStr;
-use std::ptr;
 
 /// A container chapter mark (MP4/MKV chapters), with times in seconds.
 ///
@@ -86,11 +85,11 @@ pub struct Muxer<W: Writer> {
     have_written_trailer: bool,
     /// Container-level metadata (e.g. "title", "artist"), applied to the
     /// format context right before the header is written.
-    metadata: HashMap<String, String>,
+    metadata: Metadata,
     /// Per-stream metadata (e.g. "language"), keyed by the output stream
     /// index returned from [`Muxer::add_stream`], applied right before the
     /// header is written.
-    stream_metadata: HashMap<usize, HashMap<String, String>>,
+    stream_metadata: HashMap<usize, Metadata>,
     /// Container chapters, applied right before the header is written.
     chapters: Vec<Chapter>,
 }
@@ -155,7 +154,7 @@ impl<W: Writer> Muxer<W> {
             interleaved: false,
             have_written_header: false,
             have_written_trailer: false,
-            metadata: HashMap::new(),
+            metadata: Metadata::new(),
             stream_metadata: HashMap::new(),
             chapters: Vec::new(),
         }
@@ -296,16 +295,9 @@ impl<W: Writer> Muxer<W> {
         }
         let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
 
-        for (key, value) in &self.metadata {
-            let (k, v) = (
-                crate::strutils::str_to_cstring(key),
-                crate::strutils::str_to_cstring(value),
-            );
-            let ret = unsafe { ffi::av_dict_set(&mut ctx.metadata, k.as_ptr(), v.as_ptr(), 0) };
-            if ret < 0 {
-                log::warn!("av_dict_set({key:?}) failed: {ret}");
-            }
-        }
+        // SAFETY: `ctx.metadata` is a live dictionary slot owned by the format
+        // context; `write_into_raw_dict` replaces it with our entries.
+        unsafe { self.metadata.write_into_raw_dict(&mut ctx.metadata) };
 
         let streams =
             unsafe { std::slice::from_raw_parts_mut(ctx.streams, ctx.nb_streams as usize) };
@@ -317,18 +309,9 @@ impl<W: Writer> Muxer<W> {
                 );
                 continue;
             };
-            for (key, value) in entries {
-                let (k, v) = (
-                    crate::strutils::str_to_cstring(key),
-                    crate::strutils::str_to_cstring(value),
-                );
-                let ret = unsafe {
-                    ffi::av_dict_set(&mut (**stream).metadata, k.as_ptr(), v.as_ptr(), 0)
-                };
-                if ret < 0 {
-                    log::warn!("av_dict_set(stream {idx}, {key:?}) failed: {ret}");
-                }
-            }
+            // SAFETY: `(**stream).metadata` is a live dictionary slot owned by the
+            // stream of the exclusively owned output context.
+            unsafe { entries.write_into_raw_dict(&mut (**stream).metadata) };
         }
     }
 
@@ -466,13 +449,11 @@ impl<W: Writer> Muxer<W> {
                 (*chapter_ptr).time_base = ffi::AVRational { num: 1, den: 1000 };
                 (*chapter_ptr).start = start_ms;
                 (*chapter_ptr).end = end_ms;
-                let title = crate::strutils::str_to_cstring(&chapter.title);
-                ffi::av_dict_set(
-                    &mut (*chapter_ptr).metadata,
-                    c"title".as_ptr(),
-                    title.as_ptr(),
-                    0,
-                );
+                // SAFETY: `(*chapter_ptr).metadata` starts out NULL and the chapter
+                // node is exclusively owned here (already inside an `unsafe` block).
+                Metadata::new()
+                    .insert("title", &chapter.title)
+                    .write_into_raw_dict(&mut (*chapter_ptr).metadata);
             }
             chapter_nodes.push(chapter_ptr);
         }
@@ -957,14 +938,11 @@ impl<R: Reader> Demuxer<R> {
                 continue;
             }
             unsafe {
-                let title_entry =
-                    ffi::av_dict_get((*c).metadata, c"title".as_ptr(), ptr::null(), 0);
-                let title = if title_entry.is_null() {
-                    String::new()
-                } else {
-                    crate::strutils::cstr_to_string(CStr::from_ptr((*title_entry).value))
-                        .unwrap_or_default()
-                };
+                // SAFETY: `(*c).metadata` is valid for as long as `input` is borrowed.
+                let title = Metadata::from_raw_dict((*c).metadata)
+                    .get("title")
+                    .unwrap_or_default()
+                    .to_string();
                 let tb = (*c).time_base;
                 let tb_secs = tb.num as f64 / tb.den as f64;
                 chapters.push(Chapter {
@@ -1385,9 +1363,6 @@ mod tests {
     /// 容器级 metadata 与流级 language 标签的写入与回读验证（多轨场景）。
     #[test]
     fn test_mux_metadata_and_language() -> Result<()> {
-        use std::ffi::CStr;
-        use std::ptr;
-
         let output_path = crate::test_support::test_output_path("mux", "test_mux_metadata.mp4");
 
         let (width, height) = (320, 240);
@@ -1436,47 +1411,33 @@ mod tests {
         let reader = StreamReader::new(output_path.as_path())?;
         let input = reader.input();
 
-        let get_str = |dict: *mut ffi::AVDictionary, key: &CStr| -> Option<String> {
-            unsafe {
-                let entry = ffi::av_dict_get(dict, key.as_ptr(), ptr::null(), 0);
-                if entry.is_null() {
-                    None
-                } else {
-                    Some(
-                        crate::strutils::cstr_to_string(CStr::from_ptr((*entry).value))
-                            .expect("metadata value is UTF8"),
-                    )
-                }
-            }
+        let get_str = |dict: *mut ffi::AVDictionary, key: &str| -> Option<String> {
+            // SAFETY: `dict` points at a live `AVDictionary` owned by the input
+            // format context / stream, which outlives this call.
+            unsafe { Metadata::from_raw_dict(dict) }
+                .get(key)
+                .map(String::from)
         };
 
-        let title = get_str(input.metadata, c"title");
+        let title = get_str(input.metadata, "title");
         assert_eq!(
             title.as_deref(),
             Some("rsmedia metadata test"),
             "container title metadata mismatch"
         );
 
-        let artist = get_str(input.metadata, c"artist");
+        let artist = get_str(input.metadata, "artist");
         assert_eq!(artist.as_deref(), Some("rsmedia"));
 
         let streams = input.streams();
-        let video_lang = get_str(
-            streams[video_index]
-                .metadata()
-                .map(|d| d.as_ptr() as *mut _)
-                .unwrap_or(ptr::null_mut()),
-            c"language",
-        );
+        let raw_or_null = |d: Option<rsmpeg::avutil::AVDictionaryRef>| {
+            d.map(|d| d.as_ptr() as *mut _)
+                .unwrap_or(std::ptr::null_mut())
+        };
+        let video_lang = get_str(raw_or_null(streams[video_index].metadata()), "language");
         assert_eq!(video_lang.as_deref(), Some("und"));
 
-        let audio_lang = get_str(
-            streams[audio_index]
-                .metadata()
-                .map(|d| d.as_ptr() as *mut _)
-                .unwrap_or(ptr::null_mut()),
-            c"language",
-        );
+        let audio_lang = get_str(raw_or_null(streams[audio_index].metadata()), "language");
         assert_eq!(audio_lang.as_deref(), Some("chi"));
 
         Ok(())

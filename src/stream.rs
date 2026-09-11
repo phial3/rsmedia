@@ -3,7 +3,7 @@ use crate::fmt::FrameFormat;
 use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
 use crate::strutils;
-use crate::{Options, PixelFormat, SampleFormat};
+use crate::{Metadata, PixelFormat, SampleFormat};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecParameters};
 use rsmpeg::avformat::AVStream;
@@ -192,7 +192,7 @@ impl StreamInfo {
         let codec_type = codecpar.codec_type();
         let metadata = stream
             .metadata()
-            .map_or(HashMap::new(), |d| Options::from_dict(&d).into());
+            .map_or(HashMap::new(), |d| Metadata::from_dict(&d).into());
         // 统一格式：视频 → 像素格式，音频 → 采样格式，其他 → NONE 占位
         let format = if codec_type.is_video() {
             FrameFormat::Pixel(PixelFormat::from(codecpar.format))

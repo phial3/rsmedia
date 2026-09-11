@@ -78,11 +78,11 @@ impl EncoderBuilder {
     /// * 超高清 FullUltraHd_8K: (7680, 4320) => 60_000_000,  // 60 Mbps
     const VIDEO_BIT_RATE: i64 = 1_000_000;
 
-    /// default codec
+    /// default video codec
     const VIDEO_CODEC_NAME: &'static str = "libx264";
+    /// default audio codec
     const AUDIO_CODEC_NAME: &'static str = "aac";
-    /// 字幕默认编码器：subrip（通用文本格式）。MP4 容器请用
-    /// [`Self::with_codec_name`] 指定 `mov_text`。
+    /// 字幕默认编码器：subrip（通用文本格式）。MP4 容器请用 指定 [`mov_text`]
     const SUBTITLE_CODEC_NAME: &'static str = "subrip";
 
     /// 字幕编码器时间基分母：1/1000 秒（毫秒精度），与 ffmpeg CLI 行为一致。
@@ -573,6 +573,10 @@ impl EncoderBuilder {
 
         self.setup_codec_context(&mut encode_ctx, use_crf, pixel_format, sample_format)?;
 
+        // 编码器输入时间基：与滤镜图 buffer 源（下方 FilterParams）和"滤镜未改写
+        // 帧率时的编码器 time_base"同源。必须在 self 被部分 move 之前求值。
+        let input_time_base = self.effective_time_base();
+
         // 在 hw_device_config / codec_opts 被 move 之前构造 filter graph：
         // 此位置 self 尚未被部分 move，可直接借用 self 计算 time_base。
         // 滤镜链可声明要求的输入格式（如 GIF 调色板链要求 RGB 输入、输出
@@ -592,7 +596,7 @@ impl EncoderBuilder {
                             .and_then(FrameFormat::into_pixel)
                             .unwrap_or(pixel_format),
                         format: pixel_format,
-                        time_base: self.effective_time_base(),
+                        time_base: input_time_base,
                         frame_rate: self.frame_rate,
                         pixel_aspect: encode_ctx.sample_aspect_ratio, // sample aspect ratio (0 if unknown)
                     })
@@ -605,7 +609,7 @@ impl EncoderBuilder {
                         src_format: filter_input_format
                             .and_then(FrameFormat::into_sample)
                             .unwrap_or(sample_format),
-                        time_base: self.effective_time_base(), // time_base = 1 / sample_rate
+                        time_base: input_time_base, // time_base = 1 / sample_rate
                     })
                 }
                 _ => {
@@ -754,7 +758,8 @@ impl EncoderBuilder {
             scale_algorithm: self.scale_algorithm,
             pending_packets: VecDeque::new(),
             audio_fifo: None,
-            audio_pts: 0,
+            next_pts: 0,
+            input_time_base,
         })
     }
 }
@@ -827,10 +832,23 @@ pub struct Encoder {
     /// 恰好给出 `frame_size` 个样本，而待编码音频帧大小可能可变（滤镜输出、或用户
     /// 输入不足一帧），需先累积补齐到帧长再送编码器。
     audio_fifo: Option<AVAudioFifo>,
-    /// 音频缓冲下一帧的 pts（编码器时间基 `1/sample_rate` 下的样本位置计数）。
-    /// 取首帧 pts 作为起点，此后每切出一帧按 `frame_size` 递增；对音频而言样本
-    /// 位置即正确时间轴，比直接沿用滤镜 pts 更可靠。
-    audio_pts: i64,
+    /// 下一个自动分配的 pts（`input_time_base` 下的 tick 计数）。
+    ///
+    /// 用户未设置 pts（`AV_NOPTS_VALUE`）的帧由此计数器自动编号：视频每帧 +1
+    /// （输入时间基 = `1/fps`，每帧恰一 tick），音频按样本数递增（输入时间基 =
+    /// `1/sample_rate`，样本位置即时间轴）。用户设置了 pts 的帧照常使用其值，
+    /// 但计数器仍跳到其后，保证后续未设置的帧能接续正确的时间轴。
+    ///
+    /// 固定帧长音频（aac 等）由 `audio_fifo` 重新切帧：输出帧的 pts 无法取自
+    /// 任何单个输入帧，只能用"已输出累计样本数"。因此首次缓冲时以首帧 pts
+    /// （若设置）播种本计数器，此后每切出一帧按 `frame_size` 递增、flush 末帧
+    /// 按 `remaining` 递增——与视频/直发路径共用同一个计数器。
+    next_pts: i64,
+    /// 编码器**输入**时间基：滤镜存在时为滤镜图 buffer 源的时间基（= 建图时的
+    /// `effective_time_base()`），否则等于编码器 time_base。滤镜改写输出帧率时
+    /// 编码器 time_base 会被改为 `1/滤镜输出fps`，与输入时间基不再相等，因此
+    /// 必须显式保存，供 pts 换算与自动编号使用。
+    input_time_base: ffi::AVRational,
 }
 
 impl Encoder {
@@ -984,7 +1002,10 @@ impl Encoder {
     }
 
     fn send_frame_to_encoder(&mut self, frame_opt: Option<AVFrame>) -> Result<()> {
-        if let Some(frame) = frame_opt {
+        if let Some(mut frame) = frame_opt {
+            // pts 处理必须在进滤镜/格式转换之前：滤镜（`fps`/`framerate` 等）需要
+            // 有效 pts 才能正确工作，时间基换算也要以滤镜图输入时间基为基准。
+            self.assign_pts(&mut frame);
             // 正常编码帧：经过 filter（如有）
             // 滤镜 buffer/abuffer 源按"滤镜图输入格式"配置（声明优先，见
             // `Filter::with_input_format`；默认=编码器协商格式）。输入帧格式
@@ -1045,6 +1066,52 @@ impl Encoder {
             }
             Ok(())
         }
+    }
+
+    /// pts 的自动处理与时间基归一化（在帧进滤镜/编码器之前调用）。
+    ///
+    /// FFmpeg 在编码器输入侧**忽略** `AVFrame.time_base`，pts 一律按
+    /// `AVCodecContext.time_base` 解释。因此两件事必须在这里完成：
+    ///
+    /// 1. **时间基换算**：帧携带了有效且不同的 `time_base` 时（解码侧容器流时间基，
+    ///    如 mp4 的 `1/15360`），把 pts 换算到编码器输入时间基，否则时间轴被静默
+    ///    误读（时长/帧率全错）。
+    /// 2. **自动编号**：pts 为 `AV_NOPTS_VALUE`（用户未设置）时，用运行计数器
+    ///    [`next_pts`](Self::next_pts) 编号——视频每帧 +1 tick（输入时间基 =
+    ///    `1/fps`），音频按样本位置递增。固定帧长音频（aac 等）除外：其帧切分由
+    ///    `audio_fifo` 完成，本方法不为输入帧编号（NOPTS 原样通过），而由
+    ///    `buffer_audio_frame` 首次缓冲时用首帧 pts 播种 `next_pts`，此后每个
+    ///    输出帧按已输出样本数递增。
+    ///
+    /// 计数器在用户设置了 pts 的帧上同样前进（跳到该 pts 之后），使后续未设置
+    /// pts 的帧能接续正确的时间轴。
+    fn assign_pts(&mut self, frame: &mut AVFrame) {
+        let input_tb = self.input_time_base;
+        if frame.pts != ffi::AV_NOPTS_VALUE
+            && frame.time_base.num > 0
+            && frame.time_base.den > 0
+            && (frame.time_base.num != input_tb.num || frame.time_base.den != input_tb.den)
+        {
+            frame.set_pts(frame.pts.rescale(frame.time_base, input_tb));
+        }
+        frame.set_time_base(input_tb);
+
+        // 固定帧长音频走 audio_fifo，输出帧 pts 由 `next_pts` 按已输出样本数
+        // 递增（见 buffer_audio_frame / drain_audio_fifo），这里不编号。
+        if self.media_type == MediaType::AUDIO && self.frame_size() > 0 {
+            return;
+        }
+        if frame.pts == ffi::AV_NOPTS_VALUE {
+            frame.set_pts(self.next_pts);
+        }
+        let step = if self.media_type == MediaType::AUDIO {
+            // 输入时间基 = 1/sample_rate，样本位置即时间轴。
+            frame.nb_samples.max(1) as i64
+        } else {
+            // 输入时间基 = 1/fps，每帧恰一 tick。
+            1
+        };
+        self.next_pts = frame.pts + step;
     }
 
     /// 将已通过 filter（或无 filter）的帧做 rescale/hw 上传后发送给编码器。
@@ -1113,12 +1180,11 @@ impl Encoder {
         if self.audio_fifo.is_none() {
             let channels = self.ch_layout().nb_channels;
             let sample_fmt = self.sample_fmt() as _;
-            // 首次缓冲时记录起始 pts（编码器时间基下的样本位置）
-            self.audio_pts = if frame.pts != ffi::AV_NOPTS_VALUE {
-                frame.pts
-            } else {
-                0
-            };
+            // 首次缓冲时以首帧 pts（编码器时间基下的样本位置，`assign_pts` 已
+            // 完成换算/自动编号的对齐）播种样本计数器；未设置则保持 0 起步。
+            if frame.pts != ffi::AV_NOPTS_VALUE {
+                self.next_pts = frame.pts;
+            }
             self.audio_fifo = Some(AVAudioFifo::new(sample_fmt, channels, frame_size));
         }
         unsafe {
@@ -1148,8 +1214,8 @@ impl Encoder {
                     .unwrap()
                     .read(frame.data.as_ptr(), frame_size)?;
             }
-            frame.set_pts(self.audio_pts);
-            self.audio_pts += frame_size as i64;
+            frame.set_pts(self.next_pts);
+            self.next_pts += frame_size as i64;
             self.check_frame(Some(&frame))?;
             self.send_ready_frame(frame)?;
         }
@@ -1181,8 +1247,8 @@ impl Encoder {
                 .context("Failed to allocate audio frame buffer")?;
             fifo.read(frame.data.as_ptr(), remaining)?;
         }
-        frame.set_pts(self.audio_pts);
-        self.audio_pts += remaining as i64;
+        frame.set_pts(self.next_pts);
+        self.next_pts += remaining as i64;
         self.check_frame(Some(&frame))?;
         self.send_ready_frame(frame)
     }
@@ -2297,6 +2363,136 @@ mod tests {
                 .map(|(d, _)| d)
                 .unwrap_or(expected_delta);
             assert_eq!(delta, expected_delta, "pts delta mismatch vs 1/fps");
+
+            crate::test_support::remove_test_output(&path);
+            Ok(())
+        }
+
+        /// 用户完全不设置 pts（`MediaFrame.pts` 保持 `AV_NOPTS_VALUE`）时，编码器
+        /// 必须自动按 `1/fps` 编号：解码回读的 pts 从 0 起步且等差。这是
+        /// "自动 pts" 行为的端到端回归测试（此前所有帧 pts=0，mp4 mux 直接报错）。
+        #[test]
+        fn test_video_pts_fully_automatic() -> Result<()> {
+            use crate::{DecoderBuilder, MediaType};
+
+            let width = 64usize;
+            let height = 64usize;
+            let n_frames = 8usize;
+            let fps: f64 = 30.0;
+
+            let path = crate::test_support::test_output_path("encode", "rsmedia_no_pts_video.mp4");
+            crate::test_support::remove_test_output(&path);
+
+            let encoder = EncoderBuilder::new_video(width, height)
+                .with_fps(fps as f32)
+                .build()?;
+            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let v_idx = muxer.add_stream(encoder)?;
+            for i in 0..n_frames {
+                // 关键：不调用 set_pts —— pts 保持 AV_NOPTS_VALUE，由编码器自动编号。
+                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                muxer.mux(frame.to_avframe()?, v_idx)?;
+            }
+            muxer.finish()?;
+
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+            let mut pts_list: Vec<i64> = Vec::new();
+            while let Some(frame) = decoder.decode_frame(&mut reader)? {
+                pts_list.push(frame.pts);
+            }
+            assert_eq!(pts_list.len(), n_frames, "decoded frame count mismatch");
+
+            // 解码输出按显示顺序排列，pts 应严格等差（步长 = 1/fps 换算到流时间基）。
+            let tb = decoder.time_base();
+            let expected_delta = (tb.den as f64 / tb.num as f64 / fps).round() as i64;
+            assert!(
+                expected_delta > 0,
+                "non-positive expected pts delta: {expected_delta}"
+            );
+            for (i, pts) in pts_list.iter().enumerate() {
+                assert_eq!(
+                    *pts,
+                    i as i64 * expected_delta,
+                    "frame {i}: pts {pts} != {i}*{expected_delta} (tb {}/{})",
+                    tb.num,
+                    tb.den
+                );
+            }
+
+            crate::test_support::remove_test_output(&path);
+            Ok(())
+        }
+
+        /// 音频同样完全不设置 pts：固定帧长编码器（aac，frame_size=1024）经
+        /// `audio_fifo` 切帧后按样本位置自动编号，且输入帧长可变（700/1300/...）
+        /// 也必须产出无缝、等差的样本时间轴。
+        #[test]
+        fn test_audio_pts_fully_automatic() -> Result<()> {
+            use crate::{DecoderBuilder, MediaType, SampleFormat};
+
+            let sample_rate: u32 = 44_100;
+            let channels: u32 = 2;
+            let frame_size: i64 = 1024;
+            // 可变输入帧长，故意都不足/超过 1024，触发 fifo 的切分与合并。
+            let input_sizes = [700u32, 1300, 900, 1100, 1000];
+            let total_samples: u32 = input_sizes.iter().sum();
+
+            let path = crate::test_support::test_output_path("encode", "rsmedia_no_pts_audio.mp4");
+            crate::test_support::remove_test_output(&path);
+
+            let encoder = EncoderBuilder::new_audio(
+                128_000,
+                channels as i32,
+                sample_rate as i32,
+                SampleFormat::FLTP,
+            )
+            .build()?;
+            assert_eq!(encoder.frame_size(), frame_size as i32, "aac frame_size");
+
+            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let a_idx = muxer.add_stream(encoder)?;
+            for &nb in &input_sizes {
+                // 关键：不设置 pts，样本位置由 audio_fifo 的计数器自动维护。
+                let frame = sine_audio_frame::<f32>(440.0, channels, nb, sample_rate);
+                muxer.mux(frame.to_avframe()?, a_idx)?;
+            }
+            muxer.finish()?;
+
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
+            let mut pts_list: Vec<i64> = Vec::new();
+            let mut decoded_samples: i64 = 0;
+            while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
+                pts_list.push(frame.pts);
+                decoded_samples += frame.nb_samples as i64;
+            }
+            assert!(!pts_list.is_empty(), "no audio frames decoded");
+
+            // 解码 pts 位于输出流时间基；a从 0 起步、按 frame_size 等差。
+            let tb = decoder.time_base();
+            let expected_delta =
+                (frame_size as f64 * tb.den as f64 / tb.num as f64 / sample_rate as f64).round()
+                    as i64;
+            assert!(
+                expected_delta > 0,
+                "non-positive expected pts delta: {expected_delta}"
+            );
+            for (i, pts) in pts_list.iter().enumerate() {
+                assert_eq!(
+                    *pts,
+                    i as i64 * expected_delta,
+                    "audio frame {i}: pts {pts} != {i}*{expected_delta} (tb {}/{})",
+                    tb.num,
+                    tb.den
+                );
+            }
+            // 采样量守恒：解码出的样本总量应等于输入总量（aac 原样还原样本数，
+            // 末帧不足 frame_size 的部分由容器 edit list 裁掉编码器填充）。
+            assert_eq!(
+                decoded_samples, total_samples as i64,
+                "sample count mismatch: {decoded_samples} vs {total_samples}"
+            );
 
             crate::test_support::remove_test_output(&path);
             Ok(())
