@@ -430,12 +430,12 @@ where
             // video frame
             frame.set_width(self.width as i32);
             frame.set_height(self.height as i32);
-            frame.set_format(self.format.as_raw());
+            frame.set_format(i32::from(self.format));
             frame.set_pict_type(self.pict_type);
             fill_video_data(&mut frame, &self.data)?;
         } else {
             // audio frame
-            frame.set_format(self.format.as_raw());
+            frame.set_format(i32::from(self.format));
             frame.set_nb_samples(self.nb_samples as i32);
             frame.set_sample_rate(self.sample_rate as i32);
             frame.set_ch_layout(

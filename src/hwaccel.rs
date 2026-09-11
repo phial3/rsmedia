@@ -520,13 +520,17 @@ unsafe impl Send for HWContext {}
 unsafe impl Sync for HWContext {}
 
 ffi_enum_wrap_from!(
-    /// 硬件设备类型（对应 FFmpeg `AV_HWDEVICE_TYPE_*`）。
+    /// Hardware device type (FFmpeg `AV_HWDEVICE_TYPE_*`).
     ///
-    /// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，
-    /// 未知/当前版本不支持的设备类型回退为 `NONE`（而非 panic）。
+    /// Generated from one `variant => constant` table with a two-way `From`. A value the table
+    /// does not list panics instead of degrading to `NONE`: an unknown device type means the
+    /// caller's assumption about the source is wrong, so it should fail fast rather than silently
+    /// fall back to "no hardware device".
+    ///
+    /// `AV_HWDEVICE_TYPE_NONE` itself is a listed value, so it still converts to `NONE`.
     HWDeviceType => ffi::AVHWDeviceType,
     repr = u32,
-    fallback = Self::NONE {
+    fallback = panic {
         /// ffi definition NONE: 0
         NONE => ffi::AV_HWDEVICE_TYPE_NONE;
         /// Video Decode and Presentation API for Unix (VDPAU)

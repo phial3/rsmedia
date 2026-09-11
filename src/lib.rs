@@ -35,6 +35,7 @@ pub use encode::{Encoder, EncoderBuilder};
 pub use error::{Error, Result, RsmediaError};
 pub use filter::Filter;
 pub use fmt::{FrameFormat, SampleFormat};
+pub use hwaccel::{HWDeviceConfig, HWDeviceType};
 pub use init::init;
 pub use io::{AVSeekFlag, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
