@@ -343,7 +343,7 @@ impl DecoderBuilder {
 /// # Example
 ///
 /// ```ignore
-/// let decoder = Decoder::new(Path::new("video.mp4")).unwrap();
+/// let decoder = Decoder::new("video.mp4").unwrap();
 /// decoder
 ///     .decode_iter()
 ///     .take_while(Result::is_ok)
@@ -587,7 +587,7 @@ impl Decoder {
     /// # Example
     ///
     /// ```ignore
-    /// let mut decoder = Decoder::new_subtitle(Path::new("video.mp4"))?;
+    /// let mut decoder = Decoder::new_subtitle("video.mp4").unwrap();
     /// while let Some(segment) = decoder.decode_subtitle_segment(&mut reader)? {
     ///     println!("{}-{}ms: {}", segment.start_ms, segment.end_ms, segment.text);
     /// }
@@ -1409,7 +1409,7 @@ mod tests {
             make_test_video(&path, width, height, *n_frames, *fps)?;
 
             let filters = vec![Filter::new(name, MediaType::VIDEO, spec.to_string())];
-            let mut reader = StreamReader::new(path.as_path())?;
+            let mut reader = StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
                 .with_filters(filters)
                 .build_from_reader(&reader)?;

@@ -24,7 +24,7 @@
 //!
 //!     // 1. 按目标规格建编码器（默认 AAC）并加入 Muxer
 //!     let encoder = Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?;
-//!     let mut muxer = Muxer::new(Path::new("out.m4a"))?;
+//!     let mut muxer = Muxer::new("out.m4a")?;
 //!     let audio_index = muxer.add_encoder(encoder)?;
 //!
 //!     // 2. 用 PcmSink 绑定音频流；spec 描述实时源（如麦克风）的采样率/声道数，
@@ -408,7 +408,7 @@ mod tests {
         let total_in = 44_100usize; // 1 秒
 
         let encoder = Encoder::new_audio(channels as i32, in_rate as i32, SampleFormat::FLTP)?;
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let audio_index = muxer.add_encoder(encoder)?;
         let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(in_rate, channels))?;
 
@@ -451,7 +451,7 @@ mod tests {
         let in_total = 48_000usize; // 1 秒
 
         let encoder = Encoder::new_audio(out_channels as i32, out_rate as i32, SampleFormat::FLTP)?;
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let audio_index = muxer.add_encoder(encoder)?;
         let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(in_rate, in_channels))?;
 
@@ -487,7 +487,7 @@ mod tests {
         let total_in = 22_050usize; // 0.5 秒
 
         let encoder = Encoder::new_audio(channels as i32, in_rate as i32, SampleFormat::FLTP)?;
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let audio_index = muxer.add_encoder(encoder)?;
         let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(in_rate, channels))?;
 
@@ -528,7 +528,7 @@ mod tests {
         let total_in = 22_050usize; // 0.5 秒
 
         let encoder = Encoder::new_audio(channels as i32, in_rate as i32, SampleFormat::FLTP)?;
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let audio_index = muxer.add_encoder(encoder)?;
         let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(in_rate, channels))?;
 
@@ -578,7 +578,7 @@ mod tests {
             EncoderBuilder::new_audio(128_000, channels as i32, in_rate as i32, SampleFormat::FLTP)
                 .with_filters(vec![filter])
                 .build()?;
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let audio_index = muxer.add_encoder(encoder)?;
         let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(in_rate, channels))?;
 
@@ -609,7 +609,7 @@ mod tests {
             let output_path = test_support::test_output_path("pcm", "test_pcm_invalid.m4a");
             test_support::remove_test_output(&output_path);
             let encoder = Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?;
-            let mut muxer = Muxer::new(output_path.as_path())?;
+            let mut muxer = Muxer::new(&output_path)?;
             let audio_index = muxer.add_encoder(encoder)?;
             assert!(PcmSink::new(muxer, audio_index, spec).is_err());
             Ok(())
@@ -621,14 +621,14 @@ mod tests {
         let output_path = test_support::test_output_path("pcm", "test_pcm_invalid.m4a");
         test_support::remove_test_output(&output_path);
         let video_encoder = EncoderBuilder::new_video(64, 64).build()?;
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let video_index = muxer.add_encoder(video_encoder)?;
         assert!(PcmSink::new(muxer, video_index, PcmSpec::new(44_100, 2)).is_err());
 
         // 声道不对齐的交错块拒绝；空块为 no-op
         let output_path = test_support::test_output_path("pcm", "test_pcm_invalid.m4a");
         let encoder = Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?;
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let audio_index = muxer.add_encoder(encoder)?;
         let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(44_100, 2))?;
         assert!(sink.write_f32(&[0.0f32; 3]).is_err());

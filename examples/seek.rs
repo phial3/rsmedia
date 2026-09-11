@@ -15,10 +15,9 @@
 //! Defaults to `assets/mp4.mp4` when the argument is omitted.
 
 use rsmedia::io::{AVSeekFlag, Seekable};
-use rsmedia::{Decoder, DecoderBuilder, Location, MediaType, Reader, StreamReader, Url};
+use rsmedia::{Decoder, DecoderBuilder, MediaType, Reader, StreamReader};
 
 use anyhow::Result;
-use std::path::Path;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -29,7 +28,7 @@ fn main() -> Result<()> {
     let arg = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "assets/mp4.mp4".to_string());
-    let mut reader = StreamReader::new(location(&arg))?;
+    let mut reader = StreamReader::new(arg.clone())?;
 
     // Cheap pre-check of the IO layer: true for local files, in-memory data and
     // HTTP servers honouring `Accept-Ranges`; false for live streams / pipes /
@@ -66,17 +65,6 @@ fn main() -> Result<()> {
     );
 
     Ok(())
-}
-
-/// Parses a command-line argument into a [`Location`]: anything that parses as an
-/// absolute URL (scheme longer than one character, so a Windows drive letter is
-/// not mistaken for a scheme) is treated as a network source, otherwise as a
-/// local path.
-fn location(arg: &str) -> Location {
-    match Url::parse(arg) {
-        Ok(url) if url.scheme().len() > 1 => Location::from(url),
-        _ => Location::from(Path::new(arg)),
-    }
 }
 
 /// Reads until the next frame is decoded and returns its PTS.

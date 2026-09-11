@@ -37,7 +37,7 @@ fn check(codec: &'static str, ext: &str) -> anyhow::Result<()> {
         .with_hardware_device(Some(dev))
         .build()?;
     let enc_tb = enc.time_base();
-    let mut muxer = rsmedia::mux::Muxer::new(path.as_path())?;
+    let mut muxer = rsmedia::mux::Muxer::new(&path)?;
     let v_idx = muxer.add_encoder(enc)?;
     for i in 0..n {
         let mut av = rainbow_frame(w, h, i as f32 / n as f32).to_avframe()?;
@@ -47,7 +47,7 @@ fn check(codec: &'static str, ext: &str) -> anyhow::Result<()> {
     }
     muxer.finish()?;
 
-    let mut reader = rsmedia::StreamReader::new(path.as_path())?;
+    let mut reader = rsmedia::StreamReader::new(&path)?;
     let mut dec = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
     let mut count = 0usize;
     while let Some(f) = dec.decode_frame(&mut reader)? {

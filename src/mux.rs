@@ -59,7 +59,7 @@ impl Chapter {
 /// ```no_run
 /// use std::path::Path;
 /// use rsmedia::mux::Muxer;
-/// let mut muxer = Muxer::new(Path::new("to_file.mkv")).unwrap();
+/// let mut muxer = Muxer::new("to_file.mkv").unwrap();
 /// // Add streams and mux packets...
 /// muxer.finish().unwrap();
 /// ```
@@ -71,7 +71,7 @@ impl Chapter {
 /// use rsmedia::mux::Muxer;
 /// use rsmedia::error::Result;
 /// fn main() -> Result<()> {
-///     let mut muxer = Muxer::new(Path::new("output.mp4"))?;
+///     let mut muxer = Muxer::new("output.mp4")?;
 ///     // Add streams and mux packets...
 ///     muxer.finish()?;
 ///     Ok(())
@@ -752,6 +752,27 @@ impl<W: Writer> Drop for Muxer<W> {
     }
 }
 
+/// stream definition for demuxer
+pub struct DemuxerStream {
+    pub decoder: Decoder,
+    pub stream_info: StreamInfo,
+    pub media_type: MediaType,
+    pub stream_index: usize,
+}
+
+impl DemuxerStream {
+    pub fn new(decoder: Decoder, stream_info: StreamInfo) -> Self {
+        let media_type = decoder.media_type();
+        let stream_index = stream_info.index;
+        Self {
+            decoder,
+            media_type,
+            stream_info,
+            stream_index,
+        }
+    }
+}
+
 /// Demuxer
 ///
 /// Two construction modes:
@@ -772,27 +793,6 @@ pub struct Demuxer<R: Reader> {
     /// an empty `streams` is also a valid decode-mode state (a container with no
     /// decodable stream), and callers must be able to tell the two apart.
     passthrough: bool,
-}
-
-/// stream definition for demuxer
-pub struct DemuxerStream {
-    pub decoder: Decoder,
-    pub stream_info: StreamInfo,
-    pub media_type: MediaType,
-    pub stream_index: usize,
-}
-
-impl DemuxerStream {
-    pub fn new(decoder: Decoder, stream_info: StreamInfo) -> Self {
-        let media_type = decoder.media_type();
-        let stream_index = stream_info.index;
-        Self {
-            decoder,
-            media_type,
-            stream_info,
-            stream_index,
-        }
-    }
 }
 
 impl Demuxer<StreamReader> {
@@ -1043,7 +1043,7 @@ impl<R: Reader> Demuxer<R> {
     /// use rsmedia::io::StreamReader;
     /// use rsmedia::error::Result;
     /// fn main() -> Result<()> {
-    ///     let reader = StreamReader::new(Path::new("my_file.mp4"))?;
+    ///     let reader = StreamReader::new("my_file.mp4")?;
     ///     let mut demuxer = Demuxer::new_passthrough(reader)?;
     ///     for result in demuxer.packets() {
     ///         let (stream_index, packet) = result?;
@@ -1136,7 +1136,7 @@ impl<R: Reader> Demuxer<R> {
 /// use rsmedia::mux::Demuxer;
 /// use rsmedia::error::Result;
 /// fn main() -> Result<()> {
-///     let mut demuxer = Demuxer::new(Path::new("my_file.mp4"))?;
+///     let mut demuxer = Demuxer::new("my_file.mp4")?;
 ///     for result in demuxer {
 ///         let (stream_index, frame) = result?;
 ///         println!("stream_index: {}, frame: {}", stream_index, frame.width);
@@ -1274,7 +1274,7 @@ mod tests {
         let (width, height) = (640, 360);
         let video_encoder = Encoder::new_video(width, height)?;
 
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
 
         let encoder_frame_rate = video_encoder.frame_rate();
         let encoder_time_base = video_encoder.time_base();
@@ -1332,7 +1332,7 @@ mod tests {
 
         // 添加音频流
         let audio_encoder = Encoder::new_audio(channels, sample_rate, SampleFormat::FLTP).unwrap();
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
 
         let encoder_time_base = audio_encoder.time_base();
         let audio_index = muxer.add_encoder(audio_encoder)?;
@@ -1407,7 +1407,7 @@ mod tests {
         let audio_encoder = Encoder::new_audio(2, sample_rate, SampleFormat::FLTP).unwrap();
         let audio_time_base = audio_encoder.time_base();
 
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let video_index = muxer.add_encoder(video_encoder)?;
         let audio_index = muxer.add_encoder(audio_encoder)?;
 
@@ -1438,7 +1438,7 @@ mod tests {
         muxer.finish()?;
 
         // 回读验证：容器级 title/artist 与各流 language 标签
-        let reader = StreamReader::new(output_path.as_path())?;
+        let reader = StreamReader::new(&output_path)?;
         let input = reader.input();
 
         let get_str = |dict: *mut ffi::AVDictionary, key: &str| -> Option<String> {
@@ -1548,7 +1548,7 @@ mod tests {
         let audio_encoder =
             Encoder::new_audio(AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, SampleFormat::FLTP)?;
 
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
 
         let video_time_base = video_encoder.time_base();
         let audio_time_base = audio_encoder.time_base();
@@ -1762,7 +1762,7 @@ mod tests {
         let encoder_time_base = video_encoder.time_base();
 
         {
-            let mut muxer = Muxer::new(output_path.as_path())?;
+            let mut muxer = Muxer::new(&output_path)?;
             let video_index = muxer.add_encoder(video_encoder)?;
             for index in 0..12 {
                 let mut frame = generate_video_frame(width, height, index);
@@ -1774,7 +1774,7 @@ mod tests {
         }
 
         // Drop 自动完成 flush + trailer 后，文件应可被读取并解码
-        let demuxer = Demuxer::new(output_path.as_path())?;
+        let demuxer = Demuxer::new(&output_path)?;
         // 能成功创建 demuxer 且能读到帧即证明容器完整（有 header + trailer）
         let decoded = demuxer.filter_map(|res| res.ok().map(|_| ())).count();
         assert!(
@@ -1807,7 +1807,7 @@ mod tests {
             .with_subtitle_header(header)
             .build()?;
 
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let video_index = muxer.add_encoder(video_encoder)?;
         let subtitle_index = muxer.add_encoder(subtitle_encoder)?;
         assert_ne!(video_index, subtitle_index, "two encoder streams");
@@ -1832,7 +1832,7 @@ mod tests {
         muxer.finish()?;
 
         // 回读：字幕解码通道逐段无损还原。
-        let mut reader = StreamReader::new(output_path.as_path())?;
+        let mut reader = StreamReader::new(&output_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
             .with_codec_name(Some("mov_text".to_string()))
             .build_from_reader(&reader)?;
@@ -1859,7 +1859,7 @@ mod tests {
         let video_encoder = Encoder::new_video(width, height)?;
         let encoder_time_base = video_encoder.time_base();
 
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let video_index = muxer.add_encoder(video_encoder)?;
 
         // 参数校验 fail fast（时间非法；含 NUL 的标题在写头时被跳过并告警）
@@ -1879,7 +1879,7 @@ mod tests {
         muxer.finish()?;
 
         // 回读：标题 + 秒级起止
-        let demuxer = Demuxer::new(output_path.as_path())?;
+        let demuxer = Demuxer::new(&output_path)?;
         let chapters = demuxer.chapters();
         assert_eq!(chapters.len(), 2, "expected 2 chapters, got {chapters:?}");
         assert_eq!(chapters[0].title, "Intro");
@@ -1893,7 +1893,7 @@ mod tests {
         let mkv_path = crate::test_support::test_output_path("mux", "test_mux_chapters.mkv");
         let video_encoder = Encoder::new_video(width, height)?;
         let encoder_time_base = video_encoder.time_base();
-        let mut muxer = Muxer::new(mkv_path.as_path())?;
+        let mut muxer = Muxer::new(&mkv_path)?;
         let video_index = muxer.add_encoder(video_encoder)?;
         muxer.add_chapter(Chapter::new("MKV Intro", 0.0, 1.0))?;
         for index in 0..encoder_time_base.den as i64 {
@@ -1904,7 +1904,7 @@ mod tests {
         }
         muxer.finish()?;
 
-        let demuxer = Demuxer::new(mkv_path.as_path())?;
+        let demuxer = Demuxer::new(&mkv_path)?;
         let chapters = demuxer.chapters();
         assert_eq!(
             chapters.len(),
@@ -1938,7 +1938,7 @@ mod tests {
             .with_filters(vec![video::gif_palette(out_fps, None)])
             .build()?;
 
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let video_index = muxer.add_encoder(encoder)?;
 
         // 2 秒 @30fps 输入（编码器 time_base = 1/30，帧间隔 1 tick）
@@ -1952,7 +1952,7 @@ mod tests {
         muxer.finish()?;
 
         // 回读验证：帧数 ~20（fps=10 x 2s），codec 为 GIF，尺寸不变
-        let demuxer = Demuxer::new(output_path.as_path())?;
+        let demuxer = Demuxer::new(&output_path)?;
         let frames: Vec<_> = demuxer.filter_map(|res| res.ok()).collect();
         assert_eq!(
             frames.len(),
@@ -1967,7 +1967,7 @@ mod tests {
         let frame_count = frames.len() as f64;
 
         // 容器流信息校验
-        let reader = StreamReader::new(output_path.as_path())?;
+        let reader = StreamReader::new(&output_path)?;
         let stream = &reader.input().streams()[0];
         assert_eq!(stream.codecpar().codec_id, ffi::AV_CODEC_ID_GIF);
 
@@ -2001,7 +2001,7 @@ mod tests {
         let video_encoder = Encoder::new_video(width, height)?;
         let encoder_time_base = video_encoder.time_base();
 
-        let mut muxer = Muxer::new(output_path.as_path())?;
+        let mut muxer = Muxer::new(&output_path)?;
         let video_index = muxer.add_encoder(video_encoder)?;
 
         // 生成一张 RGB24 渐变封面帧（编码器自动协商并转换为 mjpeg 支持的格式）
@@ -2034,7 +2034,7 @@ mod tests {
         muxer.finish()?;
 
         // 回读验证：封面流存在且带 attached_pic 标记，编码为 mjpeg
-        let reader = StreamReader::new(output_path.as_path())?;
+        let reader = StreamReader::new(&output_path)?;
         let streams = reader.input().streams();
         assert_eq!(
             streams.len(),

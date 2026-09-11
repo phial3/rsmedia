@@ -87,7 +87,7 @@ fn main() -> Result<()> {
     // 编码器规格可以与设备不同（例：设备 48kHz 单声道 -> 编码器 44.1kHz 立体声），
     // PcmSink 内部的持久重采样器会自动完成格式/采样率/声道数转换。
     let encoder = Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
-    let mut muxer = Muxer::new(output.as_path())?;
+    let mut muxer = Muxer::new(&output)?;
     let audio_index = muxer.add_encoder(encoder)?;
     let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels))?;
 
@@ -237,7 +237,7 @@ mod tests {
         let (rate, channels) = (44_100u32, 2u16);
         let encoder =
             Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
-        let mut muxer = Muxer::new(output.as_path())?;
+        let mut muxer = Muxer::new(&output)?;
         let audio_index = muxer.add_encoder(encoder)?;
         let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels))?;
 
