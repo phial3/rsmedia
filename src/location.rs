@@ -142,11 +142,15 @@ mod tests {
             Location::Network(_)
         ));
 
-        // `file:` URLs map back to a plain path.
-        assert_eq!(
-            Location::from("file:///tmp/aaa.mov"),
-            Location::File("/tmp/aaa.mov".into())
-        );
+        // `file:` URLs map back to a plain path. On Unix, `file:///tmp/...` maps to
+        // `/tmp/...`. On Windows, `file:///tmp/...` is not a valid Windows absolute
+        // path, so `to_file_path()` fails and the raw URL string is kept as-is.
+        let file_url = Location::from("file:///tmp/aaa.mov");
+        #[cfg(not(windows))]
+        let expected = Location::File("/tmp/aaa.mov".into());
+        #[cfg(windows)]
+        let expected = Location::File("file:///tmp/aaa.mov".into());
+        assert_eq!(file_url, expected);
 
         // Windows drive letters are paths, not a "c:" protocol.
         assert_eq!(
