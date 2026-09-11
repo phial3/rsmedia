@@ -2487,11 +2487,17 @@ mod tests {
                     tb.den
                 );
             }
-            // 采样量守恒：解码出的样本总量应等于输入总量（aac 原样还原样本数，
-            // 末帧不足 frame_size 的部分由容器 edit list 裁掉编码器填充）。
-            assert_eq!(
-                decoded_samples, total_samples as i64,
-                "sample count mismatch: {decoded_samples} vs {total_samples}"
+            // Sample conservation: aac restores samples losslessly, but the
+            // encoder pads the last frame up to `frame_size`. Whether that
+            // padding is cropped depends on the container/version: the ffmpeg 9
+            // mp4 demuxer trims it via the edit list (decoded == input), while
+            // 6/7/8 return the full padded last frame. The version-independent
+            // invariant is therefore: padding is less than one frame.
+            let padding = decoded_samples - total_samples as i64;
+            assert!(
+                (0..frame_size).contains(&padding),
+                "sample count mismatch: decoded {decoded_samples} vs input {total_samples} \
+                 (padding {padding} must be in [0, {frame_size}))"
             );
 
             crate::test_support::remove_test_output(&path);
