@@ -1,180 +1,127 @@
-use crate::error::{Result, format_err};
+//! Color utilities built on top of [`colorous`] and [`colorutils_rs`].
+//!
+//! [`colorous::Color`] is a plain `{ r, g, b: u8 }` struct with no alpha and no
+//! room for helper methods (it is a foreign type, so inherent impls and orphan
+//! trait impls are rejected by the compiler). This module therefore defines its
+//! own `Color` — same channel fields **plus** an alpha channel — and bridges to
+//! colorous with lossless `From` conversions, so gradient/palette output
+//! converts with a single `.into()`.
 
+use std::fmt::{LowerHex, UpperHex};
+
+/// An RGBA color.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Color(pub u32);
-
-/// base
-impl Color {
-    pub const fn from_rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self(((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | (a as u32))
-    }
-
-    pub const fn from_rgb(r: u8, g: u8, b: u8) -> Self {
-        Self::from_rgba(r, g, b, 0xff)
-    }
-
-    pub fn rgba(&self) -> (u8, u8, u8, u8) {
-        let r = ((self.0 >> 24) & 0xff) as u8;
-        let g = ((self.0 >> 16) & 0xff) as u8;
-        let b = ((self.0 >> 8) & 0xff) as u8;
-        let a = (self.0 & 0xff) as u8;
-        (r, g, b, a)
-    }
-
-    pub fn rgb(&self) -> (u8, u8, u8) {
-        let (r, g, b, _) = self.rgba();
-        (r, g, b)
-    }
-
-    pub fn bgr(&self) -> (u8, u8, u8) {
-        let (r, g, b) = self.rgb();
-        (b, g, r)
-    }
-
-    pub fn r(&self) -> u8 {
-        self.rgba().0
-    }
-
-    pub fn g(&self) -> u8 {
-        self.rgba().1
-    }
-
-    pub fn b(&self) -> u8 {
-        self.rgba().2
-    }
-
-    pub fn a(&self) -> u8 {
-        self.rgba().3
-    }
-
-    pub fn hex(&self, uppercase: bool) -> String {
-        if uppercase {
-            format!("#{:08X}", self.0)
-        } else {
-            format!("#{:08x}", self.0)
-        }
-    }
-
-    pub fn with_alpha(self, a: u8) -> Self {
-        let (r, g, b) = self.rgb();
-        (r, g, b, a).into()
-    }
-
-    /// Create a palette from a slice of colors.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use rsmedia::Color;
-    /// // 从 u32 数组创建
-    /// let colors = Color::create_palette(&[0xFF0000FF, 0x00FF00FF, 0x0000FFFF]);
-    /// ```
-    ///
-    /// ```
-    /// # use rsmedia::Color;
-    /// // 从 RGB 元组数组创建
-    /// let rgb_colors = Color::create_palette(&[
-    ///     (255, 0, 0),
-    ///     (0, 255, 0),
-    ///     (0, 0, 255),
-    /// ]);
-    /// ```
-    ///
-    /// ```
-    /// # use rsmedia::Color;
-    /// // 从 RGB 数组创建
-    /// let array_colors = Color::create_palette(&[
-    ///     [255, 128, 0],
-    ///     [128, 0, 128],
-    ///     [0, 128, 128],
-    /// ]);
-    /// ```
-    pub fn create_palette<A: Into<Self> + Copy>(xs: &[A]) -> Vec<Self> {
-        xs.iter().copied().map(Into::into).collect()
-    }
-
-    /// Create a palette from a slice of colors, with error handling.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use rsmedia::Color;
-    /// let colors = Color::try_create_palette(&[0xFF0000FF, 0x00FF00FF, 0x0000FFFF]).unwrap();
-    /// ```
-    ///
-    /// ```
-    /// # use rsmedia::Color;
-    /// // 从十六进制字符串数组创建（可能失败）
-    /// let hex_colors = Color::try_create_palette(&["#FF0000", "#00FF00", "#0000FF"])
-    ///     .expect("Invalid hex color");
-    /// ```
-    ///
-    /// ```
-    /// # use rsmedia::Color;
-    /// // 混合有效和无效的字符串会返回错误
-    /// let result = Color::try_create_palette(&["#FF0000", "invalid", "#0000FF"]);
-    /// assert!(result.is_err());
-    /// ```
-    pub fn try_create_palette<A: TryInto<Self> + Copy>(xs: &[A]) -> Result<Vec<Self>>
-    where
-        <A as TryInto<Self>>::Error: std::fmt::Debug,
-    {
-        xs.iter()
-            .copied()
-            .map(|x| {
-                x.try_into()
-                    .map_err(|e| format_err!("Failed to convert: {:?}", e))
-            })
-            .collect()
-    }
-
-    /// Generate visually distinct colors by evenly distributing hues in HSL space.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use rsmedia::Color;
-    /// // 生成 5 个在 HSL 空间中均匀分布的颜色（色相 0-360 度）
-    /// let distinct_colors = Color::palette_distinct(5);
-    /// assert_eq!(distinct_colors.len(), 5);
-    /// ```
-    ///
-    /// ```
-    /// # use rsmedia::Color;
-    /// // 生成 10 个不同的颜色
-    /// let palette = Color::palette_distinct(10);
-    /// assert_eq!(palette.len(), 10);
-    /// ```
-    ///
-    /// ```
-    /// # use rsmedia::Color;
-    /// // 生成 0 个颜色返回空数组
-    /// let empty = Color::palette_distinct(0);
-    /// assert!(empty.is_empty());
-    /// ```
-    pub fn palette_distinct(count: usize) -> Vec<Color> {
-        if count == 0 {
-            return Vec::new();
-        }
-        (0..count)
-            .map(|i| {
-                // 均匀分布色相(0-360度)
-                let hue = (i as f32 * 360.0 / count as f32) % 360.0;
-                // 固定饱和度和亮度为适中值；from_hsl 的 s/l 取值范围为 0-100
-                let saturation = 0.7;
-                let lightness = 0.5;
-                Color::from_hsl(
-                    hue as u16,
-                    (saturation * 100.0) as u16,
-                    (lightness * 100.0) as u16,
-                )
-            })
-            .collect()
-    }
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
 }
 
 /// extend
 impl Color {
+    /// Creates a color from the three channels (alpha = `0xFF`).
+    #[inline]
+    #[must_use]
+    pub const fn from_rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b, a: 0xFF }
+    }
+
+    /// Creates a color from all four channels.
+    #[inline]
+    #[must_use]
+    pub const fn from_rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
+    }
+
+    /// Returns `(r, g, b)`.
+    #[inline]
+    #[must_use]
+    pub const fn as_tuple(&self) -> (u8, u8, u8, u8) {
+        (self.r, self.g, self.b, self.a)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn into_tuple(self) -> (u8, u8, u8, u8) {
+        self.as_tuple()
+    }
+
+    /// Returns `[r, g, b, a]`.
+    #[inline]
+    #[must_use]
+    pub const fn as_array(&self) -> [u8; 4] {
+        [self.r, self.g, self.b, self.a]
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn into_array(self) -> [u8; 4] {
+        self.as_array()
+    }
+
+    /// Returns `(r, g, b, a)`.
+    #[inline]
+    #[must_use]
+    pub const fn rgba(&self) -> (u8, u8, u8, u8) {
+        (self.r, self.g, self.b, self.a)
+    }
+
+    /// Returns `(r, g, b)`.
+    #[inline]
+    #[must_use]
+    pub const fn rgb(&self) -> (u8, u8, u8) {
+        (self.r, self.g, self.b)
+    }
+
+    /// Red channel accessor (kept for API compatibility with the previous
+    /// tuple-based implementation).
+    #[inline]
+    #[must_use]
+    pub const fn r(&self) -> u8 {
+        self.r
+    }
+
+    /// Green channel accessor.
+    #[inline]
+    #[must_use]
+    pub const fn g(&self) -> u8 {
+        self.g
+    }
+
+    /// Blue channel accessor.
+    #[inline]
+    #[must_use]
+    pub const fn b(&self) -> u8 {
+        self.b
+    }
+
+    /// Alpha channel accessor.
+    #[inline]
+    #[must_use]
+    pub const fn a(&self) -> u8 {
+        self.a
+    }
+
+    /// Returns the same color with a new alpha value.
+    #[inline]
+    #[must_use]
+    pub const fn with_alpha(mut self, a: u8) -> Self {
+        self.a = a;
+        self
+    }
+
+    /// Formats the color as `#RRGGBBAA` (`uppercase` selects the letter case).
+    #[inline]
+    #[must_use]
+    pub fn hex(&self, uppercase: bool) -> String {
+        if uppercase {
+            format!("#{:02X}{:02X}{:02X}{:02X}", self.r, self.g, self.b, self.a)
+        } else {
+            format!("#{:02x}{:02x}{:02x}{:02x}", self.r, self.g, self.b, self.a)
+        }
+    }
+
     /// HSV
     pub fn from_hsv(h: u16, s: u16, v: u16) -> Self {
         let rgb = colorutils_rs::Hsv::new(h, s, v).to_rgb8();
@@ -182,7 +129,7 @@ impl Color {
     }
 
     pub fn to_hsv(&self) -> colorutils_rs::Hsv {
-        let (r, g, b) = self.rgb();
+        let (r, g, b, _a) = self.as_tuple();
         colorutils_rs::Rgb::<u8>::new(r, g, b).to_hsv()
     }
 
@@ -193,7 +140,7 @@ impl Color {
     }
 
     pub fn to_hsl(&self) -> colorutils_rs::Hsl {
-        let (r, g, b) = self.rgb();
+        let (r, g, b, _a) = self.as_tuple();
         colorutils_rs::Rgb::<u8>::new(r, g, b).to_hsl()
     }
 
@@ -204,7 +151,7 @@ impl Color {
     }
 
     pub fn to_lab(&self) -> colorutils_rs::Lab {
-        let (r, g, b) = self.rgb();
+        let (r, g, b, _a) = self.as_tuple();
         colorutils_rs::Rgb::<u8>::new(r, g, b).to_lab()
     }
 
@@ -215,7 +162,7 @@ impl Color {
     }
 
     pub fn to_xyb(&self) -> colorutils_rs::Xyb {
-        let (r, g, b) = self.rgb();
+        let (r, g, b, _a) = self.as_tuple();
         let rgb = colorutils_rs::Rgb::<u8>::new(r, g, b);
         colorutils_rs::Xyb::from_rgb(rgb, colorutils_rs::TransferFunction::Srgb)
     }
@@ -227,16 +174,37 @@ impl Color {
     }
 
     pub fn to_xyz(&self) -> colorutils_rs::Xyz {
-        let (r, g, b) = self.rgb();
+        let (r, g, b, _a) = self.as_tuple();
         let rgb = colorutils_rs::Rgb::<u8>::new(r, g, b);
         colorutils_rs::Xyz::from_srgb(rgb)
     }
 }
 
+impl LowerHex for Color {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{:02x}{:02x}{:02x}{:02x}",
+            self.r, self.g, self.b, self.a
+        )
+    }
+}
+
+impl UpperHex for Color {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{:02X}{:02X}{:02X}{:02X}",
+            self.r, self.g, self.b, self.a
+        )
+    }
+}
+
 /// convert
 impl From<u32> for Color {
+    /// `0xRRGGBBAA` packing (what [`Color::hex`] emits).
     fn from(x: u32) -> Self {
-        Self(x)
+        Self::from_rgba((x >> 24) as u8, (x >> 16) as u8, (x >> 8) as u8, x as u8)
     }
 }
 
@@ -272,8 +240,7 @@ impl From<Color> for (u8, u8, u8, u8) {
 
 impl From<Color> for [u8; 4] {
     fn from(color: Color) -> Self {
-        let (r, g, b, a) = color.rgba();
-        [r, g, b, a]
+        color.as_array()
     }
 }
 
@@ -290,9 +257,31 @@ impl From<Color> for [u8; 3] {
     }
 }
 
+/// Lossless RGB conversion from a colorous gradient/palette output
+/// (`TURBO.eval_rational(..).into()`); alpha is set to fully opaque.
+impl From<colorous::Color> for Color {
+    fn from(c: colorous::Color) -> Self {
+        Self::from_rgb(c.r, c.g, c.b)
+    }
+}
+
+/// Converts back into colorous (e.g. to feed other colorous APIs); the alpha
+/// channel is dropped, since colorous colors carry no alpha.
+impl From<Color> for colorous::Color {
+    fn from(c: Color) -> Self {
+        Self {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+        }
+    }
+}
+
 impl TryFrom<&str> for Color {
     type Error = &'static str;
 
+    /// Parses `#RRGGBBAA` (the leading `#` is optional; a 6-digit value is
+    /// treated as fully opaque).
     fn try_from(x: &str) -> std::result::Result<Self, Self::Error> {
         let hex = x.trim_start_matches('#');
         let hex = match hex.len() {
@@ -302,45 +291,58 @@ impl TryFrom<&str> for Color {
         };
 
         u32::from_str_radix(&hex, 16)
-            .map(Self)
+            .map(Self::from)
             .map_err(|_| "Failed to convert `Color` from str: invalid hex")
     }
 }
 
-/// 彩虹色
-pub const RED: Color = Color::from_rgb(255, 0, 0);
-pub const ORANGE: Color = Color::from_rgb(255, 165, 0);
-pub const YELLOW: Color = Color::from_rgb(255, 255, 0);
-pub const GREEN: Color = Color::from_rgb(0, 128, 0);
-pub const BLUE: Color = Color::from_rgb(0, 0, 255);
-pub const INDIGO: Color = Color::from_rgb(75, 0, 130);
-pub const VIOLET: Color = Color::from_rgb(238, 130, 238);
+/// Declares a named [`Color`] constant from an `(r, g, b)` tuple (alpha
+/// defaults to fully opaque). An optional 4th element sets the alpha.
+///
+/// The tuple form keeps the color tables below compact; each entry expands to
+/// `Color::from_rgb(..)` / `Color::from_rgba(..)`, so the constants stay
+/// evaluable at compile time.
+macro_rules! color {
+    ($name:ident, ($r:expr, $g:expr, $b:expr)) => {
+        pub const $name: Color = Color::from_rgb($r, $g, $b);
+    };
+    ($name:ident, ($r:expr, $g:expr, $b:expr, $a:expr)) => {
+        pub const $name: Color = Color::from_rgba($r, $g, $b, $a);
+    };
+}
 
-/// 基本颜色
-pub const PURPLE: Color = Color::from_rgb(128, 0, 128);
-pub const MAGENTA: Color = Color::from_rgb(255, 0, 255);
-pub const CYAN: Color = Color::from_rgb(0, 255, 255);
-pub const LIME: Color = Color::from_rgb(0, 255, 0);
-pub const TEAL: Color = Color::from_rgb(0, 128, 128);
-pub const BLACK: Color = Color::from_rgb(0, 0, 0);
-pub const WHITE: Color = Color::from_rgb(255, 255, 255);
-pub const GRAY: Color = Color::from_rgb(128, 128, 128);
-pub const SILVER: Color = Color::from_rgb(192, 192, 192);
-pub const MAROON: Color = Color::from_rgb(128, 0, 0);
-pub const OLIVE: Color = Color::from_rgb(128, 128, 0);
-pub const NAVY: Color = Color::from_rgb(0, 0, 128);
-
-/// 扩展颜色
-pub const PINK: Color = Color::from_rgb(255, 192, 203);
-pub const BROWN: Color = Color::from_rgb(165, 42, 42);
-pub const GOLD: Color = Color::from_rgb(255, 215, 0);
-pub const TURQUOISE: Color = Color::from_rgb(64, 224, 208);
-pub const LAVENDER: Color = Color::from_rgb(230, 230, 250);
-pub const CORAL: Color = Color::from_rgb(255, 127, 80);
-pub const SALMON: Color = Color::from_rgb(250, 128, 114);
-pub const CRIMSON: Color = Color::from_rgb(220, 20, 60);
-pub const KHAKI: Color = Color::from_rgb(240, 230, 140);
-pub const PLUM: Color = Color::from_rgb(221, 160, 221);
+// rainbow
+color!(RED, (255, 0, 0));
+color!(ORANGE, (255, 165, 0));
+color!(YELLOW, (255, 255, 0));
+color!(GREEN, (0, 128, 0));
+color!(BLUE, (0, 0, 255));
+color!(INDIGO, (75, 0, 130));
+color!(VIOLET, (238, 130, 238));
+// base
+color!(PURPLE, (128, 0, 128));
+color!(MAGENTA, (255, 0, 255));
+color!(CYAN, (0, 255, 255));
+color!(LIME, (0, 255, 0));
+color!(TEAL, (0, 128, 128));
+color!(BLACK, (0, 0, 0));
+color!(WHITE, (255, 255, 255));
+color!(GRAY, (128, 128, 128));
+color!(SILVER, (192, 192, 192));
+color!(MAROON, (128, 0, 0));
+color!(OLIVE, (128, 128, 0));
+color!(NAVY, (0, 0, 128));
+// extension
+color!(PINK, (255, 192, 203));
+color!(BROWN, (165, 42, 42));
+color!(GOLD, (255, 215, 0));
+color!(TURQUOISE, (64, 224, 208));
+color!(LAVENDER, (230, 230, 250));
+color!(CORAL, (255, 127, 80));
+color!(SALMON, (250, 128, 114));
+color!(CRIMSON, (220, 20, 60));
+color!(KHAKI, (240, 230, 140));
+color!(PLUM, (221, 160, 221));
 
 /// Convert RGB to HSV color space.
 ///
@@ -436,6 +438,16 @@ mod tests {
         assert_eq!(RED, Color::from_rgb(255, 0, 0));
         assert_eq!(GREEN, Color::from_rgb(0, 128, 0));
         assert_eq!(BLUE, Color::from_rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn test_color_macro_tuple_and_rgba_forms() {
+        // 3-element form: opaque alpha.
+        assert_eq!(CRIMSON, Color::from_rgba(220, 20, 60, 0xFF));
+        // 4-element form: explicit alpha.
+        color!(GHOST, (248, 248, 255, 128));
+        assert_eq!(GHOST, Color::from_rgba(248, 248, 255, 128));
+        assert_eq!(GHOST.a, 128);
     }
 
     #[test]

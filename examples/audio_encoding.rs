@@ -50,7 +50,7 @@ fn encode_audio(output: &Path) -> Result<()> {
     .build()?;
     let enc_tb = encoder.time_base();
     let mut muxer = Muxer::new(output)?;
-    let a_idx = muxer.add_stream(encoder)?;
+    let a_idx = muxer.add_encoder(encoder)?;
 
     let total_frames = SAMPLE_RATE * DURATION_SEC / NB_SAMPLES;
     let mut total_pts: i64 = 0;

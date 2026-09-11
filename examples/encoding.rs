@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
     let enc_tb = encoder.time_base();
     let mut muxer = rsmedia::mux::Muxer::new(output_path).expect("failed to create muxer");
     let v_idx = muxer
-        .add_stream(encoder)
+        .add_encoder(encoder)
         .expect("failed to add video stream");
 
     // 方法一：encoder.encode() 手动记录 position

@@ -6,7 +6,7 @@ pub mod encode;
 #[cfg(feature = "ndarray")]
 pub mod frame;
 #[cfg(feature = "ndarray")]
-pub use frame::{MediaFrame, MediaFrameType};
+pub use frame::{FrameSideData, MediaFrame, MediaFrameType};
 pub mod codec;
 pub mod colors;
 pub mod error;
@@ -41,7 +41,7 @@ pub use io::{AVSeekFlag, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
 pub use mux::Chapter;
-pub use options::{Options, Quality, VideoProfile};
+pub use options::{Metadata, Options, Quality, VideoProfile};
 pub use pcm::{PcmSink, PcmSpec};
 pub use pixel::PixelFormat;
 pub use resize::Resize;

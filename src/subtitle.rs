@@ -78,7 +78,7 @@ pub fn copy_subtitle_stream<R: Reader, W: Writer>(
 ///   2. 写 header；
 ///   3. 逐段编码并把包 pts 从编码器 time_base 换算到输出流 time_base 后写盘；
 ///   4. flush 编码器（字幕路径为 no-op）+ 写 trailer。
-pub fn encode_subtitle_segments_to_file(
+pub fn encode_subtitle_segments(
     writer: &mut impl Writer,
     encoder: &mut crate::encode::Encoder,
     segments: &[SubtitleSegment],
@@ -186,18 +186,28 @@ impl SubtitleSegment {
     }
 }
 
-/// 从 ASS `Dialogue:` 行提取正文文本（第 10 个字段，即第 9 个逗号之后）。
+/// Extracts the text payload from an ASS rect string.
 ///
-/// 行格式：`Dialogue: layer,start,end,style,name,marginL,marginR,marginV,effect,text`。
-/// 正文本身可包含逗号，因此只按前 9 个逗号切分。
+/// Two shapes occur in practice, distinguished by the optional prefix:
+///
+/// - **Full `Dialogue:` line** (`Dialogue: layer,start,end,style,name,ML,MR,MV,effect,text`,
+///   produced by ASS/SRT decoders in transcode pipelines) — text starts after
+///   the 9th comma.
+/// - **`AVCodecContext`-internal shape** (`readorder,layer,style,name,ML,MR,MV,effect,text`,
+///   produced by the mov_text decoder) — no prefix and no timestamps, so text
+///   starts after the 8th comma.
+///
+/// The text itself may contain commas, so only the fixed leading fields are
+/// split. ASS hard/soft line breaks (`\N` / `\n`) are normalised to newlines.
 fn ass_dialogue_text(ass: &CStr) -> Option<String> {
     let line = ass.to_str().ok()?;
+    let fields_before_text = if line.starts_with("Dialogue:") { 9 } else { 8 };
     let mut commas = 0usize;
     let mut text_start = None;
     for (i, ch) in line.char_indices() {
         if ch == ',' {
             commas += 1;
-            if commas == 9 {
+            if commas == fields_before_text {
                 text_start = Some(i + 1);
                 break;
             }
@@ -266,7 +276,7 @@ mod tests {
             .with_subtitle_header(ASS_HEADER)
             .build()?;
         let mut writer = crate::io::StreamWriter::new(path.as_path())?;
-        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
+        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         // 2) Decode: via the generic Decoder subtitle channel
         let mut reader = crate::io::StreamReader::new(path.as_path())?;
@@ -347,7 +357,7 @@ mod tests {
             .with_subtitle_header(ASS_HEADER)
             .build()?;
         let mut writer = crate::io::StreamWriter::new(path.as_path())?;
-        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
+        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         // 2) Read back: verify the subtitle stream exists
         let mut reader = StreamReader::new(path.as_path())?;
@@ -417,7 +427,7 @@ mod tests {
             .with_subtitle_header(ASS_HEADER)
             .build()?;
         let mut writer = crate::io::StreamWriter::new(path.as_path())?;
-        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
+        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         let content = std::fs::read_to_string(&path)?;
         // 时间戳行：由 packet pts/duration（毫秒）端到端生成，验证整条时间戳链路
@@ -462,7 +472,7 @@ mod tests {
             .with_subtitle_header(ASS_HEADER)
             .build()?;
         let mut writer = crate::io::StreamWriter::new(input_path.as_path())?;
-        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
+        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         // 2) Read the MKV and copy the subtitle stream to another MKV
         let output_path = test_support::test_output_path("subtitle", "rsmedia_passthrough_out.mkv");
@@ -524,7 +534,7 @@ mod tests {
             .with_subtitle_header(ASS_HEADER)
             .build()?;
         let mut writer = crate::io::StreamWriter::new(path.as_path())?;
-        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
+        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         // 2) Read back: verify the subtitle stream exists
         let mut reader = StreamReader::new(path.as_path())?;

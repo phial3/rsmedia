@@ -1,5 +1,6 @@
 use crate::error::{Context, Result, RsmediaError};
 use crate::fmt::FrameFormat;
+use crate::options::Metadata;
 use crate::pixel::PixelFormat;
 use crate::{MediaType, SampleFormat, imgutils, time};
 
@@ -39,6 +40,19 @@ impl MediaFrameType for f64 {}
 /// A frame array is the `ndarray` version of `AVFrame`
 /// It is 3-dimensional array with dims `(H, W, C)` and type byte.
 ///
+/// # Field coverage
+///
+/// Every value-carrying field of `AVFrame` is mirrored here, so
+/// [`from_avframe`](MediaFrame::from_avframe) and [`to_avframe`](MediaFrame::to_avframe)
+/// form a lossless round trip for the modelled fields.
+///
+/// The `AVFrame` fields that are *not* mirrored are the ones that cannot be carried as
+/// values: `data` / `linesize` / `extended_data` are what [`data`](Self::data) packs
+/// into an `ndarray`, `buf` / `extended_buf` / `nb_extended_buf` / `opaque` /
+/// `opaque_ref` / `private_ref` are ownership handles, and `hw_frames_ctx` describes a
+/// hardware frame pool that has no meaning once the samples are copied into host
+/// memory. They are intentionally excluded rather than missing.
+///
 /// # Parameters
 ///
 /// * `T` - The underlying data type for samples/pixels:
@@ -52,12 +66,26 @@ impl MediaFrameType for f64 {}
 /// * For FLTP: `f32`
 #[derive(Debug, Clone)]
 pub struct MediaFrame<T> {
-    /// 呈现时间戳（Presentation Timestamp），单位由 `time_base` 决定。
+    /// Presentation timestamp, in `time_base` units.
+    ///
+    /// `AV_NOPTS_VALUE` means "not set": the encoder then assigns pts automatically
+    /// (video: one frame per `1/fps` tick; audio: sample-position counting), so a
+    /// freshly created frame does not have to carry a hand-computed pts.
     pub pts: i64,
-    /// 解码时间戳（Decoding Timestamp），同 `pts` 单位；0 表示未设置。
-    pub dts: i64,
-    /// 帧理论持续时间，同 `time_base` 单位；0 表示未知或未设置。
+    /// Decode timestamp copied from the source packet, in `time_base` units.
+    ///
+    /// Named after `AVFrame.pkt_dts`; `AV_NOPTS_VALUE` when unset — the default an
+    /// `AVFrame` carries — matching [`best_effort_timestamp`](Self::best_effort_timestamp).
+    pub pkt_dts: i64,
+    /// Frame duration in `time_base` units; `0` when unknown or unset.
+    ///
+    /// This is the canonical duration and the field written back to
+    /// `AVFrame.duration`; [`pkt_duration`](Self::pkt_duration) mirrors it.
     pub duration: i64,
+    /// Mirror of [`duration`](Self::duration), kept for the pre-7.0
+    /// `AVFrame.pkt_duration` name. FFmpeg 7 dropped that AVFrame field and only
+    /// `AVFrame.duration` remains, so both fields here always hold the same value.
+    pub pkt_duration: i64,
     /// 像素/采样格式（统一表示）。
     /// Video: [`FrameFormat::Pixel`]（含 [`PixelFormat`]）
     /// Audio: [`FrameFormat::Sample`]（含 [`SampleFormat`]）
@@ -95,20 +123,71 @@ pub struct MediaFrame<T> {
     pub quality: i32,
     /// 应重复的场数（interlace 相关，通常为 0）。
     pub repeat_pict: i32,
-    /// 色彩空间（`AVColorSpace`，如 BT709）。
-    pub color_space: ffi::AVColorSpace,
+    /// YUV colorspace (`AVColorSpace`, e.g. BT709); named after `AVFrame.colorspace`.
+    ///
+    /// Note the asymmetry across FFmpeg structs: `AVFrame` spells it `colorspace`
+    /// while `AVCodecParameters` spells it `color_space` — each mirror here follows
+    /// the struct it wraps.
+    pub colorspace: ffi::AVColorSpace,
     /// 色彩原色（`AVColorPrimaries`）。
     pub color_primaries: ffi::AVColorPrimaries,
     /// 色彩传输特性（`AVColorTransferCharacteristic`）。
     pub color_trc: ffi::AVColorTransferCharacteristic,
     /// 色彩采样范围（`AVColorRange`，MPEG/JPEG）。
     pub color_range: ffi::AVColorRange,
+    /// Chroma sample location (`AVChromaLocation`): where the chroma samples sit
+    /// relative to the luma grid. `AVCHROMA_LOC_UNSPECIFIED` when unknown.
+    pub chroma_location: ffi::AVChromaLocation,
     /// 像素宽高比（视频帧的 sample_aspect_ratio，0/1 表示未知）。
     pub sample_aspect_ratio: ffi::AVRational,
-    /// 帧时长（`AVPacket.duration` 副本，与 pts 同单位；0 表示未知）。
-    pub pkt_duration: i64,
+    /// Cropping rectangle in pixels: the coded picture has `crop_top` / `crop_bottom`
+    /// rows and `crop_left` / `crop_right` columns discarded to obtain the region
+    /// intended for presentation. All zero when the whole coded picture is shown.
+    pub crop_top: usize,
+    /// Discarded rows at the bottom of the coded picture; see [`Self::crop_top`].
+    pub crop_bottom: usize,
+    /// Discarded columns on the left of the coded picture; see [`Self::crop_top`].
+    pub crop_left: usize,
+    /// Discarded columns on the right of the coded picture; see [`Self::crop_top`].
+    pub crop_right: usize,
+    /// How the alpha channel is to be interpreted (`AVAlphaMode`).
+    ///
+    /// FFmpeg 8+ only: the field does not exist on 6/7, where alpha is unambiguous.
+    #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+    pub alpha_mode: ffi::AVAlphaMode,
     /// 最佳努力时间戳（解码器启发式估计，同 time_base 单位）。
     pub best_effort_timestamp: i64,
+    /// Decoder error flags (`FF_DECODE_ERROR_*`): non-zero when the decoder produced
+    /// the frame but the bitstream was damaged. `0` on a clean decode.
+    pub decode_error_flags: i32,
+    /// Frame-level key/value metadata, copied from `AVFrame.metadata`.
+    ///
+    /// A plain string map ([`Metadata`]) instead of the FFI `AVDictionary`: FFmpeg
+    /// represents an empty dictionary as a null pointer, which is exactly what an
+    /// empty map means.
+    pub metadata: Metadata,
+    /// Frame side data, copied out of `AVFrame.side_data` into owned buffers.
+    ///
+    /// Side data carries auxiliary per-frame payloads (HDR mastering metadata,
+    /// display matrices, motion vectors, ...). Each entry keeps its
+    /// `AVFrameSideDataType` discriminant and raw payload, so side-data types this
+    /// crate does not know about still survive a round trip unchanged.
+    pub side_data: Vec<FrameSideData>,
+}
+
+/// One entry of [`MediaFrame::side_data`], copied into owned memory.
+///
+/// The owned counterpart of `AVFrameSideData`. `AVFrameSideData.buf` (the owning
+/// buffer reference) is deliberately not carried — [`data`](Self::data) is already a
+/// full copy of the payload.
+#[derive(Debug, Clone)]
+pub struct FrameSideData {
+    /// Side-data type (`AVFrameSideDataType`), e.g. `AV_FRAME_DATA_DISPLAYMATRIX`.
+    pub type_: ffi::AVFrameSideDataType,
+    /// Raw payload, exactly `AVFrameSideData.size` bytes.
+    pub data: Vec<u8>,
+    /// Entry-level metadata; empty when the entry carries no dictionary.
+    pub metadata: Metadata,
 }
 
 impl<T: MediaFrameType> Default for MediaFrame<T> {
@@ -116,8 +195,8 @@ impl<T: MediaFrameType> Default for MediaFrame<T> {
     /// 通过 struct-update 语法只覆盖本方相关的字段，从而消除重复的默认初始化。
     fn default() -> Self {
         Self {
-            pts: 0,
-            dts: 0,
+            pts: ffi::AV_NOPTS_VALUE,
+            pkt_dts: ffi::AV_NOPTS_VALUE,
             duration: 0,
             pkt_duration: 0,
             // 占位格式，具体构造器会覆盖；默认中性值用于避免越界访问。
@@ -137,12 +216,22 @@ impl<T: MediaFrameType> Default for MediaFrame<T> {
             repeat_pict: 0,
             // 色彩属性默认标记为“未知”（UNSPECIFIED/RANGE_UNSPECIFIED=0），
             // 避免把 0 误当成 AV_COL_SPC_RGB 写入 AVFrame，干扰滤镜/编码器的色彩判定。
-            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            colorspace: ffi::AVCOL_SPC_UNSPECIFIED,
             color_primaries: ffi::AVCOL_PRI_UNSPECIFIED,
             color_trc: ffi::AVCOL_TRC_UNSPECIFIED,
             color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
+            chroma_location: ffi::AVCHROMA_LOC_UNSPECIFIED,
             sample_aspect_ratio: time::new_rational(0, 1),
+            crop_top: 0,
+            crop_bottom: 0,
+            crop_left: 0,
+            crop_right: 0,
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+            alpha_mode: ffi::AVALPHA_MODE_UNSPECIFIED,
             best_effort_timestamp: ffi::AV_NOPTS_VALUE,
+            decode_error_flags: 0,
+            metadata: Metadata::new(),
+            side_data: Vec::new(),
         }
     }
 }
@@ -276,8 +365,8 @@ where
             .then_some(self.format)
     }
 
-    pub fn set_dts(&mut self, dts: i64) {
-        self.dts = dts;
+    pub fn set_pkt_dts(&mut self, pkt_dts: i64) {
+        self.pkt_dts = pkt_dts;
     }
 
     pub fn set_time_base(&mut self, time_base: ffi::AVRational) {
@@ -295,7 +384,7 @@ where
 
         let (width, height) = (frame.width as usize, frame.height as usize);
         let pts = frame.pts;
-        let dts = frame.pkt_dts;
+        let pkt_dts = frame.pkt_dts;
         let format = frame.format;
         let duration = frame.duration;
         // AVFrame 的 time_base 常未被解码器填充（默认 0/0）。无效时：
@@ -322,8 +411,9 @@ where
             let mut m = Self {
                 format: FrameFormat::Sample(SampleFormat::from(format)),
                 pts,
-                dts,
+                pkt_dts,
                 duration,
+                pkt_duration: duration,
                 time_base,
                 data: audio_data(frame)?,
                 media_type: MediaType::AUDIO,
@@ -340,14 +430,14 @@ where
                 width,
                 height,
                 pts,
-                dts,
+                pkt_dts,
                 format: FrameFormat::Pixel(PixelFormat::from(format)),
                 duration,
                 time_base,
                 data: video_data(frame)?,
                 media_type: MediaType::VIDEO,
                 pict_type: frame.pict_type,
-                pkt_duration: frame.duration,
+                pkt_duration: duration,
                 ..Self::default()
             };
             m.copy_avframe_meta(frame);
@@ -358,38 +448,72 @@ where
     }
 
     /// 从 `AVFrame` 拷贝与编解码/色彩相关的元数据字段（两个构造分支完全一致的部分）。
+    ///
+    /// The write counterpart is [`write_metadata`](Self::write_metadata); the two must
+    /// stay in sync field by field.
     fn copy_avframe_meta(&mut self, frame: &AVFrame) {
         self.key_frame = frame.flags & ffi::AV_FRAME_FLAG_KEY as i32 != 0;
         self.flags = frame.flags;
         self.quality = frame.quality;
         self.repeat_pict = frame.repeat_pict;
-        self.color_space = frame.colorspace;
+        self.colorspace = frame.colorspace;
         self.color_primaries = frame.color_primaries;
         self.color_trc = frame.color_trc;
         self.color_range = frame.color_range;
+        self.chroma_location = frame.chroma_location;
         self.sample_aspect_ratio = frame.sample_aspect_ratio;
+        self.crop_top = frame.crop_top;
+        self.crop_bottom = frame.crop_bottom;
+        self.crop_left = frame.crop_left;
+        self.crop_right = frame.crop_right;
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        {
+            self.alpha_mode = frame.alpha_mode;
+        }
         self.best_effort_timestamp = frame.best_effort_timestamp;
+        self.decode_error_flags = frame.decode_error_flags;
+        // SAFETY: `frame.metadata` is valid for as long as `frame` is borrowed.
+        self.metadata = unsafe { Metadata::from_raw_dict(frame.metadata) };
+        self.side_data = side_data_from_avframe(frame);
     }
 
     /// 将 `MediaFrame` 的元数据字段写回 `AVFrame`，与 [`copy_avframe_meta`](Self::copy_avframe_meta)
     /// 构成对称的读写对——新增字段时两处需同步维护。
     ///
     /// 相比 rsmpeg 的 setter，这里通过 owned 句柄的裸指针写入 setter 无法覆盖的字段
-    /// （`flags`/`quality`/`repeat_pict`/色彩元数据等），生命周期安全。
+    /// （`flags`/`quality`/`repeat_pict`/色彩元数据/`pkt_dts` 等），生命周期安全。
     fn write_metadata(&self, frame: &mut AVFrame) {
         unsafe {
             let raw = frame.as_mut_ptr();
             (*raw).flags = self.flags;
             (*raw).quality = self.quality;
             (*raw).repeat_pict = self.repeat_pict;
-            (*raw).colorspace = self.color_space;
+            (*raw).colorspace = self.colorspace;
             (*raw).color_primaries = self.color_primaries;
             (*raw).color_trc = self.color_trc;
             (*raw).color_range = self.color_range;
+            (*raw).chroma_location = self.chroma_location;
             (*raw).sample_aspect_ratio = self.sample_aspect_ratio;
-            (*raw).duration = self.pkt_duration;
+            (*raw).crop_top = self.crop_top;
+            (*raw).crop_bottom = self.crop_bottom;
+            (*raw).crop_left = self.crop_left;
+            (*raw).crop_right = self.crop_right;
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+            {
+                (*raw).alpha_mode = self.alpha_mode;
+            }
+            // `duration` is the canonical field; `pkt_duration` is only a mirror, see
+            // the field docs.
+            (*raw).duration = self.duration;
+            // `AVFrame::new()` leaves `pkt_dts` at `AV_NOPTS_VALUE`, so this is the
+            // only place the frame's decode timestamp can come from.
+            (*raw).pkt_dts = self.pkt_dts;
             (*raw).best_effort_timestamp = self.best_effort_timestamp;
+            (*raw).decode_error_flags = self.decode_error_flags;
+            // SAFETY: `(*raw).metadata` is a live dictionary slot owned by `frame`.
+            self.metadata.write_into_raw_dict(&mut (*raw).metadata);
         }
+        write_side_data(frame, &self.side_data);
     }
 
     /// 仅拷贝标量元数据（不含大块 `data`），用于产出基于当前帧元数据的转换结果。
@@ -397,7 +521,7 @@ where
     fn meta_only(&self) -> Self {
         Self {
             pts: self.pts,
-            dts: self.dts,
+            pkt_dts: self.pkt_dts,
             duration: self.duration,
             format: self.format, // 调用方随后按需覆盖
             data: Default::default(),
@@ -413,13 +537,23 @@ where
             flags: self.flags,
             quality: self.quality,
             repeat_pict: self.repeat_pict,
-            color_space: self.color_space,
+            colorspace: self.colorspace,
             color_primaries: self.color_primaries,
             color_trc: self.color_trc,
             color_range: self.color_range,
+            chroma_location: self.chroma_location,
             sample_aspect_ratio: self.sample_aspect_ratio,
+            crop_top: self.crop_top,
+            crop_bottom: self.crop_bottom,
+            crop_left: self.crop_left,
+            crop_right: self.crop_right,
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+            alpha_mode: self.alpha_mode,
             pkt_duration: self.pkt_duration,
             best_effort_timestamp: self.best_effort_timestamp,
+            decode_error_flags: self.decode_error_flags,
+            metadata: self.metadata.clone(),
+            side_data: self.side_data.clone(),
         }
     }
 
@@ -447,7 +581,6 @@ where
         // 写回 setter 无法覆盖的元数据（与 copy_avframe_meta 对称）。
         self.write_metadata(&mut frame);
         frame.set_pts(self.pts);
-        // Keep `pkt_dts`/`duration`
 
         // 统一口径：无论视频/音频都优先使用 `time_base`；仅在未设置时才按
         // 音频采样率推导 `1/sample_rate`，与 `from_avframe` 的推断规则一致。
@@ -488,10 +621,10 @@ where
         self.check_video_format(FrameFormat::Pixel(PixelFormat::RGB24), "RGB24")
     }
 
-    /// 选择标准色彩矩阵：优先读取帧携带的 `color_space` 元数据，未标记时
+    /// 选择标准色彩矩阵：优先读取帧携带的 `colorspace` 元数据，未标记时
     /// 回退到按分辨率启发式（SD -> BT.601 / HD -> BT.709 / UHD -> BT.2020）
     fn auto_colorspace(&self) -> YuvStandardMatrix {
-        let colorspace = self.color_space;
+        let colorspace = self.colorspace;
         if colorspace == ffi::AVCOL_SPC_BT709 {
             return YuvStandardMatrix::Bt709;
         }
@@ -919,6 +1052,67 @@ fn audio_sample_size(format: i32) -> Result<usize> {
         ffi::AV_SAMPLE_FMT_DBL | ffi::AV_SAMPLE_FMT_DBLP => Ok(8),
         ffi::AV_SAMPLE_FMT_S64 | ffi::AV_SAMPLE_FMT_S64P => Ok(8),
         _ => Err(RsmediaError::custom("Unsupported sample format")),
+    }
+}
+
+/// Copies `AVFrame.side_data` into owned [`FrameSideData`] entries.
+fn side_data_from_avframe(frame: &AVFrame) -> Vec<FrameSideData> {
+    let count = frame.nb_side_data.max(0) as usize;
+    if count == 0 || frame.side_data.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: FFmpeg guarantees `side_data` points at `nb_side_data` valid pointers.
+    let entries = unsafe { std::slice::from_raw_parts(frame.side_data, count) };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let entry = unsafe { entry.as_ref()? };
+            let mut data = vec![0u8; entry.size];
+            if entry.size > 0 && !entry.data.is_null() {
+                // SAFETY: the side-data payload is `size` bytes long.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(entry.data, data.as_mut_ptr(), entry.size);
+                }
+            }
+            Some(FrameSideData {
+                type_: entry.type_,
+                data,
+                // SAFETY: `entry.metadata` is valid for as long as the borrowed
+                // `AVFrameSideData` (i.e. this call).
+                metadata: unsafe { Metadata::from_raw_dict(entry.metadata) },
+            })
+        })
+        .collect()
+}
+
+/// Writes owned [`FrameSideData`] entries into an `AVFrame`.
+///
+/// The target frame is always freshly allocated by [`MediaFrame::to_avframe`], so it
+/// carries no pre-existing side data and needs no removal pass.
+fn write_side_data(frame: &mut AVFrame, entries: &[FrameSideData]) {
+    for entry in entries {
+        if entry.data.is_empty() {
+            continue;
+        }
+        // SAFETY: `frame` is a live AVFrame we own and the frame has no side data yet,
+        // so this neither aliases nor overwrites existing entries.
+        let raw = unsafe {
+            ffi::av_frame_new_side_data(frame.as_mut_ptr(), entry.type_, entry.data.len())
+        };
+        if raw.is_null() {
+            log::warn!(
+                "Failed to allocate side data of type {} ({} bytes)",
+                entry.type_,
+                entry.data.len()
+            );
+            continue;
+        }
+        // SAFETY: `av_frame_new_side_data` allocated exactly `entry.data.len()` bytes,
+        // and `(*raw).metadata` is a live dictionary slot owned by that entry.
+        unsafe {
+            std::ptr::copy_nonoverlapping(entry.data.as_ptr(), (*raw).data, entry.data.len());
+            entry.metadata.write_into_raw_dict(&mut (*raw).metadata);
+        }
     }
 }
 
@@ -2166,7 +2360,7 @@ mod tests {
         assert_eq!(media.flags as u32, ffi::AV_FRAME_FLAG_KEY);
         assert_eq!(media.quality, 12);
         assert_eq!(media.repeat_pict, 1);
-        assert_eq!(media.color_space, ffi::AVCOL_SPC_BT709);
+        assert_eq!(media.colorspace, ffi::AVCOL_SPC_BT709);
         assert_eq!(media.color_range, ffi::AVCOL_RANGE_JPEG);
         assert_eq!(media.sample_aspect_ratio.num, 4);
         assert_eq!(media.sample_aspect_ratio.den, 3);
@@ -2178,7 +2372,7 @@ mod tests {
         assert!(back.key_frame);
         assert_eq!(back.quality, 12);
         assert_eq!(back.repeat_pict, 1);
-        assert_eq!(back.color_space, ffi::AVCOL_SPC_BT709);
+        assert_eq!(back.colorspace, ffi::AVCOL_SPC_BT709);
         assert_eq!(back.sample_aspect_ratio.num, 4);
 
         Ok(())
@@ -2269,7 +2463,7 @@ mod tests {
             assert_eq!(media.format, FrameFormat::Pixel(fmt));
 
             let back = media.to_avframe()?;
-            assert_eq!(back.format, fmt.into());
+            assert_eq!(back.format, i32::from(fmt));
             assert_eq!(back.width as usize, width);
             assert_eq!(back.height as usize, height);
 
@@ -2409,6 +2603,124 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// Every field `from_avframe` reads must be written back by `to_avframe`, so an
+    /// `AVFrame -> MediaFrame -> AVFrame` round trip is lossless for the modelled
+    /// fields. Guards the two defects that used to exist here: `pkt_dts` was never
+    /// written, and `duration` was fed from `pkt_duration`.
+    #[test]
+    fn test_avframe_roundtrip_preserves_all_modelled_fields() -> Result<()> {
+        let mut av = AVFrame::new();
+        av.set_format(ffi::AV_PIX_FMT_RGB24);
+        av.set_width(16);
+        av.set_height(16);
+        unsafe {
+            let p = av.as_mut_ptr();
+            (*p).pkt_dts = 1234;
+            (*p).duration = 7;
+            (*p).best_effort_timestamp = 99;
+            (*p).decode_error_flags = 0x2;
+            (*p).chroma_location = ffi::AVCHROMA_LOC_CENTER;
+            (*p).crop_top = 1;
+            (*p).crop_bottom = 2;
+            (*p).crop_left = 3;
+            (*p).crop_right = 4;
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+            {
+                (*p).alpha_mode = ffi::AVALPHA_MODE_STRAIGHT;
+            }
+            assert_eq!(
+                ffi::av_dict_set(&mut (*p).metadata, c"title".as_ptr(), c"hello".as_ptr(), 0),
+                0
+            );
+            let sd = ffi::av_frame_new_side_data(p, ffi::AV_FRAME_DATA_DISPLAYMATRIX, 4);
+            assert!(!sd.is_null());
+            std::ptr::copy_nonoverlapping([9u8, 8, 7, 6].as_ptr(), (*sd).data, 4);
+        }
+        av.alloc_buffer()?;
+
+        // AVFrame -> MediaFrame
+        let media = MediaFrame::<u8>::from_avframe(&av)?;
+        assert_eq!(media.pkt_dts, 1234);
+        assert_eq!(media.duration, 7);
+        assert_eq!(media.pkt_duration, 7, "pkt_duration mirrors duration");
+        assert_eq!(media.best_effort_timestamp, 99);
+        assert_eq!(media.decode_error_flags, 0x2);
+        assert_eq!(media.chroma_location, ffi::AVCHROMA_LOC_CENTER);
+        assert_eq!(
+            (
+                media.crop_top,
+                media.crop_bottom,
+                media.crop_left,
+                media.crop_right
+            ),
+            (1, 2, 3, 4)
+        );
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        assert_eq!(media.alpha_mode, ffi::AVALPHA_MODE_STRAIGHT);
+        assert_eq!(
+            media.metadata.get("title"),
+            Some("hello"),
+            "metadata should be copied into the Options map"
+        );
+        assert_eq!(media.side_data.len(), 1);
+        assert_eq!(media.side_data[0].type_, ffi::AV_FRAME_DATA_DISPLAYMATRIX);
+        assert_eq!(media.side_data[0].data, [9u8, 8, 7, 6]);
+
+        // MediaFrame -> AVFrame: the values must land back on the AVFrame verbatim.
+        let back = media.to_avframe()?;
+        assert_eq!(back.pkt_dts, 1234);
+        assert_eq!(back.duration, 7);
+        assert_eq!(back.best_effort_timestamp, 99);
+        assert_eq!(back.decode_error_flags, 0x2);
+        assert_eq!(back.chroma_location, ffi::AVCHROMA_LOC_CENTER);
+        assert_eq!(
+            (
+                back.crop_top,
+                back.crop_bottom,
+                back.crop_left,
+                back.crop_right
+            ),
+            (1, 2, 3, 4)
+        );
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        assert_eq!(back.alpha_mode, ffi::AVALPHA_MODE_STRAIGHT);
+        assert!(!back.metadata.is_null(), "metadata should be written back");
+        assert_eq!(back.nb_side_data, 1);
+        unsafe {
+            assert_eq!((**back.side_data).type_, ffi::AV_FRAME_DATA_DISPLAYMATRIX);
+            assert_eq!((**back.side_data).size, 4);
+            assert_eq!(
+                std::slice::from_raw_parts((**back.side_data).data, 4),
+                &[9u8, 8, 7, 6]
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The audio path used to lose `duration`: it was read into `duration` but written
+    /// back from `pkt_duration`, which the audio branch never set.
+    #[test]
+    fn test_audio_roundtrip_preserves_duration() -> Result<()> {
+        let mut av = AVFrame::new();
+        av.set_format(ffi::AV_SAMPLE_FMT_FLTP);
+        av.set_nb_samples(8);
+        av.set_sample_rate(8000);
+        av.set_ch_layout(AVChannelLayout::from_nb_channels(1).into_inner());
+        unsafe {
+            (*av.as_mut_ptr()).duration = 111;
+        }
+        av.alloc_buffer()?;
+
+        let media = MediaFrame::<f32>::from_avframe(&av)?;
+        assert_eq!(media.duration, 111);
+        assert_eq!(media.pkt_duration, 111);
+
+        let back = media.to_avframe()?;
+        assert_eq!(back.duration, 111, "audio frame duration must survive");
         Ok(())
     }
 }

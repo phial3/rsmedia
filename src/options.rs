@@ -1,8 +1,10 @@
 use crate::strutils;
 
-use rsmpeg::avutil::AVDictionary;
+use rsmpeg::avutil::{AVDictionary, AVDictionaryRef};
+use rsmpeg::ffi;
 
 use std::collections::{BTreeMap, HashMap};
+use std::ptr::NonNull;
 
 /// A wrapper type for ffmpeg options.
 ///
@@ -31,6 +33,13 @@ use std::collections::{BTreeMap, HashMap};
 /// ```
 #[derive(Clone, Default, Hash, PartialEq, Eq)]
 pub struct Options(BTreeMap<String, String>);
+
+/// Alias of [`Options`] for the string key/value metadata carried by media
+/// structures — `AVFrame.metadata`, container-level and per-stream metadata.
+///
+/// Use it in field/parameter positions to express "this is a metadata map",
+/// reserving the [`Options`] name for encoder/muxer option sets.
+pub type Metadata = Options;
 
 impl Options {
     /// Creates an empty options set.
@@ -123,6 +132,46 @@ impl Options {
                 }
             })
             .collect()
+    }
+
+    /// Reads entries back from a raw `AVDictionary` pointer, the form FFmpeg
+    /// structs expose (e.g. `AVFrame.metadata`, `AVStream.metadata`).
+    ///
+    /// FFmpeg represents an empty dictionary as a null pointer, so a null `dict`
+    /// yields an empty `Options`. Non-UTF-8 entries are skipped with a warning.
+    ///
+    /// # Safety
+    ///
+    /// `dict` must be null or point to a valid `AVDictionary` that outlives the call.
+    pub(crate) unsafe fn from_raw_dict(dict: *mut ffi::AVDictionary) -> Self {
+        let Some(ptr) = NonNull::new(dict) else {
+            return Self::new();
+        };
+        // SAFETY: the reference is non-owning (`wrap_ref_pure` wraps the pointer in
+        // `ManuallyDrop`) and is dropped before this function returns; the caller
+        // guarantees the dictionary outlives the call.
+        let borrowed = unsafe { AVDictionaryRef::from_raw(ptr) };
+        Self::from_dict(&borrowed)
+    }
+
+    /// Replaces the `AVDictionary` at `*dest` with `self`, freeing whatever was
+    /// stored there.
+    ///
+    /// This is the write counterpart of [`from_raw_dict`](Self::from_raw_dict) for
+    /// metadata slots embedded in FFmpeg structs (`AVFrame.metadata`,
+    /// `AVStream.metadata`, ...). An empty `Options` just frees the slot and leaves
+    /// a null pointer — FFmpeg's representation of "no metadata". Ownership of the
+    /// freshly built dictionary is transferred to `*dest`.
+    ///
+    /// # Safety
+    ///
+    /// `dest` must point at a live `AVDictionary` slot owned by an FFmpeg struct,
+    /// or be null.
+    pub(crate) unsafe fn write_into_raw_dict(&self, dest: &mut *mut ffi::AVDictionary) {
+        unsafe { ffi::av_dict_free(dest) };
+        if let Some(dict) = self.to_dict() {
+            *dest = dict.into_raw().as_ptr();
+        }
     }
 
     /// Creates options such that ffmpeg will prefer TCP transport when reading RTSP stream (over
@@ -292,6 +341,22 @@ impl From<HashMap<String, String>> for Options {
     }
 }
 
+/// `BTreeMap<String, String>` -> `Options` (zero-copy: shares the internal
+/// representation).
+impl From<BTreeMap<String, String>> for Options {
+    fn from(item: BTreeMap<String, String>) -> Self {
+        Self(item)
+    }
+}
+
+/// `Options` -> `BTreeMap<String, String>` (zero-copy: yields the internal
+/// representation).
+impl From<Options> for BTreeMap<String, String> {
+    fn from(item: Options) -> Self {
+        item.0
+    }
+}
+
 /// `Options` -> `HashMap<String, String>`
 impl From<Options> for HashMap<String, String> {
     fn from(item: Options) -> Self {
@@ -456,6 +521,73 @@ mod tests {
 
         let back: HashMap<String, String> = opts.into();
         assert_eq!(back, map);
+    }
+
+    #[test]
+    fn test_options_btreemap_roundtrip() {
+        let mut map = BTreeMap::new();
+        map.insert("a".to_string(), "1".to_string());
+        map.insert("b".to_string(), "2".to_string());
+
+        let opts: Options = map.clone().into();
+        assert_eq!(opts.get("b"), Some("2"));
+
+        let back: BTreeMap<String, String> = opts.into();
+        assert_eq!(back, map);
+    }
+
+    #[test]
+    fn test_options_from_raw_dict_null_is_empty() {
+        // FFmpeg 的空字典就是 NULL 指针：from_raw_dict(NULL) 必须得到空 Options。
+        let opts = unsafe { Options::from_raw_dict(std::ptr::null_mut()) };
+        assert!(opts.is_empty());
+    }
+
+    #[test]
+    fn test_options_raw_dict_read() {
+        let mut dict = AVDictionary::new(c"title", c"hello", 0);
+        // SAFETY: `dict` 是合法字典，且在本调用期间存活。
+        let opts = unsafe { Options::from_raw_dict(dict.as_mut_ptr()) };
+        assert_eq!(opts.get("title"), Some("hello"));
+        assert_eq!(opts.len(), 1);
+    }
+
+    #[test]
+    fn test_options_write_into_raw_dict_roundtrip() {
+        let mut opts = Options::new();
+        opts.insert("title", "hello").insert("artist", "rsmedia");
+
+        let mut dest: *mut ffi::AVDictionary = std::ptr::null_mut();
+        // SAFETY: `dest` 为 NULL，函数按"空槽位"处理。
+        unsafe { opts.write_into_raw_dict(&mut dest) };
+        assert!(!dest.is_null(), "non-empty options must materialize");
+
+        // SAFETY: `dest` 刚由 to_dict 物化，合法且存活。
+        let back = unsafe { Options::from_raw_dict(dest) };
+        assert_eq!(back.get("title"), Some("hello"));
+        assert_eq!(back.get("artist"), Some("rsmedia"));
+
+        // SAFETY: 释放测试自建的字典，避免泄漏。
+        unsafe { ffi::av_dict_free(&mut dest) };
+        assert!(dest.is_null());
+    }
+
+    #[test]
+    fn test_options_write_into_raw_dict_empty_stores_null() {
+        let mut dest: *mut ffi::AVDictionary = std::ptr::null_mut();
+        // SAFETY: `dest` 为 NULL。
+        unsafe { Options::new().write_into_raw_dict(&mut dest) };
+        assert!(
+            dest.is_null(),
+            "empty Options must store NULL (no metadata)"
+        );
+
+        // 已有内容时写入空 Options：旧字典被释放并清回 NULL。
+        let owned = AVDictionary::new(c"title", c"hello", 0);
+        let mut dest = owned.into_raw().as_ptr();
+        // SAFETY: `dest` 指向刚转移的合法字典。
+        unsafe { Options::new().write_into_raw_dict(&mut dest) };
+        assert!(dest.is_null());
     }
 
     #[test]

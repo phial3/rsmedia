@@ -146,7 +146,7 @@ fn encode_video_container(container_type: &str, codec_name: &str) -> Result<()> 
         .build()?;
     let enc_tb = encoder.time_base();
     let mut muxer = rsmedia::mux::Muxer::new(output_path.as_path())?;
-    let v_idx = muxer.add_stream(encoder)?;
+    let v_idx = muxer.add_encoder(encoder)?;
 
     let mut frame = AVFrame::new();
     frame.set_format(ffi::AV_PIX_FMT_YUV420P as _);

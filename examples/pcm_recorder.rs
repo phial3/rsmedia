@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     // PcmSink 内部的持久重采样器会自动完成格式/采样率/声道数转换。
     let encoder = Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
     let mut muxer = Muxer::new(output.as_path())?;
-    let audio_index = muxer.add_stream(encoder)?;
+    let audio_index = muxer.add_encoder(encoder)?;
     let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels))?;
 
     // ---- cpal 侧：音频回调线程 --mpsc--> 主线程（PcmSink 非线程安全，留在主线程）----
@@ -238,7 +238,7 @@ mod tests {
         let encoder =
             Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
         let mut muxer = Muxer::new(output.as_path())?;
-        let audio_index = muxer.add_stream(encoder)?;
+        let audio_index = muxer.add_encoder(encoder)?;
         let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels))?;
 
         // 1 秒 440Hz 正弦，模拟 cpal 回调块粒度
