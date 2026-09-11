@@ -21,11 +21,12 @@ pub mod mux;
 pub mod options;
 pub mod pcm;
 pub mod pixel;
+pub mod resample;
 pub mod resize;
+pub mod scale;
 pub mod stream;
 pub mod strutils;
 pub mod subtitle;
-pub mod swctx;
 pub mod time;
 
 pub use codec::{CodecConfig, FormatInfo, Profile};
@@ -44,10 +45,11 @@ pub use mux::Chapter;
 pub use options::{Metadata, Options, Quality, VideoProfile};
 pub use pcm::{PcmSink, PcmSpec};
 pub use pixel::PixelFormat;
+pub use resample::Resampler;
 pub use resize::Resize;
+pub use scale::{ScaleAlgorithm, ScaleQuality, Scaler};
 pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
-pub use swctx::SwsFlags;
 pub use time::Time;
 
 /// Re-export internal definition for caller to use.

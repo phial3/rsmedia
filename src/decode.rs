@@ -7,10 +7,10 @@ use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::{Reader, Seekable};
 use crate::options::Options;
 use crate::resize::Resize;
+use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
 use crate::stream::StreamInfo;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
-use crate::swctx::{self, SwsFlags};
 use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket, AVSubtitle};
@@ -30,7 +30,10 @@ pub struct DecoderBuilder {
     codec_opts: Option<Options>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
-    scale_algorithm: SwsFlags,
+    /// 缩放核选择（互斥，只取一个算法位）
+    scale_algorithm: ScaleAlgorithm,
+    /// 缩放质量位（可多位，见 [`ScaleQuality`]）；构建 `Scaler` 时由 [`ScaleQuality::mask`] 合成为掩码
+    scale_quality: Vec<ScaleQuality>,
     resize: Option<Resize>,
     /// 解码输出目标像素格式（仅视频），默认 [`PixelFormat::YUV420P`]。
     pix_fmt: Option<PixelFormat>,
@@ -51,7 +54,8 @@ impl DecoderBuilder {
             hw_device_config: None,
             thread_count: num_cpus::get(),
             flags: AVCodecFlag::LOW_DELAY,
-            scale_algorithm: SwsFlags::default(),
+            scale_algorithm: ScaleAlgorithm::default(),
+            scale_quality: ScaleQuality::default_quality().to_vec(),
             resize: None,
             pix_fmt: None,
         }
@@ -96,14 +100,30 @@ impl DecoderBuilder {
         self
     }
 
-    /// Set the scaling algorithm used when converting decoded frames to a
-    /// canonical pixel format (e.g. YUV420P).
+    /// Set the scaling algorithm used when converting decoded frames to the
+    /// output pixel format (and, with [`Self::with_resize`], to the output size).
     ///
-    /// Defaults to [`SwsFlags::BICUBIC`]. Use
-    /// [`SwsFlags::BILINEAR`] for output consistent with FFmpeg's command
-    /// line default, or [`SwsFlags::AREA`] when downscaling.
-    pub fn with_scale_algorithm(mut self, algorithm: SwsFlags) -> Self {
+    /// The algorithm picks the scaling kernel and is **mutually exclusive** —
+    /// FFmpeg's header states *"Scaler selection options. Only one may be active
+    /// at a time."* Defaults to [`ScaleAlgorithm::BICUBIC`]; use
+    /// [`ScaleAlgorithm::BILINEAR`] for output consistent with FFmpeg's command
+    /// line default, or [`ScaleAlgorithm::AREA`] when downscaling. The
+    /// quality/behaviour bits are set separately with [`Self::with_scale_quality`].
+    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
         self.scale_algorithm = algorithm;
+        self
+    }
+
+    /// Set the scaling quality/behaviour bits used when converting decoded frames.
+    ///
+    /// Unlike the algorithm (exactly one bit), the quality flags are a set: pass the
+    /// bits themselves as a list — `[ScaleQuality::BITEXACT]`,
+    /// `[ScaleQuality::FULL_CHR_H_INT, ScaleQuality::ACCURATE_RND]`, … — and they are
+    /// combined into the mask handed to FFmpeg. Taking a list of [`ScaleQuality`]
+    /// values rather than a raw `u32` means an invalid flag cannot be passed.
+    /// Defaults to [`ScaleQuality::default_mask`].
+    pub fn with_scale_quality(mut self, quality: impl AsRef<[ScaleQuality]>) -> Self {
+        self.scale_quality = quality.as_ref().to_vec();
         self
     }
 
@@ -331,7 +351,7 @@ impl DecoderBuilder {
             filter_graph,
             context: decode_ctx,
             state: CodecContextState::Normal,
-            scale_algorithm: self.scale_algorithm,
+            scaler: Scaler::new_with_options(self.scale_algorithm, self.scale_quality),
             resize: self.resize,
             output_pix_fmt,
         })
@@ -361,7 +381,7 @@ pub struct Decoder {
     stream_index: usize,
     media_type: MediaType,
     state: CodecContextState,
-    scale_algorithm: SwsFlags,
+    scaler: Scaler,
     resize: Option<Resize>,
     /// 解码输出目标像素格式（仅视频）
     output_pix_fmt: PixelFormat,
@@ -839,12 +859,11 @@ impl Decoder {
                     || sw_frame.width != out_w as i32
                     || sw_frame.height != out_h as i32
                 {
-                    swctx::scale_with_flags(
+                    self.scaler.scale_frame(
                         &sw_frame,
                         out_w as i32,
                         out_h as i32,
                         target_sw_pix_fmt,
-                        self.scale_algorithm,
                     )?
                 } else {
                     sw_frame

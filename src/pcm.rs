@@ -46,8 +46,8 @@
 use crate::error::{Context, Result, RsmediaError};
 use crate::io::Writer;
 use crate::mux::Muxer;
+use crate::resample::Resampler;
 use crate::stream::MediaType;
-use crate::swctx::Resampler;
 use crate::time;
 
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};

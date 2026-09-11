@@ -8,9 +8,10 @@ use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
 use crate::options::{CRF_CAPABLE_CODECS, Options, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
+use crate::resample;
+use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
-use crate::swctx::{self, SwsFlags};
 use crate::time::{self, Rescale};
 use crate::{MediaType, SampleFormat};
 
@@ -57,7 +58,10 @@ pub struct EncoderBuilder {
     subtitle_header: Option<String>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
-    scale_algorithm: SwsFlags,
+    /// 缩放核选择（互斥，只取一个算法位）
+    scale_algorithm: ScaleAlgorithm,
+    /// 缩放质量位（可多位，见 [`ScaleQuality`]）；构建 `Scaler` 时由 [`ScaleQuality::mask`] 合成为掩码
+    scale_quality: Vec<ScaleQuality>,
 }
 
 impl EncoderBuilder {
@@ -310,9 +314,26 @@ impl EncoderBuilder {
     /// Set the scaling algorithm used when converting input frames to the
     /// encoder's target pixel format (e.g. RGB24 -> YUV420P).
     ///
-    /// Defaults to [`ScaleAlgorithm::Bicubic`].
-    pub fn with_scale_algorithm(mut self, algorithm: SwsFlags) -> Self {
+    /// The algorithm picks the scaling kernel and is **mutually exclusive** —
+    /// FFmpeg's header states *"Scaler selection options. Only one may be active
+    /// at a time."* Defaults to [`ScaleAlgorithm::BICUBIC`]; the quality/behaviour
+    /// bits are set separately with [`Self::with_scale_quality`].
+    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
         self.scale_algorithm = algorithm;
+        self
+    }
+
+    /// Set the scaling quality/behaviour bits used when converting input frames
+    /// to the encoder's target pixel format.
+    ///
+    /// Unlike the algorithm (exactly one bit), the quality flags are a set: pass the
+    /// bits themselves as a list — `[ScaleQuality::BITEXACT]`,
+    /// `[ScaleQuality::FULL_CHR_H_INT, ScaleQuality::ACCURATE_RND]`, … — and they are
+    /// combined into the mask handed to FFmpeg. Taking a list of [`ScaleQuality`]
+    /// values rather than a raw `u32` means an invalid flag cannot be passed.
+    /// Defaults to [`ScaleQuality::default_mask`].
+    pub fn with_scale_quality(mut self, quality: impl AsRef<[ScaleQuality]>) -> Self {
+        self.scale_quality = quality.as_ref().to_vec();
         self
     }
 
@@ -755,7 +776,7 @@ impl EncoderBuilder {
             filter_graph,
             context: encode_ctx,
             state: CodecContextState::Normal,
-            scale_algorithm: self.scale_algorithm,
+            scaler: Scaler::new_with_options(self.scale_algorithm, self.scale_quality),
             pending_packets: VecDeque::new(),
             audio_fifo: None,
             next_pts: 0,
@@ -794,7 +815,8 @@ impl Default for EncoderBuilder {
             filters: None,
             subtitle_header: None,
             hw_device_config: None,
-            scale_algorithm: SwsFlags::default(),
+            scale_algorithm: ScaleAlgorithm::default(),
+            scale_quality: ScaleQuality::default_quality().to_vec(),
         }
     }
 }
@@ -824,7 +846,7 @@ pub struct Encoder {
     hw_context: Option<Arc<HWContext>>,
     media_type: MediaType,
     state: CodecContextState,
-    scale_algorithm: SwsFlags,
+    scaler: Scaler,
     /// 编码器缓冲满（send_frame 返回 EAGAIN）时，先行排空的已就绪包暂存于此， 由 `receive_packet` 优先取出，
     /// 避免丢包。按 FIFO 出队（`pop_front`）， 保证与编码器输出顺序一致（否则 dts 会乱序、mux 报错）。
     pending_packets: VecDeque<AVPacket>,
@@ -1015,24 +1037,19 @@ impl Encoder {
                     _ => FrameFormat::Sample(self.sample_fmt()),
                 }
             });
-            let scale_algorithm = self.scale_algorithm;
+            // 先把帧转换到滤镜图输入格式（此转换需要 `&mut self` 以复用可变的
+            // `scaler`/重采样上下文），转换完成后再借用 `filter_graph` 处理。
+            let converted = match graph_input_format {
+                FrameFormat::Pixel(dst) if frame.format != dst as i32 => {
+                    self.scale_encoder_frame(&frame, dst)?
+                }
+                FrameFormat::Sample(dst) if frame.format != dst as i32 => {
+                    resample::convert_frame(&frame, frame.ch_layout, dst as _, frame.sample_rate)?
+                }
+                _ => frame,
+            };
             if let Some(graph) = self.filter_graph.as_mut() {
-                let frame = match graph_input_format {
-                    FrameFormat::Pixel(dst) if frame.format != dst as i32 => {
-                        swctx::scale_with_flags(
-                            &frame,
-                            frame.width,
-                            frame.height,
-                            dst,
-                            scale_algorithm,
-                        )?
-                    }
-                    FrameFormat::Sample(dst) if frame.format != dst as i32 => {
-                        swctx::convert_frame(&frame, frame.ch_layout, dst as _, frame.sample_rate)?
-                    }
-                    _ => frame,
-                };
-                match graph.process_frame(Some(frame))? {
+                match graph.process_frame(Some(converted))? {
                     Some(filtered) => self.send_frame_post_filter(filtered)?,
                     None => {
                         // filter 暂未输出（内部缓冲中），等待后续帧驱动
@@ -1040,7 +1057,7 @@ impl Encoder {
                     }
                 }
             } else {
-                self.send_frame_post_filter(frame)?;
+                self.send_frame_post_filter(converted)?;
             }
             Ok(())
         } else {
@@ -1274,7 +1291,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn rescale(&self, frame: AVFrame) -> Result<AVFrame> {
+    fn rescale(&mut self, frame: AVFrame) -> Result<AVFrame> {
         let scaled_frame = match self.media_type {
             MediaType::VIDEO => {
                 let target_sw_pix_fmt = if let Some(hw_ctx) = self.hw_context.as_ref() {
@@ -1283,13 +1300,7 @@ impl Encoder {
                     self.pix_fmt()
                 };
                 if frame.format != i32::from(target_sw_pix_fmt) {
-                    swctx::scale_with_flags(
-                        &frame,
-                        frame.width,
-                        frame.height,
-                        target_sw_pix_fmt,
-                        self.scale_algorithm,
-                    )?
+                    self.scale_encoder_frame(&frame, target_sw_pix_fmt)?
                 } else {
                     frame
                 }
@@ -1300,7 +1311,7 @@ impl Encoder {
                     || frame.format != self.sample_fmt() as i32
                     || frame.ch_layout.nb_channels != ch_layout.nb_channels
                 {
-                    swctx::convert_frame(
+                    resample::convert_frame(
                         &frame,
                         ch_layout.clone().into_inner(),
                         self.sample_fmt() as _,
@@ -1319,6 +1330,17 @@ impl Encoder {
             }
         };
         Ok(scaled_frame)
+    }
+
+    /// Scale a video frame to the encoder's target pixel format, through the
+    /// encoder's persistent [`Scaler`].
+    ///
+    /// The destination keeps the source geometry (size changes are the filter
+    /// graph's job, see [`Filter`]); the scaler rebuilds its context by itself
+    /// when the geometry or format changes mid-stream.
+    fn scale_encoder_frame(&mut self, frame: &AVFrame, dst_fmt: PixelFormat) -> Result<AVFrame> {
+        self.scaler
+            .scale_frame(frame, frame.width, frame.height, dst_fmt)
     }
 
     /// Check if the frame is valid for encoding.
@@ -2556,6 +2578,40 @@ mod tests {
             Ok(())
         }
 
+        /// builder 的缩放选项进入编码器持有的 [`Scaler`]：算法位一个、质量位可多个。
+        #[test]
+        fn test_builder_scale_options_reach_the_scaler() -> Result<()> {
+            use crate::scale::{ScaleAlgorithm, ScaleQuality};
+
+            // 多质量位（掩码）+ 非默认算法。
+            let encoder = EncoderBuilder::new_video(320, 240)
+                .with_scale_algorithm(ScaleAlgorithm::LANCZOS)
+                .with_scale_quality([
+                    ScaleQuality::FULL_CHR_H_INT,
+                    ScaleQuality::ACCURATE_RND,
+                    ScaleQuality::BITEXACT,
+                ])
+                .build()?;
+            assert_eq!(encoder.scaler.algorithm(), ScaleAlgorithm::LANCZOS);
+            assert_eq!(encoder.scaler.quality(), ScaleQuality::default_mask());
+            assert_eq!(
+                encoder.scaler.flags(),
+                ScaleAlgorithm::LANCZOS.as_raw() | ScaleQuality::default_mask()
+            );
+
+            // 默认策略：BICUBIC + 默认质量掩码。
+            let encoder = EncoderBuilder::new_video(320, 240).build()?;
+            assert_eq!(encoder.scaler.algorithm(), ScaleAlgorithm::default());
+            assert_eq!(encoder.scaler.quality(), ScaleQuality::default_mask());
+
+            // 单个质量位（`Into<u32>`）。
+            let encoder = EncoderBuilder::new_video(320, 240)
+                .with_scale_quality([ScaleQuality::BITEXACT])
+                .build()?;
+            assert_eq!(encoder.scaler.quality(), ScaleQuality::BITEXACT.as_raw());
+            Ok(())
+        }
+
         /// 综合参数组合往返测试：编码→解码，覆盖 编解码器 / fps / 源尺寸 / resize /
         /// 缩放算法 / 延迟滤镜 的交叉组合，验证：
         ///   1) 解码器 resize 后输出尺寸正确；
@@ -2564,7 +2620,7 @@ mod tests {
         #[test]
         fn test_param_combination_roundtrip() -> Result<()> {
             use crate::filter::Filter;
-            use crate::{DecoderBuilder, MediaType, Resize, SwsFlags};
+            use crate::{DecoderBuilder, MediaType, Resize, ScaleAlgorithm};
 
             let codecs: &[(&str, bool)] = &[
                 ("libx264", true), // 支持延迟滤镜插值
@@ -2576,7 +2632,11 @@ mod tests {
                 Some(Resize::Exact(32, 32)),   // 精确尺寸
                 Some(Resize::FitEven(16, 16)), // 保持宽高比、偶数尺寸
             ];
-            let algos: &[SwsFlags] = &[SwsFlags::BICUBIC, SwsFlags::POINT, SwsFlags::LANCZOS];
+            let algos: &[ScaleAlgorithm] = &[
+                ScaleAlgorithm::BICUBIC,
+                ScaleAlgorithm::POINT,
+                ScaleAlgorithm::LANCZOS,
+            ];
             let fps_list: &[f32] = &[24.0, 30.0];
 
             for &(codec, delayed) in codecs {
