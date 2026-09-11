@@ -11,6 +11,7 @@ use rsmpeg::avutil::{self, AVChannelLayout};
 use rsmpeg::ffi;
 
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 
 // 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，
@@ -37,10 +38,16 @@ ffi_enum_wrap_from!(
 );
 
 impl MediaType {
-    pub fn get_media_type_string(&self) -> String {
+    pub fn get_media_name(&self) -> String {
         avutil::get_media_type_string(*self as _).map_or("Unknown".to_string(), |s| {
             strutils::cstr_to_string(s).unwrap()
         })
+    }
+}
+
+impl Display for MediaType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.get_media_name())
     }
 }
 
@@ -525,7 +532,7 @@ fn hw_encoder_name(hw_type: HWDeviceType, codec_id: ffi::AVCodecID) -> Option<St
 }
 
 impl std::fmt::Debug for StreamInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let codec_name = unsafe {
             let codec_id = self.codec_id as ffi::AVCodecID;
             strutils::c_char_to_str(ffi::avcodec_get_name(codec_id))
@@ -534,7 +541,7 @@ impl std::fmt::Debug for StreamInfo {
             FrameFormat::Pixel(p) => p.get_pix_fmt_name().to_owned(),
             FrameFormat::Sample(s) => s.get_sample_fmt_name(),
         };
-        let stream_type = self.media_type.get_media_type_string();
+        let stream_type = self.media_type.get_media_name();
         write!(
             f,
             "{} #{}: codec={}, format={}, size={}x{}, fps={:?}, bit_rate={}, sample_rate={}, nb_channels={}, video_delay={}",
@@ -553,8 +560,8 @@ impl std::fmt::Debug for StreamInfo {
     }
 }
 
-impl std::fmt::Display for StreamInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl Display for StreamInfo {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, f)
     }
 }
