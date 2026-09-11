@@ -500,7 +500,13 @@ mod tests {
     #[should_panic(expected = "Invalid HWDeviceType value")]
     fn hw_device_type_panics_on_unknown_value() {
         use crate::hwaccel::HWDeviceType;
-        let _ = HWDeviceType::from(u32::MAX);
+        // `HWDeviceType::from` takes `ffi::AVHWDeviceType`, whose underlying integer drifts by
+        // platform: `c_uint` on Unix, but `c_int` on Windows because MSVC gives an all
+        // non-negative C enum a signed `int`. Deriving the probe value from an FFI constant keeps
+        // the argument exactly that type — an explicitly typed `u32::MAX` compiles on Unix and
+        // fails on Windows.
+        let unknown = ffi::AV_HWDEVICE_TYPE_NONE + 9999;
+        let _ = HWDeviceType::from(unknown);
     }
 
     /// The macro's second rule, `fallback = <expression>`, is still supported — this probe keeps
