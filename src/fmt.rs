@@ -39,13 +39,17 @@ ffi_enum!(
 
 // 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）。
 ffi_enum_wrap_from!(
-    /// 音频采样格式（对应 FFmpeg `AV_SAMPLE_FMT_*`）。
+    /// Audio sample format (FFmpeg `AV_SAMPLE_FMT_*`).
     ///
-    /// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，
-    /// 未知/版本差异的 `AV_SAMPLE_FMT_*` 回退为 `NONE`（而非 panic）。
+    /// Generated from one `variant => constant` table with a two-way `From`. A value the table
+    /// does not list panics instead of degrading to `NONE`: silently treating an unknown format
+    /// as `NONE` would risk encoding into the wrong format, which is far harder to diagnose than
+    /// a fast failure.
+    ///
+    /// `AV_SAMPLE_FMT_NONE` itself is a listed value, so it still converts to `NONE`.
     SampleFormat => ffi::AVSampleFormat,
     repr = i32,
-    fallback = Self::NONE {
+    fallback = panic {
         /// < none
         NONE => ffi::AV_SAMPLE_FMT_NONE;
         /// < unsigned 8 bits
@@ -112,15 +116,6 @@ pub enum FrameFormat {
 }
 
 impl FrameFormat {
-    /// 取回 FFmpeg 原生格式值（`AV_PIX_FMT_*` 或 `AV_SAMPLE_FMT_*` 的数字表示）。
-    #[inline]
-    pub fn as_raw(&self) -> i32 {
-        match self {
-            FrameFormat::Pixel(p) => (*p).into(),
-            FrameFormat::Sample(s) => *s as i32,
-        }
-    }
-
     /// 提取视频像素格式（音频格式返回 `None`）。
     pub fn into_pixel(self) -> Option<PixelFormat> {
         match self {
@@ -134,6 +129,21 @@ impl FrameFormat {
         match self {
             Self::Sample(fmt) => Some(fmt),
             Self::Pixel(_) => None,
+        }
+    }
+}
+
+/// Raw FFmpeg format value: the numeric `AV_PIX_FMT_*` or `AV_SAMPLE_FMT_*`.
+///
+/// Both arms convert through `Into`, so the two wrapped format types are handled identically, and
+/// callers obtain the raw value exactly as they do for every other wrapper type in this crate:
+/// with `Into`. There is deliberately no `as_raw()` here — that method exists only on bit sets,
+/// where it doubles as the explicit counterpart of the bit operators.
+impl From<FrameFormat> for i32 {
+    fn from(value: FrameFormat) -> Self {
+        match value {
+            FrameFormat::Pixel(fmt) => fmt.into(),
+            FrameFormat::Sample(fmt) => fmt.into(),
         }
     }
 }

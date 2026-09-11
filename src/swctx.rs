@@ -70,15 +70,17 @@ ffi_enum!(
 );
 
 impl SwsFlags {
-    /// 返回该算法对应的完整 swscale flags（算法位 + 质量 flag）。
-    /// （`SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND | SWS_BITEXACT`）恒被附加。
-    #[allow(clippy::unnecessary_cast)]
+    /// Returns the complete swscale flags for this algorithm: the algorithm bits plus the
+    /// quality flags, which are always added (`SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND |
+    /// SWS_BITEXACT`).
+    ///
+    /// Combines the named flag with raw masks through the generated `BitOr`, which is precisely
+    /// what that operator exists for: assembling a mask for the FFI boundary.
+    #[allow(clippy::unnecessary_cast)] // `SWS_*` is a bare integer before FFmpeg 8.
     pub fn complete(self) -> u32 {
-        let mut flag = self.as_raw() as u32;
-        flag |= ffi::SWS_FULL_CHR_H_INT as u32;
-        flag |= ffi::SWS_ACCURATE_RND as u32;
-        flag |= ffi::SWS_BITEXACT as u32;
-        flag
+        self | (ffi::SWS_FULL_CHR_H_INT as u32)
+            | (ffi::SWS_ACCURATE_RND as u32)
+            | (ffi::SWS_BITEXACT as u32)
     }
 }
 

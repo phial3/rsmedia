@@ -18,10 +18,15 @@ use std::ops::Deref;
 // 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）——
 // 挂在宏调用外部的 doc 注释 rustdoc 不认，会触发 unused_doc_comments 警告。
 ffi_enum_wrap_from!(
-    /// 媒体类型（对应 FFmpeg `AVMEDIA_TYPE_*`）：流的分类属性
+    /// Media type (FFmpeg `AVMEDIA_TYPE_*`): the classification of a stream.
+    ///
+    /// Generated from one `variant => constant` table with a two-way `From`. A value the table
+    /// does not list panics rather than degrading to `UNKNOWN`, so a stream type this crate does
+    /// not model is reported immediately instead of being silently treated as unknown — the
+    /// listed `AVMEDIA_TYPE_UNKNOWN` still converts to `UNKNOWN` as usual.
     MediaType => ffi::AVMediaType,
     repr = i32,
-    fallback = Self::UNKNOWN {
+    fallback = panic {
         UNKNOWN => ffi::AVMEDIA_TYPE_UNKNOWN;
         VIDEO => ffi::AVMEDIA_TYPE_VIDEO;
         AUDIO => ffi::AVMEDIA_TYPE_AUDIO;

@@ -2,7 +2,7 @@ use crate::error::{Context, Result, RsmediaError};
 use crate::location::Location;
 use crate::options::Options;
 use crate::stream::MediaType;
-use crate::strutils;
+use crate::{strutils, time};
 
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
 use rsmpeg::avformat::{
@@ -22,12 +22,18 @@ const AVERROR_EIO: i32 = -libc::EIO;
 /// avio 内部缓冲大小（读写回调模式的滚动窗口）。
 const AVIO_BUFFER_SIZE: usize = 4096;
 
-ffi_enum_flags!(AVSeekFlag, i32 {
-    BACKWARD => ffi::AVSEEK_FLAG_BACKWARD;
-    BYTE => ffi::AVSEEK_FLAG_BYTE;
-    ANY => ffi::AVSEEK_FLAG_ANY;
-    FRAME => ffi::AVSEEK_FLAG_FRAME;
-});
+ffi_enum!(
+    /// Flags for [`Seekable::seek_to_frame`] (FFmpeg `AVSEEK_FLAG_*`).
+    ///
+    /// Combinable: `AVSeekFlag::BACKWARD | AVSeekFlag::ANY` yields the raw `i32` mask that
+    /// `seek_to_frame` accepts, since its parameter is `impl Into<i32>`.
+    AVSeekFlag, i32 {
+        BACKWARD => ffi::AVSEEK_FLAG_BACKWARD;
+        BYTE => ffi::AVSEEK_FLAG_BYTE;
+        ANY => ffi::AVSEEK_FLAG_ANY;
+        FRAME => ffi::AVSEEK_FLAG_FRAME;
+    }
+);
 
 pub trait Reader {
     fn input(&self) -> &AVFormatContextInput;
@@ -132,9 +138,9 @@ pub trait Seekable: Reader {
     /// * `timestamp_ms` - Number of millisecond from start of video to seek to.
     fn seek_to_timestamp(&mut self, timestamp_ms: i64) -> Result<()> {
         // Conversion factor from timestamp in milliseconds to `TIME_BASE` units.
-        const CONVERSION_FACTOR: i64 = (ffi::AV_TIME_BASE_Q.den / 1000) as i64;
+        const CONVERSION_FACTOR: i64 = (time::TIME_BASE.den / 1000) as i64;
         // One second left and right leeway when seeking.
-        const LEEWAY: i64 = ffi::AV_TIME_BASE_Q.den as i64;
+        const LEEWAY: i64 = time::TIME_BASE.den as i64;
         let timestamp = CONVERSION_FACTOR * timestamp_ms;
         // 注意区间必须不对称（max 比 min 更贴近 ts）：`avformat_seek_file` 会
         // 忽略调用方的 BACKWARD 标志，并对不支持 read_seek2 的 demuxer 依据
@@ -1682,7 +1688,7 @@ mod tests {
     use crate::{DecoderBuilder, MediaType};
     use rsmpeg::avutil::AVFrame;
 
-    /// `ffi_enum_flags!` 生成的组合能力：`|` 组合与 `Into<i32>` 转换。
+    /// `ffi_enum!` 生成的位集合能力：`|` 组合与 `Into<i32>` 转换。
     #[test]
     fn test_avseek_flag_bitops() {
         // 注意：rsmpeg 侧的 AVSEEK_FLAG_* 常量类型为 u32，断言时归一化到 i32。
