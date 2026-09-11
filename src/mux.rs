@@ -8,7 +8,6 @@ use crate::{
     Decoder, DecoderBuilder, Encoder, EncoderBuilder, Location, StreamReader, StreamWriter,
 };
 
-use dashmap::DashMap;
 use rsmpeg::avcodec::AVPacket;
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
@@ -16,7 +15,6 @@ use rsmpeg::ffi;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ptr;
-use std::sync::Arc;
 
 /// A container chapter mark (MP4/MKV chapters), with times in seconds.
 ///
@@ -743,43 +741,24 @@ impl<W: Writer> Drop for Muxer<W> {
 
 /// Demuxer
 ///
-/// 两种构造模式：
-/// - **解码模式**（[`new`](Demuxer::new) / [`new_from_reader`](Demuxer::new_from_reader) /
-///   [`new_single_stream`](Demuxer::new_single_stream)）：迭代产出解码后的
-///   `AVFrame`；
-/// - **透传模式**（[`new_passthrough`](Demuxer::new_passthrough)）：不构建任何
-///   解码器，通过 [`demux_packet`](Demuxer::demux_packet) /
-///   [`packets`](Demuxer::packets) 产出原始 `AVPacket`，用于 remux
-///   （转封装，不解码不重编码）。
+/// Two construction modes:
+/// - **Decode mode** ([`new`](Demuxer::new) / [`new_from_reader`](Demuxer::new_from_reader) /
+///   [`new_single_stream`](Demuxer::new_single_stream)): iteration yields decoded
+///   `AVFrame`s.
+/// - **Passthrough mode** ([`new_passthrough`](Demuxer::new_passthrough)): no decoder is
+///   built; [`demux_packet`](Demuxer::demux_packet) / [`packets`](Demuxer::packets) yield
+///   raw `AVPacket`s for remuxing (re-wrapping without decode or re-encode).
 pub struct Demuxer<R: Reader> {
     pub reader: R,
-    inner: DemuxerInner,
-    states: Arc<DashMap<usize, i32>>,
-}
-
-/// Demuxer 工作模式。
-enum DemuxerInner {
-    /// 透传：不解码，仅迭代原始 packet。
-    Passthrough,
-    /// 解码：每个被选中的流持有一个 decoder。
-    Decode { streams: Vec<DemuxerStream> },
-}
-
-impl<R: Reader> Demuxer<R> {
-    /// 透传模式下的解码流列表（空）。
-    fn decode_streams(&self) -> &[DemuxerStream] {
-        match &self.inner {
-            DemuxerInner::Decode { streams } => streams,
-            DemuxerInner::Passthrough => &[],
-        }
-    }
-
-    fn decode_streams_mut(&mut self) -> &mut [DemuxerStream] {
-        match &mut self.inner {
-            DemuxerInner::Decode { streams } => streams,
-            DemuxerInner::Passthrough => &mut [],
-        }
-    }
+    /// One decoder per selected stream; always empty in passthrough mode.
+    streams: Vec<DemuxerStream>,
+    /// `true` when built via [`Demuxer::new_passthrough`], i.e. no decoders exist and
+    /// only raw packets are produced.
+    ///
+    /// Kept as an explicit flag instead of inferring it from `streams.is_empty()`:
+    /// an empty `streams` is also a valid decode-mode state (a container with no
+    /// decodable stream), and callers must be able to tell the two apart.
+    passthrough: bool,
 }
 
 /// stream definition for demuxer
@@ -891,8 +870,8 @@ impl<R: Reader> Demuxer<R> {
 
         Ok(Self {
             reader,
-            inner: DemuxerInner::Decode { streams },
-            states: Arc::new(DashMap::new()),
+            streams,
+            passthrough: false,
         })
     }
 
@@ -932,10 +911,8 @@ impl<R: Reader> Demuxer<R> {
 
         Ok(Self {
             reader,
-            inner: DemuxerInner::Decode {
-                streams: vec![DemuxerStream::new(decoder, stream_info)],
-            },
-            states: Arc::new(DashMap::new()),
+            streams: vec![DemuxerStream::new(decoder, stream_info)],
+            passthrough: false,
         })
     }
 
@@ -949,14 +926,19 @@ impl<R: Reader> Demuxer<R> {
     pub fn new_passthrough(reader: R) -> Result<Demuxer<R>> {
         Ok(Self {
             reader,
-            inner: DemuxerInner::Passthrough,
-            states: Arc::new(DashMap::new()),
+            streams: Vec::new(),
+            passthrough: true,
         })
     }
 
-    /// 当前为解码模式时返回解码流列表；透传模式返回空切片。
+    /// Decoders for the selected streams, in container stream order.
+    ///
+    /// Always empty in passthrough mode (no decoders are built); use
+    /// [`is_passthrough`](Self::is_passthrough) to tell "empty because of
+    /// passthrough" apart from "empty because the container has no decodable
+    /// stream".
     pub fn streams(&self) -> &[DemuxerStream] {
-        self.decode_streams()
+        &self.streams
     }
 
     /// Reads back the container chapters (title/start/end in seconds).
@@ -997,14 +979,14 @@ impl<R: Reader> Demuxer<R> {
     }
 
     pub fn get_stream(&self, index: usize) -> Result<&DemuxerStream> {
-        self.decode_streams()
+        self.streams
             .iter()
             .find(|s| s.stream_index == index)
             .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut DemuxerStream> {
-        self.decode_streams_mut()
+        self.streams
             .iter_mut()
             .find(|s| s.stream_index == index)
             .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
@@ -1023,20 +1005,9 @@ impl<R: Reader> Demuxer<R> {
         self.reader.input().nb_streams as usize
     }
 
-    fn set_flushed(&self, stream_index: usize) {
-        self.states.insert(stream_index, 1);
-    }
-
-    fn is_flushed(&self, stream_index: usize) -> bool {
-        self.states
-            .get(&stream_index)
-            .map(|v| *v.value() == 1)
-            .unwrap_or(false)
-    }
-
-    /// 是否为透传（remux）模式。
+    /// Whether this demuxer was built in passthrough (remux) mode.
     pub fn is_passthrough(&self) -> bool {
-        matches!(self.inner, DemuxerInner::Passthrough)
+        self.passthrough
     }
 
     /// 读取下一个**原始 packet**（不解码）。
@@ -1091,9 +1062,10 @@ impl<R: Reader> Demuxer<R> {
             if !read_exhausted {
                 match self.reader.read_packet() {
                     Ok(Some((stream_idx, packet))) => {
-                        let streams = self.decode_streams_mut();
-                        let Some(demux_stream) =
-                            streams.iter_mut().find(|s| s.stream_index == stream_idx)
+                        let Some(demux_stream) = self
+                            .streams
+                            .iter_mut()
+                            .find(|s| s.stream_index == stream_idx)
                         else {
                             // Packets of skipped streams (chapter tracks,
                             // unselected streams in single-stream mode, ...)
@@ -1116,26 +1088,22 @@ impl<R: Reader> Demuxer<R> {
                     }
                 }
             } else {
-                let stream_count = self.decode_streams().len();
-                for i in 0..stream_count {
-                    // 先获取 stream_idx，避免后面重复借用
-                    let stream_idx = self.decode_streams()[i].stream_index;
-
-                    // 使用实际的 stream_idx 检查状态
-                    if self.is_flushed(stream_idx) {
+                // Drain every decoder that has not reached EOF yet. The
+                // decoder's own state (`Decoder::is_flushed`) is the single
+                // source of truth here: a decoder is skipped only once it truly
+                // flushed, so a transient EAGAIN in the middle of draining never
+                // causes buffered frames to be dropped. The loop is bounded, so
+                // a decoder that keeps reporting "no frame yet" simply ends this
+                // `demux()` call with `Ok(None)`.
+                for demux_stream in self.streams.iter_mut() {
+                    if demux_stream.decoder.is_flushed() {
                         continue;
                     }
-
-                    // 然后获取stream的可变引用
-                    let demuxer_stream = &mut self.decode_streams_mut()[i];
-                    match demuxer_stream.decoder.drain_raw() {
-                        Ok(Some(frame)) => {
-                            return Ok(Some((demuxer_stream.stream_index, frame)));
-                        }
+                    let stream_idx = demux_stream.stream_index;
+                    match demux_stream.decoder.drain_raw() {
+                        Ok(Some(frame)) => return Ok(Some((stream_idx, frame))),
                         Ok(None) => {
-                            log::debug!("Stream: [{stream_idx}] Decoder flushed. EOF reached.");
-                            self.set_flushed(stream_idx);
-                            continue;
+                            log::debug!("Stream: [{stream_idx}] produced no frame this pass.");
                         }
                         Err(e) => {
                             log::error!("Stream: [{stream_idx}] Decoder Drain Error: {e}");

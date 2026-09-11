@@ -1,12 +1,21 @@
-//! 演示解码器的定位（seek）能力。
+//! Demonstrates the seek capability of a reader.
 //!
-//! 覆盖的 API（直接作用于 `Reader + Seekable`，裸 `Decoder` 同步解码）：
-//! - `Seekable::seek_to_frame` —— 定位到指定帧号
-//! - `Seekable::seek_to_timestamp` —— 定位到指定时间戳（毫秒）
-//! - `Seekable::seek_to_start` —— 回到开头
+//! The same `StreamReader` + `Seekable` code works for both a local mp4 and an
+//! http/rtsp source: whether a seek succeeds depends on the **runtime source**,
+//! so every call reports failure through `Result`, and
+//! `Seekable::is_byte_seekable` gives a cheap pre-check of the IO layer.
+//!
+//! APIs covered:
+//! - `Seekable::is_byte_seekable` — cheap pre-check for seek support
+//! - `Seekable::seek_to_frame` — seek to a frame number
+//! - `Seekable::seek_to_timestamp` — seek to a timestamp (milliseconds)
+//! - `Seekable::seek_to_start` — rewind to the beginning
+//!
+//! Usage: `cargo run --example seek [local path | http(s)/rtsp URL]`
+//! Defaults to `assets/mp4.mp4` when the argument is omitted.
 
-use rsmedia::io::Seekable;
-use rsmedia::{Decoder, DecoderBuilder, MediaType, Reader, StreamReader};
+use rsmedia::io::{AVSeekFlag, Seekable};
+use rsmedia::{Decoder, DecoderBuilder, Location, MediaType, Reader, StreamReader, Url};
 
 use anyhow::Result;
 use std::path::Path;
@@ -17,26 +26,39 @@ fn main() -> Result<()> {
         .init();
     rsmedia::init()?;
 
-    let source = Path::new("/tmp/test.mp4");
-    let mut reader = StreamReader::new(source)?;
+    let arg = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "assets/mp4.mp4".to_string());
+    let mut reader = StreamReader::new(location(&arg))?;
+
+    // Cheap pre-check of the IO layer: true for local files, in-memory data and
+    // HTTP servers honouring `Accept-Ranges`; false for live streams / pipes /
+    // most RTSP (whose demuxer may still seek by timestamp — opaque in FFmpeg
+    // 5.0+, so a `false` here does not mean seek_to_timestamp fails).
+    if reader.is_byte_seekable() {
+        println!("reader reports byte-seekable: {arg}");
+    } else {
+        println!("reader does not report byte-seekable; seek may fail or be imprecise: {arg}");
+    }
+
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
     let stream_index = decoder.stream_index();
 
-    // 1. 定位到第 3 帧（按帧号 + AVSEEK_FLAG_FRAME 定位）
-    reader.seek_to_frame(stream_index, 3, rsmpeg::ffi::AVSEEK_FLAG_FRAME as i32)?;
+    // 1. Seek to frame 3 (by frame number, with AVSEEK_FLAG_FRAME).
+    reader.seek_to_frame(stream_index, 3, AVSeekFlag::FRAME)?;
     println!(
         "seek_to_frame(3) -> pts={}",
         next_pts(&mut decoder, &mut reader)?
     );
 
-    // 2. 定位到 10 秒处（按时间戳 seek，落到最近关键帧）
+    // 2. Seek to 10s (by timestamp, landing on the nearest keyframe).
     reader.seek_to_timestamp(10_000)?;
     println!(
         "seek_to_timestamp(10_000ms) -> pts={}",
         next_pts(&mut decoder, &mut reader)?
     );
 
-    // 3. 回到开头
+    // 3. Rewind to the beginning.
     reader.seek_to_start()?;
     println!(
         "seek_to_start() -> pts={}",
@@ -46,7 +68,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 逐步读取，直到解码出下一帧并返回其 PTS。
+/// Parses a command-line argument into a [`Location`]: anything that parses as an
+/// absolute URL (scheme longer than one character, so a Windows drive letter is
+/// not mistaken for a scheme) is treated as a network source, otherwise as a
+/// local path.
+fn location(arg: &str) -> Location {
+    match Url::parse(arg) {
+        Ok(url) if url.scheme().len() > 1 => Location::from(url),
+        _ => Location::from(Path::new(arg)),
+    }
+}
+
+/// Reads until the next frame is decoded and returns its PTS.
 fn next_pts<R>(decoder: &mut Decoder, reader: &mut R) -> Result<i64>
 where
     R: Reader,

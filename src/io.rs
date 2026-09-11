@@ -22,6 +22,13 @@ const AVERROR_EIO: i32 = -libc::EIO;
 /// avio 内部缓冲大小（读写回调模式的滚动窗口）。
 const AVIO_BUFFER_SIZE: usize = 4096;
 
+ffi_enum_flags!(AVSeekFlag, i32 {
+    BACKWARD => ffi::AVSEEK_FLAG_BACKWARD;
+    BYTE => ffi::AVSEEK_FLAG_BYTE;
+    ANY => ffi::AVSEEK_FLAG_ANY;
+    FRAME => ffi::AVSEEK_FLAG_FRAME;
+});
+
 pub trait Reader {
     fn input(&self) -> &AVFormatContextInput;
     fn input_mut(&mut self) -> &mut AVFormatContextInput;
@@ -54,24 +61,81 @@ pub trait Reader {
     }
 }
 
-/// 支持随机定位（seek）的 [`Reader`] 能力接口。
+/// Random-access (seek) capability interface.
 ///
-/// 通过该 trait（而非具体类型判断）表达 seek 能力，任何基于可 seek
-/// 后端（文件、内存缓冲等）实现的 Reader 都可以实现它；Decoder 等上层
-/// 消费者以 `R: Reader + Seekable` 的形式在编译期获得该能力。
+/// This trait expresses "**seek operations are available**", not "a seek is
+/// guaranteed to succeed". Whether a seek works depends on the **runtime
+/// source**, which is why every method returns [`Result`] and reports the
+/// underlying FFmpeg error on failure. A single [`StreamReader`] can read both a
+/// local mp4 and an http/rtsp source, so both share this one API; the only
+/// difference is whether a seek succeeds at runtime:
+///
+/// | Source | Seekable | Notes |
+/// |--------|----------|-------|
+/// | Local file (`file` protocol) | yes | regular files are always byte-seekable |
+/// | In-memory buffer ([`BufferReader`]) | yes | a seek callback is installed, so seeking always works |
+/// | HTTP(S) | server-dependent | seekable when the server returns `Accept-Ranges: bytes`; chunked/live responses usually are not |
+/// | RTSP / RTP | server-dependent | depends on whether the server supports Range / PLAY jumps |
+///
+/// Use [`is_byte_seekable`](Seekable::is_byte_seekable) for a cheap pre-check
+/// of the IO layer; container-level demuxer seek (e.g. RTSP) is opaque in
+/// FFmpeg 5.0+ and cannot be probed, so treat the return value of each
+/// `seek_*` call as authoritative.
+///
+/// # Example
+///
+/// ```no_run
+/// use rsmedia::io::Seekable;
+/// use rsmedia::{StreamReader, Url};
+///
+/// # fn main() -> rsmedia::error::Result<()> {
+/// // Network source: URLs and local paths share the same seek API.
+/// let url = Url::parse("https://example.com/video.mp4").unwrap();
+/// let mut reader = StreamReader::new(url)?;
+/// if reader.is_byte_seekable() {
+///     reader.seek_to_timestamp(10_000)?; // seek to the keyframe near 10s
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub trait Seekable: Reader {
+    /// Whether the underlying IO is byte-addressable, i.e. FFmpeg's
+    /// `AVIOContext::seekable` has the `AVIO_SEEKABLE_NORMAL` bit set.
+    ///
+    /// - Local files and in-memory buffers ([`BufferReader`]): `true`.
+    /// - HTTP(S): `true` when the server returns `Accept-Ranges: bytes`.
+    /// - Live streams / pipes / most RTSP: `false`.
+    ///
+    /// This is the strongest **cheaply detectable** signal for "will a seek
+    /// work" (e.g. whether to enable a draggable progress bar without doing an
+    /// actual seek, which resets decoders and drops buffered data), but it is
+    /// still **neither necessary nor sufficient**:
+    ///
+    /// - Demuxer-level container seek is opaque since FFmpeg 5.0
+    ///   (`AVInputFormat` no longer exposes `read_seek`), so e.g. RTSP reports
+    ///   `false` yet may still seek by timestamp through its own `read_seek`.
+    /// - Conversely `AVFMT_NO_BYTE_SEEK` (set even by mp4/mov) only forbids
+    ///   `AVSEEK_FLAG_BYTE`, not timestamp seeks, so it is deliberately *not*
+    ///   consulted here.
+    ///
+    /// Treat the return value of each `seek_*` call as the authority.
+    fn is_byte_seekable(&self) -> bool {
+        let pb = self.input().pb;
+        unsafe { !pb.is_null() && ((*pb).seekable & ffi::AVIO_SEEKABLE_NORMAL as i32) != 0 }
+    }
+
     /// Seek in reader. This will change the reader head so that it points to a location within one
     /// second of the target timestamp or it will return an error.
     ///
     /// # Arguments
     ///
-    /// * `timestamp_milliseconds` - Number of millisecond from start of video to seek to.
-    fn seek_to_timestamp(&mut self, timestamp_milliseconds: i64) -> Result<()> {
+    /// * `timestamp_ms` - Number of millisecond from start of video to seek to.
+    fn seek_to_timestamp(&mut self, timestamp_ms: i64) -> Result<()> {
         // Conversion factor from timestamp in milliseconds to `TIME_BASE` units.
         const CONVERSION_FACTOR: i64 = (ffi::AV_TIME_BASE_Q.den / 1000) as i64;
         // One second left and right leeway when seeking.
         const LEEWAY: i64 = ffi::AV_TIME_BASE_Q.den as i64;
-        let timestamp = CONVERSION_FACTOR * timestamp_milliseconds;
+        let timestamp = CONVERSION_FACTOR * timestamp_ms;
         // 注意区间必须不对称（max 比 min 更贴近 ts）：`avformat_seek_file` 会
         // 忽略调用方的 BACKWARD 标志，并对不支持 read_seek2 的 demuxer 依据
         // `(ts - min) > (max - ts)` 推导回退方向（见 libavformat/seek.c）。
@@ -105,12 +169,19 @@ pub trait Seekable: Reader {
     ///
     /// * `stream_index` - The index of the stream to seek to.
     /// * `frame_ts` - The timestamp of the target frame. This is typically derived from the frame's presentation timestamp (PTS).
-    /// * `flags` - Flags to use when seeking. Possible values include:
-    ///   - `AVSEEK_FLAG_BACKWARD` (1) <- Seek backward.
-    ///   - `AVSEEK_FLAG_BYTE` (2) <- Seek based on position in bytes.
-    ///   - `AVSEEK_FLAG_ANY` (4) <- Seek to any frame, even non-key frames.
-    ///   - `AVSEEK_FLAG_FRAME` (8) <- Seek based on frame number.
-    fn seek_to_frame(&mut self, stream_index: usize, frame_ts: i64, flags: i32) -> Result<()> {
+    /// * `flags` - [`AVSeekFlag`] bit flags, combinable with `|`, e.g.
+    ///   `AVSeekFlag::BACKWARD | AVSeekFlag::ANY` (or mixed with a raw mask:
+    ///   `AVSeekFlag::ANY | 2`); a raw `i32` is also accepted.
+    ///   [`AVSeekFlag::FRAME`] alone seeks by frame number,
+    ///   [`AVSeekFlag::BYTE`] seeks by byte position, and [`AVSeekFlag::ANY`]
+    ///   allows landing on a non-keyframe.
+    fn seek_to_frame(
+        &mut self,
+        stream_index: usize,
+        frame_ts: i64,
+        flags: impl Into<i32>,
+    ) -> Result<()> {
+        let flags = flags.into();
         unsafe {
             let res = ffi::av_seek_frame(
                 self.input_mut().as_mut_ptr(),
@@ -119,14 +190,28 @@ pub trait Seekable: Reader {
                 flags,
             );
             if res < 0 {
-                return Err(RsmediaError::custom(format!("Seek to frame failed: {res}")));
+                return Err(RsmediaError::custom(format!(
+                    "Seek to frame failed: stream={stream_index}, ts={frame_ts}, flags={flags}, err={res}"
+                )));
             }
             Ok(())
         }
     }
 }
 
-/// `avformat_seek_file` 薄封装：`min`/`ts`/`max` 构成目标区间。
+/// Thin wrapper over `avformat_seek_file`: `min`/`ts`/`max` bound the target interval.
+///
+/// # Arguments
+///
+/// * `input` - The input context.
+/// * `stream_index` - Target stream index; `-1` means timestamps are in `AV_TIME_BASE` units.
+/// * `min` / `ts` / `max` - Target interval, inclusive on both ends.
+///
+/// Always called with `flags = 0`: `avformat_seek_file` ignores
+/// `AVSEEK_FLAG_BACKWARD` and derives the seek direction from the **asymmetry**
+/// of the interval instead (see [`Seekable::seek_to_timestamp`]). Use
+/// [`Seekable::seek_to_frame`] when `AVSeekFlag` values such as `FRAME` / `BYTE`
+/// are needed.
 fn seek_file(
     input: &mut AVFormatContextInput,
     stream_index: i32,
@@ -422,6 +507,10 @@ impl<'a> StreamReaderBuilder<'a> {
 }
 
 /// Video reader that can read from files or URLs.
+///
+/// Implements [`Seekable`]: local files are always byte-seekable, whereas
+/// network sources (http/rtsp) depend on the protocol and the server — see the
+/// capability table on [`Seekable`].
 pub struct StreamReader {
     pub source: Location,
     pub input: AVFormatContextInput,
@@ -567,7 +656,9 @@ impl<'a> BufferReaderBuilder<'a> {
 
 /// Video reader that reads from an in-memory buffer.
 ///
-/// 支持随机定位（实现了 [`Seekable`]），因为整个输入都在内存中。
+/// Implements [`Seekable`]: the whole input lives in memory and the custom AVIO
+/// installs a seek callback, so FFmpeg sets `AVIO_SEEKABLE_NORMAL` and
+/// [`Seekable::is_byte_seekable`] is always `true`.
 pub struct BufferReader {
     input: AVFormatContextInput,
     // 保活 interrupt_callback 的 opaque 数据，见 [`StreamReader::interrupt`]。
@@ -697,9 +788,9 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
 
 /// Video reader that reads from any [`std::io::Read`] implementor.
 ///
-/// 流式输入（socket、管道、解密流等），不支持 seek。由于
-/// `avformat_open_input` 需要 probe，`reader` 必须能重复读取（无需 seek，
-/// probe 只前进不回退）。
+/// For streaming inputs (sockets, pipes, decryptors, ...). Does **not** implement
+/// [`Seekable`]. Because `avformat_open_input` needs to probe, `reader` must be
+/// re-readable; no seeking is required since probing only moves forward.
 pub struct IoReader {
     input: AVFormatContextInput,
     // 保活 interrupt_callback 的 opaque 数据，见 [`StreamReader::interrupt`]。
@@ -1591,6 +1682,30 @@ mod tests {
     use crate::{DecoderBuilder, MediaType};
     use rsmpeg::avutil::AVFrame;
 
+    /// `ffi_enum_flags!` 生成的组合能力：`|` 组合与 `Into<i32>` 转换。
+    #[test]
+    fn test_avseek_flag_bitops() {
+        // 注意：rsmpeg 侧的 AVSEEK_FLAG_* 常量类型为 u32，断言时归一化到 i32。
+        let combined = AVSeekFlag::BACKWARD | AVSeekFlag::ANY;
+        assert_eq!(
+            combined,
+            ffi::AVSEEK_FLAG_BACKWARD as i32 | ffi::AVSEEK_FLAG_ANY as i32
+        );
+
+        // 与 rsmpeg 的 u32 常量混合时需显式 `as i32`（宏只实现 BitOr<i32>，
+        // 以免 repr=u32 的旗标枚举生成重复 impl）。
+        let mixed = AVSeekFlag::FRAME | (ffi::AVSEEK_FLAG_BYTE as i32);
+        assert_eq!(
+            mixed,
+            ffi::AVSEEK_FLAG_FRAME as i32 | ffi::AVSEEK_FLAG_BYTE as i32
+        );
+
+        let raw: i32 = AVSeekFlag::FRAME.into();
+        assert_eq!(raw, ffi::AVSEEK_FLAG_FRAME as i32);
+        // as_raw 与 Into 结果一致
+        assert_eq!(AVSeekFlag::BYTE.as_raw(), i32::from(AVSeekFlag::BYTE));
+    }
+
     /// 生成 RGB24 渐变测试帧（image2 序列写入用）。
     fn generate_rgb_frame(width: usize, height: usize, index: i64) -> AVFrame {
         let mut frame = AVFrame::new();
@@ -1774,6 +1889,33 @@ mod tests {
             .expect("expected a frame after seek to start");
         assert!(frame.width > 0 && frame.height > 0);
 
+        Ok(())
+    }
+
+    /// Local mp4: `StreamReader`'s underlying IO is byte-seekable, so
+    /// `is_byte_seekable` must be `true` and `seek_to_start` must succeed.
+    #[test]
+    fn test_stream_reader_local_is_byte_seekable() -> Result<()> {
+        let mut reader = StreamReader::new(std::path::Path::new("assets/mp4.mp4"))?;
+        assert!(
+            reader.is_byte_seekable(),
+            "local file IO should report byte-seekable"
+        );
+        reader.seek_to_start()?;
+        Ok(())
+    }
+
+    /// In-memory input: `BufferReader` installs a seek callback, so FFmpeg sets
+    /// `AVIO_SEEKABLE_NORMAL` and `is_byte_seekable` is always `true`.
+    #[test]
+    fn test_buffer_reader_is_byte_seekable() -> Result<()> {
+        let data = std::fs::read("assets/mp4.mp4")?;
+        let mut reader = BufferReader::new(data)?;
+        assert!(
+            reader.is_byte_seekable(),
+            "in-memory reader with a seek callback should report byte-seekable"
+        );
+        reader.seek_to_start()?;
         Ok(())
     }
 

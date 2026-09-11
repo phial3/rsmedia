@@ -1,6 +1,6 @@
 use image::{ImageBuffer, Rgb};
 
-use rsmedia::io::Seekable;
+use rsmedia::io::{AVSeekFlag, Seekable};
 use rsmedia::{DecoderBuilder, FrameFormat, MediaFrame, MediaType, StreamReader, filter};
 
 use anyhow::{Context, Result};
@@ -52,11 +52,7 @@ async fn main() -> Result<()> {
 
     // seek to the 20th frame
     reader
-        .seek_to_frame(
-            decoder.stream_index(),
-            20,
-            rsmpeg::ffi::AVSEEK_FLAG_FRAME as i32,
-        )
+        .seek_to_frame(decoder.stream_index(), 20, AVSeekFlag::FRAME)
         .unwrap();
 
     loop {

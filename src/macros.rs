@@ -279,3 +279,72 @@ macro_rules! ffi_enum {
         }
     };
 }
+
+/// FFI 可组合位旗标宏：在 [`ffi_enum!`] 的基础上额外生成 `From<$enum> for $repr`
+/// （即 `Into<$repr>`）与 `BitOr` 组合运算，供 `Enum::A | Enum::B`、
+/// `Enum::A | raw` 等位标志组合（结果为原始整数，因为任意组合值不一定是合法变体）。
+///
+/// 仅用于**语义上是位标志**（可按位或组合）的常量组（如 `AVSEEK_FLAG_*`）；
+/// 纯互斥枚举（如 `AV_PIX_FMT_*` ID）请用 [`ffi_enum!`]，避免暴露无意义的 `|`。
+///
+/// # 参数
+/// ffi_enum_flags!(EnumName, ReprType { ... });
+///
+/// # Example
+///
+/// ```ignore
+/// ffi_enum_flags!(AVSeekFlag, i32 {
+///     BACKWARD => ffi::AVSEEK_FLAG_BACKWARD;
+///     BYTE     => ffi::AVSEEK_FLAG_BYTE;
+///     ANY      => ffi::AVSEEK_FLAG_ANY;
+///     FRAME    => ffi::AVSEEK_FLAG_FRAME;
+/// });
+///
+/// // 组合：结果为 i32，可直接传给接收 `impl Into<i32>` 的 API
+/// let flags = AVSeekFlag::BACKWARD | AVSeekFlag::ANY;
+/// ```
+macro_rules! ffi_enum_flags {
+    (
+        $(#[$enum_doc:meta])*
+        $enum_ident:ident, $repr_ty:ty {
+            $(
+                $(#[$var_meta:meta])*
+                $var:ident => $ffi_val:expr;
+            )*
+        }
+    ) => {
+        ffi_enum!(
+            $(#[$enum_doc])*
+            $enum_ident, $repr_ty {
+                $(
+                    $(#[$var_meta])*
+                    $var => $ffi_val;
+                )*
+            }
+        );
+
+        impl From<$enum_ident> for $repr_ty {
+            fn from(v: $enum_ident) -> Self {
+                v.as_raw()
+            }
+        }
+
+        /// `Enum::A | Enum::B`：组合位标志，结果为原始整数。
+        impl std::ops::BitOr for $enum_ident {
+            type Output = $repr_ty;
+
+            fn bitor(self, rhs: Self) -> Self::Output {
+                self.as_raw() | rhs.as_raw()
+            }
+        }
+
+        /// `Enum::A | raw`：与原始旗标值混合组合。
+        impl std::ops::BitOr<$repr_ty> for $enum_ident {
+            type Output = $repr_ty;
+
+            fn bitor(self, rhs: $repr_ty) -> Self::Output {
+                self.as_raw() | rhs
+            }
+        }
+    };
+}

@@ -36,7 +36,7 @@ pub use error::{Error, Result, RsmediaError};
 pub use filter::Filter;
 pub use fmt::{FrameFormat, SampleFormat};
 pub use init::init;
-pub use io::{Reader, Writer};
+pub use io::{AVSeekFlag, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
 pub use mux::Chapter;
