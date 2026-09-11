@@ -186,18 +186,28 @@ impl SubtitleSegment {
     }
 }
 
-/// 从 ASS `Dialogue:` 行提取正文文本（第 10 个字段，即第 9 个逗号之后）。
+/// Extracts the text payload from an ASS rect string.
 ///
-/// 行格式：`Dialogue: layer,start,end,style,name,marginL,marginR,marginV,effect,text`。
-/// 正文本身可包含逗号，因此只按前 9 个逗号切分。
+/// Two shapes occur in practice, distinguished by the optional prefix:
+///
+/// - **Full `Dialogue:` line** (`Dialogue: layer,start,end,style,name,ML,MR,MV,effect,text`,
+///   produced by ASS/SRT decoders in transcode pipelines) — text starts after
+///   the 9th comma.
+/// - **`AVCodecContext`-internal shape** (`readorder,layer,style,name,ML,MR,MV,effect,text`,
+///   produced by the mov_text decoder) — no prefix and no timestamps, so text
+///   starts after the 8th comma.
+///
+/// The text itself may contain commas, so only the fixed leading fields are
+/// split. ASS hard/soft line breaks (`\N` / `\n`) are normalised to newlines.
 fn ass_dialogue_text(ass: &CStr) -> Option<String> {
     let line = ass.to_str().ok()?;
+    let fields_before_text = if line.starts_with("Dialogue:") { 9 } else { 8 };
     let mut commas = 0usize;
     let mut text_start = None;
     for (i, ch) in line.char_indices() {
         if ch == ',' {
             commas += 1;
-            if commas == 9 {
+            if commas == fields_before_text {
                 text_start = Some(i + 1);
                 break;
             }

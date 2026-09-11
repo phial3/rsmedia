@@ -931,14 +931,6 @@ impl Encoder {
     }
 
     /// ASS 时间格式 `H:MM:SS.cc`（厘秒精度）。
-    fn ass_timestamp(ms: i64) -> String {
-        let ms = ms.max(0);
-        let (h, rem) = (ms / 3_600_000, ms % 3_600_000);
-        let (m, rem) = (rem / 60_000, rem % 60_000);
-        let (s, cs) = (rem / 1000, (rem % 1000) / 10);
-        format!("{h}:{m:02}:{s:02}.{cs:02}")
-    }
-
     /// 编码一条字幕段落（仅字幕编码器）。
     ///
     /// 字幕编码走 rsmpeg 的 [`AVCodecContext::encode_subtitle`]（同步 API，无
@@ -956,16 +948,16 @@ impl Encoder {
             return Ok(Vec::new());
         }
 
-        // 构建含单个 ASS 文本 rect 的 AVSubtitle：rect 的 ass 为完整
-        // Dialogue 行（含起止时间），由 rsmpeg 分配并在 subtitle Drop 时
-        // 经 avsubtitle_free 释放。
+        // Build a single ASS text rect. `AVCodecContext::encode_subtitle`
+        // hands `rect.ass` to the codec's `ff_ass_split_dialog`, whose
+        // hardcoded field list is `ReadOrder, Layer, Style, Name, MarginL,
+        // MarginR, MarginV, Effect, Text` — **no start/end timestamps**: the
+        // timings are carried by the packet pts/duration set below. A full
+        // `Dialogue:` line would shift every field by two (the timestamps get
+        // eaten by Layer/Style) and surface as a stray comma prepended to the
+        // decoded text plus a spurious zero-style record.
         let mut subtitle = AVSubtitle::new();
-        let dialogue = format!(
-            "Dialogue: 0,{},{},Default,,0,0,0,,{}",
-            Self::ass_timestamp(segment.start_ms),
-            Self::ass_timestamp(segment.end_ms),
-            segment.text
-        );
+        let dialogue = format!("0,0,Default,,0,0,0,,{}", segment.text);
         let dialogue_c = std::ffi::CString::new(dialogue)
             .map_err(|e| RsmediaError::custom(format!("Subtitle text contains NUL byte: {e}")))?;
         subtitle
@@ -1290,7 +1282,7 @@ impl Encoder {
                 } else {
                     self.pix_fmt()
                 };
-                if frame.format != target_sw_pix_fmt.into() {
+                if frame.format != i32::from(target_sw_pix_fmt) {
                     swctx::scale_with_flags(
                         &frame,
                         frame.width,
@@ -1614,7 +1606,6 @@ unsafe impl Send for Encoder {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use std::collections::HashMap;
 
     // ====================================================================

@@ -858,7 +858,7 @@ mod tests {
 
         assert_eq!(dst.width, 32);
         assert_eq!(dst.height, 32);
-        assert_eq!(dst.format, PixelFormat::RGB24.into());
+        assert_eq!(dst.format, i32::from(PixelFormat::RGB24));
 
         // 输出缓冲非零
         unsafe {
@@ -915,7 +915,7 @@ mod tests {
 
         assert_eq!(dst.width, 32);
         assert_eq!(dst.height, 32);
-        assert_eq!(dst.format, PixelFormat::RGB24.into());
+        assert_eq!(dst.format, i32::from(PixelFormat::RGB24));
         unsafe {
             let data = std::slice::from_raw_parts(dst.data[0], dst.linesize[0] as usize * 32);
             assert!(!data.iter().all(|&b| b == 0), "scaled output is empty");

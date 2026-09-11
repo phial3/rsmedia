@@ -37,12 +37,12 @@ pub const AUDIO_MEDIA_SECS: f64 = 3.0;
 
 /// Subtitle job: 30 mov_text segments, one cue every 2 s (60 s of media).
 pub const SEGMENTS_PER_JOB: usize = 30;
-pub const SUBTITLE_MEDIA_SECS: f64 = 60.0;
+pub const SUBTITLE_MEDIA_SECS: f64 = 3.0;
 
 /// Jobs of each kind per pool batch in `encode_pipeline`.
 pub const JOBS_PER_KIND: usize = 4;
 
-const ASS_HEADER: &str = "[Script Info]\n\
+pub const ASS_HEADER: &str = "[Script Info]\n\
      ScriptType: v4.00+\n\
      \n\
      [V4+ Styles]\n\

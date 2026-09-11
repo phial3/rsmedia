@@ -2463,7 +2463,7 @@ mod tests {
             assert_eq!(media.format, FrameFormat::Pixel(fmt));
 
             let back = media.to_avframe()?;
-            assert_eq!(back.format, fmt.into());
+            assert_eq!(back.format, i32::from(fmt));
             assert_eq!(back.width as usize, width);
             assert_eq!(back.height as usize, height);
 

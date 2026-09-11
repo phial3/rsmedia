@@ -835,7 +835,7 @@ impl Decoder {
                         })?,
                     None => (sw_frame.width as u32, sw_frame.height as u32),
                 };
-                if sw_frame.format != target_sw_pix_fmt.into()
+                if sw_frame.format != i32::from(target_sw_pix_fmt)
                     || sw_frame.width != out_w as i32
                     || sw_frame.height != out_h as i32
                 {
@@ -1253,7 +1253,7 @@ mod tests {
 
         let mut frames = 0usize;
         while let Some(frame) = decoder.decode_raw(&mut reader)? {
-            assert_eq!(frame.format, PixelFormat::RGB24.into());
+            assert_eq!(frame.format, i32::from(PixelFormat::RGB24));
             frames += 1;
         }
         assert!(frames > 0, "expected at least one decoded frame");

@@ -701,7 +701,9 @@ impl HWDeviceType {
                     let hw_config_supports_codec = ((*hw_config).methods as i32
                         & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32)
                         != 0;
-                    if hw_config_supports_codec && (*hw_config).device_type == (*self).into() {
+                    if hw_config_supports_codec
+                        && HWDeviceType::from((*hw_config).device_type) == *self
+                    {
                         break Some((*hw_config).pix_fmt);
                     }
                 } else {

@@ -29,22 +29,9 @@ use std::time::Duration;
 
 mod common;
 use common::{
-    AUDIO_FRAMES, CHANNELS, FPS, HEIGHT, SAMPLE_RATE, SEGMENTS_PER_JOB, VIDEO_FRAMES, WIDTH,
-    bench_dir, cores,
+    ASS_HEADER, AUDIO_FRAMES, CHANNELS, FPS, HEIGHT, SAMPLE_RATE, SEGMENTS_PER_JOB, VIDEO_FRAMES,
+    WIDTH, bench_dir, cores,
 };
-
-const ASS_HEADER: &str = "[Script Info]\n\
-     ScriptType: v4.00+\n\
-     \n\
-     [V4+ Styles]\n\
-     Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, \
-     OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, \
-     ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, \
-     Alignment, MarginL, MarginR, MarginV, Encoding\n\
-     Style: Default,Arial,16,&Hffffff,&Hffffff,&H0,&H0,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n\
-     \n\
-     [Events]\n\
-     Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
 
 /// One iteration: a complete 3-stream MP4 (2 s video + ~3 s audio + 30
 /// subtitle cues), every encoder using `enc_threads` threads.
@@ -83,10 +70,14 @@ fn encode_container(path: &Path, enc_threads: usize) -> Result<()> {
     for i in 0..VIDEO_FRAMES {
         let frame = rainbow_frame(i as f32 / VIDEO_FRAMES as f32).to_avframe()?;
         for mut pkt in v_enc.encode_raw(frame)? {
-            if pkt.duration <= 0 {
-                pkt.set_duration(v_frame_ticks);
-            }
-            write_packet(&mut writer, &mut pkt, v_idx, v_enc.time_base(), v_tb)?;
+            write_packet(
+                &mut writer,
+                &mut pkt,
+                v_idx,
+                v_enc.time_base(),
+                v_tb,
+                v_frame_ticks,
+            )?;
         }
     }
 
@@ -100,26 +91,34 @@ fn encode_container(path: &Path, enc_threads: usize) -> Result<()> {
         let nb = 700u32 + ((i as u32 * 173) % 1200);
         let frame = sine_audio_frame(nb).to_avframe()?;
         for mut pkt in a_enc.encode_raw(frame)? {
-            if pkt.duration <= 0 {
-                pkt.set_duration(a_frame_ticks);
-            }
-            write_packet(&mut writer, &mut pkt, a_idx, a_enc.time_base(), a_tb)?;
+            write_packet(
+                &mut writer,
+                &mut pkt,
+                a_idx,
+                a_enc.time_base(),
+                a_tb,
+                a_frame_ticks,
+            )?;
         }
     }
 
     // Subtitle segments (synchronous encode API; no drain/flush buffering).
     let segments: Vec<SubtitleSegment> = (0..SEGMENTS_PER_JOB)
         .map(|i| {
+            // One cue every 100 ms within the ~3 s media window, so the
+            // subtitle track duration matches the video/audio tracks (a
+            // track extending far beyond the others inflates the movie
+            // duration and breaks seeking in players).
             SubtitleSegment::new(
-                (i * 2000) as i64,
-                (i * 2000 + 1800) as i64,
+                (i * 100) as i64,
+                (i * 100 + 90) as i64,
                 format!("Line {i} of the container benchmark"),
             )
         })
         .collect();
     for segment in &segments {
         for mut pkt in s_enc.encode_subtitle_segment(segment)? {
-            write_packet(&mut writer, &mut pkt, s_idx, s_enc.time_base(), s_tb)?;
+            write_packet(&mut writer, &mut pkt, s_idx, s_enc.time_base(), s_tb, 0)?;
         }
     }
 
@@ -138,10 +137,18 @@ fn write_packet(
     stream_idx: usize,
     enc_tb: rsmpeg::ffi::AVRational,
     out_tb: rsmpeg::ffi::AVRational,
+    fallback_duration_ticks: i64,
 ) -> Result<()> {
     pkt.set_pos(-1);
     pkt.set_stream_index(stream_idx as i32);
+    // `rescale_ts` converts pts/dts AND duration from enc_tb to out_tb. The
+    // duration must therefore be set AFTER this call: a value assigned in
+    // out_tb units beforehand gets converted a second time (inflating it by
+    // the enc_tb/out_tb ratio and corrupting the track's tkhd/elst duration).
     pkt.rescale_ts(enc_tb, out_tb);
+    if pkt.duration <= 0 && fallback_duration_ticks > 0 {
+        pkt.set_duration(fallback_duration_ticks);
+    }
     writer.write_interleaved(pkt)?;
     Ok(())
 }
