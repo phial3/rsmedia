@@ -350,13 +350,6 @@ impl HWContext {
     ///
     /// # Returns
     /// * `Result<AVFrame>` - A new frame in system memory with transferred data
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let hw_frame = // ... frame from decoder
-    /// let sw_frame = hw_context.hw_download(&hw_frame)?;
-    /// // Now sw_frame contains the data in CPU memory
-    /// ```
     pub fn hw_download(&self, hw_frame: &AVFrame) -> Result<AVFrame> {
         let hw_down_start = std::time::Instant::now();
 
@@ -408,13 +401,6 @@ impl HWContext {
     ///
     /// # Returns
     /// * `Result<AVFrame>` - A new frame in hardware memory with transferred data
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let sw_frame = // ... frame in system memory
-    /// let hw_frame = hw_context.hw_upload(&sw_frame)?;
-    /// // Now hw_frame contains the data in GPU memory
-    /// ```
     pub fn hw_upload(&self, encoder: &mut AVCodecContext, sw_frame: &AVFrame) -> Result<AVFrame> {
         let hw_up_start = std::time::Instant::now();
 

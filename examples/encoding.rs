@@ -41,15 +41,20 @@ fn main() -> anyhow::Result<()> {
 
     let output_path = Path::new("/tmp/rainbow.mp4");
 
-    let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
+    let encoder = EncoderBuilder::new_video(width as usize, height as usize)
         // encoder with CUDA acceleration
         // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
         // libx264, libx265, h264_nvenc, h264_vaapi
         // .with_codec_name("h264_nvenc".to_string())
         // .with_options(Options::preset_h264_nvenc())
         .with_filters(filters)
-        .build_wrapped(output_path)
+        .build()
         .expect("failed to create encoder");
+    let enc_tb = encoder.time_base();
+    let mut muxer = rsmedia::mux::Muxer::new(output_path).expect("failed to create muxer");
+    let v_idx = muxer
+        .add_stream(encoder)
+        .expect("failed to add video stream");
 
     // 方法一：encoder.encode() 手动记录 position
     // let duration: Time = Time::from_nth_of_a_second(24);
@@ -74,14 +79,17 @@ fn main() -> anyhow::Result<()> {
     //     position = position.aligned_with(duration).add();
     // }
 
-    // 方法二：encoder.write_frame() 自动记录 position
+    // 方法二：encoder.mux() 手动记录 position
     for i in 0..256 {
         // This will create a smooth rainbow animation video!
         let frame = rainbow_frame(width as usize, height as usize, i as f32 / 256.0);
-        encoder.write_frame(frame)?;
+        let mut av = frame.to_avframe()?;
+        av.set_pts(i as i64);
+        av.set_time_base(enc_tb);
+        muxer.mux(av, v_idx)?;
     }
 
-    encoder.finish()?;
+    muxer.finish()?;
 
     Ok(())
 }

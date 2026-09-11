@@ -14,26 +14,31 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use rsmedia::mux::Muxer;
-//! use rsmedia::pcm::{PcmSink, PcmSpec};
-//! use rsmedia::{Encoder, SampleFormat};
-//! use std::path::Path;
+//! ```no_run
+//! use rsmedia::error::Result;
+//! fn main() -> Result<()> {
+//!     use rsmedia::mux::Muxer;
+//!     use rsmedia::pcm::{PcmSink, PcmSpec};
+//!     use rsmedia::{Encoder, SampleFormat};
+//!     use std::path::Path;
 //!
-//! // 1. 按目标规格建编码器（默认 AAC）并加入 Muxer
-//! let encoder = Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?;
-//! let mut muxer = Muxer::new(Path::new("out.m4a"))?;
-//! let audio_index = muxer.add_stream(encoder)?;
+//!     // 1. 按目标规格建编码器（默认 AAC）并加入 Muxer
+//!     let encoder = Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?;
+//!     let mut muxer = Muxer::new(Path::new("out.m4a"))?;
+//!     let audio_index = muxer.add_stream(encoder)?;
 //!
-//! // 2. 用 PcmSink 绑定音频流；spec 描述实时源（如麦克风）的采样率/声道数，
-//! //    与编码器规格不一致时由内部持久重采样器自动转换
-//! let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(48_000, 2))?;
+//!     // 2. 用 PcmSink 绑定音频流；spec 描述实时源（如麦克风）的采样率/声道数，
+//!     //    与编码器规格不一致时由内部持久重采样器自动转换
+//!     let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(48_000, 2))?;
 //!
-//! // 3. 在 cpal 录音回调里直接投交错 f32 块（O(1) 内存，无需对齐 frame_size）
-//! sink.write_f32(&mic_chunk)?;
+//!     // 3. 在 cpal 录音回调里直接投交错 f32 块（O(1) 内存，无需对齐 frame_size）
+//!     let mic_chunk = vec![0.0f32; 1024];
+//!     sink.write_f32(&mic_chunk)?;
 //!
-//! // 4. 冲刷重采样尾样/编码器并写 trailer（Drop 可兜底，显式调用可感知错误）
-//! sink.finish()?;
+//!     // 4. 冲刷重采样尾样/编码器并写 trailer（Drop 可兜底，显式调用可感知错误）
+//!     sink.finish()?;
+//!     Ok(())
+//! }
 //! ```
 //!
 //! 完整可运行的 cpal 录音示例见 `examples/pcm_recorder.rs`。
@@ -124,7 +129,11 @@ impl<W: Writer> PcmSink<W> {
                     mux_stream.media_type
                 )));
             }
-            let encoder = &mux_stream.encoder;
+            let encoder = mux_stream.encoder.as_ref().ok_or_else(|| {
+                RsmediaError::custom(format!(
+                    "stream {stream_index} is a copy stream; PCM playback requires an encoder stream"
+                ))
+            })?;
             if encoder.sample_rate() <= 0 {
                 return Err(RsmediaError::invalid_config(
                     "audio encoder has invalid sample rate",

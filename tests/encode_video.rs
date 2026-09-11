@@ -140,10 +140,13 @@ fn encode_video_container(container_type: &str, codec_name: &str) -> Result<()> 
 
     let output_path = test_output_path("encode_video", &format!("test.{container_type}"));
 
-    let mut encoder = EncoderBuilder::new_video(WIDTH, HEIGHT)
+    let encoder = EncoderBuilder::new_video(WIDTH, HEIGHT)
         .with_fps(25.0)
         .with_codec_name(codec_name.to_string())
-        .build_wrapped(output_path.as_path())?;
+        .build()?;
+    let enc_tb = encoder.time_base();
+    let mut muxer = rsmedia::mux::Muxer::new(output_path.as_path())?;
+    let v_idx = muxer.add_stream(encoder)?;
 
     let mut frame = AVFrame::new();
     frame.set_format(ffi::AV_PIX_FMT_YUV420P as _);
@@ -156,11 +159,12 @@ fn encode_video_container(container_type: &str, codec_name: &str) -> Result<()> 
     for i in 0..FRAME_COUNT {
         fill_test_frame(&mut frame, i)?;
         frame.set_pts(i as i64);
-        encoder.encode_raw(frame.clone())?;
+        frame.set_time_base(enc_tb);
+        muxer.mux(frame.clone(), v_idx)?;
     }
 
     // flush encoder and write trailer
-    encoder.finish()?;
+    muxer.finish()?;
 
     Ok(())
 }

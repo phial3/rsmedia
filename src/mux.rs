@@ -8,14 +8,13 @@ use crate::{
     Decoder, DecoderBuilder, Encoder, EncoderBuilder, Location, StreamReader, StreamWriter,
 };
 
-use dashmap::DashMap;
+use rsmpeg::avcodec::AVPacket;
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ptr;
-use std::sync::Arc;
 
 /// A container chapter mark (MP4/MKV chapters), with times in seconds.
 ///
@@ -58,32 +57,26 @@ impl Chapter {
 ///
 /// Mux to an MKV file:
 ///
-/// ```rust,ignore
-/// let reader = Reader::new(Path::new("from_file.mp4")).unwrap();
-/// let writer = Writer::new(Path::new("to_file.mkv")).unwrap();
-/// let muxer = MuxerBuilder::new(writer)
-///     .with_streams(&reader)
-///     .unwrap()
-///     .build();
-/// while let Ok(packet) = reader.read() {
-///     muxer.mux(packet).unwrap();
-/// }
+/// ```no_run
+/// use std::path::Path;
+/// use rsmedia::mux::Muxer;
+/// let mut muxer = Muxer::new(Path::new("to_file.mkv")).unwrap();
+/// // Add streams and mux packets...
 /// muxer.finish().unwrap();
 /// ```
 ///
 /// Mux from file to MP4 and print length of first 100 buffer segments:
 ///
-/// ```rust,ignore
-/// let reader = Reader::new(Path::new("my_file.mp4")).unwrap();
-/// let writer = BufferWriter::new("mp4").unwrap();
-/// let mut muxer = MuxerBuilder::new(writer)
-///     .with_streams(&reader)
-///     .build()
-///     .unwrap();
-/// for _ in 0..100 {
-///     println!("len: {}", muxer.mux().unwrap().len());
+/// ```no_run
+/// use std::path::Path;
+/// use rsmedia::mux::Muxer;
+/// use rsmedia::error::Result;
+/// fn main() -> Result<()> {
+///     let mut muxer = Muxer::new(Path::new("output.mp4"))?;
+///     // Add streams and mux packets...
+///     muxer.finish()?;
+///     Ok(())
 /// }
-/// muxer.finish()?;
 /// ```
 pub struct Muxer<W: Writer> {
     pub writer: W,
@@ -102,23 +95,48 @@ pub struct Muxer<W: Writer> {
     chapters: Vec<Chapter>,
 }
 
+/// 单个输出流。既可以是编码流（持有 [`Encoder`]，由 [`Muxer::add_stream`]
+/// 创建，输入 `AVFrame`），也可以是**透传流**（`encoder` 为 `None`，由
+/// [`Muxer::add_copy_stream`] 创建，直接写入原始 `AVPacket`）。
 pub struct MuxerStream {
-    pub encoder: Encoder,
+    pub encoder: Option<Encoder>,
     pub stream_info: StreamInfo,
     pub media_type: MediaType,
     pub stream_index: usize,
+    /// 透传/remux 模式下源流的时间基，用于把 `mux_packet` 的 pts/dts
+    /// 从源流时间基换算到输出流时间基。
+    pub src_time_base: Option<ffi::AVRational>,
 }
 
 impl MuxerStream {
-    pub fn new(encoder: Encoder, stream_info: StreamInfo) -> Self {
+    pub fn new_encoded(encoder: Encoder, stream_info: StreamInfo) -> Self {
         let media_type = encoder.media_type();
         let stream_index = stream_info.index;
         Self {
-            encoder,
+            encoder: Some(encoder),
             media_type,
             stream_info,
             stream_index,
+            src_time_base: None,
         }
+    }
+
+    /// 透传流：直接拷贝源的编解码参数，`src_time_base` 用于时间戳换算。
+    pub fn new_copy(stream_info: StreamInfo, src_time_base: ffi::AVRational) -> Self {
+        let media_type = stream_info.media_type;
+        let stream_index = stream_info.index;
+        Self {
+            encoder: None,
+            media_type,
+            stream_info,
+            stream_index,
+            src_time_base: Some(src_time_base),
+        }
+    }
+
+    /// 是否为透传（copy/remux）流。
+    pub fn is_copy(&self) -> bool {
+        self.encoder.is_none()
     }
 }
 
@@ -149,12 +167,52 @@ impl<W: Writer> Muxer<W> {
         Ok(())
     }
 
+    /// 开关交错写入（interleaved）。
+    ///
+    /// 部分容器（如 MP4/MOV）要求以交错方式写包（等价于
+    /// `av_interleaved_write_frame`），并将写入推迟到输出流时间基/时长可用
+    /// 时。透传（remux）MP4 时通常需要开启。默认关闭，与编码流挨个
+    /// [`Self::mux`] 逐帧写包的旧行为保持一致。
+    pub fn set_interleaved(&mut self, interleaved: bool) -> &mut Self {
+        self.interleaved = interleaved;
+        self
+    }
+
     pub fn add_stream(&mut self, encoder: Encoder) -> Result<usize> {
         let stream_idx = self
             .writer
             .add_stream(encoder.codecpar(), encoder.time_base());
         let stream_info = StreamInfo::from_writer(&self.writer, stream_idx)?;
-        self.streams.push(MuxerStream::new(encoder, stream_info));
+        self.streams
+            .push(MuxerStream::new_encoded(encoder, stream_info));
+        Ok(stream_idx)
+    }
+
+    /// 添加一个**透传（copy）流**用于 remux（转封装，不解码不重编码）。
+    ///
+    /// 从源 demuxer 的某个流拷贝编解码参数到输出容器，并记录源流时间基
+    /// 供 [`Self::mux_packet`] 做时间戳换算。返回输出流的 index（传给
+    /// [`Self::mux_packet`]）。
+    ///
+    /// 典型用法：`Demuxer::new_passthrough` 迭代的 packet（保留原流 index）
+    /// 与 `Muxer::add_copy_stream` 输入的源流一一对应。
+    pub fn add_copy_stream(&mut self, src_info: &StreamInfo) -> Result<usize> {
+        let src_time_base = src_info.time_base;
+        let stream_idx = self
+            .writer
+            .add_stream(src_info.codec_parameters.clone(), src_info.time_base);
+        // 拷贝的 codec_parameters 携带源容器专属的 codec_tag（如 `mp4a`
+        // /`avc1`）。跨容器 remux（mp4→mkv 等）时这些 tag 与目标 muxer 不
+        // 兼容，清空后由目标 muxer 在 write_header 时自行指派正确 tag。
+        // 与 ffmpeg remux 的 `codec_tag = 0` 语义一致。
+        unsafe {
+            let ctx = self.writer.output_mut().as_mut_ptr();
+            let stream = *(*ctx).streams.add(stream_idx);
+            (*(*stream).codecpar).codec_tag = 0;
+        }
+        let stream_info = StreamInfo::from_writer(&self.writer, stream_idx)?;
+        self.streams
+            .push(MuxerStream::new_copy(stream_info, src_time_base));
         Ok(stream_idx)
     }
 
@@ -476,42 +534,109 @@ impl<W: Writer> Muxer<W> {
         Ok(())
     }
 
-    /// Mux a single packet. This will mux a single packet.
+    /// 写入 container header（并应用 metadata/chapters），带幂等判断。
+    ///
+    /// header 一旦写出，后续所有 `mux`/`mux_packet` 直接写包；本函数在首个
+    /// 包之前被主动调用，避免每个包路径各自重复 header 逻辑。
+    fn ensure_header_written(&mut self) -> Result<()> {
+        if self.have_written_header {
+            return Ok(());
+        }
+        self.have_written_header = true;
+        self.apply_metadata();
+        self.apply_chapters();
+        self.writer.write_header()?;
+        self.refresh_stream_info()
+    }
+
+    /// Mux a single frame through an encoder stream.
+    ///
+    /// 只适用于通过 [`Self::add_stream`] 添加的编码流；若目标是透传流
+    /// （[`Self::add_copy_stream`]），应改用 [`Self::mux_packet`]。
     ///
     /// # Arguments
     ///
-    /// * `packet` - [`Packet`] to mux.
+    /// * `frame` - [`AVFrame`] to encode and mux.
+    /// * `stream_idx` - Index of the target output stream.
     pub fn mux(&mut self, frame: AVFrame, stream_idx: usize) -> Result<Option<W::Out>> {
-        if self.have_written_header {
-            let interleaved = self.interleaved;
-            let mux_stream = self.get_stream_mut(stream_idx)?;
-            let enc_time_base = mux_stream.encoder.time_base();
-            let out_time_base = mux_stream.stream_info.time_base;
-            let packets = mux_stream.encoder.encode_raw(frame)?;
-            // mux_stream 对 self.streams 的借用至此结束，之后可独占使用 self.writer
+        self.ensure_header_written()?;
 
-            let mut last_out = None;
-            for mut packet in packets {
-                packet.set_pos(-1);
-                packet.set_stream_index(stream_idx as i32);
-                // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
-                // encode_ctx_timebase => out_stream_time_base
-                packet.rescale_ts(enc_time_base, out_time_base);
+        let interleaved = self.interleaved;
+        let mux_stream = self.get_stream_mut(stream_idx)?;
+        let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
+            RsmediaError::custom(format!(
+                "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
+            ))
+        })?;
+        let enc_time_base = encoder.time_base();
+        let out_time_base = mux_stream.stream_info.time_base;
+        let packets = encoder.encode_raw(frame)?;
+        // 编码器输出的 packet 常不带 duration（mpeg4 等），若缺失则按
+        // 帧率/采样率补上，否则 MP4 等交错 muxer 无法推导**最后一帧**的
+        // 时长，导致末帧被丢弃（与 Encoder::flush 的补全逻辑保持一致）。
+        let duration_fallback = encoder.packet_duration();
+        // mux_stream 对 self.streams 的借用至此结束，之后可独占使用 self.writer
 
-                last_out = if interleaved {
-                    Some(self.writer.write_interleaved(&mut packet)?)
-                } else {
-                    Some(self.writer.write_frame(&mut packet)?)
-                };
+        let mut last_out = None;
+        for mut packet in packets {
+            packet.set_pos(-1);
+            packet.set_stream_index(stream_idx as i32);
+            if packet.duration <= 0 {
+                packet.set_duration(duration_fallback);
             }
-            Ok(last_out)
+            // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
+            // encode_ctx_timebase => out_stream_time_base
+            packet.rescale_ts(enc_time_base, out_time_base);
+
+            last_out = if interleaved {
+                Some(self.writer.write_interleaved(&mut packet)?)
+            } else {
+                Some(self.writer.write_frame(&mut packet)?)
+            };
+        }
+        Ok(last_out)
+    }
+
+    /// Mux a raw (decoded_source / remux) packet through a **copy stream**.
+    ///
+    /// 用于 remux（转封装）：直接把 demuxer 读到的原始 `AVPacket` 写入输出
+    /// 容器，不解码、不重编码。pts/dts 从源流时间基（`add_copy_stream` 记录）
+    /// 换算到输出流时间基。
+    ///
+    /// # Arguments
+    ///
+    /// * `packet`   - 来自 [`Demuxer::demux_packet`] 的原始包；其 `stream_index`
+    ///   会在写入前被改写为输出流 index。
+    /// * `stream_idx` - [`Self::add_copy_stream`] 返回的输出流 index。
+    pub fn mux_packet(
+        &mut self,
+        packet: &mut AVPacket,
+        stream_idx: usize,
+    ) -> Result<Option<W::Out>> {
+        self.ensure_header_written()?;
+
+        let (src_time_base, out_time_base) = {
+            let mux_stream = self.get_stream(stream_idx)?;
+            let src_time_base = mux_stream.src_time_base.ok_or_else(|| {
+                RsmediaError::custom(format!(
+                    "Stream {stream_idx} is not a copy stream: use mux() instead of mux_packet()"
+                ))
+            })?;
+            // 输出流头写出后 muxer 可能重设 time_base（如 MP4），必须实时取。
+            let out_time_base = self.writer.stream_time_base(stream_idx);
+            (src_time_base, out_time_base)
+        };
+
+        packet.set_pos(-1);
+        packet.set_stream_index(stream_idx as i32);
+        // src_stream_time_base => out_stream_time_base（重复调用会重复换算，
+        // 因此只在我们自己保存的源时间基与输出时间基之间进行一次换算）
+        packet.rescale_ts(src_time_base, out_time_base);
+
+        if self.interleaved {
+            self.writer.write_interleaved(packet).map(Some)
         } else {
-            self.have_written_header = true;
-            self.apply_metadata();
-            self.apply_chapters();
-            self.writer.write_header()?;
-            self.refresh_stream_info()?;
-            self.mux(frame, stream_idx)
+            self.writer.write_frame(packet).map(Some)
         }
     }
 
@@ -526,9 +651,13 @@ impl<W: Writer> Muxer<W> {
 
         for mux_stream in self.streams.iter_mut() {
             // flush the encoder to ensure all packets are sent to the muxer.
+            // 透传流没有编码器延迟缓冲，无需 flush。
+            let Some(encoder) = mux_stream.encoder.as_mut() else {
+                continue;
+            };
             let out_stream_index = mux_stream.stream_index;
             let out_stream_time_base = mux_stream.stream_info.time_base;
-            mux_stream.encoder.flush(
+            encoder.flush(
                 &mut self.writer,
                 self.interleaved,
                 out_stream_index,
@@ -545,10 +674,39 @@ impl<W: Writer> Muxer<W> {
             Ok(None)
         }
     }
+
+    /// Consumes the muxer and returns the underlying writer.
+    ///
+    /// 应在 [`Self::finish`] 之后调用；此时 trailer 已写出，可从 writer 中
+    /// 取回最终输出（如 [`crate::io::BufferWriter::into_bytes`] 或
+    /// [`crate::io::CustomIoWriter::into_inner`]）。若忘记调用 `finish()`，
+    /// 此处会自动补写 trailer（与 `Drop` 的兜底行为一致）。
+    pub fn into_writer(mut self) -> W {
+        // 先补写 trailer，使 Drop 的自动 flush 逻辑成为空操作。
+        if self.have_written_header
+            && !self.have_written_trailer
+            && let Err(err) = self.finish()
+        {
+            log::error!("Failed to auto-flush muxer on into_writer: {err:#}");
+        }
+        // SAFETY: `Muxer` 实现了 `Drop`，不能直接 move 字段。此处用
+        // `ManuallyDrop` 跳过 `Muxer::Drop`（此时其逻辑已是空操作），
+        // 取走 writer 后手动析构其余字段，保证 encoder 等资源正常释放。
+        unsafe {
+            let mut this = std::mem::ManuallyDrop::new(self);
+            let writer = std::ptr::read(&this.writer);
+            std::ptr::drop_in_place(&mut this.streams);
+            std::ptr::drop_in_place(&mut this.metadata);
+            std::ptr::drop_in_place(&mut this.stream_metadata);
+            std::ptr::drop_in_place(&mut this.chapters);
+            writer
+        }
+    }
 }
 
-unsafe impl<W: Writer> Send for Muxer<W> {}
-unsafe impl<W: Writer> Sync for Muxer<W> {}
+/// SAFETY: 仅承诺可移动到其他线程独占使用（`Send`）。`AVFormatContext` 及
+/// 内部 encoder 均非线程安全，`&Self` 跨线程共享（`Sync`）不成立，故不实现。
+unsafe impl<W: Writer + Send> Send for Muxer<W> {}
 
 /// Validates a metadata key/value pair: rejects interior NUL bytes, which
 /// cannot be represented in the C strings handed to `av_dict_set`.
@@ -582,10 +740,25 @@ impl<W: Writer> Drop for Muxer<W> {
 }
 
 /// Demuxer
+///
+/// Two construction modes:
+/// - **Decode mode** ([`new`](Demuxer::new) / [`new_from_reader`](Demuxer::new_from_reader) /
+///   [`new_single_stream`](Demuxer::new_single_stream)): iteration yields decoded
+///   `AVFrame`s.
+/// - **Passthrough mode** ([`new_passthrough`](Demuxer::new_passthrough)): no decoder is
+///   built; [`demux_packet`](Demuxer::demux_packet) / [`packets`](Demuxer::packets) yield
+///   raw `AVPacket`s for remuxing (re-wrapping without decode or re-encode).
 pub struct Demuxer<R: Reader> {
     pub reader: R,
+    /// One decoder per selected stream; always empty in passthrough mode.
     streams: Vec<DemuxerStream>,
-    states: Arc<DashMap<usize, i32>>,
+    /// `true` when built via [`Demuxer::new_passthrough`], i.e. no decoders exist and
+    /// only raw packets are produced.
+    ///
+    /// Kept as an explicit flag instead of inferring it from `streams.is_empty()`:
+    /// an empty `streams` is also a valid decode-mode state (a container with no
+    /// decodable stream), and callers must be able to tell the two apart.
+    passthrough: bool,
 }
 
 /// stream definition for demuxer
@@ -617,13 +790,57 @@ impl Demuxer<StreamReader> {
 }
 
 impl<R: Reader> Demuxer<R> {
+    /// 为单个流构建解码器（含硬件失败回退软件的逻辑）。
+    fn build_decoder(
+        reader: &R,
+        stream_info: &StreamInfo,
+        device_config: &Option<HWDeviceConfig>,
+        filters: &HashMap<MediaType, Vec<Filter>>,
+    ) -> Result<Decoder> {
+        let media_type = stream_info.media_type;
+        let device_type = device_config.as_ref().map(|c| c.device_type);
+        let Some(codec_name) = stream_info.find_decoder_name(device_type) else {
+            return Err(RsmediaError::custom(format!(
+                "No decoder found for codec_id {:#x} (stream {})",
+                stream_info.codec_id, stream_info.index
+            )));
+        };
+        match DecoderBuilder::new(media_type)
+            .with_codec_name(codec_name.clone())
+            .with_hardware_device(device_config.clone())
+            .with_filters(filters.get(&media_type).cloned())
+            .build_from_reader(reader)
+        {
+            Ok(decoder) => Ok(decoder),
+            Err(e) if device_type.is_some() => {
+                // 硬件解码器构建失败（如 hw 初始化失败）：回退软件解码器重试，
+                // 与 find_decoder_name 的回退语义对齐；再失败才让错误上抛。
+                log::warn!(
+                    "HW decoder '{codec_name}' failed to build: {e:#}; \
+                     falling back to software decoder"
+                );
+                let software_name = stream_info
+                    .find_decoder_name(None)
+                    .unwrap_or_else(|| codec_name.clone());
+                DecoderBuilder::new(media_type)
+                    .with_codec_name(software_name)
+                    .with_filters(filters.get(&media_type).cloned())
+                    .build_from_reader(reader)
+                    .context("Failed to build decoder (hw and software both failed)")
+            }
+            Err(e) => Err(RsmediaError::custom(format!(
+                "Failed to build decoder: {e:#}"
+            ))),
+        }
+    }
+
+    /// 全流解码模式：为容器中所有可解码的流构建解码器。
     pub fn new_from_reader(
         reader: R,
         filters: Option<Vec<Filter>>,
         device_config: Option<HWDeviceConfig>,
     ) -> Result<Demuxer<R>> {
         let nb_streams = reader.input().nb_streams as usize;
-        let device_type = device_config.as_ref().map(|c| c.device_type);
         let filter_map = filters.unwrap_or_default().into_iter().fold(
             HashMap::<MediaType, Vec<Filter>>::new(),
             |mut map, f| {
@@ -635,9 +852,9 @@ impl<R: Reader> Demuxer<R> {
         let mut streams = Vec::new();
         for stream_idx in 0..nb_streams {
             let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
-            let media_type = stream_info.media_type;
             // auto detect hardware acceleration decoder codec
-            let Some(codec_name) = stream_info.find_decoder_name(device_type) else {
+            let device_type = device_config.as_ref().map(|c| c.device_type);
+            if stream_info.find_decoder_name(device_type).is_none() {
                 // Streams without a registered decoder (chapter tracks,
                 // attached pictures, binary data, ...) are skipped instead of
                 // failing the whole demuxer.
@@ -646,47 +863,80 @@ impl<R: Reader> Demuxer<R> {
                     stream_info.codec_id
                 );
                 continue;
-            };
-            let decoder = match DecoderBuilder::new(media_type)
-                .with_codec_name(codec_name.clone())
-                .with_hardware_device(device_config.clone())
-                .with_filters(filter_map.get(&media_type).cloned())
-                .build_from_reader(&reader)
-            {
-                Ok(decoder) => decoder,
-                Err(e) if device_type.is_some() => {
-                    // 硬件解码器构建失败（如 hw 初始化失败）：回退软件解码器重试，
-                    // 与 find_decoder_name 的回退语义对齐；再失败才让错误上抛。
-                    log::warn!(
-                        "HW decoder '{codec_name}' failed to build: {e:#}; \
-                         falling back to software decoder"
-                    );
-                    let software_name = stream_info
-                        .find_decoder_name(None)
-                        .unwrap_or_else(|| codec_name.clone());
-                    DecoderBuilder::new(media_type)
-                        .with_codec_name(software_name)
-                        .with_filters(filter_map.get(&media_type).cloned())
-                        .build_from_reader(&reader)
-                        .context("Failed to build decoder (hw and software both failed)")?
-                }
-                Err(e) => {
-                    return Err(RsmediaError::custom(format!(
-                        "Failed to build decoder: {e:#}"
-                    )));
-                }
-            };
-
+            }
+            let decoder = Self::build_decoder(&reader, &stream_info, &device_config, &filter_map)?;
             streams.push(DemuxerStream::new(decoder, stream_info));
         }
 
         Ok(Self {
             reader,
             streams,
-            states: Arc::new(DashMap::new()),
+            passthrough: false,
         })
     }
 
+    /// 单流解码模式：只为 `media_type` 的最佳流（ffmpeg `find_best_stream`
+    /// 语义，由 [`StreamInfo`] 选择）构建解码器，其余流的 packet 在迭代时
+    /// 丢弃。适合"只抽视频帧/只取音频"的单流场景。
+    ///
+    /// 找不到该类型的流时返回错误。
+    pub fn new_single_stream(
+        reader: R,
+        media_type: MediaType,
+        filters: Option<Vec<Filter>>,
+        device_config: Option<HWDeviceConfig>,
+    ) -> Result<Demuxer<R>> {
+        let nb_streams = reader.input().nb_streams as usize;
+        let filter_map = filters.unwrap_or_default().into_iter().fold(
+            HashMap::<MediaType, Vec<Filter>>::new(),
+            |mut map, f| {
+                map.entry(f.media_type()).or_default().push(f);
+                map
+            },
+        );
+
+        // 选择该类型的第一个流（best stream 已在 probe 阶段由 ffmpeg 排序）。
+        let mut selected: Option<StreamInfo> = None;
+        for stream_idx in 0..nb_streams {
+            let info = StreamInfo::from_reader(&reader, stream_idx)?;
+            if info.media_type == media_type {
+                selected = Some(info);
+                break;
+            }
+        }
+        let stream_info = selected.ok_or_else(|| {
+            RsmediaError::custom(format!("No stream of type {media_type:?} found in input"))
+        })?;
+        let decoder = Self::build_decoder(&reader, &stream_info, &device_config, &filter_map)?;
+
+        Ok(Self {
+            reader,
+            streams: vec![DemuxerStream::new(decoder, stream_info)],
+            passthrough: false,
+        })
+    }
+
+    /// 透传模式（remux）：不构建任何解码器，仅通过
+    /// [`demux_packet`](Self::demux_packet) / [`packets`](Self::packets)
+    /// 迭代原始 `AVPacket`。
+    ///
+    /// 开销最小（无 codec 初始化、无解码），用于转封装：配合
+    /// [`Muxer::add_copy_stream`](crate::mux::Muxer::add_copy_stream) 和
+    /// [`Muxer::mux_packet`](crate::mux::Muxer::mux_packet) 可原样搬运码流。
+    pub fn new_passthrough(reader: R) -> Result<Demuxer<R>> {
+        Ok(Self {
+            reader,
+            streams: Vec::new(),
+            passthrough: true,
+        })
+    }
+
+    /// Decoders for the selected streams, in container stream order.
+    ///
+    /// Always empty in passthrough mode (no decoders are built); use
+    /// [`is_passthrough`](Self::is_passthrough) to tell "empty because of
+    /// passthrough" apart from "empty because the container has no decodable
+    /// stream".
     pub fn streams(&self) -> &[DemuxerStream] {
         &self.streams
     }
@@ -742,18 +992,71 @@ impl<R: Reader> Demuxer<R> {
             .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
     }
 
-    fn set_flushed(&self, stream_index: usize) {
-        self.states.insert(stream_index, 1);
+    /// 返回输入容器第 `index` 个流的 [`StreamInfo`]（从 reader 实时读取）。
+    ///
+    /// 在透传模式（remux）下同样可用，用于把某条输入流喂给
+    /// [`Muxer::add_copy_stream`] 建立对应的输出透传流。
+    pub fn stream_info(&self, index: usize) -> Result<StreamInfo> {
+        StreamInfo::from_reader(&self.reader, index)
     }
 
-    fn is_flushed(&self, stream_index: usize) -> bool {
-        self.states
-            .get(&stream_index)
-            .map(|v| *v.value() == 1)
-            .unwrap_or(false)
+    /// 输入流总数。
+    pub fn nb_streams(&self) -> usize {
+        self.reader.input().nb_streams as usize
+    }
+
+    /// Whether this demuxer was built in passthrough (remux) mode.
+    pub fn is_passthrough(&self) -> bool {
+        self.passthrough
+    }
+
+    /// 读取下一个**原始 packet**（不解码）。
+    ///
+    /// 透传模式（[`new_passthrough`](Self::new_passthrough)）的主迭代入口，
+    /// 也可在解码模式下用于高级场景（如混合 remux）。注意：解码模式下调用
+    /// 本方法会"消耗" packet，对应的帧将不会出现在 [`demux`](Self::demux)
+    /// 的迭代中——两种迭代方式不要对同一流混用。
+    ///
+    /// 返回 `Ok(None)` 表示输入结束。
+    pub fn demux_packet(&mut self) -> Result<Option<(usize, AVPacket)>> {
+        self.reader.read_packet()
+    }
+
+    /// 原始 packet 迭代器（透传模式专用入口，等价于循环调用
+    /// [`demux_packet`](Self::demux_packet)）。
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use rsmedia::mux::Demuxer;
+    /// use rsmedia::io::StreamReader;
+    /// use rsmedia::error::Result;
+    /// fn main() -> Result<()> {
+    ///     let reader = StreamReader::new(Path::new("my_file.mp4"))?;
+    ///     let mut demuxer = Demuxer::new_passthrough(reader)?;
+    ///     for result in demuxer.packets() {
+    ///         let (stream_index, packet) = result?;
+    ///         println!("packet from stream {stream_index}");
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn packets(&mut self) -> impl Iterator<Item = Result<(usize, AVPacket)>> + '_ {
+        std::iter::from_fn(|| match self.demux_packet() {
+            Ok(Some(item)) => Some(Ok(item)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        })
     }
 
     pub fn demux(&mut self) -> Result<Option<(usize, AVFrame)>> {
+        if self.is_passthrough() {
+            return Err(RsmediaError::invalid_config(
+                "Demuxer is in passthrough mode: use demux_packet()/packets() instead of demux()"
+                    .to_string(),
+            ));
+        }
         let mut read_exhausted = false;
         loop {
             if !read_exhausted {
@@ -764,7 +1067,8 @@ impl<R: Reader> Demuxer<R> {
                             .iter_mut()
                             .find(|s| s.stream_index == stream_idx)
                         else {
-                            // Packets of skipped streams (chapter tracks, ...)
+                            // Packets of skipped streams (chapter tracks,
+                            // unselected streams in single-stream mode, ...)
                             // are dropped.
                             log::debug!("Dropping packet of undecodable stream {stream_idx}");
                             continue;
@@ -784,25 +1088,22 @@ impl<R: Reader> Demuxer<R> {
                     }
                 }
             } else {
-                for i in 0..self.streams.len() {
-                    // 先获取 stream_idx，避免后面重复借用
-                    let stream_idx = self.streams[i].stream_index;
-
-                    // 使用实际的 stream_idx 检查状态
-                    if self.is_flushed(stream_idx) {
+                // Drain every decoder that has not reached EOF yet. The
+                // decoder's own state (`Decoder::is_flushed`) is the single
+                // source of truth here: a decoder is skipped only once it truly
+                // flushed, so a transient EAGAIN in the middle of draining never
+                // causes buffered frames to be dropped. The loop is bounded, so
+                // a decoder that keeps reporting "no frame yet" simply ends this
+                // `demux()` call with `Ok(None)`.
+                for demux_stream in self.streams.iter_mut() {
+                    if demux_stream.decoder.is_flushed() {
                         continue;
                     }
-
-                    // 然后获取stream的可变引用
-                    let demuxer_stream = &mut self.streams[i];
-                    match demuxer_stream.decoder.drain_raw() {
-                        Ok(Some(frame)) => {
-                            return Ok(Some((demuxer_stream.stream_index, frame)));
-                        }
+                    let stream_idx = demux_stream.stream_index;
+                    match demux_stream.decoder.drain_raw() {
+                        Ok(Some(frame)) => return Ok(Some((stream_idx, frame))),
                         Ok(None) => {
-                            log::debug!("Stream: [{stream_idx}] Decoder flushed. EOF reached.");
-                            self.set_flushed(stream_idx);
-                            continue;
+                            log::debug!("Stream: [{stream_idx}] produced no frame this pass.");
                         }
                         Err(e) => {
                             log::error!("Stream: [{stream_idx}] Decoder Drain Error: {e}");
@@ -820,10 +1121,17 @@ impl<R: Reader> Demuxer<R> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// let mut demuxer = Demuxer::from_reader(StreamReader::new(Path::new("my_file.mp4"))?)?;
-/// for (stream_index, frame) in demuxer {
-///     println!("stream_index: {}, frame: {}", stream_index, frame.width());
+/// ```no_run
+/// use std::path::Path;
+/// use rsmedia::mux::Demuxer;
+/// use rsmedia::error::Result;
+/// fn main() -> Result<()> {
+///     let mut demuxer = Demuxer::new(Path::new("my_file.mp4"))?;
+///     for result in demuxer {
+///         let (stream_index, frame) = result?;
+///         println!("stream_index: {}, frame: {}", stream_index, frame.width);
+///     }
+///     Ok(())
 /// }
 /// ```
 impl<R: Reader> Iterator for Demuxer<R> {
@@ -838,8 +1146,10 @@ impl<R: Reader> Iterator for Demuxer<R> {
     }
 }
 
+/// 仅承诺可移动到其他线程独占使用：内部的 AVFormatContextInput /
+/// AVCodecContext 均为 FFmpeg 非线程安全句柄，`&Demuxer` 不可跨线程共享，
+/// 故只实现 `Send`、不实现 `Sync`。
 unsafe impl<R: Reader> Send for Demuxer<R> {}
-unsafe impl<R: Reader> Sync for Demuxer<R> {}
 
 #[cfg(test)]
 mod tests {
@@ -981,7 +1291,7 @@ mod tests {
 
         // Demuxer 测试视频解码
         let demuxer = Demuxer::new(output_path)?;
-        for des in &demuxer.streams {
+        for des in demuxer.streams() {
             println!("{:?}, {:?}", des.stream_index, des.media_type)
         }
 
@@ -1051,7 +1361,7 @@ mod tests {
 
         // Demuxer 测试音频解码
         let demuxer = Demuxer::new(output_path)?;
-        for des in &demuxer.streams {
+        for des in demuxer.streams() {
             println!("{:?}, {:?}", des.stream_index, des.media_type)
         }
 
@@ -1332,7 +1642,7 @@ mod tests {
 
         // 解封装验证
         let demuxer = Demuxer::new(output_path)?;
-        for stream in &demuxer.streams {
+        for stream in demuxer.streams() {
             println!("{:?}, {:?}", stream.stream_index, stream.media_type)
         }
 
@@ -1354,7 +1664,7 @@ mod tests {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// transcode("input.mp4", "output.mov").unwrap();
     /// ```
     fn transcode(input_path: &str, output_path: &str) -> Result<()> {
@@ -1362,7 +1672,7 @@ mod tests {
         let input = input_reader.input();
 
         // inner output
-        use crate::io::private::Output;
+        use crate::io::Writer as _;
         let mut output_writer = StreamWriter::new(Path::new(output_path))?;
         let output = output_writer.output_mut();
 

@@ -1,4 +1,3 @@
-/// Color: 0xRRGGBBAA
 use crate::error::{Result, format_err};
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
@@ -61,10 +60,61 @@ impl Color {
         (r, g, b, a).into()
     }
 
+    /// Create a palette from a slice of colors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// // 从 u32 数组创建
+    /// let colors = Color::create_palette(&[0xFF0000FF, 0x00FF00FF, 0x0000FFFF]);
+    /// ```
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// // 从 RGB 元组数组创建
+    /// let rgb_colors = Color::create_palette(&[
+    ///     (255, 0, 0),
+    ///     (0, 255, 0),
+    ///     (0, 0, 255),
+    /// ]);
+    /// ```
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// // 从 RGB 数组创建
+    /// let array_colors = Color::create_palette(&[
+    ///     [255, 128, 0],
+    ///     [128, 0, 128],
+    ///     [0, 128, 128],
+    /// ]);
+    /// ```
     pub fn create_palette<A: Into<Self> + Copy>(xs: &[A]) -> Vec<Self> {
         xs.iter().copied().map(Into::into).collect()
     }
 
+    /// Create a palette from a slice of colors, with error handling.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// let colors = Color::try_create_palette(&[0xFF0000FF, 0x00FF00FF, 0x0000FFFF]).unwrap();
+    /// ```
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// // 从十六进制字符串数组创建（可能失败）
+    /// let hex_colors = Color::try_create_palette(&["#FF0000", "#00FF00", "#0000FF"])
+    ///     .expect("Invalid hex color");
+    /// ```
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// // 混合有效和无效的字符串会返回错误
+    /// let result = Color::try_create_palette(&["#FF0000", "invalid", "#0000FF"]);
+    /// assert!(result.is_err());
+    /// ```
     pub fn try_create_palette<A: TryInto<Self> + Copy>(xs: &[A]) -> Result<Vec<Self>>
     where
         <A as TryInto<Self>>::Error: std::fmt::Debug,
@@ -78,13 +128,30 @@ impl Color {
             .collect()
     }
 
-    pub fn palette_rand(n: usize) -> Vec<Self> {
-        (0..n)
-            .map(|_| rand::random::<[u8; 3]>())
-            .map(Self::from)
-            .collect()
-    }
-
+    /// Generate visually distinct colors by evenly distributing hues in HSL space.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// // 生成 5 个在 HSL 空间中均匀分布的颜色（色相 0-360 度）
+    /// let distinct_colors = Color::palette_distinct(5);
+    /// assert_eq!(distinct_colors.len(), 5);
+    /// ```
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// // 生成 10 个不同的颜色
+    /// let palette = Color::palette_distinct(10);
+    /// assert_eq!(palette.len(), 10);
+    /// ```
+    ///
+    /// ```
+    /// # use rsmedia::Color;
+    /// // 生成 0 个颜色返回空数组
+    /// let empty = Color::palette_distinct(0);
+    /// assert!(empty.is_empty());
+    /// ```
     pub fn palette_distinct(count: usize) -> Vec<Color> {
         if count == 0 {
             return Vec::new();
@@ -324,50 +391,6 @@ pub fn color_delta_e(c1: &Color, c2: Color) -> f32 {
     )
     .into_color();
     lab1.difference(lab2)
-}
-
-/// Map a scalar in `[min, max]` to an RGB color from the given colormap.
-///
-/// Useful for rendering grayscale / depth / heatmap data as pseudo-color
-/// visualizations. Values outside `[min, max]` are clamped to the range.
-pub fn colormap_lookup(
-    gradient: &colorous::Gradient,
-    value: f64,
-    min: f64,
-    max: f64,
-) -> (u8, u8, u8) {
-    let span = max - min;
-    let t = if span <= f64::EPSILON || !span.is_finite() {
-        0.0
-    } else {
-        ((value - min) / span).clamp(0.0, 1.0)
-    };
-    let steps = 255usize;
-    let c = gradient.eval_rational((t * steps as f64).round() as usize, steps);
-    (c.r, c.g, c.b)
-}
-
-/// Render an entire grayscale frame (`Array2`) to an RGB frame using a colormap.
-///
-/// `gray` values in `[min, max]` are mapped to colors; the result is an
-/// `Array3` of shape `(height, width, 3)` suitable for constructing a
-/// `MediaFrame` (RGB24) or saving as an image.
-#[cfg(feature = "ndarray")]
-pub fn grayscale_to_colormap<T>(
-    gradient: &colorous::Gradient,
-    gray: &ndarray::Array2<T>,
-    min: f64,
-    max: f64,
-) -> ndarray::Array3<u8>
-where
-    T: num_traits::NumCast + Copy,
-{
-    let (h, w) = gray.dim();
-    ndarray::Array3::from_shape_fn((h, w, 3), |(y, x, c)| {
-        let v = num_traits::cast::<T, f64>(gray[[y, x]]).unwrap_or(0.0);
-        let (r, g, b) = colormap_lookup(gradient, v, min, max);
-        [r, g, b][c]
-    })
 }
 
 #[cfg(test)]
@@ -631,26 +654,5 @@ mod tests {
         let white = Color::from_rgb(255, 255, 255);
         let de = color_delta_e(&black, white);
         assert!(de > 50.0, "black vs white deltaE should be large, got {de}");
-    }
-
-    #[test]
-    fn test_colormap_lookup() {
-        let g = colorous::VIRIDIS;
-        let lo = colormap_lookup(&g, 0.0, 0.0, 1.0);
-        let hi = colormap_lookup(&g, 1.0, 0.0, 1.0);
-        assert_ne!(lo, hi);
-        // 越界值被钳制到端点
-        assert_eq!(colormap_lookup(&g, -10.0, 0.0, 1.0), lo);
-        assert_eq!(colormap_lookup(&g, 99.0, 0.0, 1.0), hi);
-    }
-
-    #[test]
-    fn test_grayscale_to_colormap() {
-        let g = colorous::MAGMA;
-        let gray = ndarray::Array2::from_shape_fn((4, 5), |(y, x)| (y * 5 + x) as u8);
-        let rgb = grayscale_to_colormap(&g, &gray, 0.0, 19.0);
-        assert_eq!(rgb.dim(), (4, 5, 3));
-        // 最暗处与最亮处的映射颜色不同
-        assert_ne!(rgb[[0, 0, 0]], rgb[[3, 4, 0]]);
     }
 }

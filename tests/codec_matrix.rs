@@ -57,25 +57,41 @@ fn video_roundtrip(
     if let Some(options) = extra_options {
         builder = builder.with_options(options);
     }
-    let mut encoder = builder
-        .build_wrapped(path.as_path())
+    let encoder = builder
+        .build()
         .map_err(|e| anyhow::anyhow!("{label}: build encoder failed: {e}"))?;
+    let enc_tb = encoder.time_base();
+    let mut muxer = rsmedia::mux::Muxer::new(path.as_path())
+        .map_err(|e| anyhow::anyhow!("{label}: build muxer failed: {e}"))?;
+    // MP4/MOV 需要交错写包（av_interleaved_write_frame），否则末帧可能被丢弃
+    muxer.set_interleaved(true);
+    let v_idx = muxer
+        .add_stream(encoder)
+        .map_err(|e| anyhow::anyhow!("{label}: add video stream failed: {e}"))?;
     for i in 0..FRAMES {
         let frame = gradient_video_frame(WIDTH, HEIGHT, i as f32 / FRAMES as f32);
-        encoder
-            .write_frame(frame)
-            .map_err(|e| anyhow::anyhow!("{label}: write_frame {i} failed: {e}"))?;
+        let mut av = frame
+            .to_avframe()
+            .map_err(|e| anyhow::anyhow!("{label}: to_avframe {i} failed: {e}"))?;
+        // 编码器 time_base = 1/FPS，帧索引即 pts（每帧 1 tick = 1/FPS 秒）
+        av.set_pts(i as i64);
+        av.set_time_base(enc_tb);
+        muxer
+            .mux(av, v_idx)
+            .map_err(|e| anyhow::anyhow!("{label}: mux {i} failed: {e}"))?;
     }
-    encoder
+    muxer
         .finish()
         .map_err(|e| anyhow::anyhow!("{label}: finish failed: {e}"))?;
 
+    let mut reader = rsmedia::StreamReader::new(path.as_path())
+        .map_err(|e| anyhow::anyhow!("{label}: open reader failed: {e}"))?;
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-        .build_wrapped(path.as_path())
+        .build_from_reader(&reader)
         .map_err(|e| anyhow::anyhow!("{label}: open decoder failed: {e}"))?;
     let mut decoded = 0usize;
     while let Some(frame) = decoder
-        .decode_frame()
+        .decode_frame(&mut reader)
         .map_err(|e| anyhow::anyhow!("{label}: decode failed: {e}"))?
     {
         assert_eq!(
@@ -126,21 +142,36 @@ fn audio_roundtrip(
     if let Some(quality) = quality {
         builder = builder.with_quality(quality);
     }
-    let mut encoder = builder
-        .build_wrapped(path.as_path())
+    let encoder = builder
+        .build()
         .map_err(|e| anyhow::anyhow!("{label}: build encoder failed: {e}"))?;
+    let enc_tb = encoder.time_base();
+    let mut muxer = rsmedia::mux::Muxer::new(path.as_path())
+        .map_err(|e| anyhow::anyhow!("{label}: build muxer failed: {e}"))?;
+    let a_idx = muxer
+        .add_stream(encoder)
+        .map_err(|e| anyhow::anyhow!("{label}: add audio stream failed: {e}"))?;
+    let mut total_pts: i64 = 0;
     for i in 0..AUDIO_FRAMES {
         let frame = sine_audio_frame(440.0, CHANNELS, nb_samples, sample_rate);
-        encoder
-            .write_frame(frame)
-            .map_err(|e| anyhow::anyhow!("{label}: write_frame {i} failed: {e}"))?;
+        let mut av = frame
+            .to_avframe()
+            .map_err(|e| anyhow::anyhow!("{label}: to_avframe {i} failed: {e}"))?;
+        av.set_pts(total_pts);
+        av.set_time_base(enc_tb);
+        total_pts += nb_samples as i64;
+        muxer
+            .mux(av, a_idx)
+            .map_err(|e| anyhow::anyhow!("{label}: mux {i} failed: {e}"))?;
     }
-    encoder
+    muxer
         .finish()
         .map_err(|e| anyhow::anyhow!("{label}: finish failed: {e}"))?;
 
+    let mut reader = rsmedia::StreamReader::new(path.as_path())
+        .map_err(|e| anyhow::anyhow!("{label}: open reader failed: {e}"))?;
     let mut decoder = DecoderBuilder::new(MediaType::AUDIO)
-        .build_wrapped(path.as_path())
+        .build_from_reader(&reader)
         .map_err(|e| anyhow::anyhow!("{label}: open decoder failed: {e}"))?;
     // Decoders emit different native sample formats (AAC/MP3/Opus -> FLTP,
     // FLAC -> S16/S32), so read raw AVFrames here: a typed `MediaFrame<T>`
@@ -148,7 +179,7 @@ fn audio_roundtrip(
     let mut decoded = 0usize;
     let mut total_samples = 0i64;
     while let Some(frame) = decoder
-        .decode_raw()
+        .decode_raw(&mut reader)
         .map_err(|e| anyhow::anyhow!("{label}: decode failed: {e}"))?
     {
         assert_eq!(

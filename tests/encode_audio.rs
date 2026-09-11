@@ -499,10 +499,13 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
         filter::audio::atempo(1.25), // 加速 25%
     ];
 
-    let mut encoder = EncoderBuilder::new_audio(bit_rate, channels, sample_rate, sample_format)
+    let encoder = EncoderBuilder::new_audio(bit_rate, channels, sample_rate, sample_format)
         .with_codec_name(codec_name.to_string())
         .with_filters(audio_filters)
-        .build_wrapped(output_path.as_path())?;
+        .build()?;
+    let enc_tb = encoder.time_base();
+    let mut muxer = rsmedia::mux::Muxer::new(output_path.as_path())?;
+    let a_idx = muxer.add_stream(encoder)?;
 
     // rsmedia 编码器内部对固定帧大小编码器做 AVAudioFifo 缓冲，
     // 这里统一用 1024 样本块驱动即可
@@ -522,11 +525,12 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
     for pts in (0..total_samples).step_by(frame_size as usize) {
         generate_sine_wave(&mut frame, 440.0, sample_rate).context("Failed to generate samples")?;
         frame.set_pts(pts);
-        encoder.encode_raw(frame.clone())?;
+        frame.set_time_base(enc_tb);
+        muxer.mux(frame.clone(), a_idx)?;
     }
 
     // flush encoder and write trailer
-    encoder.finish()?;
+    muxer.finish()?;
 
     Ok(())
 }

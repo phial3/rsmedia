@@ -31,19 +31,26 @@ fn check(codec: &'static str, ext: &str) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&path);
 
     let dev = HWDeviceConfig::auto_platform_with(&[HWDeviceType::VIDEOTOOLBOX])?;
-    let mut enc = EncoderBuilder::new_video(w, h)
+    let enc = EncoderBuilder::new_video(w, h)
         .with_fps(30.0)
         .with_codec_name(codec.to_string())
         .with_hardware_device(Some(dev))
-        .build_wrapped(path.clone())?;
+        .build()?;
+    let enc_tb = enc.time_base();
+    let mut muxer = rsmedia::mux::Muxer::new(path.as_path())?;
+    let v_idx = muxer.add_stream(enc)?;
     for i in 0..n {
-        enc.write_frame(rainbow_frame(w, h, i as f32 / n as f32))?;
+        let mut av = rainbow_frame(w, h, i as f32 / n as f32).to_avframe()?;
+        av.set_pts(i as i64);
+        av.set_time_base(enc_tb);
+        muxer.mux(av, v_idx)?;
     }
-    enc.finish()?;
+    muxer.finish()?;
 
-    let mut dec = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.clone())?;
+    let mut reader = rsmedia::StreamReader::new(path.as_path())?;
+    let mut dec = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
     let mut count = 0usize;
-    while let Some(f) = dec.decode_frame()? {
+    while let Some(f) = dec.decode_frame(&mut reader)? {
         count += 1;
         if count == 1 {
             println!("[{codec}] decoded[0]: {}x{}", f.width, f.height);

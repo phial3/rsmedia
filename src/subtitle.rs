@@ -68,6 +68,42 @@ pub fn copy_subtitle_stream<R: Reader, W: Writer>(
     Ok(count)
 }
 
+/// Encode a list of subtitle segments through a bare [`Encoder`] into the
+/// container written by `writer` (see [`crate::io::StreamWriter`]).
+///
+/// 字幕编码走同步 API（`encode_subtitle_segment`，无 send/receive 缓冲），
+/// 不能复用 [`crate::mux::Muxer::mux`]（其内部调用 `encoder.encode_raw`
+/// 仅面向音视频编码流）。此处直接：
+///   1. 向 writer 添加字幕流（编码器 codec par + time_base）；
+///   2. 写 header；
+///   3. 逐段编码并把包 pts 从编码器 time_base 换算到输出流 time_base 后写盘；
+///   4. flush 编码器（字幕路径为 no-op）+ 写 trailer。
+pub fn encode_subtitle_segments_to_file(
+    writer: &mut impl Writer,
+    encoder: &mut crate::encode::Encoder,
+    segments: &[SubtitleSegment],
+) -> Result<()> {
+    let enc_tb = encoder.time_base();
+    let index = writer.add_stream(encoder.codecpar(), enc_tb);
+    writer.write_header()?;
+    let out_tb = writer.stream_time_base(index);
+
+    for segment in segments {
+        for mut packet in encoder.encode_subtitle_segment(segment)? {
+            packet.set_stream_index(index as i32);
+            packet.set_pos(-1);
+            packet.rescale_ts(enc_tb, out_tb);
+            writer.write_interleaved(&mut packet)?;
+        }
+    }
+
+    // 字幕编码器同步路径无内部缓冲，flush 为 no-op（置为 Flushed），但仍须
+    // 写 trailer 以封闭容器。
+    encoder.flush(writer, false, index, out_tb)?;
+    writer.write_trailer()?;
+    Ok(())
+}
+
 /// A single subtitle text segment with start/end times.
 #[derive(Debug, Clone)]
 pub struct SubtitleSegment {
@@ -181,7 +217,6 @@ mod tests {
     use crate::encode::EncoderBuilder;
     use crate::error::RsmediaError;
     use crate::io::StreamReader;
-    use crate::io::private::{Output, Write};
     use crate::test_support;
     use crate::time::Rescale;
 
@@ -229,16 +264,17 @@ mod tests {
         let mut encoder = EncoderBuilder::new_subtitle()
             .with_codec_name(Some("mov_text".to_string()))
             .with_subtitle_header(ASS_HEADER)
-            .build_wrapped(path.as_path())?;
-        encoder.encode_subtitle_segments(&segments)?;
-        encoder.finish()?;
+            .build()?;
+        let mut writer = crate::io::StreamWriter::new(path.as_path())?;
+        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
 
         // 2) Decode: via the generic Decoder subtitle channel
+        let mut reader = crate::io::StreamReader::new(path.as_path())?;
         let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
             .with_codec_name(Some("mov_text".to_string()))
-            .build_wrapped(path.as_path())?;
+            .build_from_reader(&reader)?;
         let mut decoded: Vec<SubtitleSegment> = Vec::new();
-        while let Some(segment) = decoder.decode_subtitle_segment()? {
+        while let Some(segment) = decoder.decode_subtitle_segment(&mut reader)? {
             decoded.push(segment);
         }
 
@@ -251,7 +287,7 @@ mod tests {
         }
 
         // 4) Flushed 之后继续解码应报错（与音视频路径语义一致）
-        assert!(decoder.decode_subtitle_segment().is_err());
+        assert!(decoder.decode_subtitle_segment(&mut reader).is_err());
 
         Ok(())
     }
@@ -309,9 +345,9 @@ mod tests {
         let mut encoder = EncoderBuilder::new_subtitle()
             .with_codec_name(Some("mov_text".to_string()))
             .with_subtitle_header(ASS_HEADER)
-            .build_wrapped(path.as_path())?;
-        encoder.encode_subtitle_segments(&segments)?;
-        encoder.finish()?;
+            .build()?;
+        let mut writer = crate::io::StreamWriter::new(path.as_path())?;
+        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
 
         // 2) Read back: verify the subtitle stream exists
         let mut reader = StreamReader::new(path.as_path())?;
@@ -379,9 +415,9 @@ mod tests {
         let segments = sample_segments();
         let mut encoder = EncoderBuilder::new_subtitle()
             .with_subtitle_header(ASS_HEADER)
-            .build_wrapped(path.as_path())?;
-        encoder.encode_subtitle_segments(&segments)?;
-        encoder.finish()?;
+            .build()?;
+        let mut writer = crate::io::StreamWriter::new(path.as_path())?;
+        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
 
         let content = std::fs::read_to_string(&path)?;
         // 时间戳行：由 packet pts/duration（毫秒）端到端生成，验证整条时间戳链路
@@ -424,9 +460,9 @@ mod tests {
         let segments = sample_segments();
         let mut encoder = EncoderBuilder::new_subtitle()
             .with_subtitle_header(ASS_HEADER)
-            .build_wrapped(input_path.as_path())?;
-        encoder.encode_subtitle_segments(&segments)?;
-        encoder.finish()?;
+            .build()?;
+        let mut writer = crate::io::StreamWriter::new(input_path.as_path())?;
+        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
 
         // 2) Read the MKV and copy the subtitle stream to another MKV
         let output_path = test_support::test_output_path("subtitle", "rsmedia_passthrough_out.mkv");
@@ -486,9 +522,9 @@ mod tests {
         let mut encoder = EncoderBuilder::new_subtitle()
             .with_codec_name(Some("ass".to_string()))
             .with_subtitle_header(ASS_HEADER)
-            .build_wrapped(path.as_path())?;
-        encoder.encode_subtitle_segments(&segments)?;
-        encoder.finish()?;
+            .build()?;
+        let mut writer = crate::io::StreamWriter::new(path.as_path())?;
+        encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
 
         // 2) Read back: verify the subtitle stream exists
         let mut reader = StreamReader::new(path.as_path())?;

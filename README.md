@@ -156,28 +156,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .parse::<Url>()
         .unwrap();
 
-    let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+    let reader = StreamReader::new(source)?;
+    let mut demuxer = Demuxer::new_single_stream(reader, MediaType::VIDEO, None, None)
           // decoder with CUDA acceleration
           // .with_hardware_device(HWDeviceConfig::auto_platform_with(&[HWDeviceType::CUDA]).ok())
           // .with_codec_name("h264_cuvid".to_string())
-          .build_wrapped(source)
           .context("failed to create decoder")?;
 
   loop {
-    match decoder.decode::<u8>() {
-      Ok(Some(yuv_frame)) => {
+    match demuxer.demux() {
+      Ok(Some((stream_index, frame))) => {
         println!(
-          "decoded frame pts: {}, type: {:?}, format:{:?}",
-          yuv_frame.pts,
-          yuv_frame.media_type,
-          yuv_frame
-            .video_format()
-            .map(|f| f.get_pix_fmt_name())
-            .unwrap_or_else(|| "N/A".to_string())
+          "decoded frame pts: {}, stream_index: {}, format:{:?}",
+          frame.pts,
+          stream_index,
+          frame.format,
         );
         
         // processing frame here...
-        // process_frame(yuv_frame)?;
+        // process_frame(frame)?;
       }
       Ok(None) => {
         println!("Decoder has reached the end of the stream");
@@ -201,15 +198,18 @@ fn main() -> Result<(), Box<dyn Error>> {
   rsmedia::init().unwrap();
 
   let output_path = Path::new("/tmp/rainbow.mp4");
-  let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
+  let encoder = EncoderBuilder::new_video(width as usize, height as usize)
           // encoder with CUDA acceleration
           // .with_hardware_device(HWDeviceConfig::auto_platform_with(&[HWDeviceType::CUDA]).ok())
           // libx264, libx265, h264_nvenc, h264_vaapi
           // .with_codec_name("h264_nvenc".to_string())
           // .with_options(Options::preset_h264_nvenc())
           .with_filters(filters)
-          .build_wrapped(output_path)
+          .build()
           .expect("failed to create encoder");
+  let enc_tb = encoder.time_base();
+  let mut muxer = Muxer::new(output_path).expect("failed to create muxer");
+  let v_idx = muxer.add_stream(encoder)?;
 
   let duration: Time = Time::from_nth_of_a_second(24);
   let mut position = Time::zero();
@@ -220,12 +220,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     frame.set_pts(
       position
-              .aligned_with_rational(encoder.time_base())
+              .aligned_with_rational(enc_tb)
               .into_value()
               .unwrap(),
     );
 
-    encoder.encode(frame)?;
+    let mut av = frame.to_avframe()?;
+    av.set_time_base(enc_tb);
+    muxer.mux(av, v_idx)?;
 
     println!("Encoded frame {} at position {}", i, position);
 
@@ -233,7 +235,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     position = position.aligned_with(duration).add();
   }
 
-  encoder.finish()?;
+  muxer.finish()?;
 
   Ok(())
 }

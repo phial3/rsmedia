@@ -8,12 +8,11 @@ use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
 use crate::options::{CRF_CAPABLE_CODECS, Options, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
-use crate::stream::StreamInfo;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
 use crate::swctx::{self, SwsFlags};
 use crate::time::{self, Rescale};
-use crate::{Location, MediaType, SampleFormat, StreamWriter};
+use crate::{MediaType, SampleFormat};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket, AVSubtitle};
 use rsmpeg::avutil::{self, AVAudioFifo, AVChannelLayout, AVChannelLayoutRef, AVFrame};
@@ -352,9 +351,9 @@ impl EncoderBuilder {
 
     /// Some formats want stream headers to be separate.
     ///
-    /// 仅对独立的 [`Self::build()`] 路径生效；`build_wrapped*` 路径会按
-    /// 实际输出容器的 `AVFMT_GLOBALHEADER` flag 自动派生（见
-    /// [`Self::build_wrapped_with_writer`]），显式设置会被覆盖。
+    /// 显式设置编码器的 `AV_CODEC_FLAG_GLOBAL_HEADER` 相关 flag。注意：使用
+    /// [`Muxer`](crate::mux::Muxer) 写容器时，输出容器的 `AVFMT_GLOBALHEADER`
+    /// flag 由 muxer 派生，这里显式设置可能无法覆盖。
     pub fn with_oformat_flags(mut self, flag: AVFormatFlag) -> Self {
         self.ofmt_flag = flag.as_raw();
         self
@@ -513,32 +512,6 @@ impl EncoderBuilder {
                 Ok(negotiated)
             }
         }
-    }
-
-    /// Build an [`EncoderWrapper`] with a [`StreamWriter`].
-    pub fn build_wrapped(
-        self,
-        destination: impl Into<Location>,
-    ) -> Result<EncoderWrapper<StreamWriter>> {
-        let writer = StreamWriter::new(destination)?;
-        self.build_wrapped_with_writer(writer, true)
-    }
-
-    /// Build an [`EncoderWrapper`] with a custom writer.
-    pub fn build_wrapped_with_writer<W: Writer>(
-        mut self,
-        mut writer: W,
-        interleaved: bool,
-    ) -> Result<EncoderWrapper<W>> {
-        // 按实际输出容器派生全局头 flag（与 ffmpeg CLI 一致）。
-        // mp4/mkv/flac 等 AVFMT_GLOBALHEADER 格式要求编码器在 open 前设置
-        // AV_CODEC_FLAG_GLOBAL_HEADER，extradata（AAC AudioSpecificConfig、
-        // flac STREAMINFO 等）才会生成并随 codecpar 写入容器；mpegts/avi
-        // 等带内头格式则不能设置，否则 x264 等编码器不再输出带内参数集。
-        self.ofmt_flag = writer.output().oformat().flags as u32;
-        let encoder = self.build()?;
-        let index = writer.add_stream(encoder.codecpar(), encoder.time_base());
-        EncoderWrapper::new(encoder, writer, index, interleaved)
     }
 
     /// Build an [`Encoder`].
@@ -1407,7 +1380,7 @@ impl Encoder {
     ///
     /// 先求单帧时长（秒），再换算到编码器 time_base 的整数 tick：
     /// `ticks = av_rescale_q(1, frame_dur_sec, time_base)`。
-    fn packet_duration(&self) -> i64 {
+    pub(crate) fn packet_duration(&self) -> i64 {
         let tb = self.time_base();
         let frame_dur_sec = match self.media_type {
             // 视频：1 / frame_rate
@@ -1571,210 +1544,6 @@ impl Drop for Encoder {
 ///   `Send` is implemented: moving an Encoder to another thread for exclusive
 ///   use is safe, as all resources move with the object.
 unsafe impl Send for Encoder {}
-
-/// 编码器包装器，持有编码器和写入器
-pub struct EncoderWrapper<W: Writer> {
-    writer: W,
-    encoder: Encoder,
-    interleaved: bool,
-    stream_index: usize,
-    stream_info: StreamInfo,
-    have_written_header: bool,
-    have_written_trailer: bool,
-    /// 自动时间戳的当前位置，由 [`write_frame`](Self::write_frame) 维护。
-    position: time::Time,
-    frame_duration: time::Time,
-}
-
-impl<W: Writer> EncoderWrapper<W> {
-    /// 创建一个新的编码器包装器
-    pub fn new(
-        encoder: Encoder,
-        writer: W,
-        stream_index: usize,
-        interleaved: bool,
-    ) -> Result<Self> {
-        let stream_info = StreamInfo::from_writer(&writer, stream_index)
-            .context("Failed to create stream info from writer")?;
-        // 当前帧时长：视频按帧率，音频按采样数/采样率；字幕时间戳由段落自带
-        // （start_ms/end_ms），不使用自动递增 pts，帧时长置 0。
-        let duration = match encoder.media_type {
-            // 帧时长 = 1 / frame_rate，即取帧率(fr.num / fr.den)的倒数 (fr.den / fr.num)
-            MediaType::VIDEO => {
-                let fr = encoder.frame_rate();
-                time::Time::new(Some(1), time::new_rational(fr.den, fr.num.max(1)))
-            }
-            // 帧时长 = nb_samples / sample_rate
-            MediaType::AUDIO => time::Time::new(
-                Some(encoder.frame_size() as i64),
-                time::new_rational(1, encoder.sample_rate().max(1)),
-            ),
-            MediaType::SUBTITLE => time::Time::zero(),
-            _ => {
-                return Err(RsmediaError::custom(format!(
-                    "No supported encoder for media_type: {:?}",
-                    encoder.media_type
-                )));
-            }
-        };
-        Ok(Self {
-            writer,
-            encoder,
-            interleaved,
-            stream_index,
-            stream_info,
-            have_written_header: false,
-            have_written_trailer: false,
-            position: time::Time::zero(),
-            frame_duration: duration,
-        })
-    }
-
-    #[cfg(feature = "ndarray")]
-    pub fn encode<T: MediaFrameType>(&mut self, frame: MediaFrame<T>) -> Result<()> {
-        let raw_frame = frame.to_avframe()?;
-        self.encode_raw(raw_frame)
-    }
-
-    pub fn encode_raw(&mut self, frame: AVFrame) -> Result<()> {
-        // Write file header if we hadn't done that yet.
-        if !self.have_written_header {
-            self.writer.write_header()?;
-            self.have_written_header = true;
-        }
-
-        for mut packet in self.encoder.encode_raw(frame)? {
-            packet.set_pos(-1);
-            packet.set_stream_index(self.stream_index as i32);
-            if packet.duration <= 0 {
-                packet.set_duration(self.encoder.packet_duration());
-            }
-            // 实时获取输出流时间基（write_header 后 muxer 可能调整 timescale）。
-            packet.rescale_ts(
-                self.time_base(),
-                self.writer.stream_time_base(self.stream_index),
-            );
-
-            if self.interleaved {
-                self.writer.write_interleaved(&mut packet)?;
-            } else {
-                self.writer.write_frame(&mut packet)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// 编码一条字幕段落并写入输出（仅字幕编码器）。
-    ///
-    /// 时间戳由段落自带（start_ms/end_ms），无需调用方设置 pts。
-    pub fn encode_subtitle_segment(&mut self, segment: &SubtitleSegment) -> Result<()> {
-        // Write file header if we hadn't done that yet.
-        if !self.have_written_header {
-            self.writer.write_header()?;
-            self.have_written_header = true;
-        }
-
-        for mut packet in self.encoder.encode_subtitle_segment(segment)? {
-            packet.set_stream_index(self.stream_index as i32);
-            // 实时获取输出流时间基（write_header 后 muxer 可能调整 timescale）。
-            packet.rescale_ts(
-                self.time_base(),
-                self.writer.stream_time_base(self.stream_index),
-            );
-
-            if self.interleaved {
-                self.writer.write_interleaved(&mut packet)?;
-            } else {
-                self.writer.write_frame(&mut packet)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// 编码多条字幕段落并写入输出，返回成功写入的段落数。
-    pub fn encode_subtitle_segments(&mut self, segments: &[SubtitleSegment]) -> Result<usize> {
-        let mut count = 0;
-        for segment in segments {
-            self.encode_subtitle_segment(segment)?;
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// 写入一帧，并自动维护时间戳（pts）。
-    ///
-    /// 与 [`encode`](Self::encode) 不同，`write_frame` 会按帧率（视频）或
-    /// 采样率/采样数（音频）自动递增 pts，用户无需手动
-    /// [`set_pts`](MediaFrame::set_pts)。适合需要"开箱即用"地逐帧写出时使用。
-    ///
-    /// 若需要完全控制时间戳，请使用 [`encode`](Self::encode)。
-    #[cfg(feature = "ndarray")]
-    pub fn write_frame<T: MediaFrameType>(&mut self, mut frame: MediaFrame<T>) -> Result<()> {
-        let pts = self
-            .position
-            .aligned_with_rational(self.encoder.time_base())
-            .into_value()
-            .unwrap_or(0);
-        frame.set_pts(pts);
-
-        self.position = self.position.aligned_with(self.frame_duration).add();
-
-        self.encode(frame)
-    }
-
-    /// Signal to the encoder that writing has finished. This will cause any packets in the encoder
-    /// to be flushed and a trailer to be written if the container format has one.
-    ///
-    /// Note: If you don't call this function before dropping the encoder, it will be called
-    /// automatically. This will block the caller thread. Any errors cannot be propagated in this
-    /// case.
-    pub fn finish(&mut self) -> Result<()> {
-        if self.have_written_header && !self.have_written_trailer {
-            self.have_written_trailer = true;
-            self.flush()?;
-            self.writer.write_trailer()?;
-        }
-
-        Ok(())
-    }
-
-    /// 刷新编码器并写入剩余数据
-    fn flush(&mut self) -> Result<()> {
-        // 实时获取（write_header 后 muxer 可能已调整 timescale）
-        let out_stream_time_base = self.writer.stream_time_base(self.stream_index);
-        self.encoder.flush(
-            &mut self.writer,
-            self.interleaved,
-            self.stream_index,
-            out_stream_time_base,
-        )
-    }
-
-    pub fn time_base(&self) -> ffi::AVRational {
-        self.encoder.time_base()
-    }
-
-    pub fn stream_info(&self) -> &StreamInfo {
-        &self.stream_info
-    }
-
-    /// 获取内部编码器的可变引用
-    pub fn encoder_mut(&mut self) -> &mut Encoder {
-        &mut self.encoder
-    }
-
-    /// 获取内部写入器的可变引用
-    pub fn writer_mut(&mut self) -> &mut W {
-        &mut self.writer
-    }
-
-    /// 解构并返回内部组件
-    pub fn into_parts(self) -> (Encoder, W) {
-        (self.encoder, self.writer)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -2051,10 +1820,13 @@ mod tests {
                     .collect();
                 builder = builder.with_options(Some(Into::into(opts)));
             }
-            let mut encoder = builder.build_wrapped(output_path.as_path())?;
+            let video_encoder = builder.build()?;
+            let encoder_time_base = video_encoder.time_base();
+            let mut muxer = crate::mux::Muxer::new(output_path.as_path())?;
+            let video_index = muxer.add_stream(video_encoder)?;
 
             // 按容器标准时间基计算帧间隔（验证不同时间基下 pts 均匀）
-            let actual_timebase = encoder.time_base();
+            let actual_timebase = encoder_time_base;
             let frame_duration_seconds = 1.0 / fps;
             let duration_units = (frame_duration_seconds * actual_timebase.den as f64
                 / actual_timebase.num as f64)
@@ -2080,19 +1852,21 @@ mod tests {
                 );
                 frame.set_pts(
                     position
-                        .aligned_with_rational(encoder.time_base())
+                        .aligned_with_rational(encoder_time_base)
                         .into_value()
                         .unwrap(),
                 );
+                let mut avframe = frame.to_avframe()?;
+                avframe.set_time_base(encoder_time_base);
 
-                encoder.encode(frame)?;
+                muxer.mux(avframe, video_index)?;
 
                 // 使用aligned_with确保时间基一致进行加法操作
                 position = position.aligned_with(duration).add();
             }
 
             // flush encoder
-            encoder.finish().unwrap();
+            muxer.finish().unwrap();
 
             Ok(())
         }
@@ -2139,21 +1913,28 @@ mod tests {
             let path = crate::test_support::test_output_path("encode", "rsmedia_roundtrip.mp4");
             crate::test_support::remove_test_output(&path);
 
-            // 1) 编码：用 write_frame 自动维护 pts
-            let mut encoder = EncoderBuilder::new_video(width, height)
+            // 1) 编码：裸 Encoder + Muxer，手动维护 pts
+            let video_encoder = EncoderBuilder::new_video(width, height)
                 .with_fps(fps)
-                .build_wrapped(path.as_path())?;
-            for i in 0..n_frames {
-                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
-                encoder.write_frame(frame)?;
+                .build()?;
+            let enc_tb = video_encoder.time_base();
+            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let v_idx = muxer.add_stream(video_encoder)?;
+            for i in 0..n_frames as i64 {
+                let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
+                frame.set_pts(i);
+                let mut av = frame.to_avframe()?;
+                av.set_time_base(enc_tb);
+                muxer.mux(av, v_idx)?;
             }
-            encoder.finish()?;
+            muxer.finish()?;
 
             // 2) 解码回：验证帧数与解码尺寸
-            let mut decoder =
-                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut decoded = 0usize;
-            while let Some(frame) = decoder.decode_frame()? {
+            while let Some(frame) = decoder.decode_frame(&mut reader)? {
                 assert_eq!(frame.width, width);
                 assert_eq!(frame.height, height);
                 decoded += 1;
@@ -2180,20 +1961,27 @@ mod tests {
             let path = crate::test_support::test_output_path("encode", "rsmedia_crf_roundtrip.mp4");
             crate::test_support::remove_test_output(&path);
 
-            let mut encoder = EncoderBuilder::new_video(width, height)
+            let video_encoder = EncoderBuilder::new_video(width, height)
                 .with_fps(fps)
                 .with_quality(Quality::Crf(23))
-                .build_wrapped(path.as_path())?;
-            for i in 0..n_frames {
-                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
-                encoder.write_frame(frame)?;
+                .build()?;
+            let enc_tb = video_encoder.time_base();
+            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let v_idx = muxer.add_stream(video_encoder)?;
+            for i in 0..n_frames as i64 {
+                let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
+                frame.set_pts(i);
+                let mut av = frame.to_avframe()?;
+                av.set_time_base(enc_tb);
+                muxer.mux(av, v_idx)?;
             }
-            encoder.finish()?;
+            muxer.finish()?;
 
-            let mut decoder =
-                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut decoded = 0usize;
-            while decoder.decode_frame()?.is_some() {
+            while decoder.decode_frame(&mut reader)?.is_some() {
                 decoded += 1;
             }
             assert_eq!(decoded, n_frames, "CRF roundtrip frame count mismatch");
@@ -2216,23 +2004,30 @@ mod tests {
             // 未显式指定 pix_fmt：协商为 mjpeg 支持列表中的格式
             let path = crate::test_support::test_output_path("encode", "rsmedia_mjpeg.avi");
             crate::test_support::remove_test_output(&path);
-            let mut encoder = EncoderBuilder::new_video(width, height)
+            let video_encoder = EncoderBuilder::new_video(width, height)
                 .with_codec_name("mjpeg".to_string())
-                .build_wrapped(path.as_path())?;
-            for i in 0..n_frames {
-                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
-                encoder.write_frame(frame)?;
+                .build()?;
+            let enc_tb = video_encoder.time_base();
+            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let v_idx = muxer.add_stream(video_encoder)?;
+            for i in 0..n_frames as i64 {
+                let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
+                frame.set_pts(i);
+                let mut av = frame.to_avframe()?;
+                av.set_time_base(enc_tb);
+                muxer.mux(av, v_idx)?;
             }
-            encoder.finish()?;
+            muxer.finish()?;
 
-            let mut decoder =
-                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut decoded = 0usize;
-            while decoder.decode_frame()?.is_some() {
+            while decoder.decode_frame(&mut reader)?.is_some() {
                 decoded += 1;
             }
             assert_eq!(decoded, n_frames, "mjpeg roundtrip frame count mismatch");
-            drop(decoder);
+            drop(reader);
             crate::test_support::remove_test_output(&path);
 
             // 显式指定编码器不支持的像素格式：build() 应 fail fast
@@ -2263,33 +2058,41 @@ mod tests {
             crate::test_support::remove_test_output(&path);
 
             // 不经 new_audio，保持 sample_format 未显式指定
-            let mut encoder = EncoderBuilder::default()
+            let audio_encoder = EncoderBuilder::default()
                 .with_media_type(MediaType::AUDIO)
                 .with_nb_channels(channels as i32)
                 .with_sample_rate(sample_rate as i32)
                 .with_codec_name("pcm_s16le".to_string())
-                .build_wrapped(path.as_path())?;
+                .build()?;
+            let enc_tb = audio_encoder.time_base();
+            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let a_idx = muxer.add_stream(audio_encoder)?;
+            let mut total_pts: i64 = 0;
             for _ in 0..frames_to_write {
                 let frame =
                     sine_audio_frame::<f32>(440.0, channels, samples_per_frame, sample_rate);
-                encoder.write_frame(frame)?;
+                let mut av = frame.to_avframe()?;
+                av.set_pts(total_pts);
+                av.set_time_base(enc_tb);
+                total_pts += samples_per_frame as i64;
+                muxer.mux(av, a_idx)?;
             }
-            encoder.finish()?;
+            muxer.finish()?;
 
-            let mut decoder =
-                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
-            let mut total_samples = 0u64;
-            while let Some(frame) = decoder.decode::<i16>()? {
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
+            let mut total_samples_decoded = 0u64;
+            while let Some(frame) = decoder.decode::<i16>(&mut reader)? {
                 assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
                 assert_eq!(frame.nb_channels, channels, "channel count mismatch");
-                total_samples += frame.nb_samples as u64;
+                total_samples_decoded += frame.nb_samples as u64;
             }
             let expected = frames_to_write as u64 * samples_per_frame as u64;
             assert!(
-                total_samples >= expected,
-                "decoded {total_samples} samples, expected >= {expected}"
+                total_samples_decoded >= expected,
+                "decoded {total_samples_decoded} samples, expected >= {expected}"
             );
-            drop(decoder);
+            drop(reader);
             crate::test_support::remove_test_output(&path);
 
             // 显式指定编码器不支持的采样格式：build() 应 fail fast
@@ -2332,23 +2135,30 @@ mod tests {
             let path = crate::test_support::test_output_path("encode", "rsmedia_profile.mp4");
             crate::test_support::remove_test_output(&path);
 
-            let mut encoder = EncoderBuilder::new_video(width, height)
+            let encoder_bare = EncoderBuilder::new_video(width, height)
                 .with_fps(fps)
                 .with_profile(VideoProfile::High)
                 .with_level("4.1")
-                .build_wrapped(path.as_path())?;
-            for i in 0..5 {
-                let frame = rainbow_video_frame(width, height, i as f32 / 5.0);
-                encoder.write_frame(frame)?;
+                .build()?;
+            let enc_tb = encoder_bare.time_base();
+            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let v_idx = muxer.add_stream(encoder_bare)?;
+            for i in 0..5i64 {
+                let mut frame = rainbow_video_frame(width, height, i as f32 / 5.0);
+                frame.set_pts(i);
+                let mut av = frame.to_avframe()?;
+                av.set_time_base(enc_tb);
+                muxer.mux(av, v_idx)?;
             }
-            encoder.finish()?;
+            muxer.finish()?;
 
-            let decoder = DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
-            let info = decoder.stream_info();
+            let reader = crate::StreamReader::new(path.as_path())?;
+            let decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+            let info = crate::stream::StreamInfo::from_reader(&reader, decoder.stream_index())?;
             assert_eq!(info.profile, ffi::AV_PROFILE_H264_HIGH as i32);
             assert_eq!(info.level, 41);
 
-            drop(decoder);
+            drop(reader);
             crate::test_support::remove_test_output(&path);
             Ok(())
         }
@@ -2393,24 +2203,30 @@ mod tests {
 
             // framerate 滤镜内部缓冲运动插值帧，输入 30 帧@30fps=1s，输出仍约 30 帧，
             // 其中尾部的插值帧要等 flush(EOF) 才输出。若 flush 缓冲帧被丢弃会偏少。
-            let mut encoder = EncoderBuilder::new_video(width, height)
+            let encoder_bare = EncoderBuilder::new_video(width, height)
                 .with_fps(fps as f32)
                 .with_filters(vec![Filter::new(
                     "framerate",
                     MediaType::VIDEO,
                     "framerate=fps=30".to_string(),
                 )])
-                .build_wrapped(path.as_path())?;
-            for i in 0..n_frames {
-                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
-                encoder.write_frame(frame)?;
+                .build()?;
+            let enc_tb = encoder_bare.time_base();
+            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let v_idx = muxer.add_stream(encoder_bare)?;
+            for i in 0..n_frames as i64 {
+                let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                frame.set_pts(i);
+                let mut av = frame.to_avframe()?;
+                av.set_time_base(enc_tb);
+                muxer.mux(av, v_idx)?;
             }
-            encoder.finish()?;
+            muxer.finish()?;
 
-            let mut decoder =
-                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut decoded = 0usize;
-            while let Some(_frame) = decoder.decode_frame()? {
+            while let Some(_frame) = decoder.decode_frame(&mut reader)? {
                 decoded += 1;
             }
             assert!(
@@ -2436,29 +2252,36 @@ mod tests {
             let path = crate::test_support::test_output_path("encode", "rsmedia_auto_pts.mp4");
             crate::test_support::remove_test_output(&path);
 
-            let mut encoder = EncoderBuilder::new_video(width, height)
+            let encoder_bare = EncoderBuilder::new_video(width, height)
                 .with_fps(fps as f32)
-                .build_wrapped(path.as_path())?;
+                .build()?;
+            let enc_tb = encoder_bare.time_base();
 
             // 帧时长 = 1/fps（秒）。解码输出的 pts 位于输出流 time_base（movenc
             // 可能调整，如 MP4 用 1/15360），故在解码后按实际帧 time_base 计算期望增量。
-            for i in 0..n_frames {
-                let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
-                encoder.write_frame(frame)?;
+            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let v_idx = muxer.add_stream(encoder_bare)?;
+            for i in 0..n_frames as i64 {
+                let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                // 编码器 time_base = 1/fps，每帧 ptp 为 1 tick（=1/fps 秒），帧索引即 pt
+                frame.set_pts(i);
+                let mut av = frame.to_avframe()?;
+                av.set_time_base(enc_tb);
+                muxer.mux(av, v_idx)?;
             }
-            encoder.finish()?;
+            muxer.finish()?;
 
-            // 解码回，收集真实 pts，验证相邻帧 pts 差恒定
-            let mut decoder =
-                DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+            // 解码期望，收集真实 pts，验证相邻帧 pts 差一致
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut pts_list: Vec<i64> = Vec::new();
-            while let Some(frame) = decoder.decode_frame()? {
+            while let Some(frame) = decoder.decode_frame(&mut reader)? {
                 pts_list.push(frame.pts);
             }
             assert_eq!(pts_list.len(), n_frames);
 
             // 解码 pts 位于输出流 time_base（movenc 可能调整，如 MP4 用 1/15360）
-            let tb = decoder.decoder_mut().time_base();
+            let tb = decoder.time_base();
             let expected_delta = (tb.den as f64 / tb.num as f64 / fps).round() as i64;
 
             // 排除 B 帧重排的影响：仅断言存在一致的正增量（B 帧可能为 0/负，取出现最多的增量）
@@ -2494,12 +2317,10 @@ mod tests {
                 crate::test_support::remove_test_output(&path);
 
                 let n_frames = 12;
-                let mut encoder = EncoderBuilder::new_video(64, 64)
-                    .with_fps(fps)
-                    .build_wrapped(path.as_path())?;
+                let encoder_bare = EncoderBuilder::new_video(64, 64).with_fps(fps).build()?;
 
                 // 1) 编码器 time_base 必须等于 1/fps
-                let tb = encoder.time_base();
+                let tb = encoder_bare.time_base();
                 let expected_tb =
                     avutil::av_inv_q(avutil::av_d2q(fps as f64, EncoderBuilder::FPS_MAX));
                 assert_eq!(
@@ -2510,17 +2331,24 @@ mod tests {
                     tb.den
                 );
 
-                for i in 0..n_frames {
-                    let frame = rainbow_video_frame(64, 64, i as f32 / n_frames as f32);
-                    encoder.write_frame(frame)?;
+                let enc_tb = encoder_bare.time_base();
+                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                let v_idx = muxer.add_stream(encoder_bare)?;
+                for i in 0..n_frames as i64 {
+                    let mut frame = rainbow_video_frame(64, 64, i as f32 / n_frames as f32);
+                    frame.set_pts(i);
+                    let mut av = frame.to_avframe()?;
+                    av.set_time_base(enc_tb);
+                    muxer.mux(av, v_idx)?;
                 }
-                encoder.finish()?;
+                muxer.finish()?;
 
                 // 2) 解码回，帧数必须与编码一致（验证末帧未被 muxer 丢弃）
+                let mut reader = crate::StreamReader::new(path.as_path())?;
                 let mut decoder =
-                    DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+                    DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
                 let mut decoded = 0usize;
-                while let Some(frame) = decoder.decode_frame()? {
+                while let Some(frame) = decoder.decode_frame(&mut reader)? {
                     assert_eq!(frame.width, 64);
                     assert_eq!(frame.height, 64);
                     decoded += 1;
@@ -2591,7 +2419,7 @@ mod tests {
                                 crate::test_support::remove_test_output(&path);
 
                                 // 编码
-                                let mut enc = EncoderBuilder::new_video(w, h)
+                                let enc_bare = EncoderBuilder::new_video(w, h)
                                     .with_codec_name(Some(codec.to_string()))
                                     .with_fps(fps)
                                     .with_filters(if delayed {
@@ -2603,15 +2431,20 @@ mod tests {
                                     } else {
                                         None
                                     })
-                                    .build_wrapped(path.as_path())?;
-                                for i in 0..n_frames {
-                                    enc.write_frame(rainbow_video_frame(
-                                        w,
-                                        h,
-                                        i as f32 / n_frames as f32,
-                                    ))?;
+                                    .build()?;
+                                let enc_tb = enc_bare.time_base();
+                                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                                let v_idx = muxer.add_stream(enc_bare)?;
+                                for i in 0..n_frames as i64 {
+                                    let mut frame =
+                                        rainbow_video_frame(w, h, i as f32 / n_frames as f32);
+                                    // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
+                                    frame.set_pts(i);
+                                    let mut av = frame.to_avframe()?;
+                                    av.set_time_base(enc_tb);
+                                    muxer.mux(av, v_idx)?;
                                 }
-                                enc.finish()?;
+                                muxer.finish()?;
 
                                 // 解码（可选 resize + 缩放算法）
                                 let mut dec_builder = DecoderBuilder::new(MediaType::VIDEO)
@@ -2619,9 +2452,10 @@ mod tests {
                                 if let Some(r) = resize {
                                     dec_builder = dec_builder.with_resize(r);
                                 }
-                                let mut dec = dec_builder.build_wrapped(path.as_path())?;
+                                let mut reader = crate::StreamReader::new(path.as_path())?;
+                                let mut dec = dec_builder.build_from_reader(&reader)?;
                                 let mut decoded = 0usize;
-                                while let Some(frame) = dec.decode_frame()? {
+                                while let Some(frame) = dec.decode_frame(&mut reader)? {
                                     assert_eq!(
                                         frame.width, ew,
                                         "{codec} {w}x{h} fps={fps} resize={resize:?} {algo:?}: width got {} exp {ew}",
@@ -2768,10 +2602,10 @@ mod tests {
                 crate::test_support::remove_test_output(&path);
 
                 // 编码（应用该滤镜）；滤镜缺失时优雅跳过
-                let mut enc = match EncoderBuilder::new_video(width, height)
+                let enc = match EncoderBuilder::new_video(width, height)
                     .with_fps(fps)
                     .with_filters(vec![filter])
-                    .build_wrapped(path.as_path())
+                    .build()
                 {
                     Ok(enc) => enc,
                     Err(e) if is_filter_unavailable(&e) => {
@@ -2781,20 +2615,28 @@ mod tests {
                     }
                     Err(e) => return Err(e),
                 };
-                for i in 0..n_frames {
-                    enc.write_frame(rainbow_video_frame(
-                        width,
-                        height,
-                        i as f32 / n_frames as f32,
-                    ))?;
-                }
-                enc.finish()?;
+                let enc_tb = enc.time_base();
+                let video_idx = {
+                    let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                    let idx = muxer.add_stream(enc)?;
+                    for i in 0..n_frames {
+                        let mut frame =
+                            rainbow_video_frame(width, height, i as f32 / n_frames as f32);
+                        frame.set_pts(i as i64);
+                        let mut av = frame.to_avframe()?;
+                        av.set_time_base(enc_tb);
+                        muxer.mux(av, idx)?;
+                    }
+                    muxer.finish()?;
+                    idx
+                };
+                let _ = video_idx;
 
                 // 解码验证
-                let mut dec =
-                    DecoderBuilder::new(MediaType::VIDEO).build_wrapped(path.as_path())?;
+                let mut reader = crate::StreamReader::new(path.as_path())?;
+                let mut dec = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
                 let mut decoded = 0usize;
-                while let Some(frame) = dec.decode_frame()? {
+                while let Some(frame) = dec.decode_frame(&mut reader)? {
                     if let Some((ew, eh)) = dims {
                         assert_eq!(
                             frame.width, ew,
@@ -2933,21 +2775,21 @@ mod tests {
             crate::test_support::remove_test_output(&path);
 
             // 按容器规格创建编码器
-            let mut encoder = EncoderBuilder::new_audio(
+            let encoder = EncoderBuilder::new_audio(
                 spec.bit_rate as i64,
                 spec.channels as i32,
                 sample_rate as i32,
                 sample_format,
             )
             .with_codec_name(codec_name.to_string())
-            .build_wrapped(path.as_path())?;
+            .build()?;
 
             // 1) 音频 time_base 应为 1/sample_rate
             let tb = encoder.time_base();
-            let expected_tb = time::new_rational(1, sample_rate as i32);
+            let expected_timeb = time::new_rational(1, sample_rate as i32);
             assert_eq!(
                 (tb.num, tb.den),
-                (expected_tb.num, expected_tb.den),
+                (expected_timeb.num, expected_timeb.den),
                 "{}: audio time_base {}/{} != 1/sample_rate",
                 spec.container,
                 tb.num,
@@ -2955,49 +2797,45 @@ mod tests {
             );
 
             // 2) 编码 5 秒正弦波（1024 采样/帧，末尾不足一帧的余数忽略）；
-            //    帧数据类型按协商出的采样格式自动匹配（FLTP/FLT→f32 / S16→i16 / S32P→i32）
+            //    帧数据类型种类按协商出的采样率格式自动匹配（FLTP/FLT→f32 / S16→S16P / S32P→i32）
             const AUDIO_DURATION_SECS: u32 = 1;
             let samples_per_frame = 1024u32;
             let frames_to_write = AUDIO_DURATION_SECS * sample_rate / samples_per_frame;
             let input_samples = frames_to_write as u64 * samples_per_frame as u64;
-            match sample_format {
-                SampleFormat::FLTP | SampleFormat::FLT => {
-                    for _ in 0..frames_to_write {
-                        encoder.write_frame(sine_audio_frame::<f32>(
-                            440.0,
-                            spec.channels,
-                            samples_per_frame,
-                            sample_rate,
-                        ))?;
+            let mut total_pts: i64 = 0;
+            {
+                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                let a_idx = muxer.add_stream(encoder)?;
+                macro_rules! encode_frames {
+                    ($t:ty) => {
+                        for _ in 0..frames_to_write {
+                            let frame = sine_audio_frame::<$t>(
+                                440.0,
+                                spec.channels,
+                                samples_per_frame,
+                                sample_rate,
+                            );
+                            let mut av = frame.to_avframe()?;
+                            av.set_pts(total_pts);
+                            av.set_time_base(tb);
+                            total_pts += samples_per_frame as i64;
+                            muxer.mux(av, a_idx)?;
+                        }
+                    };
+                }
+                match sample_format {
+                    SampleFormat::FLTP | SampleFormat::FLT => encode_frames!(f32),
+                    SampleFormat::S16 | SampleFormat::S16P => encode_frames!(i16),
+                    SampleFormat::S32P => encode_frames!(i32),
+                    other => {
+                        return Err(RsmediaError::unsupported(format!(
+                            "test sample format: {other:?}"
+                        )));
                     }
                 }
-                SampleFormat::S16 | SampleFormat::S16P => {
-                    for _ in 0..frames_to_write {
-                        encoder.write_frame(sine_audio_frame::<i16>(
-                            440.0,
-                            spec.channels,
-                            samples_per_frame,
-                            sample_rate,
-                        ))?;
-                    }
-                }
-                SampleFormat::S32P => {
-                    for _ in 0..frames_to_write {
-                        encoder.write_frame(sine_audio_frame::<i32>(
-                            440.0,
-                            spec.channels,
-                            samples_per_frame,
-                            sample_rate,
-                        ))?;
-                    }
-                }
-                other => {
-                    return Err(RsmediaError::unsupported(format!(
-                        "test sample format: {other:?}"
-                    )));
-                }
+                muxer.finish()?;
             }
-            encoder.finish()?;
+            let _ = input_samples;
             println!(
                 "  {} encoded: codec={codec_name}, fmt={sample_format:?}, rate={sample_rate}, ch={}",
                 spec.container, spec.channels
@@ -3006,14 +2844,14 @@ mod tests {
             // 3) 解码验证：采样率/声道数不变，采样量不丢失。
             //    解码数据类型必须与解码器输出格式匹配（rsmedia 解码不做格式转换；
             //    部分编码器的解码器输出格式与编码格式不同，如 libopus 编码 s16、解码 fltp）。
-            let mut decoder =
-                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
-            let out_format = decoder.decoder_mut().sample_fmt();
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
+            let out_format = decoder.sample_fmt();
             let mut total_samples = 0u64;
             let mut decoded_frames = 0usize;
             macro_rules! decode_check {
                 ($t:ty) => {
-                    while let Some(frame) = decoder.decode::<$t>()? {
+                    while let Some(frame) = decoder.decode::<$t>(&mut reader)? {
                         assert_eq!(
                             frame.sample_rate, sample_rate,
                             "{}: sample rate mismatch",
@@ -3107,13 +2945,24 @@ mod tests {
             let flac_path =
                 crate::test_support::test_output_path("encode", "rsmedia_global_header.flac");
             crate::test_support::remove_test_output(&flac_path);
-            let mut encoder = EncoderBuilder::new_audio(0, 2, 44_100, SampleFormat::S16)
+            let encoder = EncoderBuilder::new_audio(0, 2, 44_100, SampleFormat::S16)
                 .with_codec_name("flac".to_string())
-                .build_wrapped(flac_path.as_path())?;
-            for _ in 0..44_100 / 1024 {
-                encoder.write_frame(sine_audio_frame::<i16>(440.0, 2, 1024, 44_100))?;
+                .build()?;
+            let enc_tb = encoder.time_base();
+            let mut total_pts: i64 = 0;
+            {
+                let mut muxer = crate::mux::Muxer::new(flac_path.as_path())?;
+                let idx = muxer.add_stream(encoder)?;
+                for _ in 0..44_100 / 1024 {
+                    let frame = sine_audio_frame::<i16>(440.0, 2, 1024, 44_100);
+                    let mut av = frame.to_avframe()?;
+                    av.set_pts(total_pts);
+                    av.set_time_base(enc_tb);
+                    total_pts += 1024;
+                    muxer.mux(av, idx)?;
+                }
+                muxer.finish()?;
             }
-            encoder.finish()?;
 
             let reader = crate::io::StreamReader::new(flac_path.as_path())?;
             let stream = reader.input().streams().first().unwrap();
@@ -3129,13 +2978,24 @@ mod tests {
             let m4a_path =
                 crate::test_support::test_output_path("encode", "rsmedia_global_header.m4a");
             crate::test_support::remove_test_output(&m4a_path);
-            let mut encoder = EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP)
+            let encoder = EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP)
                 .with_codec_name("aac".to_string())
-                .build_wrapped(m4a_path.as_path())?;
-            for _ in 0..44_100 / 1024 {
-                encoder.write_frame(sine_audio_frame::<f32>(440.0, 2, 1024, 44_100))?;
+                .build()?;
+            let enc_tb = encoder.time_base();
+            let mut total_pts: i64 = 0;
+            {
+                let mut muxer = crate::mux::Muxer::new(m4a_path.as_path())?;
+                let idx = muxer.add_stream(encoder)?;
+                for _ in 0..44_100 / 1024 {
+                    let frame = sine_audio_frame::<f32>(440.0, 2, 1024, 44_100);
+                    let mut av = frame.to_avframe()?;
+                    av.set_pts(total_pts);
+                    av.set_time_base(enc_tb);
+                    total_pts += 1024;
+                    muxer.mux(av, idx)?;
+                }
+                muxer.finish()?;
             }
-            encoder.finish()?;
 
             let reader = crate::io::StreamReader::new(m4a_path.as_path())?;
             let stream = reader.input().streams().first().unwrap();
@@ -3166,9 +3026,9 @@ mod tests {
                 crate::test_support::test_output_path("encode", "rsmedia_audio_roundtrip.m4a");
             crate::test_support::remove_test_output(&path);
 
-            let mut encoder =
+            let encoder =
                 EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                    .build_wrapped(path.as_path())?;
+                    .build()?;
 
             // 1) 音频 time_base 应为 1/sample_rate
             let tb = encoder.time_base();
@@ -3181,25 +3041,34 @@ mod tests {
                 tb.den
             );
 
-            for _ in 0..frames_to_write {
-                let frame = MediaFrame::<f32>::new_audio_frame(
-                    format,
-                    channels,
-                    samples_per_frame,
-                    sample_rate,
-                    time::new_rational(1, sample_rate as i32),
-                )?;
-                encoder.write_frame(frame)?;
+            let mut total_pts: i64 = 0;
+            {
+                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                let idx = muxer.add_stream(encoder)?;
+                for _ in 0..frames_to_write {
+                    let mut frame = MediaFrame::<f32>::new_audio_frame(
+                        format,
+                        channels,
+                        samples_per_frame,
+                        sample_rate,
+                        time::new_rational(1, sample_rate as i32),
+                    )?;
+                    frame.set_pts(total_pts);
+                    let mut av = frame.to_avframe()?;
+                    av.set_time_base(tb);
+                    total_pts += samples_per_frame as i64;
+                    muxer.mux(av, idx)?;
+                }
+                muxer.finish()?;
             }
-            encoder.finish()?;
 
             // 2) 解码验证：采样率、通道数、采样量（AAC 有编码延迟/padding，总采样数应覆盖输入）
             // 音频 FLTP 用 f32 解码（decode_frame 固定返回 u8，仅适用于视频）。
-            let mut decoder =
-                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
             let mut total_samples = 0u64;
             let mut decoded_frames = 0usize;
-            while let Some(frame) = decoder.decode::<f32>()? {
+            while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
                 assert_eq!(
                     frame.format(),
                     Some(FrameFormat::Sample(format)),
@@ -3238,24 +3107,35 @@ mod tests {
             let path = crate::test_support::test_output_path("encode", "rsmedia_audio_partial.m4a");
             crate::test_support::remove_test_output(&path);
 
-            let mut encoder =
+            let encoder =
                 EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                    .build_wrapped(path.as_path())?;
-            for _ in 0..frames_to_write {
-                encoder.write_frame(MediaFrame::<f32>::new_audio_frame(
-                    format,
-                    channels,
-                    samples_per_frame,
-                    sample_rate,
-                    time::new_rational(1, sample_rate as i32),
-                )?)?;
+                    .build()?;
+            let enc_tb = encoder.time_base();
+            let mut total_pts: i64 = 0;
+            {
+                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                let idx = muxer.add_stream(encoder)?;
+                for _ in 0..frames_to_write {
+                    let mut frame = MediaFrame::<f32>::new_audio_frame(
+                        format,
+                        channels,
+                        samples_per_frame,
+                        sample_rate,
+                        time::new_rational(1, sample_rate as i32),
+                    )?;
+                    frame.set_pts(total_pts);
+                    let mut av = frame.to_avframe()?;
+                    av.set_time_base(enc_tb);
+                    total_pts += samples_per_frame as i64;
+                    muxer.mux(av, idx)?;
+                }
+                muxer.finish()?;
             }
-            encoder.finish()?;
 
-            let mut decoder =
-                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
             let mut total_samples = 0u64;
-            while let Some(frame) = decoder.decode::<f32>()? {
+            while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
                 assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
                 assert_eq!(frame.nb_channels, channels, "channel count mismatch");
                 total_samples += frame.nb_samples as u64;
@@ -3292,42 +3172,65 @@ mod tests {
             crate::test_support::remove_test_output(&dst);
 
             // 1) 生成源音频文件
-            let mut enc =
+            let enc =
                 EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                    .build_wrapped(src.as_path())?;
-            for _ in 0..frames_to_write {
-                enc.write_frame(MediaFrame::<f32>::new_audio_frame(
-                    format,
-                    channels,
-                    samples_per_frame,
-                    sample_rate,
-                    time::new_rational(1, sample_rate as i32),
-                )?)?;
+                    .build()?;
+            let src_enc_tb = enc.time_base();
+            let mut total_pts: i64 = 0;
+            {
+                let mut muxer = crate::mux::Muxer::new(src.as_path())?;
+                let src_idx = muxer.add_stream(enc)?;
+                for _ in 0..frames_to_write {
+                    let mut frame = MediaFrame::<f32>::new_audio_frame(
+                        format,
+                        channels,
+                        samples_per_frame,
+                        sample_rate,
+                        time::new_rational(1, sample_rate as i32),
+                    )?;
+                    frame.set_pts(total_pts);
+                    let mut av = frame.to_avframe()?;
+                    av.set_time_base(src_enc_tb);
+                    total_pts += samples_per_frame as i64;
+                    muxer.mux(av, src_idx)?;
+                }
+                muxer.finish()?;
             }
-            enc.finish()?;
             let src_samples = frames_to_write as u64 * samples_per_frame as u64;
 
             // 2) 转码：解码源 → 重编码到新文件
-            let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_wrapped(src.as_path())?;
-            let mut enc2 =
+            let mut src_reader = crate::StreamReader::new(src.as_path())?;
+            let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&src_reader)?;
+            let enc2 =
                 EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                    .build_wrapped(dst.as_path())?;
+                    .build()?;
+            let dst_enc_tb = enc2.time_base();
+            let mut dst_pts: i64 = 0;
             let mut transcoded_samples = 0u64;
-            while let Some(frame) = dec.decode::<f32>()? {
-                transcoded_samples += frame.nb_samples as u64;
-                enc2.write_frame(frame)?;
+            {
+                let mut muxer = crate::mux::Muxer::new(dst.as_path())?;
+                let dst_idx = muxer.add_stream(enc2)?;
+                while let Some(frame) = dec.decode::<f32>(&mut src_reader)? {
+                    transcoded_samples += frame.nb_samples as u64;
+                    let mut av = frame.to_avframe()?;
+                    av.set_pts(dst_pts);
+                    av.set_time_base(dst_enc_tb);
+                    dst_pts += frame.nb_samples as i64;
+                    muxer.mux(av, dst_idx)?;
+                }
+                muxer.finish()?;
             }
-            enc2.finish()?;
             assert!(
                 transcoded_samples >= src_samples,
                 "decoded {transcoded_samples} source samples, expected >= {src_samples}"
             );
 
             // 3) 解码转码结果并校验
-            let mut out: crate::decode::DecoderWrapper<crate::StreamReader> =
-                DecoderBuilder::new(MediaType::AUDIO).build_wrapped(dst.as_path())?;
+            let mut out_reader = crate::StreamReader::new(dst.as_path())?;
+            let mut out: crate::Decoder =
+                DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&out_reader)?;
             let mut total = 0u64;
-            while let Some(frame) = out.decode::<f32>()? {
+            while let Some(frame) = out.decode::<f32>(&mut out_reader)? {
                 assert_eq!(
                     frame.format(),
                     Some(FrameFormat::Sample(format)),
@@ -3421,14 +3324,14 @@ mod tests {
                 );
                 crate::test_support::remove_test_output(&path);
 
-                let mut enc = match EncoderBuilder::new_audio(
+                let enc = match EncoderBuilder::new_audio(
                     128_000,
                     channels as i32,
                     sample_rate as i32,
                     format,
                 )
                 .with_filters(vec![audio_filter])
-                .build_wrapped(path.as_path())
+                .build()
                 {
                     Ok(enc) => enc,
                     // 部分滤镜（如 `fft_denoise`/`loudnorm`）依赖特定 FFmpeg 编译配置，
@@ -3440,22 +3343,33 @@ mod tests {
                     }
                     Err(e) => return Err(e),
                 };
-                for _ in 0..frames_to_write {
-                    enc.write_frame(sine_audio_frame::<f32>(
-                        440.0,
-                        channels,
-                        samples_per_frame,
-                        sample_rate,
-                    ))?;
+                let enc_tb = enc.time_base();
+                let mut total_pts: i64 = 0;
+                {
+                    let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                    let idx = muxer.add_stream(enc)?;
+                    for _ in 0..frames_to_write {
+                        let mut frame = sine_audio_frame::<f32>(
+                            440.0,
+                            channels,
+                            samples_per_frame,
+                            sample_rate,
+                        );
+                        frame.set_pts(total_pts);
+                        let mut av = frame.to_avframe()?;
+                        av.set_time_base(enc_tb);
+                        total_pts += samples_per_frame as i64;
+                        muxer.mux(av, idx)?;
+                    }
+                    muxer.finish()?;
                 }
-                enc.finish()?;
 
                 // 解码验证：不报错、能解出帧；时长保持类滤镜采样量不丢失。
-                let mut dec =
-                    DecoderBuilder::new(MediaType::AUDIO).build_wrapped(path.as_path())?;
+                let mut reader = crate::StreamReader::new(path.as_path())?;
+                let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
                 let mut total_samples = 0u64;
                 let mut decoded = 0usize;
-                while let Some(frame) = dec.decode::<f32>()? {
+                while let Some(frame) = dec.decode::<f32>(&mut reader)? {
                     assert_eq!(
                         frame.sample_rate, sample_rate,
                         "{name}: sample rate mismatch"
