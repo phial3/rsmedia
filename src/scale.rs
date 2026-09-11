@@ -642,7 +642,6 @@ mod tests {
     use crate::PixelFormat;
     use crate::error::{Context, Result};
     use rsmpeg::avutil::AVFrame;
-    use rsmpeg::ffi;
 
     fn create_test_frame(width: i32, height: i32, pix_fmt: PixelFormat) -> Result<AVFrame> {
         let mut frame = AVFrame::new();
