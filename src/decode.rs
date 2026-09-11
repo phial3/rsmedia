@@ -1359,7 +1359,7 @@ mod tests {
             .build()?;
         let encoder_time_base = video_encoder.time_base();
         let mut muxer = Muxer::new(path)?;
-        let video_index = muxer.add_stream(video_encoder)?;
+        let video_index = muxer.add_encoder(video_encoder)?;
         for i in 0..n_frames {
             let rgb = colors::hsv_to_rgb(i as f32 / n_frames as f32 * 360.0, 100.0, 100.0);
             let mut frame = MediaFrame::<u8>::new_video_frame(

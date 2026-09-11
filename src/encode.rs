@@ -1880,7 +1880,7 @@ mod tests {
             let video_encoder = builder.build()?;
             let encoder_time_base = video_encoder.time_base();
             let mut muxer = crate::mux::Muxer::new(output_path.as_path())?;
-            let video_index = muxer.add_stream(video_encoder)?;
+            let video_index = muxer.add_encoder(video_encoder)?;
 
             // 按容器标准时间基计算帧间隔（验证不同时间基下 pts 均匀）
             let actual_timebase = encoder_time_base;
@@ -1976,7 +1976,7 @@ mod tests {
                 .build()?;
             let enc_tb = video_encoder.time_base();
             let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-            let v_idx = muxer.add_stream(video_encoder)?;
+            let v_idx = muxer.add_encoder(video_encoder)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
                 // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
@@ -2024,7 +2024,7 @@ mod tests {
                 .build()?;
             let enc_tb = video_encoder.time_base();
             let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-            let v_idx = muxer.add_stream(video_encoder)?;
+            let v_idx = muxer.add_encoder(video_encoder)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
                 // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
@@ -2066,7 +2066,7 @@ mod tests {
                 .build()?;
             let enc_tb = video_encoder.time_base();
             let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-            let v_idx = muxer.add_stream(video_encoder)?;
+            let v_idx = muxer.add_encoder(video_encoder)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
                 // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
@@ -2123,7 +2123,7 @@ mod tests {
                 .build()?;
             let enc_tb = audio_encoder.time_base();
             let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-            let a_idx = muxer.add_stream(audio_encoder)?;
+            let a_idx = muxer.add_encoder(audio_encoder)?;
             let mut total_pts: i64 = 0;
             for _ in 0..frames_to_write {
                 let frame =
@@ -2199,7 +2199,7 @@ mod tests {
                 .build()?;
             let enc_tb = encoder_bare.time_base();
             let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-            let v_idx = muxer.add_stream(encoder_bare)?;
+            let v_idx = muxer.add_encoder(encoder_bare)?;
             for i in 0..5i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / 5.0);
                 frame.set_pts(i);
@@ -2270,7 +2270,7 @@ mod tests {
                 .build()?;
             let enc_tb = encoder_bare.time_base();
             let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-            let v_idx = muxer.add_stream(encoder_bare)?;
+            let v_idx = muxer.add_encoder(encoder_bare)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
                 frame.set_pts(i);
@@ -2317,7 +2317,7 @@ mod tests {
             // 帧时长 = 1/fps（秒）。解码输出的 pts 位于输出流 time_base（movenc
             // 可能调整，如 MP4 用 1/15360），故在解码后按实际帧 time_base 计算期望增量。
             let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-            let v_idx = muxer.add_stream(encoder_bare)?;
+            let v_idx = muxer.add_encoder(encoder_bare)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
                 // 编码器 time_base = 1/fps，每帧 ptp 为 1 tick（=1/fps 秒），帧索引即 pt
@@ -2378,7 +2378,7 @@ mod tests {
                 .with_fps(fps as f32)
                 .build()?;
             let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-            let v_idx = muxer.add_stream(encoder)?;
+            let v_idx = muxer.add_encoder(encoder)?;
             for i in 0..n_frames {
                 // 关键：不调用 set_pts —— pts 保持 AV_NOPTS_VALUE，由编码器自动编号。
                 let frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
@@ -2442,7 +2442,7 @@ mod tests {
             assert_eq!(encoder.frame_size(), frame_size as i32, "aac frame_size");
 
             let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-            let a_idx = muxer.add_stream(encoder)?;
+            let a_idx = muxer.add_encoder(encoder)?;
             for &nb in &input_sizes {
                 // 关键：不设置 pts，样本位置由 audio_fifo 的计数器自动维护。
                 let frame = sine_audio_frame::<f32>(440.0, channels, nb, sample_rate);
@@ -2526,7 +2526,7 @@ mod tests {
 
                 let enc_tb = encoder_bare.time_base();
                 let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-                let v_idx = muxer.add_stream(encoder_bare)?;
+                let v_idx = muxer.add_encoder(encoder_bare)?;
                 for i in 0..n_frames as i64 {
                     let mut frame = rainbow_video_frame(64, 64, i as f32 / n_frames as f32);
                     frame.set_pts(i);
@@ -2627,7 +2627,7 @@ mod tests {
                                     .build()?;
                                 let enc_tb = enc_bare.time_base();
                                 let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-                                let v_idx = muxer.add_stream(enc_bare)?;
+                                let v_idx = muxer.add_encoder(enc_bare)?;
                                 for i in 0..n_frames as i64 {
                                     let mut frame =
                                         rainbow_video_frame(w, h, i as f32 / n_frames as f32);
@@ -2811,7 +2811,7 @@ mod tests {
                 let enc_tb = enc.time_base();
                 let video_idx = {
                     let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-                    let idx = muxer.add_stream(enc)?;
+                    let idx = muxer.add_encoder(enc)?;
                     for i in 0..n_frames {
                         let mut frame =
                             rainbow_video_frame(width, height, i as f32 / n_frames as f32);
@@ -2998,7 +2998,7 @@ mod tests {
             let mut total_pts: i64 = 0;
             {
                 let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-                let a_idx = muxer.add_stream(encoder)?;
+                let a_idx = muxer.add_encoder(encoder)?;
                 macro_rules! encode_frames {
                     ($t:ty) => {
                         for _ in 0..frames_to_write {
@@ -3145,7 +3145,7 @@ mod tests {
             let mut total_pts: i64 = 0;
             {
                 let mut muxer = crate::mux::Muxer::new(flac_path.as_path())?;
-                let idx = muxer.add_stream(encoder)?;
+                let idx = muxer.add_encoder(encoder)?;
                 for _ in 0..44_100 / 1024 {
                     let frame = sine_audio_frame::<i16>(440.0, 2, 1024, 44_100);
                     let mut av = frame.to_avframe()?;
@@ -3178,7 +3178,7 @@ mod tests {
             let mut total_pts: i64 = 0;
             {
                 let mut muxer = crate::mux::Muxer::new(m4a_path.as_path())?;
-                let idx = muxer.add_stream(encoder)?;
+                let idx = muxer.add_encoder(encoder)?;
                 for _ in 0..44_100 / 1024 {
                     let frame = sine_audio_frame::<f32>(440.0, 2, 1024, 44_100);
                     let mut av = frame.to_avframe()?;
@@ -3237,7 +3237,7 @@ mod tests {
             let mut total_pts: i64 = 0;
             {
                 let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-                let idx = muxer.add_stream(encoder)?;
+                let idx = muxer.add_encoder(encoder)?;
                 for _ in 0..frames_to_write {
                     let mut frame = MediaFrame::<f32>::new_audio_frame(
                         format,
@@ -3307,7 +3307,7 @@ mod tests {
             let mut total_pts: i64 = 0;
             {
                 let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-                let idx = muxer.add_stream(encoder)?;
+                let idx = muxer.add_encoder(encoder)?;
                 for _ in 0..frames_to_write {
                     let mut frame = MediaFrame::<f32>::new_audio_frame(
                         format,
@@ -3372,7 +3372,7 @@ mod tests {
             let mut total_pts: i64 = 0;
             {
                 let mut muxer = crate::mux::Muxer::new(src.as_path())?;
-                let src_idx = muxer.add_stream(enc)?;
+                let src_idx = muxer.add_encoder(enc)?;
                 for _ in 0..frames_to_write {
                     let mut frame = MediaFrame::<f32>::new_audio_frame(
                         format,
@@ -3402,7 +3402,7 @@ mod tests {
             let mut transcoded_samples = 0u64;
             {
                 let mut muxer = crate::mux::Muxer::new(dst.as_path())?;
-                let dst_idx = muxer.add_stream(enc2)?;
+                let dst_idx = muxer.add_encoder(enc2)?;
                 while let Some(frame) = dec.decode::<f32>(&mut src_reader)? {
                     transcoded_samples += frame.nb_samples as u64;
                     let mut av = frame.to_avframe()?;
@@ -3540,7 +3540,7 @@ mod tests {
                 let mut total_pts: i64 = 0;
                 {
                     let mut muxer = crate::mux::Muxer::new(path.as_path())?;
-                    let idx = muxer.add_stream(enc)?;
+                    let idx = muxer.add_encoder(enc)?;
                     for _ in 0..frames_to_write {
                         let mut frame = sine_audio_frame::<f32>(
                             440.0,

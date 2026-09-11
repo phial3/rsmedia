@@ -66,7 +66,7 @@ fn video_roundtrip(
     // MP4/MOV 需要交错写包（av_interleaved_write_frame），否则末帧可能被丢弃
     muxer.set_interleaved(true);
     let v_idx = muxer
-        .add_stream(encoder)
+        .add_encoder(encoder)
         .map_err(|e| anyhow::anyhow!("{label}: add video stream failed: {e}"))?;
     for i in 0..FRAMES {
         let frame = gradient_video_frame(WIDTH, HEIGHT, i as f32 / FRAMES as f32);
@@ -149,7 +149,7 @@ fn audio_roundtrip(
     let mut muxer = rsmedia::mux::Muxer::new(path.as_path())
         .map_err(|e| anyhow::anyhow!("{label}: build muxer failed: {e}"))?;
     let a_idx = muxer
-        .add_stream(encoder)
+        .add_encoder(encoder)
         .map_err(|e| anyhow::anyhow!("{label}: add audio stream failed: {e}"))?;
     let mut total_pts: i64 = 0;
     for i in 0..AUDIO_FRAMES {

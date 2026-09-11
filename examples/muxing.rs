@@ -72,7 +72,7 @@ fn main() {
             }
         };
 
-        let stream_index = muxer.add_stream(encoder).unwrap();
+        let stream_index = muxer.add_encoder(encoder).unwrap();
         muxer.dump(stream_index).unwrap()
     }
 

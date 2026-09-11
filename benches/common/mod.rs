@@ -11,7 +11,7 @@ use rsmedia::frame::MediaFrame;
 use rsmedia::io::StreamWriter;
 use rsmedia::mux::Muxer;
 use rsmedia::pixel::PixelFormat;
-use rsmedia::subtitle::{SubtitleSegment, encode_subtitle_segments_to_file};
+use rsmedia::subtitle::{SubtitleSegment, encode_subtitle_segments};
 use rsmedia::{MediaType, SampleFormat, time};
 
 use std::path::{Path, PathBuf};
@@ -140,7 +140,7 @@ pub fn encode_video(path: &Path, enc_threads: usize) -> Result<()> {
         .with_thread_count(enc_threads)
         .build()?;
     let mut muxer = Muxer::new(path)?;
-    let v_idx = muxer.add_stream(encoder)?;
+    let v_idx = muxer.add_encoder(encoder)?;
 
     for i in 0..VIDEO_FRAMES {
         // pts left unset on purpose: the encoder numbers frames automatically.
@@ -161,7 +161,7 @@ pub fn encode_audio(path: &Path, enc_threads: usize) -> Result<()> {
     .with_thread_count(enc_threads)
     .build()?;
     let mut muxer = Muxer::new(path)?;
-    let a_idx = muxer.add_stream(encoder)?;
+    let a_idx = muxer.add_encoder(encoder)?;
 
     // Variable input sizes on purpose: the encoder's sample FIFO splits and
     // merges them into fixed 1024-sample AAC frames.
@@ -195,7 +195,7 @@ pub fn encode_subtitle(path: &Path, enc_threads: usize) -> Result<()> {
         .collect();
 
     let mut writer = StreamWriter::new(path)?;
-    encode_subtitle_segments_to_file(&mut writer, &mut encoder, &segments)?;
+    encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
     Ok(())
 }
 

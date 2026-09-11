@@ -3,8 +3,8 @@ use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, Writer};
 use crate::options::Metadata;
-use crate::stream::MediaType;
-use crate::stream::StreamInfo;
+use crate::stream::{MediaType, StreamInfo};
+use crate::subtitle::SubtitleSegment;
 use crate::{
     Decoder, DecoderBuilder, Encoder, EncoderBuilder, Location, StreamReader, StreamWriter,
 };
@@ -87,14 +87,14 @@ pub struct Muxer<W: Writer> {
     /// format context right before the header is written.
     metadata: Metadata,
     /// Per-stream metadata (e.g. "language"), keyed by the output stream
-    /// index returned from [`Muxer::add_stream`], applied right before the
+    /// index returned from [`Muxer::add_encoder`], applied right before the
     /// header is written.
     stream_metadata: HashMap<usize, Metadata>,
     /// Container chapters, applied right before the header is written.
     chapters: Vec<Chapter>,
 }
 
-/// 单个输出流。既可以是编码流（持有 [`Encoder`]，由 [`Muxer::add_stream`]
+/// 单个输出流。既可以是编码流（持有 [`Encoder`]，由 [`Muxer::add_encoder`]
 /// 创建，输入 `AVFrame`），也可以是**透传流**（`encoder` 为 `None`，由
 /// [`Muxer::add_copy_stream`] 创建，直接写入原始 `AVPacket`）。
 pub struct MuxerStream {
@@ -177,7 +177,7 @@ impl<W: Writer> Muxer<W> {
         self
     }
 
-    pub fn add_stream(&mut self, encoder: Encoder) -> Result<usize> {
+    pub fn add_encoder(&mut self, encoder: Encoder) -> Result<usize> {
         let stream_idx = self
             .writer
             .add_stream(encoder.codecpar(), encoder.time_base());
@@ -233,35 +233,32 @@ impl<W: Writer> Muxer<W> {
     /// `comment`. Applied when the container header is written, i.e. before
     /// the first [`Self::mux`] call; entries set after the header is written
     /// are ignored (with a warning).
-    ///
-    /// Keys and values must not contain interior NUL bytes.
     pub fn set_metadata(
         &mut self,
         key: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<&mut Self> {
-        let (key, value) = validate_metadata_pair(key, value)?;
         if self.have_written_header {
-            log::warn!("set_metadata({key:?}) after header write has no effect");
+            log::warn!("set_metadata after header write has no effect");
         }
-        self.metadata.insert(key, value);
+        self.metadata.insert(key.into(), value.into());
         Ok(self)
     }
 
     /// Sets a per-stream metadata entry for the stream with index returned
-    /// from [`Self::add_stream`]. The common case is `language` with an
+    /// from [`Self::add_encoder`]. The common case is `language` with an
     /// ISO 639-2 code ("chi", "eng", "und", ...), which players use to pick
     /// audio/subtitle tracks.
     ///
-    /// Applied when the container header is written; keys and values must not
-    /// contain interior NUL bytes.
+    /// Applied when the container header is written; entries containing
+    /// interior NUL bytes are skipped with a warning at that point.
     pub fn set_stream_metadata(
         &mut self,
         stream_index: usize,
         key: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<&mut Self> {
-        let (key, value) = validate_metadata_pair(key, value)?;
+        let (key, value) = (key.into(), value.into());
         let nb_streams = self.writer.output().nb_streams as usize;
         if stream_index >= nb_streams {
             return Err(RsmediaError::invalid_config(format!(
@@ -340,10 +337,9 @@ impl<W: Writer> Muxer<W> {
                 chapter.end, chapter.start
             )));
         }
-        let (_, title) = validate_metadata_pair("title", chapter.title.clone())?;
         self.chapters.push(Chapter {
             id: chapter.id,
-            title,
+            title: chapter.title,
             start: chapter.start,
             end: chapter.end,
         });
@@ -379,7 +375,7 @@ impl<W: Writer> Muxer<W> {
                 "add_cover_art after header write is not supported",
             ));
         }
-        let stream_idx = self.add_stream(encoder)?;
+        let stream_idx = self.add_encoder(encoder)?;
 
         // Mark the stream as an attached picture. rsmpeg only exposes the
         // output stream array immutably, so the raw stream array is accessed
@@ -532,7 +528,7 @@ impl<W: Writer> Muxer<W> {
 
     /// Mux a single frame through an encoder stream.
     ///
-    /// 只适用于通过 [`Self::add_stream`] 添加的编码流；若目标是透传流
+    /// 只适用于通过 [`Self::add_encoder`] 添加的编码流；若目标是透传流
     /// （[`Self::add_copy_stream`]），应改用 [`Self::mux_packet`]。
     ///
     /// # Arguments
@@ -569,6 +565,59 @@ impl<W: Writer> Muxer<W> {
             // encode_ctx_timebase => out_stream_time_base
             packet.rescale_ts(enc_time_base, out_time_base);
 
+            last_out = if interleaved {
+                Some(self.writer.write_interleaved(&mut packet)?)
+            } else {
+                Some(self.writer.write_frame(&mut packet)?)
+            };
+        }
+        Ok(last_out)
+    }
+
+    /// Encodes one subtitle segment through a subtitle encoder stream and
+    /// muxes the resulting packet(s).
+    ///
+    /// Subtitle encoders (mov_text, subrip, ...) use the synchronous
+    /// `avcodec_encode_subtitle` API instead of the frame-based
+    /// send/receive loop, so they cannot go through [`Self::mux`]. Each
+    /// segment yields exactly zero or one packet whose pts/duration are in
+    /// the encoder's 1/1000 time base; they are rescaled to the output
+    /// stream time base here.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment`   - The text cue with start/end times in milliseconds.
+    /// * `stream_idx` - Index of the subtitle stream created by
+    ///   [`Self::add_encoder`] with a subtitle [`Encoder`].
+    pub fn mux_subtitle_segment(
+        &mut self,
+        segment: &SubtitleSegment,
+        stream_idx: usize,
+    ) -> Result<Option<W::Out>> {
+        self.ensure_header_written()?;
+
+        let interleaved = self.interleaved;
+        let mux_stream = self.get_stream_mut(stream_idx)?;
+        let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
+            RsmediaError::custom(format!(
+                "Stream {stream_idx} is a copy stream: subtitle segments require an encoder stream"
+            ))
+        })?;
+        if encoder.media_type() != MediaType::SUBTITLE {
+            return Err(RsmediaError::invalid_config(format!(
+                "mux_subtitle_segment requires a subtitle encoder, got {}",
+                encoder.media_type()
+            )));
+        }
+        let enc_time_base = encoder.time_base();
+        let out_time_base = mux_stream.stream_info.time_base;
+        let packets = encoder.encode_subtitle_segment(segment)?;
+
+        let mut last_out = None;
+        for mut packet in packets {
+            packet.set_pos(-1);
+            packet.set_stream_index(stream_idx as i32);
+            packet.rescale_ts(enc_time_base, out_time_base);
             last_out = if interleaved {
                 Some(self.writer.write_interleaved(&mut packet)?)
             } else {
@@ -688,23 +737,6 @@ impl<W: Writer> Muxer<W> {
 /// SAFETY: 仅承诺可移动到其他线程独占使用（`Send`）。`AVFormatContext` 及
 /// 内部 encoder 均非线程安全，`&Self` 跨线程共享（`Sync`）不成立，故不实现。
 unsafe impl<W: Writer + Send> Send for Muxer<W> {}
-
-/// Validates a metadata key/value pair: rejects interior NUL bytes, which
-/// cannot be represented in the C strings handed to `av_dict_set`.
-fn validate_metadata_pair(
-    key: impl Into<String>,
-    value: impl Into<String>,
-) -> Result<(String, String)> {
-    let (key, value) = (key.into(), value.into());
-    for (what, s) in [("key", &key), ("value", &value)] {
-        if s.contains('\0') {
-            return Err(RsmediaError::invalid_config(format!(
-                "metadata {what} contains interior NUL byte: {s:?}"
-            )));
-        }
-    }
-    Ok((key, value))
-}
 
 impl<W: Writer> Drop for Muxer<W> {
     fn drop(&mut self) {
@@ -1246,7 +1278,7 @@ mod tests {
 
         let encoder_frame_rate = video_encoder.frame_rate();
         let encoder_time_base = video_encoder.time_base();
-        let video_index = muxer.add_stream(video_encoder)?;
+        let video_index = muxer.add_encoder(video_encoder)?;
 
         // 生成测试视频帧 // 3秒视频 30fps
         for index in 0..3 * encoder_frame_rate.den as i64 {
@@ -1303,7 +1335,7 @@ mod tests {
         let mut muxer = Muxer::new(output_path.as_path())?;
 
         let encoder_time_base = audio_encoder.time_base();
-        let audio_index = muxer.add_stream(audio_encoder)?;
+        let audio_index = muxer.add_encoder(audio_encoder)?;
 
         // 累积的样本数，用于计算PTS
         let mut total_samples = 0;
@@ -1376,12 +1408,10 @@ mod tests {
         let audio_time_base = audio_encoder.time_base();
 
         let mut muxer = Muxer::new(output_path.as_path())?;
-        let video_index = muxer.add_stream(video_encoder)?;
-        let audio_index = muxer.add_stream(audio_encoder)?;
+        let video_index = muxer.add_encoder(video_encoder)?;
+        let audio_index = muxer.add_encoder(audio_encoder)?;
 
-        // 参数校验：内嵌 NUL 与越界索引必须 fail fast
-        assert!(muxer.set_metadata("bad\0key", "v").is_err());
-        assert!(muxer.set_metadata("title", "bad\0value").is_err());
+        // 参数校验：越界索引必须 fail fast（含 NUL 的条目在写头时被跳过并告警）
         assert!(muxer.set_stream_metadata(99, "language", "eng").is_err());
 
         muxer.set_metadata("title", "rsmedia metadata test")?;
@@ -1462,7 +1492,7 @@ mod tests {
         let mut muxer = Muxer::new(output_path)?;
 
         let encoder_time_base = audio_encoder.time_base();
-        let audio_index = muxer.add_stream(audio_encoder)?;
+        let audio_index = muxer.add_encoder(audio_encoder)?;
 
         // 累积的样本数，用于计算PTS
         let mut total_samples = 0;
@@ -1524,8 +1554,8 @@ mod tests {
         let audio_time_base = audio_encoder.time_base();
 
         // 添加视频流 和 音频流
-        let video_idx = muxer.add_stream(video_encoder)?;
-        let audio_idx = muxer.add_stream(audio_encoder)?;
+        let video_idx = muxer.add_encoder(video_encoder)?;
+        let audio_idx = muxer.add_encoder(audio_encoder)?;
 
         // 计算总视频帧数
         let total_video_frames = (VIDEO_FPS as u32 * VIDEO_DURATION_SEC) as i64;
@@ -1703,7 +1733,7 @@ mod tests {
 
         let encoder = Encoder::new_video(320, 240)?;
         let mut muxer = Muxer::new(output_path)?;
-        muxer.add_stream(encoder)?;
+        muxer.add_encoder(encoder)?;
 
         // 未 mux 任何帧，直接 finish：应为空操作，返回 None
         let first = muxer.finish()?;
@@ -1733,7 +1763,7 @@ mod tests {
 
         {
             let mut muxer = Muxer::new(output_path.as_path())?;
-            let video_index = muxer.add_stream(video_encoder)?;
+            let video_index = muxer.add_encoder(video_encoder)?;
             for index in 0..12 {
                 let mut frame = generate_video_frame(width, height, index);
                 frame.set_pts(index * encoder_time_base.den as i64);
@@ -1757,6 +1787,70 @@ mod tests {
 
     /// 章节写入与回读：2 个章节按毫秒时间基写入 MP4，重开后 `Demuxer::chapters()`
     /// 应还原标题与秒级起止时间；参数校验（start<0、end<=start、内嵌 NUL）须报错。
+    /// 字幕通过 [`Muxer::mux_subtitle_segment`] 进入容器：视频 + 字幕两路
+    /// 编码流，写 4 条 cue 后用库内字幕解码通道回读，逐字段断言无损。
+    #[test]
+    fn test_mux_subtitle_segment() -> Result<()> {
+        use crate::MediaType;
+        use crate::subtitle::SubtitleSegment;
+
+        let output_path =
+            crate::test_support::test_output_path("mux", "test_mux_subtitle_segment.mp4");
+        crate::test_support::remove_test_output(&output_path);
+
+        let header = "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,16,&Hffffff,&Hffffff,&H0,&H0,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+
+        let video_encoder = Encoder::new_video(320, 240)?;
+        let video_tb = video_encoder.time_base();
+        let subtitle_encoder = EncoderBuilder::new_subtitle()
+            .with_codec_name(Some("mov_text".to_string()))
+            .with_subtitle_header(header)
+            .build()?;
+
+        let mut muxer = Muxer::new(output_path.as_path())?;
+        let video_index = muxer.add_encoder(video_encoder)?;
+        let subtitle_index = muxer.add_encoder(subtitle_encoder)?;
+        assert_ne!(video_index, subtitle_index, "two encoder streams");
+        muxer.set_stream_metadata(subtitle_index, "language", "eng")?;
+
+        let segments = [
+            SubtitleSegment::new(0, 400, "First cue, with, commas"),
+            SubtitleSegment::new(500, 900, "Second cue"),
+            SubtitleSegment::new(1000, 1400, "Third cue"),
+            SubtitleSegment::new(1500, 1900, "Last cue"),
+        ];
+
+        // 1 秒视频（30fps），pts 走自动编号；字幕逐段编码进容器。
+        for i in 0..30i64 {
+            let mut frame = generate_video_frame(320, 240, i);
+            frame.set_time_base(video_tb);
+            muxer.mux(frame, video_index)?;
+        }
+        for segment in &segments {
+            muxer.mux_subtitle_segment(segment, subtitle_index)?;
+        }
+        muxer.finish()?;
+
+        // 回读：字幕解码通道逐段无损还原。
+        let mut reader = StreamReader::new(output_path.as_path())?;
+        let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
+            .with_codec_name(Some("mov_text".to_string()))
+            .build_from_reader(&reader)?;
+        let mut decoded = Vec::new();
+        while let Some(segment) = decoder.decode_subtitle_segment(&mut reader)? {
+            decoded.push(segment);
+        }
+        assert_eq!(decoded.len(), segments.len(), "decoded: {decoded:?}");
+        for (got, want) in decoded.iter().zip(segments.iter()) {
+            assert_eq!(got.text, want.text, "text mismatch");
+            assert_eq!(got.start_ms, want.start_ms, "start_ms mismatch");
+            assert_eq!(got.end_ms, want.end_ms, "end_ms mismatch");
+        }
+
+        crate::test_support::remove_test_output(&output_path);
+        Ok(())
+    }
+
     #[test]
     fn test_mux_chapters() -> Result<()> {
         let output_path = crate::test_support::test_output_path("mux", "test_mux_chapters.mp4");
@@ -1766,16 +1860,11 @@ mod tests {
         let encoder_time_base = video_encoder.time_base();
 
         let mut muxer = Muxer::new(output_path.as_path())?;
-        let video_index = muxer.add_stream(video_encoder)?;
+        let video_index = muxer.add_encoder(video_encoder)?;
 
-        // 参数校验 fail fast
+        // 参数校验 fail fast（时间非法；含 NUL 的标题在写头时被跳过并告警）
         assert!(muxer.add_chapter(Chapter::new("bad", -1.0, 1.0)).is_err());
         assert!(muxer.add_chapter(Chapter::new("bad", 2.0, 1.0)).is_err());
-        assert!(
-            muxer
-                .add_chapter(Chapter::new("bad\0title", 0.0, 1.0))
-                .is_err()
-        );
 
         muxer.add_chapter(Chapter::new("Intro", 0.0, 1.0))?;
         muxer.add_chapter(Chapter::new("Part Two", 1.0, 2.0))?;
@@ -1805,7 +1894,7 @@ mod tests {
         let video_encoder = Encoder::new_video(width, height)?;
         let encoder_time_base = video_encoder.time_base();
         let mut muxer = Muxer::new(mkv_path.as_path())?;
-        let video_index = muxer.add_stream(video_encoder)?;
+        let video_index = muxer.add_encoder(video_encoder)?;
         muxer.add_chapter(Chapter::new("MKV Intro", 0.0, 1.0))?;
         for index in 0..encoder_time_base.den as i64 {
             let mut frame = generate_video_frame(width, height, index);
@@ -1850,7 +1939,7 @@ mod tests {
             .build()?;
 
         let mut muxer = Muxer::new(output_path.as_path())?;
-        let video_index = muxer.add_stream(encoder)?;
+        let video_index = muxer.add_encoder(encoder)?;
 
         // 2 秒 @30fps 输入（编码器 time_base = 1/30，帧间隔 1 tick）
         let encoder_time_base = ffi::AVRational { num: 1, den: 30 };
@@ -1913,7 +2002,7 @@ mod tests {
         let encoder_time_base = video_encoder.time_base();
 
         let mut muxer = Muxer::new(output_path.as_path())?;
-        let video_index = muxer.add_stream(video_encoder)?;
+        let video_index = muxer.add_encoder(video_encoder)?;
 
         // 生成一张 RGB24 渐变封面帧（编码器自动协商并转换为 mjpeg 支持的格式）
         let mut cover = AVFrame::new();

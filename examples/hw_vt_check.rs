@@ -38,7 +38,7 @@ fn check(codec: &'static str, ext: &str) -> anyhow::Result<()> {
         .build()?;
     let enc_tb = enc.time_base();
     let mut muxer = rsmedia::mux::Muxer::new(path.as_path())?;
-    let v_idx = muxer.add_stream(enc)?;
+    let v_idx = muxer.add_encoder(enc)?;
     for i in 0..n {
         let mut av = rainbow_frame(w, h, i as f32 / n as f32).to_avframe()?;
         av.set_pts(i as i64);

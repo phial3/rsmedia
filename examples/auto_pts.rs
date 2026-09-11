@@ -40,7 +40,7 @@ fn encode_video() -> anyhow::Result<()> {
         .with_fps(FPS)
         .build()?;
     let mut muxer = Muxer::new(std::path::Path::new("/tmp/rsmedia_auto_pts.mp4"))?;
-    let v_idx = muxer.add_stream(encoder)?;
+    let v_idx = muxer.add_encoder(encoder)?;
 
     for i in 0..VIDEO_FRAMES {
         // No `set_pts` anywhere: the encoder numbers frames 0, 1, 2, ... itself.
@@ -62,7 +62,7 @@ fn encode_audio() -> anyhow::Result<()> {
     )
     .build()?;
     let mut muxer = Muxer::new(std::path::Path::new("/tmp/rsmedia_auto_pts.m4a"))?;
-    let a_idx = muxer.add_stream(encoder)?;
+    let a_idx = muxer.add_encoder(encoder)?;
 
     // Deliberately irregular sizes around the aac frame size (1024).
     let sizes: Vec<u32> = (0..AUDIO_FRAMES)

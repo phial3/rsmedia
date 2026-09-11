@@ -1750,7 +1750,7 @@ mod tests {
         let encoder = EncoderBuilder::new_video(64, 48)
             .with_codec_name("png".to_string())
             .build()?;
-        let video_index = muxer.add_stream(encoder)?;
+        let video_index = muxer.add_encoder(encoder)?;
 
         for i in 0..n_frames {
             let mut frame = generate_rgb_frame(64, 48, i);
@@ -1787,7 +1787,7 @@ mod tests {
             let encoder = EncoderBuilder::new_video(64, 48)
                 .with_codec_name("png".to_string())
                 .build()?;
-            let video_index = muxer.add_stream(encoder)?;
+            let video_index = muxer.add_encoder(encoder)?;
             for i in 0..8 {
                 let mut frame = generate_rgb_frame(64, 48, i);
                 frame.set_pts(i);
@@ -1844,7 +1844,7 @@ mod tests {
         let mut muxer = Muxer::new_from_writer(writer);
         let encoder = EncoderBuilder::new_video(64, 48).build()?;
         let tb = encoder.time_base();
-        let video_index = muxer.add_stream(encoder)?;
+        let video_index = muxer.add_encoder(encoder)?;
         let mut total = 0usize;
         for i in 0..8 {
             let mut frame = generate_rgb_frame(64, 48, i);
@@ -1877,7 +1877,7 @@ mod tests {
             let mut muxer = Muxer::new_from_writer(writer);
             let encoder = EncoderBuilder::new_video(64, 48).build()?;
             let tb = encoder.time_base();
-            let video_index = muxer.add_stream(encoder)?;
+            let video_index = muxer.add_encoder(encoder)?;
             for i in 0..8 {
                 let mut frame = generate_rgb_frame(64, 48, i);
                 frame.set_pts(i);
@@ -1938,7 +1938,7 @@ mod tests {
             let mut muxer = Muxer::new(path.as_path())?;
             let encoder = EncoderBuilder::new_video(64, 48).build()?;
             let tb = encoder.time_base();
-            let video_index = muxer.add_stream(encoder)?;
+            let video_index = muxer.add_encoder(encoder)?;
             for i in 0..4 {
                 let mut frame = generate_rgb_frame(64, 48, i);
                 frame.set_pts(i);
@@ -1965,7 +1965,7 @@ mod tests {
         let mut muxer = Muxer::new_from_writer(writer);
         let encoder = EncoderBuilder::new_video(64, 48).build()?;
         let tb = encoder.time_base();
-        let video_index = muxer.add_stream(encoder)?;
+        let video_index = muxer.add_encoder(encoder)?;
         for i in 0..4 {
             let mut frame = generate_rgb_frame(64, 48, i);
             frame.set_pts(i);
