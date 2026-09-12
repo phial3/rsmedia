@@ -855,11 +855,11 @@ impl Decoder {
                     None => (sw_frame.width as u32, sw_frame.height as u32),
                 };
                 self.scaler.scale_if_needed(
-                     sw_frame,
-                     out_w as i32,
-                     out_h as i32,
-                     target_sw_pix_fmt,
-                 )?
+                    sw_frame,
+                    out_w as i32,
+                    out_h as i32,
+                    target_sw_pix_fmt,
+                )?
             }
             _ => {
                 // do nothing

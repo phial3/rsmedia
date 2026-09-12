@@ -1796,7 +1796,10 @@ mod tests {
         let mut graph = FilterGraph::new();
         assert!(!graph.is_initialized(), "graph should start uninitialized");
         graph.init(&params, &[filter])?;
-        assert!(graph.is_initialized(), "graph should be initialized after init");
+        assert!(
+            graph.is_initialized(),
+            "graph should be initialized after init"
+        );
 
         // 输出链路尺寸应与输入一致。
         assert_eq!(
@@ -1855,7 +1858,14 @@ mod tests {
 
         // aformat 把输入转为 S16（与 sink 约束一致）。
         let mut graph = FilterGraph::new();
-        graph.init(&params, &[audio::format(channels as u32, sample_rate as u32, SampleFormat::S16)])?;
+        graph.init(
+            &params,
+            &[audio::format(
+                channels as u32,
+                sample_rate as u32,
+                SampleFormat::S16,
+            )],
+        )?;
 
         let mut frame = AVFrame::new();
         frame.set_format(SampleFormat::FLTP as _);
