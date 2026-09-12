@@ -237,9 +237,8 @@ impl EncoderBuilder {
 
     /// Set the video frame rate from a floating-point number of frames per second.
     ///
-    /// Convenience for [`with_frame_rate`](Self::with_frame_rate) that accepts a
-    /// plain `fps` value (e.g. `30.0`, `29.97`). The value is converted to a
-    /// reduced rational via FFmpeg's `av_d2q` and used as the encoder frame rate.
+    /// The value is converted to a reduced rational via FFmpeg's `av_d2q` and used
+    /// as the encoder frame rate.
     pub fn with_fps(mut self, fps: f32) -> Self {
         if fps > 0.0 && fps.is_finite() {
             self.fps = fps;

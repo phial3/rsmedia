@@ -746,9 +746,9 @@ impl Decoder {
     ///
     /// The decoded raw frame as [`AVFrame`] if the decoder has a frame available, [`None`] if not.
     ///
-    /// 作为低层手动解码 API 的一部分公开：配合 [`into_parts`](Self::into_parts) 与
-    /// [`decode_raw_packet`](Self::decode_raw_packet) 使用，可逐 packet 送入解码器并排空
-    /// 缓冲帧。需要 [`MediaFrame`] 的高级调用请使用 [`drain`](Self::drain)。
+    /// 作为低层手动解码 API 的一部分公开：配合 [`decode_raw_packet`](Self::decode_raw_packet)
+    /// 使用，可逐 packet 送入解码器并排空缓冲帧。需要 [`MediaFrame`] 的高级调用请使用
+    /// [`drain`](Self::drain)。
     pub fn drain_raw(&mut self) -> Result<Option<AVFrame>> {
         if self.state == CodecContextState::Normal {
             self.send_packet_to_decoder(None)?;

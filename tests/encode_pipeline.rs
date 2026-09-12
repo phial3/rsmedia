@@ -24,8 +24,8 @@ use rsmedia::error::Context;
 use rsmedia::strutils;
 use rsmedia::time;
 use rsmedia::{
-    CodecConfig, DecoderBuilder, EncoderBuilder, Filter, MediaFrame, MediaType, PixelFormat, Quality, Result,
-    RsmediaError, SampleFormat, VideoProfile,
+    CodecConfig, DecoderBuilder, EncoderBuilder, Filter, MediaFrame, MediaType, PixelFormat,
+    Quality, Result, RsmediaError, SampleFormat, VideoProfile,
 };
 
 use rsmpeg::avutil;
