@@ -670,10 +670,6 @@ impl Decoder {
     /// Feeds the packet to the decoder and returns a frame if there is one available. The caller
     /// should keep feeding packets until the decoder returns a frame.
     ///
-    /// # Panics
-    ///
-    /// Panics if in draining mode.
-    ///
     /// # Return value
     ///
     /// A tuple of the [`Frame`] and timestamp (relative to the stream) and the frame itself if the

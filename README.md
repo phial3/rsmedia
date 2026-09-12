@@ -635,8 +635,6 @@ RUST_LOG=rsmedia=debug cargo run
 >
 > <https://github.com/angelcam/rust-ac-ffmpeg>
 >
-> <https://github.com/larksuite/rsmpeg>
->
 > <https://github.com/itsakeyfut/avio>
 
 ## ✨ Credits
