@@ -145,7 +145,7 @@ fn encode_video_container(container_type: &str, codec_name: &str) -> Result<()> 
         .with_codec_name(codec_name.to_string())
         .build()?;
     let enc_tb = encoder.time_base();
-    let mut muxer = rsmedia::mux::Muxer::new(output_path.as_path())?;
+    let mut muxer = rsmedia::mux::Muxer::new(&output_path)?;
     let v_idx = muxer.add_encoder(encoder)?;
 
     let mut frame = AVFrame::new();

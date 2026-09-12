@@ -11,11 +11,11 @@
 //! | `as_raw()` | no | yes | yes |
 //! | conversion raw value to variant | yes (`From<ffi> for Enum`) | no | no |
 //! | conversion variant to raw value | yes (`From<Enum> for ffi`) | no | yes (`From<Enum> for repr`, i.e. `Into<repr>`) |
-//! | combine flags into a raw mask | no | no | yes (`BitOr` on both operands) |
+//! | combine flags into a raw mask | no | no | yes (`BitOr`, either operand order) |
 //! | fallback for an unlisted value | panics; every table fails fast (the expression form is still supported but unused) | n/a | n/a |
 //!
 //! In practice the split is clean: every `ffi_enum!` call site is a bit set (`AVCodecFlag`,
-//! `AVCodecFlag2`, `AVFormatFlag`, `AVPixFmtFlag`, `SwsFlags`, `AVSeekFlag`) and every
+//! `AVCodecFlag2`, `AVFormatFlag`, `AVPixFmtFlag`, `ScaleAlgorithm`, `AVSeekFlag`) and every
 //! `ffi_enum_wrap_from!` call site is an ID (`PixelFormat`, `SampleFormat`, `MediaType`,
 //! `HWDeviceType`). `ffi_enum_wrap!` currently has no user — see the note on the macro itself
 //! for why the need for it disappeared.
@@ -24,7 +24,9 @@
 //!
 //! - A fieldless enum cannot hold an unnamed discriminant, so the bit-set operators yield the
 //!   raw integer rather than the enum, and `ffi_enum!` can never convert a raw value back into
-//!   a variant. If a combination must be stored or queried, keep it as the raw value.
+//!   a variant. `BitOr` is implemented for both operand orders (`A | B`, `A | raw`, `raw | A`),
+//!   so a chain such as `A | B | C` reads as written; if a combination must be stored or
+//!   queried, keep it as the raw value.
 //! - `ffi_enum!` does not declare an FFI type, but that is a statement about the macro's shape,
 //!   not a restriction on its constants: `SWS_*` is a bare constant on FFmpeg 6/7 and the
 //!   `ffi::SwsFlags` alias on 8+, and one table covers both.
@@ -253,7 +255,7 @@ macro_rules! ffi_enum_wrap_from {
 ///
 /// # Note
 ///
-/// Currently unused: `SwsFlags` is defined with [`ffi_enum!`] instead. That macro's `as`
+/// Currently unused: `ScaleAlgorithm` is defined with [`ffi_enum!`] instead. That macro's `as`
 /// normalisation accepts both the bare `SWS_*` constants of FFmpeg 6/7 and the `ffi::SwsFlags`
 /// alias of FFmpeg 8+, so a single table covers every supported version — whereas the
 /// `size_of::<$ffi>()` check here requires the alias to exist in all of them.
@@ -309,9 +311,10 @@ macro_rules! ffi_enum_wrap {
 /// A fieldless Rust enum cannot represent an unnamed discriminant, and most useful
 /// combinations (`BACKWARD | ANY`, `GLOBAL_HEADER | NOTIMESTAMPS`) have no variant of their
 /// own. The operators therefore return `$repr_ty`: they exist to assemble a mask **at the FFI
-/// boundary**, not to model a first-class set type. When a combination has to be stored or
-/// queried, keep it in the raw integer and test individual bits against
-/// `Enum::X.as_raw()`.
+/// boundary**, not to model a first-class set type. All three operand orders are accepted
+/// (`A | B`, `A | raw`, `raw | A`), so a longer chain keeps reading naturally. When a
+/// combination has to be stored or queried, keep it in the raw integer and test individual
+/// bits against `Enum::X.as_raw()`.
 ///
 /// # Parameters
 ///
@@ -393,6 +396,16 @@ macro_rules! ffi_enum {
                 self.as_raw() | rhs
             }
         }
+
+        /// `raw | Enum::A`: continues a chain that has already produced the raw integer,
+        /// so `A | B | C` compiles as written (the first `|` yields `$repr_ty`).
+        impl ::std::ops::BitOr<$enum_ident> for $repr_ty {
+            type Output = $repr_ty;
+
+            fn bitor(self, rhs: $enum_ident) -> Self::Output {
+                self | rhs.as_raw()
+            }
+        }
     };
 }
 
@@ -442,17 +455,17 @@ mod tests {
             (ffi::AVSEEK_FLAG_FRAME | ffi::AVSEEK_FLAG_BYTE) as i32
         );
 
-        // The result is the raw integer, so further combination stays in the raw domain.
-        // Note the asymmetry: `A | B` is fine, but `(A | B) | C` needs `C` as a raw value —
-        // there is no `BitOr<Variant> for repr`. And the reverse direction (raw -> variant)
+        // The result is the raw integer, so further combination stays in the raw domain —
+        // and `repr | Variant` is provided precisely so that a chain can be written as
+        // `A | B | C` and still produce the raw mask. The reverse direction (raw -> variant)
         // does not exist here at all; that is `ffi_enum_wrap_from!`'s job.
-        let three = two | (ffi::AVSEEK_FLAG_FRAME as i32);
+        let three = AVSeekFlag::BACKWARD | AVSeekFlag::ANY | AVSeekFlag::FRAME;
         assert_eq!(three, 1 | 4 | 8);
 
         // `repr` picks the conversion target, which is how one table covers every FFmpeg
         // version: `SWS_*` is a bare constant on 6/7 and a named alias on 8+, and both
         // normalise through `as`. Here `repr = u32`, so `Into<u32>` is generated.
-        let sws: u32 = crate::swctx::SwsFlags::BICUBIC.into();
+        let sws: u32 = crate::scale::ScaleAlgorithm::BICUBIC.into();
         assert_eq!(sws, ffi::SWS_BICUBIC as u32);
     }
 

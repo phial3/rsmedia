@@ -61,7 +61,7 @@ fn video_roundtrip(
         .build()
         .map_err(|e| anyhow::anyhow!("{label}: build encoder failed: {e}"))?;
     let enc_tb = encoder.time_base();
-    let mut muxer = rsmedia::mux::Muxer::new(path.as_path())
+    let mut muxer = rsmedia::mux::Muxer::new(&path)
         .map_err(|e| anyhow::anyhow!("{label}: build muxer failed: {e}"))?;
     // MP4/MOV 需要交错写包（av_interleaved_write_frame），否则末帧可能被丢弃
     muxer.set_interleaved(true);
@@ -84,7 +84,7 @@ fn video_roundtrip(
         .finish()
         .map_err(|e| anyhow::anyhow!("{label}: finish failed: {e}"))?;
 
-    let mut reader = rsmedia::StreamReader::new(path.as_path())
+    let mut reader = rsmedia::StreamReader::new(&path)
         .map_err(|e| anyhow::anyhow!("{label}: open reader failed: {e}"))?;
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
         .build_from_reader(&reader)
@@ -146,7 +146,7 @@ fn audio_roundtrip(
         .build()
         .map_err(|e| anyhow::anyhow!("{label}: build encoder failed: {e}"))?;
     let enc_tb = encoder.time_base();
-    let mut muxer = rsmedia::mux::Muxer::new(path.as_path())
+    let mut muxer = rsmedia::mux::Muxer::new(&path)
         .map_err(|e| anyhow::anyhow!("{label}: build muxer failed: {e}"))?;
     let a_idx = muxer
         .add_encoder(encoder)
@@ -168,7 +168,7 @@ fn audio_roundtrip(
         .finish()
         .map_err(|e| anyhow::anyhow!("{label}: finish failed: {e}"))?;
 
-    let mut reader = rsmedia::StreamReader::new(path.as_path())
+    let mut reader = rsmedia::StreamReader::new(&path)
         .map_err(|e| anyhow::anyhow!("{label}: open reader failed: {e}"))?;
     let mut decoder = DecoderBuilder::new(MediaType::AUDIO)
         .build_from_reader(&reader)

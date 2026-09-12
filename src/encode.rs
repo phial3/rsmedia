@@ -8,9 +8,10 @@ use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
 use crate::options::{CRF_CAPABLE_CODECS, Options, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
+use crate::resample;
+use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
-use crate::swctx::{self, SwsFlags};
 use crate::time::{self, Rescale};
 use crate::{MediaType, SampleFormat};
 
@@ -57,7 +58,10 @@ pub struct EncoderBuilder {
     subtitle_header: Option<String>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
-    scale_algorithm: SwsFlags,
+    /// 缩放核选择（互斥，只取一个算法位）
+    scale_algorithm: ScaleAlgorithm,
+    /// 缩放质量位（可多位，见 [`ScaleQuality`]）；构建 `Scaler` 时由 [`ScaleQuality::mask`] 合成为掩码
+    scale_quality: Vec<ScaleQuality>,
 }
 
 impl EncoderBuilder {
@@ -310,9 +314,26 @@ impl EncoderBuilder {
     /// Set the scaling algorithm used when converting input frames to the
     /// encoder's target pixel format (e.g. RGB24 -> YUV420P).
     ///
-    /// Defaults to [`ScaleAlgorithm::Bicubic`].
-    pub fn with_scale_algorithm(mut self, algorithm: SwsFlags) -> Self {
+    /// The algorithm picks the scaling kernel and is **mutually exclusive** —
+    /// FFmpeg's header states *"Scaler selection options. Only one may be active
+    /// at a time."* Defaults to [`ScaleAlgorithm::BICUBIC`]; the quality/behaviour
+    /// bits are set separately with [`Self::with_scale_quality`].
+    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
         self.scale_algorithm = algorithm;
+        self
+    }
+
+    /// Set the scaling quality/behaviour bits used when converting input frames
+    /// to the encoder's target pixel format.
+    ///
+    /// Unlike the algorithm (exactly one bit), the quality flags are a set: pass the
+    /// bits themselves as a list — `[ScaleQuality::BITEXACT]`,
+    /// `[ScaleQuality::FULL_CHR_H_INT, ScaleQuality::ACCURATE_RND]`, … — and they are
+    /// combined into the mask handed to FFmpeg. Taking a list of [`ScaleQuality`]
+    /// values rather than a raw `u32` means an invalid flag cannot be passed.
+    /// Defaults to [`ScaleQuality::default_mask`].
+    pub fn with_scale_quality(mut self, quality: impl AsRef<[ScaleQuality]>) -> Self {
+        self.scale_quality = quality.as_ref().to_vec();
         self
     }
 
@@ -755,7 +776,7 @@ impl EncoderBuilder {
             filter_graph,
             context: encode_ctx,
             state: CodecContextState::Normal,
-            scale_algorithm: self.scale_algorithm,
+            scaler: Scaler::new_with_options(self.scale_algorithm, self.scale_quality),
             pending_packets: VecDeque::new(),
             audio_fifo: None,
             next_pts: 0,
@@ -794,7 +815,8 @@ impl Default for EncoderBuilder {
             filters: None,
             subtitle_header: None,
             hw_device_config: None,
-            scale_algorithm: SwsFlags::default(),
+            scale_algorithm: ScaleAlgorithm::default(),
+            scale_quality: ScaleQuality::default_quality().to_vec(),
         }
     }
 }
@@ -804,7 +826,7 @@ impl Default for EncoderBuilder {
 /// # Example
 ///
 /// ```ignore
-/// let decoder = Decoder::new(Path::new("video_out.mkv")).unwrap();
+/// let decoder = Decoder::new("video_out.mkv").unwrap();
 /// decoder
 ///     .decode_iter()
 ///     .take_while(Result::is_ok)
@@ -824,7 +846,7 @@ pub struct Encoder {
     hw_context: Option<Arc<HWContext>>,
     media_type: MediaType,
     state: CodecContextState,
-    scale_algorithm: SwsFlags,
+    scaler: Scaler,
     /// 编码器缓冲满（send_frame 返回 EAGAIN）时，先行排空的已就绪包暂存于此， 由 `receive_packet` 优先取出，
     /// 避免丢包。按 FIFO 出队（`pop_front`）， 保证与编码器输出顺序一致（否则 dts 会乱序、mux 报错）。
     pending_packets: VecDeque<AVPacket>,
@@ -1015,24 +1037,19 @@ impl Encoder {
                     _ => FrameFormat::Sample(self.sample_fmt()),
                 }
             });
-            let scale_algorithm = self.scale_algorithm;
+            // 先把帧转换到滤镜图输入格式（此转换需要 `&mut self` 以复用可变的
+            // `scaler`/重采样上下文），转换完成后再借用 `filter_graph` 处理。
+            let converted = match graph_input_format {
+                FrameFormat::Pixel(dst) if frame.format != dst as i32 => {
+                    self.scale_encoder_frame(&frame, dst)?
+                }
+                FrameFormat::Sample(dst) if frame.format != dst as i32 => {
+                    resample::convert_frame(&frame, frame.ch_layout, dst as _, frame.sample_rate)?
+                }
+                _ => frame,
+            };
             if let Some(graph) = self.filter_graph.as_mut() {
-                let frame = match graph_input_format {
-                    FrameFormat::Pixel(dst) if frame.format != dst as i32 => {
-                        swctx::scale_with_flags(
-                            &frame,
-                            frame.width,
-                            frame.height,
-                            dst,
-                            scale_algorithm,
-                        )?
-                    }
-                    FrameFormat::Sample(dst) if frame.format != dst as i32 => {
-                        swctx::convert_frame(&frame, frame.ch_layout, dst as _, frame.sample_rate)?
-                    }
-                    _ => frame,
-                };
-                match graph.process_frame(Some(frame))? {
+                match graph.process_frame(Some(converted))? {
                     Some(filtered) => self.send_frame_post_filter(filtered)?,
                     None => {
                         // filter 暂未输出（内部缓冲中），等待后续帧驱动
@@ -1040,7 +1057,7 @@ impl Encoder {
                     }
                 }
             } else {
-                self.send_frame_post_filter(frame)?;
+                self.send_frame_post_filter(converted)?;
             }
             Ok(())
         } else {
@@ -1274,7 +1291,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn rescale(&self, frame: AVFrame) -> Result<AVFrame> {
+    fn rescale(&mut self, frame: AVFrame) -> Result<AVFrame> {
         let scaled_frame = match self.media_type {
             MediaType::VIDEO => {
                 let target_sw_pix_fmt = if let Some(hw_ctx) = self.hw_context.as_ref() {
@@ -1283,13 +1300,7 @@ impl Encoder {
                     self.pix_fmt()
                 };
                 if frame.format != i32::from(target_sw_pix_fmt) {
-                    swctx::scale_with_flags(
-                        &frame,
-                        frame.width,
-                        frame.height,
-                        target_sw_pix_fmt,
-                        self.scale_algorithm,
-                    )?
+                    self.scale_encoder_frame(&frame, target_sw_pix_fmt)?
                 } else {
                     frame
                 }
@@ -1300,7 +1311,7 @@ impl Encoder {
                     || frame.format != self.sample_fmt() as i32
                     || frame.ch_layout.nb_channels != ch_layout.nb_channels
                 {
-                    swctx::convert_frame(
+                    resample::convert_frame(
                         &frame,
                         ch_layout.clone().into_inner(),
                         self.sample_fmt() as _,
@@ -1319,6 +1330,17 @@ impl Encoder {
             }
         };
         Ok(scaled_frame)
+    }
+
+    /// Scale a video frame to the encoder's target pixel format, through the
+    /// encoder's persistent [`Scaler`].
+    ///
+    /// The destination keeps the source geometry (size changes are the filter
+    /// graph's job, see [`Filter`]); the scaler rebuilds its context by itself
+    /// when the geometry or format changes mid-stream.
+    fn scale_encoder_frame(&mut self, frame: &AVFrame, dst_fmt: PixelFormat) -> Result<AVFrame> {
+        self.scaler
+            .scale_frame(frame, frame.width, frame.height, dst_fmt)
     }
 
     /// Check if the frame is valid for encoding.
@@ -1879,7 +1901,7 @@ mod tests {
             }
             let video_encoder = builder.build()?;
             let encoder_time_base = video_encoder.time_base();
-            let mut muxer = crate::mux::Muxer::new(output_path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&output_path)?;
             let video_index = muxer.add_encoder(video_encoder)?;
 
             // 按容器标准时间基计算帧间隔（验证不同时间基下 pts 均匀）
@@ -1975,7 +1997,7 @@ mod tests {
                 .with_fps(fps)
                 .build()?;
             let enc_tb = video_encoder.time_base();
-            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&path)?;
             let v_idx = muxer.add_encoder(video_encoder)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
@@ -1988,7 +2010,7 @@ mod tests {
             muxer.finish()?;
 
             // 2) 解码回：验证帧数与解码尺寸
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut decoded = 0usize;
             while let Some(frame) = decoder.decode_frame(&mut reader)? {
@@ -2023,7 +2045,7 @@ mod tests {
                 .with_quality(Quality::Crf(23))
                 .build()?;
             let enc_tb = video_encoder.time_base();
-            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&path)?;
             let v_idx = muxer.add_encoder(video_encoder)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
@@ -2035,7 +2057,7 @@ mod tests {
             }
             muxer.finish()?;
 
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut decoded = 0usize;
             while decoder.decode_frame(&mut reader)?.is_some() {
@@ -2065,7 +2087,7 @@ mod tests {
                 .with_codec_name("mjpeg".to_string())
                 .build()?;
             let enc_tb = video_encoder.time_base();
-            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&path)?;
             let v_idx = muxer.add_encoder(video_encoder)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
@@ -2077,7 +2099,7 @@ mod tests {
             }
             muxer.finish()?;
 
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut decoded = 0usize;
             while decoder.decode_frame(&mut reader)?.is_some() {
@@ -2122,7 +2144,7 @@ mod tests {
                 .with_codec_name("pcm_s16le".to_string())
                 .build()?;
             let enc_tb = audio_encoder.time_base();
-            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&path)?;
             let a_idx = muxer.add_encoder(audio_encoder)?;
             let mut total_pts: i64 = 0;
             for _ in 0..frames_to_write {
@@ -2136,7 +2158,7 @@ mod tests {
             }
             muxer.finish()?;
 
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
             let mut total_samples_decoded = 0u64;
             while let Some(frame) = decoder.decode::<i16>(&mut reader)? {
@@ -2198,7 +2220,7 @@ mod tests {
                 .with_level("4.1")
                 .build()?;
             let enc_tb = encoder_bare.time_base();
-            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&path)?;
             let v_idx = muxer.add_encoder(encoder_bare)?;
             for i in 0..5i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / 5.0);
@@ -2209,7 +2231,7 @@ mod tests {
             }
             muxer.finish()?;
 
-            let reader = crate::StreamReader::new(path.as_path())?;
+            let reader = crate::StreamReader::new(&path)?;
             let decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let info = crate::stream::StreamInfo::from_reader(&reader, decoder.stream_index())?;
             assert_eq!(info.profile, ffi::AV_PROFILE_H264_HIGH as i32);
@@ -2269,7 +2291,7 @@ mod tests {
                 )])
                 .build()?;
             let enc_tb = encoder_bare.time_base();
-            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&path)?;
             let v_idx = muxer.add_encoder(encoder_bare)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
@@ -2280,7 +2302,7 @@ mod tests {
             }
             muxer.finish()?;
 
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut decoded = 0usize;
             while let Some(_frame) = decoder.decode_frame(&mut reader)? {
@@ -2316,7 +2338,7 @@ mod tests {
 
             // 帧时长 = 1/fps（秒）。解码输出的 pts 位于输出流 time_base（movenc
             // 可能调整，如 MP4 用 1/15360），故在解码后按实际帧 time_base 计算期望增量。
-            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&path)?;
             let v_idx = muxer.add_encoder(encoder_bare)?;
             for i in 0..n_frames as i64 {
                 let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
@@ -2329,7 +2351,7 @@ mod tests {
             muxer.finish()?;
 
             // 解码期望，收集真实 pts，验证相邻帧 pts 差一致
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut pts_list: Vec<i64> = Vec::new();
             while let Some(frame) = decoder.decode_frame(&mut reader)? {
@@ -2377,7 +2399,7 @@ mod tests {
             let encoder = EncoderBuilder::new_video(width, height)
                 .with_fps(fps as f32)
                 .build()?;
-            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&path)?;
             let v_idx = muxer.add_encoder(encoder)?;
             for i in 0..n_frames {
                 // 关键：不调用 set_pts —— pts 保持 AV_NOPTS_VALUE，由编码器自动编号。
@@ -2386,7 +2408,7 @@ mod tests {
             }
             muxer.finish()?;
 
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
             let mut pts_list: Vec<i64> = Vec::new();
             while let Some(frame) = decoder.decode_frame(&mut reader)? {
@@ -2441,7 +2463,7 @@ mod tests {
             .build()?;
             assert_eq!(encoder.frame_size(), frame_size as i32, "aac frame_size");
 
-            let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+            let mut muxer = crate::mux::Muxer::new(&path)?;
             let a_idx = muxer.add_encoder(encoder)?;
             for &nb in &input_sizes {
                 // 关键：不设置 pts，样本位置由 audio_fifo 的计数器自动维护。
@@ -2450,7 +2472,7 @@ mod tests {
             }
             muxer.finish()?;
 
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
             let mut pts_list: Vec<i64> = Vec::new();
             let mut decoded_samples: i64 = 0;
@@ -2525,7 +2547,7 @@ mod tests {
                 );
 
                 let enc_tb = encoder_bare.time_base();
-                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                let mut muxer = crate::mux::Muxer::new(&path)?;
                 let v_idx = muxer.add_encoder(encoder_bare)?;
                 for i in 0..n_frames as i64 {
                     let mut frame = rainbow_video_frame(64, 64, i as f32 / n_frames as f32);
@@ -2537,7 +2559,7 @@ mod tests {
                 muxer.finish()?;
 
                 // 2) 解码回，帧数必须与编码一致（验证末帧未被 muxer 丢弃）
-                let mut reader = crate::StreamReader::new(path.as_path())?;
+                let mut reader = crate::StreamReader::new(&path)?;
                 let mut decoder =
                     DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
                 let mut decoded = 0usize;
@@ -2556,6 +2578,40 @@ mod tests {
             Ok(())
         }
 
+        /// builder 的缩放选项进入编码器持有的 [`Scaler`]：算法位一个、质量位可多个。
+        #[test]
+        fn test_builder_scale_options_reach_the_scaler() -> Result<()> {
+            use crate::scale::{ScaleAlgorithm, ScaleQuality};
+
+            // 多质量位（掩码）+ 非默认算法。
+            let encoder = EncoderBuilder::new_video(320, 240)
+                .with_scale_algorithm(ScaleAlgorithm::LANCZOS)
+                .with_scale_quality([
+                    ScaleQuality::FULL_CHR_H_INT,
+                    ScaleQuality::ACCURATE_RND,
+                    ScaleQuality::BITEXACT,
+                ])
+                .build()?;
+            assert_eq!(encoder.scaler.algorithm(), ScaleAlgorithm::LANCZOS);
+            assert_eq!(encoder.scaler.quality(), ScaleQuality::default_mask());
+            assert_eq!(
+                encoder.scaler.flags(),
+                ScaleAlgorithm::LANCZOS.as_raw() | ScaleQuality::default_mask()
+            );
+
+            // 默认策略：BICUBIC + 默认质量掩码。
+            let encoder = EncoderBuilder::new_video(320, 240).build()?;
+            assert_eq!(encoder.scaler.algorithm(), ScaleAlgorithm::default());
+            assert_eq!(encoder.scaler.quality(), ScaleQuality::default_mask());
+
+            // 单个质量位（`Into<u32>`）。
+            let encoder = EncoderBuilder::new_video(320, 240)
+                .with_scale_quality([ScaleQuality::BITEXACT])
+                .build()?;
+            assert_eq!(encoder.scaler.quality(), ScaleQuality::BITEXACT.as_raw());
+            Ok(())
+        }
+
         /// 综合参数组合往返测试：编码→解码，覆盖 编解码器 / fps / 源尺寸 / resize /
         /// 缩放算法 / 延迟滤镜 的交叉组合，验证：
         ///   1) 解码器 resize 后输出尺寸正确；
@@ -2564,7 +2620,7 @@ mod tests {
         #[test]
         fn test_param_combination_roundtrip() -> Result<()> {
             use crate::filter::Filter;
-            use crate::{DecoderBuilder, MediaType, Resize, SwsFlags};
+            use crate::{DecoderBuilder, MediaType, Resize, ScaleAlgorithm};
 
             let codecs: &[(&str, bool)] = &[
                 ("libx264", true), // 支持延迟滤镜插值
@@ -2576,7 +2632,11 @@ mod tests {
                 Some(Resize::Exact(32, 32)),   // 精确尺寸
                 Some(Resize::FitEven(16, 16)), // 保持宽高比、偶数尺寸
             ];
-            let algos: &[SwsFlags] = &[SwsFlags::BICUBIC, SwsFlags::POINT, SwsFlags::LANCZOS];
+            let algos: &[ScaleAlgorithm] = &[
+                ScaleAlgorithm::BICUBIC,
+                ScaleAlgorithm::POINT,
+                ScaleAlgorithm::LANCZOS,
+            ];
             let fps_list: &[f32] = &[24.0, 30.0];
 
             for &(codec, delayed) in codecs {
@@ -2626,7 +2686,7 @@ mod tests {
                                     })
                                     .build()?;
                                 let enc_tb = enc_bare.time_base();
-                                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                                let mut muxer = crate::mux::Muxer::new(&path)?;
                                 let v_idx = muxer.add_encoder(enc_bare)?;
                                 for i in 0..n_frames as i64 {
                                     let mut frame =
@@ -2645,7 +2705,7 @@ mod tests {
                                 if let Some(r) = resize {
                                     dec_builder = dec_builder.with_resize(r);
                                 }
-                                let mut reader = crate::StreamReader::new(path.as_path())?;
+                                let mut reader = crate::StreamReader::new(&path)?;
                                 let mut dec = dec_builder.build_from_reader(&reader)?;
                                 let mut decoded = 0usize;
                                 while let Some(frame) = dec.decode_frame(&mut reader)? {
@@ -2810,7 +2870,7 @@ mod tests {
                 };
                 let enc_tb = enc.time_base();
                 let video_idx = {
-                    let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                    let mut muxer = crate::mux::Muxer::new(&path)?;
                     let idx = muxer.add_encoder(enc)?;
                     for i in 0..n_frames {
                         let mut frame =
@@ -2826,7 +2886,7 @@ mod tests {
                 let _ = video_idx;
 
                 // 解码验证
-                let mut reader = crate::StreamReader::new(path.as_path())?;
+                let mut reader = crate::StreamReader::new(&path)?;
                 let mut dec = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
                 let mut decoded = 0usize;
                 while let Some(frame) = dec.decode_frame(&mut reader)? {
@@ -2997,7 +3057,7 @@ mod tests {
             let input_samples = frames_to_write as u64 * samples_per_frame as u64;
             let mut total_pts: i64 = 0;
             {
-                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                let mut muxer = crate::mux::Muxer::new(&path)?;
                 let a_idx = muxer.add_encoder(encoder)?;
                 macro_rules! encode_frames {
                     ($t:ty) => {
@@ -3037,7 +3097,7 @@ mod tests {
             // 3) 解码验证：采样率/声道数不变，采样量不丢失。
             //    解码数据类型必须与解码器输出格式匹配（rsmedia 解码不做格式转换；
             //    部分编码器的解码器输出格式与编码格式不同，如 libopus 编码 s16、解码 fltp）。
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
             let out_format = decoder.sample_fmt();
             let mut total_samples = 0u64;
@@ -3144,7 +3204,7 @@ mod tests {
             let enc_tb = encoder.time_base();
             let mut total_pts: i64 = 0;
             {
-                let mut muxer = crate::mux::Muxer::new(flac_path.as_path())?;
+                let mut muxer = crate::mux::Muxer::new(&flac_path)?;
                 let idx = muxer.add_encoder(encoder)?;
                 for _ in 0..44_100 / 1024 {
                     let frame = sine_audio_frame::<i16>(440.0, 2, 1024, 44_100);
@@ -3157,7 +3217,7 @@ mod tests {
                 muxer.finish()?;
             }
 
-            let reader = crate::io::StreamReader::new(flac_path.as_path())?;
+            let reader = crate::io::StreamReader::new(&flac_path)?;
             let stream = reader.input().streams().first().unwrap();
             assert_eq!(stream.codecpar().codec_id, ffi::AV_CODEC_ID_FLAC);
             assert!(
@@ -3177,7 +3237,7 @@ mod tests {
             let enc_tb = encoder.time_base();
             let mut total_pts: i64 = 0;
             {
-                let mut muxer = crate::mux::Muxer::new(m4a_path.as_path())?;
+                let mut muxer = crate::mux::Muxer::new(&m4a_path)?;
                 let idx = muxer.add_encoder(encoder)?;
                 for _ in 0..44_100 / 1024 {
                     let frame = sine_audio_frame::<f32>(440.0, 2, 1024, 44_100);
@@ -3190,7 +3250,7 @@ mod tests {
                 muxer.finish()?;
             }
 
-            let reader = crate::io::StreamReader::new(m4a_path.as_path())?;
+            let reader = crate::io::StreamReader::new(&m4a_path)?;
             let stream = reader.input().streams().first().unwrap();
             assert_eq!(stream.codecpar().codec_id, ffi::AV_CODEC_ID_AAC);
             assert!(
@@ -3236,7 +3296,7 @@ mod tests {
 
             let mut total_pts: i64 = 0;
             {
-                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                let mut muxer = crate::mux::Muxer::new(&path)?;
                 let idx = muxer.add_encoder(encoder)?;
                 for _ in 0..frames_to_write {
                     let mut frame = MediaFrame::<f32>::new_audio_frame(
@@ -3257,7 +3317,7 @@ mod tests {
 
             // 2) 解码验证：采样率、通道数、采样量（AAC 有编码延迟/padding，总采样数应覆盖输入）
             // 音频 FLTP 用 f32 解码（decode_frame 固定返回 u8，仅适用于视频）。
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
             let mut total_samples = 0u64;
             let mut decoded_frames = 0usize;
@@ -3306,7 +3366,7 @@ mod tests {
             let enc_tb = encoder.time_base();
             let mut total_pts: i64 = 0;
             {
-                let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                let mut muxer = crate::mux::Muxer::new(&path)?;
                 let idx = muxer.add_encoder(encoder)?;
                 for _ in 0..frames_to_write {
                     let mut frame = MediaFrame::<f32>::new_audio_frame(
@@ -3325,7 +3385,7 @@ mod tests {
                 muxer.finish()?;
             }
 
-            let mut reader = crate::StreamReader::new(path.as_path())?;
+            let mut reader = crate::StreamReader::new(&path)?;
             let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
             let mut total_samples = 0u64;
             while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
@@ -3371,7 +3431,7 @@ mod tests {
             let src_enc_tb = enc.time_base();
             let mut total_pts: i64 = 0;
             {
-                let mut muxer = crate::mux::Muxer::new(src.as_path())?;
+                let mut muxer = crate::mux::Muxer::new(&src)?;
                 let src_idx = muxer.add_encoder(enc)?;
                 for _ in 0..frames_to_write {
                     let mut frame = MediaFrame::<f32>::new_audio_frame(
@@ -3392,7 +3452,7 @@ mod tests {
             let src_samples = frames_to_write as u64 * samples_per_frame as u64;
 
             // 2) 转码：解码源 → 重编码到新文件
-            let mut src_reader = crate::StreamReader::new(src.as_path())?;
+            let mut src_reader = crate::StreamReader::new(&src)?;
             let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&src_reader)?;
             let enc2 =
                 EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
@@ -3401,7 +3461,7 @@ mod tests {
             let mut dst_pts: i64 = 0;
             let mut transcoded_samples = 0u64;
             {
-                let mut muxer = crate::mux::Muxer::new(dst.as_path())?;
+                let mut muxer = crate::mux::Muxer::new(&dst)?;
                 let dst_idx = muxer.add_encoder(enc2)?;
                 while let Some(frame) = dec.decode::<f32>(&mut src_reader)? {
                     transcoded_samples += frame.nb_samples as u64;
@@ -3419,7 +3479,7 @@ mod tests {
             );
 
             // 3) 解码转码结果并校验
-            let mut out_reader = crate::StreamReader::new(dst.as_path())?;
+            let mut out_reader = crate::StreamReader::new(&dst)?;
             let mut out: crate::Decoder =
                 DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&out_reader)?;
             let mut total = 0u64;
@@ -3539,7 +3599,7 @@ mod tests {
                 let enc_tb = enc.time_base();
                 let mut total_pts: i64 = 0;
                 {
-                    let mut muxer = crate::mux::Muxer::new(path.as_path())?;
+                    let mut muxer = crate::mux::Muxer::new(&path)?;
                     let idx = muxer.add_encoder(enc)?;
                     for _ in 0..frames_to_write {
                         let mut frame = sine_audio_frame::<f32>(
@@ -3558,7 +3618,7 @@ mod tests {
                 }
 
                 // 解码验证：不报错、能解出帧；时长保持类滤镜采样量不丢失。
-                let mut reader = crate::StreamReader::new(path.as_path())?;
+                let mut reader = crate::StreamReader::new(&path)?;
                 let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
                 let mut total_samples = 0u64;
                 let mut decoded = 0usize;

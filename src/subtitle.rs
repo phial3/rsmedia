@@ -275,11 +275,11 @@ mod tests {
             .with_codec_name(Some("mov_text".to_string()))
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(path.as_path())?;
+        let mut writer = crate::io::StreamWriter::new(&path)?;
         encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         // 2) Decode: via the generic Decoder subtitle channel
-        let mut reader = crate::io::StreamReader::new(path.as_path())?;
+        let mut reader = crate::io::StreamReader::new(&path)?;
         let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
             .with_codec_name(Some("mov_text".to_string()))
             .build_from_reader(&reader)?;
@@ -356,11 +356,11 @@ mod tests {
             .with_codec_name(Some("mov_text".to_string()))
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(path.as_path())?;
+        let mut writer = crate::io::StreamWriter::new(&path)?;
         encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         // 2) Read back: verify the subtitle stream exists
-        let mut reader = StreamReader::new(path.as_path())?;
+        let mut reader = StreamReader::new(&path)?;
         let (index, _) = reader.find_best_stream(crate::MediaType::SUBTITLE)?;
         let (codec_id, stream_tb) = {
             let stream = reader.input().streams().get(index).unwrap();
@@ -426,7 +426,7 @@ mod tests {
         let mut encoder = EncoderBuilder::new_subtitle()
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(path.as_path())?;
+        let mut writer = crate::io::StreamWriter::new(&path)?;
         encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         let content = std::fs::read_to_string(&path)?;
@@ -471,15 +471,15 @@ mod tests {
         let mut encoder = EncoderBuilder::new_subtitle()
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(input_path.as_path())?;
+        let mut writer = crate::io::StreamWriter::new(&input_path)?;
         encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         // 2) Read the MKV and copy the subtitle stream to another MKV
         let output_path = test_support::test_output_path("subtitle", "rsmedia_passthrough_out.mkv");
         test_support::remove_test_output(&output_path);
 
-        let mut reader = StreamReader::new(input_path.as_path())?;
-        let mut out_writer = crate::io::StreamWriter::new(output_path.as_path())?;
+        let mut reader = StreamReader::new(&input_path)?;
+        let mut out_writer = crate::io::StreamWriter::new(&output_path)?;
 
         // Find subtitle stream in input
         let (src_index, _) = reader.find_best_stream(crate::MediaType::SUBTITLE)?;
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(count, segments.len(), "should copy all subtitle packets");
 
         // 3) Verify output has the subtitle stream with correct codec
-        let out_reader = StreamReader::new(output_path.as_path())?;
+        let out_reader = StreamReader::new(&output_path)?;
         let subtitle_streams: Vec<_> = out_reader
             .input()
             .streams()
@@ -533,11 +533,11 @@ mod tests {
             .with_codec_name(Some("ass".to_string()))
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(path.as_path())?;
+        let mut writer = crate::io::StreamWriter::new(&path)?;
         encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
 
         // 2) Read back: verify the subtitle stream exists
-        let mut reader = StreamReader::new(path.as_path())?;
+        let mut reader = StreamReader::new(&path)?;
         let (index, _) = reader.find_best_stream(crate::MediaType::SUBTITLE)?;
         let (codec_id, stream_tb) = {
             let stream = reader.input().streams().get(index).unwrap();

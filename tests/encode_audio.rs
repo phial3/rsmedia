@@ -504,7 +504,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
         .with_filters(audio_filters)
         .build()?;
     let enc_tb = encoder.time_base();
-    let mut muxer = rsmedia::mux::Muxer::new(output_path.as_path())?;
+    let mut muxer = rsmedia::mux::Muxer::new(&output_path)?;
     let a_idx = muxer.add_encoder(encoder)?;
 
     // rsmedia 编码器内部对固定帧大小编码器做 AVAudioFifo 缓冲，

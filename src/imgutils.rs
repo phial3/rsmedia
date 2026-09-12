@@ -619,7 +619,7 @@ pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
         _ => {
             // 其他格式（YUV/BGR 族等）：swscale 统一转 RGB24
             let rgb =
-                crate::swctx::scale_frame(frame, frame.width, frame.height, PixelFormat::RGB24)?;
+                crate::scale::scale_frame(frame, frame.width, frame.height, PixelFormat::RGB24)?;
             let buf = copy_frame_to_buffer(&rgb)?;
             image::RgbImage::from_raw(width, height, buf)
                 .map(image::DynamicImage::ImageRgb8)

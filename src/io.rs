@@ -92,12 +92,12 @@ pub trait Reader {
 ///
 /// ```no_run
 /// use rsmedia::io::Seekable;
-/// use rsmedia::{StreamReader, Url};
+/// use rsmedia::StreamReader;
 ///
 /// # fn main() -> rsmedia::error::Result<()> {
-/// // Network source: URLs and local paths share the same seek API.
-/// let url = Url::parse("https://example.com/video.mp4").unwrap();
-/// let mut reader = StreamReader::new(url)?;
+/// // Network source: a plain string literal is enough -- anything with a
+/// // network scheme becomes a URL, everything else a filesystem path.
+/// let mut reader = StreamReader::new("https://example.com/video.mp4")?;
 /// if reader.is_byte_seekable() {
 ///     reader.seek_to_timestamp(10_000)?; // seek to the keyframe near 10s
 /// }
@@ -418,7 +418,7 @@ fn install_interrupt(ctx: &mut AVFormatContextInput, interrupt: &Interrupt) {
 /// let mut options = Options::new();
 /// options.insert("rtsp_transport", "tcp");
 ///
-/// let mut reader = StreamReaderBuilder::new(Path::new("my_file.mp4"))
+/// let mut reader = StreamReaderBuilder::new("my_file.mp4")
 ///    .with_options(Some(options))
 ///    .build()
 ///    .unwrap();
@@ -1010,8 +1010,8 @@ impl<'a> StreamWriterBuilder<'a> {
 ///     "frag_keyframe+empty_moov".to_string(),
 /// );
 ///
-/// let mut writer = WriterBuilder::new(Path::new("my_file.mp4"))
-///     .with_options(&options.into())
+/// let mut writer = StreamWriterBuilder::new("my_file.mp4")
+///     .with_options(Some(options))
 ///     .build()
 ///     .unwrap();
 /// ```
@@ -1742,7 +1742,7 @@ mod tests {
         let pattern = crate::test_support::test_output_path("images", "img_%03d.png");
         let n_frames = 8;
 
-        let writer = StreamWriterBuilder::new(pattern.as_path())
+        let writer = StreamWriterBuilder::new(&pattern)
             .with_format("image2")
             .build()?;
         let mut muxer = Muxer::new_from_writer(writer);
@@ -1780,7 +1780,7 @@ mod tests {
         // 复用写入测试生成的序列；若不存在则现场生成
         let pattern = crate::test_support::test_output_path("images", "img_%03d.png");
         if !pattern.with_file_name("img_001.png").exists() {
-            let writer = StreamWriterBuilder::new(pattern.as_path())
+            let writer = StreamWriterBuilder::new(&pattern)
                 .with_format("image2")
                 .build()?;
             let mut muxer = Muxer::new_from_writer(writer);
@@ -1796,7 +1796,7 @@ mod tests {
             muxer.finish()?;
         }
 
-        let reader = StreamReaderBuilder::new(pattern.as_path())
+        let reader = StreamReaderBuilder::new(&pattern)
             .with_format("image2")
             .with_options(Options::from_iter([(
                 "framerate".to_string(),
@@ -1935,7 +1935,7 @@ mod tests {
         let path = crate::test_support::test_output_path("io", "rsmedia_io_reader.ts");
         crate::test_support::remove_test_output(&path);
         {
-            let mut muxer = Muxer::new(path.as_path())?;
+            let mut muxer = Muxer::new(&path)?;
             let encoder = EncoderBuilder::new_video(64, 48).build()?;
             let tb = encoder.time_base();
             let video_index = muxer.add_encoder(encoder)?;

@@ -51,7 +51,7 @@ fn main() -> Result<()> {
     ];
 
     let filter_count = filters.len();
-    let mut reader = StreamReader::new(source.as_path()).context("failed to open input")?;
+    let mut reader = StreamReader::new(&source).context("failed to open input")?;
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
         .with_filters(filters)
         .build_from_reader(&reader)

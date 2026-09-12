@@ -1,235 +1,9 @@
 use crate::error::{Context, Result, RsmediaError};
-use crate::{PixelFormat, SampleFormat, imgutils, time};
+use crate::{SampleFormat, imgutils, time};
 
 use rsmpeg::avutil::{AVFrame, AVSamples};
 use rsmpeg::ffi;
 use rsmpeg::swresample::SwrContext;
-use rsmpeg::swscale::SwsContext;
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////// Video Scaler SwsContext ////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////
-// FFmpeg `SWS_*` 定义参考（对应 swscale 头的开关位，见
-// https://ffmpeg.org/doxygen/trunk/swscale_8h_source.html ）：
-//   SWS_STRICT         1 << 11   Return an error on underspecified conversions.
-//   SWS_PRINT_INFO     1 << 12   Emit verbose log of scaling parameters.
-//   SWS_FULL_CHR_H_INT 1 << 13   Perform full chroma upsampling when upscaling to RGB.
-//   SWS_FULL_CHR_H_INP 1 << 14   Perform full chroma interpolation when downscaling RGB.
-//   SWS_ACCURATE_RND   1 << 18   Force bit-exact output rounding.
-//   SWS_BITEXACT       1 << 19   Disable platform-specific optimizations for bit-exactness.
-//   SWS_UNSTABLE       1 << 20   Prefer experimental code paths.
-//   SWS_DIRECT_BGR     1 << 15   Deprecated: no effect.
-//   SWS_ERROR_DIFFUSION 1 << 23   Deprecated: set `SwsContext.dither` instead.
-//   SWS_FAST_BILINEAR  1 <<  0   fast bilinear filtering
-//   SWS_BILINEAR       1 <<  1   bilinear filtering
-//   SWS_BICUBIC        1 <<  2   2-tap cubic B-spline
-//   SWS_X              1 <<  3   experimental
-//   SWS_POINT          1 <<  4   nearest neighbor
-//   SWS_AREA           1 <<  5   area averaging
-//   SWS_BICUBLIN       1 <<  6   bicubic luma, bilinear chroma
-//   SWS_GAUSS          1 <<  7   gaussian approximation
-//   SWS_SINC           1 <<  8   unwindowed sinc
-//   SWS_LANCZOS        1 <<  9   3-tap sinc/sinc
-//   SWS_SPLINE         1 << 10   unwindowed natural cubic spline
-//
-// 版本差异（详见 https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/doc/APIchanges）：
-// - FFmpeg 6/7：`SWS_*` 是裸整型常量，`ffi::SwsFlags` 类型别名不存在；
-//   libswscale 只有 legacy 路径（`sws_getContext()` 初始化 + `sws_scale_frame()`）。
-// - FFmpeg 8+：`SWS_*` 常量类型化为 `ffi::SwsFlags`（MSVC 上底层为 `c_int`，Unix 为
-//   `c_uint`），`sws_init_context()` 被废弃，官方推荐 `sws_alloc_context()` → 设置字段
-//   → `sws_scale_frame()` 的全动态模式（FFmpeg 9 起拒绝 legacy/modern 混用）。
-// `ffi_enum!` 判别值的 `as u32` 归一化使 6/7 的裸常量与 8+ 的 `ffi::SwsFlags` 别名
-// 常量都能编译，故这里统一用 `ffi_enum!` 单表定义，无需按版本复制变体表。
-ffi_enum!(
-    /// Sws scale filter flags (SWS_*)
-    #[allow(non_camel_case_types)]
-    SwsFlags, u32 {
-        /// fast bilinear filtering
-        FAST_BILINEAR => ffi::SWS_FAST_BILINEAR;
-        /// bilinear filtering
-        BILINEAR => ffi::SWS_BILINEAR;
-        /// 2-tap cubic B-spline
-        BICUBIC => ffi::SWS_BICUBIC;
-        /// experimental
-        X => ffi::SWS_X;
-        /// nearest neighbor
-        POINT => ffi::SWS_POINT;
-        /// area averaging
-        AREA => ffi::SWS_AREA;
-        /// bicubic luma, bilinear chroma
-        BICUBLIN => ffi::SWS_BICUBLIN;
-        /// gaussian approximation
-        GAUSS => ffi::SWS_GAUSS;
-        /// unwindowed sinc
-        SINC => ffi::SWS_SINC;
-        /// 3‑tap sinc/sinc
-        LANCZOS => ffi::SWS_LANCZOS;
-        /// unwindowed natural cubic spline
-        SPLINE => ffi::SWS_SPLINE;
-    }
-);
-
-impl SwsFlags {
-    /// Returns the complete swscale flags for this algorithm: the algorithm bits plus the
-    /// quality flags, which are always added (`SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND |
-    /// SWS_BITEXACT`).
-    ///
-    /// Combines the named flag with raw masks through the generated `BitOr`, which is precisely
-    /// what that operator exists for: assembling a mask for the FFI boundary.
-    #[allow(clippy::unnecessary_cast)] // `SWS_*` is a bare integer before FFmpeg 8.
-    pub fn complete(self) -> u32 {
-        self | (ffi::SWS_FULL_CHR_H_INT as u32)
-            | (ffi::SWS_ACCURATE_RND as u32)
-            | (ffi::SWS_BITEXACT as u32)
-    }
-}
-
-#[allow(clippy::derivable_impls)]
-impl Default for SwsFlags {
-    fn default() -> Self {
-        Self::BICUBIC
-    }
-}
-
-/// 创建软件缩放上下文（按 FFmpeg 版本走新旧 API 路径）：
-/// - FFmpeg 6/7：legacy 路径，`sws_getContext()` 一次性传入源/目标参数完成初始化；
-/// - FFmpeg 8+：modern 全动态路径，`sws_alloc_context()` 分配后仅设置 flags 字段，
-///   尺寸/格式等参数由 `sws_scale_frame()` 从帧属性推导（`sws_init_context()` 自
-///   FFmpeg 8.0 起废弃，FFmpeg 9 起拒绝 legacy/modern API 混用）。
-#[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-fn setup_scaler(
-    src_width: i32,
-    src_height: i32,
-    src_pix_fmt: ffi::AVPixelFormat,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: ffi::AVPixelFormat,
-    flags: u32,
-) -> Result<SwsContext> {
-    SwsContext::get_context(
-        src_width,
-        src_height,
-        src_pix_fmt,
-        dst_width,
-        dst_height,
-        dst_pix_fmt,
-        flags,
-        None,
-        None,
-        None,
-    )
-    .context("Failed to create a swscale context.")
-}
-
-/// FFmpeg 8+ 的 modern 全动态路径：参数签名与 6/7 分支保持一致以便调用方无感切换，
-/// 除 flags 外的参数（尺寸/格式）由 [`SwsContext::scale_full_frame`] 从帧属性推导，
-/// 此处忽略。
-#[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-#[allow(unused_variables)]
-fn setup_scaler(
-    src_width: i32,
-    src_height: i32,
-    src_pix_fmt: ffi::AVPixelFormat,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: ffi::AVPixelFormat,
-    flags: u32,
-) -> Result<SwsContext> {
-    let mut sws_ctx = SwsContext::alloc().context("Failed to allocate a swscale context.")?;
-    sws_ctx.set_flags(flags);
-    Ok(sws_ctx)
-}
-
-/// # Safety
-///
-/// ffi::sws_scale_frame
-pub fn scale_frame(
-    src_frame: &AVFrame,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: PixelFormat,
-) -> Result<AVFrame> {
-    scale_with_flags(
-        src_frame,
-        dst_width,
-        dst_height,
-        dst_pix_fmt,
-        SwsFlags::default(),
-    )
-}
-
-/// # Safety
-///
-/// ffi::sws_scale_frame
-pub fn scale_with_flags(
-    src_frame: &AVFrame,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: PixelFormat,
-    scaler_algo: SwsFlags,
-) -> Result<AVFrame> {
-    if !src_frame.hw_frames_ctx.is_null() {
-        return Err(RsmediaError::unsupported(
-            "Hardware frames are not supported in this software scalar",
-        ));
-    }
-
-    let mut dst_frame = AVFrame::new();
-    dst_frame.set_width(dst_width);
-    dst_frame.set_height(dst_height);
-    dst_frame.set_format(dst_pix_fmt.into());
-    dst_frame
-        .alloc_buffer()
-        .context("Failed to allocate destination frame buffer")?;
-    imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
-    let mut sws_ctx = setup_scaler(
-        src_frame.width,
-        src_frame.height,
-        src_frame.format,
-        dst_width,
-        dst_height,
-        dst_pix_fmt.into(),
-        scaler_algo.complete(),
-    )
-    .context("Failed to create swscale context.")?;
-
-    // FFmpeg 6/7：legacy 初始化的上下文直调 `sws_scale_frame`（对已初始化上下文属
-    // 向后兼容用法）；FFmpeg 8+：全动态上下文必须走 modern 封装
-    // [`SwsContext::scale_full_frame`]，FFmpeg 9 起对未初始化的上下文直调底层
-    // `sws_scale_frame` 会因新旧 API 混用而拒绝（AVERROR EINVAL）。
-    #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-    {
-        let ret = unsafe {
-            ffi::sws_scale_frame(
-                sws_ctx.as_mut_ptr(),
-                dst_frame.as_mut_ptr(),
-                src_frame.as_ptr(),
-            )
-        };
-        if ret < 0 {
-            return Err(RsmediaError::custom(format!(
-                "Failed to call sws_scale_frame, ret: {ret}"
-            )));
-        }
-    }
-
-    #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-    sws_ctx
-        .scale_full_frame(&mut dst_frame, src_frame)
-        .context("Failed to scale frame.")?;
-
-    log::debug!(
-        "Sws scale from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
-        src_frame.width,
-        src_frame.height,
-        PixelFormat::from(src_frame.format),
-        dst_width,
-        dst_height,
-        dst_pix_fmt
-    );
-
-    Ok(dst_frame)
-}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////// Audio Resampler SwrContext /////////////////////////////////////////
@@ -334,9 +108,9 @@ pub fn convert_frame(
     dst_frame.set_format(out_sample_fmt);
     dst_frame.set_ch_layout(out_ch_layout);
     // 输出帧的缓冲必须按重采样后的输出样本数分配，而不是简单地使用输入样本数。
-    // 当输入/输出采样率不同时，swr_convert_frame() 会写入比输入样本数更多的输出样本，
+    // 当输入/输出采样率不同时，swr_convert() 会写入比输入样本数更多的输出样本，
     // 但 FFmpeg 不会自动扩大已分配的输出缓冲（只把放不下的部分存入内部 FIFO），
-    // 若这里 mb_samples 设得过小，将导致 swr_convert 越界写。
+    // 若这里 nb_samples 设得过小，将导致 swr_convert 越界写。
     // 用 swr_get_out_samples() 得到所需输出样本数的上界来分配缓冲。
     let out_samples = resampler.get_out_samples(src_frame.nb_samples).max(1);
     dst_frame.set_nb_samples(out_samples);
@@ -349,8 +123,8 @@ pub fn convert_frame(
     // 转换输入 AVFrame 中的样本并将其写入输出 AVFrame。
     // 输入和输出 AVFrame 必须设置通道布局、采样率和格式。
     // 如果输出 AVFrame 没有分配数据指针，则将在调用 av_frame_get_buffer() 分配帧时设置 nb_samples 字段。
-    // 输出的 AVFrame 可以是 NULL，或者分配的样本少于所需的数量。在这种情况下，未写入输出的剩余样本将被添加到内部 FIFO 缓冲区，在下次调用此函数或 swr_convert() 时返回。
-    // 如果转换采样率，内部重采样延迟缓冲区中可能会有剩余数据。要以输出方式获取这些数据，请调用此函数或 swr_convert()，并输入 NULL。
+    // 输出的 AVFrame 可以是 NULL，或者分配的样本少于所需的数量。在这种情况下，未写入输出的剩余样本将被添加到内部 FIFO 缓冲区，在下次调用此函数时返回。
+    // 如果转换采样率，内部重采样延迟缓冲区中可能会有剩余数据。要以输出方式获取这些数据，请调用此函数，并输入 NULL。
     resampler
         .convert_frame(src_frame, &mut dst_frame)
         .context("Failed to convert frame.")?;
@@ -407,8 +181,8 @@ impl Resampler {
     }
 
     /// Convert an input frame into an output frame with allocated buffer
-    /// (persistent context: samples that cannot be written due to insufficient
-    /// output capacity remain internally buffered and are returned with subsequent calls).
+    /// (persistent context: samples that cannot be written with `swr_convert` due to
+    /// insufficient output capacity remain internally buffered and are returned with subsequent calls).
     ///
     /// The caller must set format/layout/sample_rate/nb_samples on `dst` and
     /// call `alloc_buffer`; after conversion, `dst.nb_samples` is the actual
@@ -466,8 +240,8 @@ impl Resampler {
     /// Drain the remaining samples from the resampler (EOF flush).
     ///
     /// `dst` must already have an allocated buffer; after conversion,
-    /// `dst.nb_samples` is the actual number of samples obtained (possibly 0).
-    /// Repeat the call until 0 is returned to fully drain.
+    /// `dst.nb_samples` is the actual number of samples (possibly 0).
+    /// Repeat until 0 samples are returned to fully drain.
     pub fn flush(&mut self, dst: &mut AVFrame) -> Result<()> {
         self.swr
             .convert_frame(None, dst)
@@ -650,7 +424,6 @@ mod tests {
         let nb_samples = 1024;
         let nb_channels = 2;
 
-        // 测试所有格式组合
         for in_fmt in AUDIO_FORMATS {
             println!("\nTesting input format: {:?}", in_fmt);
 
@@ -713,7 +486,6 @@ mod tests {
                         let result =
                             convert_frame(&src_frame, ch_layout, out_fmt.format, out_rate)?;
 
-                        // 验证转换结果
                         assert_eq!(result.format, out_fmt.format);
                         assert_eq!(result.sample_rate, out_rate);
                         assert_eq!(result.ch_layout.nb_channels, nb_channels);
@@ -817,109 +589,6 @@ mod tests {
             }
         }
 
-        Ok(())
-    }
-
-    /// 用确定性数据填充 YUV420P 帧的全部平面（保证转换产物非零可断言）。
-    unsafe fn fill_yuv420p(frame: &mut AVFrame) {
-        for plane in 0..3usize {
-            let height = if plane == 0 {
-                frame.height
-            } else {
-                frame.height / 2
-            };
-            let data = unsafe {
-                std::slice::from_raw_parts_mut(
-                    frame.data[plane],
-                    frame.linesize[plane] as usize * height as usize,
-                )
-            };
-            for (i, b) in data.iter_mut().enumerate() {
-                *b = (i % 251) as u8;
-            }
-        }
-    }
-
-    /// 视频缩放：64x64 YUV420P -> 32x32 RGB24。
-    ///
-    /// 覆盖 [`scale_with_flags`] 的完整执行路径——FFmpeg 6/7 走 legacy
-    /// `sws_scale_frame`，FFmpeg 8+ 走 modern `scale_full_frame`。
-    #[test]
-    fn test_scale_frame_video() -> Result<()> {
-        let mut src = AVFrame::new();
-        src.set_width(64);
-        src.set_height(64);
-        src.set_format(PixelFormat::YUV420P.into());
-        src.alloc_buffer().context("alloc src buffer")?;
-        unsafe { fill_yuv420p(&mut src) };
-
-        let dst = scale_with_flags(&src, 32, 32, PixelFormat::RGB24, SwsFlags::LANCZOS)
-            .context("scale failed")?;
-
-        assert_eq!(dst.width, 32);
-        assert_eq!(dst.height, 32);
-        assert_eq!(dst.format, i32::from(PixelFormat::RGB24));
-
-        // 输出缓冲非零
-        unsafe {
-            let data = std::slice::from_raw_parts(dst.data[0], dst.linesize[0] as usize * 32);
-            assert!(!data.iter().all(|&b| b == 0), "scaled output is empty");
-        }
-        Ok(())
-    }
-
-    /// FFmpeg 8+ modern 全动态参数的完整用法验证（6/7 无这些类型化字段）：
-    ///
-    /// - `flags`（`u32` 位标志）：算法位（`SWS_*` 滤波器选择）+ 质量位
-    ///   （`SWS_ACCURATE_RND`/`SWS_BITEXACT` 等），rsmedia 公开路径经
-    ///   [`SwsFlags::complete`] 组装；
-    /// - `threads`：并行线程数，0 = 自动；
-    /// - `dither`（`SwsDither`）：抖动算法，作用于色深降低/Bayer 输出，
-    ///   默认 AUTO；
-    /// - `alpha_blend`（`SwsAlphaBlend`）：目标带 alpha 通道时的逐像素混合
-    ///   方式，默认 NONE（直接覆盖）；
-    /// - `scaler` / `backends`（仅 FFmpeg 9）：显式选择 scaler 类型与实现
-    ///   后端，`scaler` 非默认值时覆盖 flags 的算法位。
-    #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-    #[test]
-    fn test_scale_modern_options() -> Result<()> {
-        use rsmpeg::swscale::SwsContext;
-
-        let mut src = AVFrame::new();
-        src.set_width(64);
-        src.set_height(64);
-        src.set_format(PixelFormat::YUV420P.into());
-        src.alloc_buffer().context("alloc src buffer")?;
-        unsafe { fill_yuv420p(&mut src) };
-
-        let mut ctx = SwsContext::alloc().context("allocate sws context")?;
-        ctx.set_flags(SwsFlags::LANCZOS.complete());
-        ctx.set_threads(0);
-        ctx.set_dither(ffi::SWS_DITHER_AUTO);
-        ctx.set_alpha_blend(ffi::SWS_ALPHA_BLEND_NONE);
-        #[cfg(feature = "ffmpeg9")]
-        {
-            // 显式指定 scaler 类型（覆盖 flags 算法位）与允许的实现后端。
-            ctx.set_scaler(ffi::SWS_SCALE_BICUBIC);
-            ctx.set_backends(ffi::SWS_BACKEND_ALL);
-        }
-
-        let mut dst = AVFrame::new();
-        dst.set_width(32);
-        dst.set_height(32);
-        dst.set_format(PixelFormat::RGB24.into());
-        dst.alloc_buffer().context("alloc dst buffer")?;
-
-        ctx.scale_full_frame(&mut dst, &src)
-            .context("scale with modern options failed")?;
-
-        assert_eq!(dst.width, 32);
-        assert_eq!(dst.height, 32);
-        assert_eq!(dst.format, i32::from(PixelFormat::RGB24));
-        unsafe {
-            let data = std::slice::from_raw_parts(dst.data[0], dst.linesize[0] as usize * 32);
-            assert!(!data.iter().all(|&b| b == 0), "scaled output is empty");
-        }
         Ok(())
     }
 }
