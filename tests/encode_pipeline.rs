@@ -25,7 +25,7 @@ use rsmedia::strutils;
 use rsmedia::time;
 use rsmedia::{
     CodecConfig, EncoderBuilder, Filter, MediaFrame, MediaType, PixelFormat, Quality, Result,
-    RsmediaError, SampleFormat, VideoProfile,
+    RsmediaError, SampleFormat,
 };
 
 use rsmpeg::avutil;
@@ -518,7 +518,9 @@ mod video {
     #[test]
     #[cfg(unix)]
     fn test_profile_level_applied() -> Result<()> {
-        use rsmedia::DecoderBuilder;
+        // 本测试仅 Unix 编译（`#[cfg(unix)]`），导入放在函数内，
+        // 避免 Windows 构建报 unused import。
+        use rsmedia::{DecoderBuilder, VideoProfile};
 
         let width = 64usize;
         let height = 64usize;
