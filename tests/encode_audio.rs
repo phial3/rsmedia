@@ -11,7 +11,7 @@ use rsmpeg::{
     ffi,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rsmedia::codec::CodecConfig;
 use rsmedia::{EncoderBuilder, SampleFormat, filter, strutils};
 use std::ffi::{CStr, CString};
@@ -538,7 +538,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
 /// 遍历常见音频容器逐一编码；编码器缺失的容器跳过并报告，
 /// 但要求至少一个容器成功，防止环境异常时测试空壳通过。
 #[test]
-fn test_encode_audio_containers() {
+fn test_encode_audio_containers() -> Result<()> {
     let mut skipped = Vec::new();
     let mut encoded = 0;
 
@@ -548,10 +548,11 @@ fn test_encode_audio_containers() {
             Err(e) if e.to_string().contains("not available in this FFmpeg build") => {
                 skipped.push(*container_type)
             }
-            Err(e) => panic!("encode {container_type} failed: {e:#}"),
+            Err(e) => return Err(anyhow!("encode {container_type} failed: {e:#}")),
         }
     }
 
     println!("encoded {encoded} containers, skipped: {skipped:?}");
     assert!(encoded > 0, "all audio container encodings were skipped");
+    Ok(())
 }

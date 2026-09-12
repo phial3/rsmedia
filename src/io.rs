@@ -1786,8 +1786,9 @@ mod tests {
         let dir = pattern.parent().unwrap();
         for i in 1..=n_frames {
             let file = dir.join(format!("img_{i:03}.png"));
-            let meta = std::fs::metadata(&file)
-                .unwrap_or_else(|e| panic!("expected sequence file {}: {e}", file.display()));
+            let meta = std::fs::metadata(&file).map_err(|e| {
+                RsmediaError::custom(format!("expected sequence file {}: {e}", file.display()))
+            })?;
             assert!(meta.len() > 0, "sequence file {} is empty", file.display());
         }
         // 未写入的下一个编号不应存在

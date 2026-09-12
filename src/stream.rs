@@ -634,15 +634,14 @@ mod tests {
     /// 存在性验证：表中列出但当前 FFmpeg 构建未注册的硬件解码器（如
     /// ffmpeg6 无 `*_vulkan`）应回退到软件解码器，而不是返回无效名字。
     #[test]
-    fn test_find_decoder_name_unregistered_hw_falls_back() {
-        let reader =
-            StreamReader::new(std::path::Path::new("assets/mp4.mp4")).expect("open test asset");
-        let info = StreamInfo::from_reader(&reader, 0).expect("read stream 0");
+    fn test_find_decoder_name_unregistered_hw_falls_back() -> Result<()> {
+        let reader = StreamReader::new("assets/mp4.mp4")?;
+        let info = StreamInfo::from_reader(&reader, 0)?;
 
         for hw in [HWDeviceType::CUDA, HWDeviceType::VULKAN, HWDeviceType::QSV] {
             let name = info
                 .find_decoder_name(Some(hw))
-                .unwrap_or_else(|| panic!("lookup for {hw:?}"));
+                .ok_or_else(|| RsmediaError::custom(format!("lookup for {hw:?} failed")))?;
             let registered = if let Some(codec) =
                 AVCodec::find_decoder_by_name(&strutils::str_to_cstring(&name))
             {
@@ -655,5 +654,6 @@ mod tests {
                 "find_decoder_name({hw:?}) returned '{name}' which is not registered"
             );
         }
+        Ok(())
     }
 }

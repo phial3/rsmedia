@@ -24,8 +24,8 @@ use rsmedia::error::Context;
 use rsmedia::strutils;
 use rsmedia::time;
 use rsmedia::{
-    CodecConfig, EncoderBuilder, Filter, MediaFrame, MediaType, PixelFormat, Quality, Result,
-    RsmediaError, SampleFormat,
+    CodecConfig, DecoderBuilder, EncoderBuilder, Filter, MediaFrame, MediaType, PixelFormat, Quality, Result,
+    RsmediaError, SampleFormat, VideoProfile,
 };
 
 use rsmpeg::avutil;
@@ -516,12 +516,7 @@ mod video {
     /// profile/level 通过私有选项传给 libx264：编码到 MP4 后重新打开，
     /// 容器元数据（avcC/SPS）应回报 profile=High(100)、level=4.1(41)。
     #[test]
-    #[cfg(unix)]
     fn test_profile_level_applied() -> Result<()> {
-        // 本测试仅 Unix 编译（`#[cfg(unix)]`），导入放在函数内，
-        // 避免 Windows 构建报 unused import。
-        use rsmedia::{DecoderBuilder, VideoProfile};
-
         let width = 64usize;
         let height = 64usize;
         let fps = 25.0;
