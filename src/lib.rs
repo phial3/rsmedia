@@ -7,6 +7,7 @@ pub mod encode;
 pub mod frame;
 #[cfg(feature = "ndarray")]
 pub use frame::{FrameSideData, MediaFrame, MediaFrameType};
+pub mod bsf;
 pub mod codec;
 pub mod colors;
 pub mod error;
@@ -29,6 +30,7 @@ pub mod strutils;
 pub mod subtitle;
 pub mod time;
 
+pub use bsf::Bsf;
 pub use codec::{CodecConfig, FormatInfo, Profile};
 pub use colors::Color;
 pub use decode::{Decoder, DecoderBuilder, thumbnail};
