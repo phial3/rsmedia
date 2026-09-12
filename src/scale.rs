@@ -1112,10 +1112,7 @@ mod tests {
         // 缓冲的尾部留白恒在 `buf[0].data + size - 64`，即池缓冲的物理末尾。
         let second_buf_size = unsafe { (*second.buf[0]).size };
         let tail = unsafe {
-            std::slice::from_raw_parts(
-                (*second.buf[0]).data.add(second_buf_size - 64),
-                64,
-            )
+            std::slice::from_raw_parts((*second.buf[0]).data.add(second_buf_size - 64), 64)
         };
         assert!(tail.iter().all(|&b| b == 0), "缓冲尾部留白非零");
         Ok(())
