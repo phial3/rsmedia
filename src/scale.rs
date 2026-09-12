@@ -616,6 +616,32 @@ impl Scaler {
 
         Ok(dst_frame)
     }
+
+    /// Like [`Scaler::scale_frame`], but takes ownership of `src`.
+    ///
+    /// When the source already matches the requested destination format **and**
+    /// dimensions, `src` is returned unchanged (zero-cost, no allocation);
+    /// otherwise it is converted via the persistent context into a newly
+    /// allocated destination frame.
+    ///
+    /// This centralises the "convert only when the pixel format / geometry
+    /// differ" short-circuit that would otherwise be duplicated across the
+    /// decode and encode pipelines.
+    pub fn scale_if_needed(
+        &mut self,
+        src: AVFrame,
+        dst_width: i32,
+        dst_height: i32,
+        dst_pix_fmt: PixelFormat,
+    ) -> Result<AVFrame> {
+        if src.format == i32::from(dst_pix_fmt)
+            && src.width == dst_width
+            && src.height == dst_height
+        {
+            return Ok(src);
+        }
+        self.scale_frame(&src, dst_width, dst_height, dst_pix_fmt)
+    }
 }
 
 impl Default for Scaler {
@@ -760,6 +786,44 @@ mod tests {
             PixelFormat::RGB24,
         )?;
         assert_eq!((third.width, third.height), (32, 32));
+        Ok(())
+    }
+
+    /// `scale_if_needed` returns the source frame unchanged when the target
+    /// format and dimensions already match (zero-cost no-op), and converts
+    /// only when they differ.
+    #[test]
+    fn test_scale_if_needed_noops_on_matching_format_and_size() -> Result<()> {
+        let mut scaler = Scaler::new();
+
+        // 源已是目标格式与尺寸 → 应原样返回（no-op）。
+        let matching = scaler.scale_if_needed(
+            create_test_frame(64, 64, PixelFormat::RGB24)?,
+            64,
+            64,
+            PixelFormat::RGB24,
+        )?;
+        assert_eq!((matching.width, matching.height), (64, 64));
+        assert_eq!(matching.format, i32::from(PixelFormat::RGB24));
+
+        // 仅尺寸不同 → 必须缩放。
+        let resized = scaler.scale_if_needed(
+            create_test_frame(64, 64, PixelFormat::RGB24)?,
+            32,
+            32,
+            PixelFormat::RGB24,
+        )?;
+        assert_eq!((resized.width, resized.height), (32, 32));
+
+        // 仅格式不同 → 必须转换。
+        let conv = scaler.scale_if_needed(
+            create_test_frame(64, 64, PixelFormat::YUV420P)?,
+            64,
+            64,
+            PixelFormat::RGB24,
+        )?;
+        assert_eq!((conv.width, conv.height), (64, 64));
+        assert_eq!(conv.format, i32::from(PixelFormat::RGB24));
         Ok(())
     }
 

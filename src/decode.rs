@@ -363,12 +363,11 @@ impl DecoderBuilder {
 /// # Example
 ///
 /// ```ignore
-/// let decoder = Decoder::new("video.mp4").unwrap();
-/// decoder
-///     .decode_iter()
-///     .take_while(Result::is_ok)
-///     .for_each(|frame| println!("Got frame!"),
-/// );
+/// let mut reader = StreamReader::new("video.mp4").unwrap();
+/// let mut decoder = Decoder::new_video("video.mp4").unwrap();
+/// while let Some(frame) = decoder.decode(&mut reader).unwrap() {
+///     println!("Got frame!");
+/// }
 /// ```
 pub struct Decoder {
     context: AVCodecContext,
@@ -855,19 +854,12 @@ impl Decoder {
                         })?,
                     None => (sw_frame.width as u32, sw_frame.height as u32),
                 };
-                if sw_frame.format != i32::from(target_sw_pix_fmt)
-                    || sw_frame.width != out_w as i32
-                    || sw_frame.height != out_h as i32
-                {
-                    self.scaler.scale_frame(
-                        &sw_frame,
-                        out_w as i32,
-                        out_h as i32,
-                        target_sw_pix_fmt,
-                    )?
-                } else {
-                    sw_frame
-                }
+                self.scaler.scale_if_needed(
+                    sw_frame,
+                    out_w as i32,
+                    out_h as i32,
+                    target_sw_pix_fmt,
+                )?
             }
             _ => {
                 // do nothing

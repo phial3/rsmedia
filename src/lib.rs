@@ -41,7 +41,7 @@ pub use init::init;
 pub use io::{AVSeekFlag, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
-pub use mux::Chapter;
+pub use mux::{Chapter, Demuxer, Muxer};
 pub use options::{Metadata, Options, Quality, VideoProfile};
 pub use pcm::{PcmSink, PcmSpec};
 pub use pixel::PixelFormat;
@@ -52,7 +52,6 @@ pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
 pub use time::Time;
 
-/// Re-export internal definition for caller to use.
 pub use rsmpeg::avutil;
 
 /// Unit-test helpers
