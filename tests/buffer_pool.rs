@@ -75,19 +75,20 @@ fn test_pooled_scaler_encode_roundtrip() -> Result<()> {
     // 池化缩放：64x64 → 32x32，10 帧。每帧编码后立即归还缓冲（复用路径）。
     let mut scaler = Scaler::new().with_buffer_pool(true);
     let frames = 10;
+    let mut first_ptr = 0usize;
     for i in 0..frames {
         let src = make_source_frame(64, 64, i as u8 * 7)?;
         let mut dst = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
-        assert_eq!(
-            scaler.pool_allocations(),
-            Some(1),
-            "稳态复用，只有首帧真实分配"
-        );
+        // 稳态复用：从第二帧起数据指针必须与首帧相同（缓冲被池回收复用）。
+        if first_ptr == 0 {
+            first_ptr = dst.data[0] as usize;
+        } else {
+            assert_eq!(dst.data[0] as usize, first_ptr, "稳态复用失败");
+        }
         dst.set_pts(i);
         dst.set_time_base(enc_time_base);
         muxer.mux(dst, video_index)?;
     }
-    assert_eq!(scaler.pool_allocations(), Some(1));
     muxer.finish()?;
 
     // 解码回读：帧数无损。

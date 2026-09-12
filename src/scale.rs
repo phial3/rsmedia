@@ -1,6 +1,6 @@
 use crate::error::{Context, Result, RsmediaError};
-use crate::pool::BufferPool;
 use crate::{PixelFormat, imgutils};
+use rsmpeg::avutil::AVBufferPool;
 
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
@@ -490,7 +490,7 @@ struct BoundScaler {
     dst_width: i32,
     dst_height: i32,
     dst_pix_fmt: PixelFormat,
-    pool: Option<BufferPool>,
+    pool: Option<AVBufferPool>,
 }
 
 impl Scaler {
@@ -548,7 +548,6 @@ impl Scaler {
     ///
     /// let scaler = Scaler::new().with_buffer_pool(true);
     /// assert!(scaler.pool_enabled());
-    /// assert_eq!(scaler.pool_allocations(), None); // not bound yet
     /// ```
     pub fn with_buffer_pool(mut self, enabled: bool) -> Self {
         self.pool_enabled = enabled;
@@ -559,19 +558,6 @@ impl Scaler {
     /// (see [`Self::with_buffer_pool`]).
     pub fn pool_enabled(&self) -> bool {
         self.pool_enabled
-    }
-
-    /// Total buffers **actually allocated** by the internal frame pool so far, or
-    /// `None` when pooling is disabled or the context is not bound yet.
-    ///
-    /// Recycled buffers do not count, so on a steady stream this stalls at a small
-    /// number while the frame count keeps growing — the direct evidence that pooling
-    /// is working.
-    pub fn pool_allocations(&self) -> Option<u64> {
-        self.bound
-            .as_ref()
-            .and_then(|bound| bound.pool.as_ref())
-            .map(BufferPool::allocations)
     }
 
     /// The scaling kernel this scaler was configured with.
@@ -634,7 +620,7 @@ impl Scaler {
             // 池与上下文同生命周期：按本次绑定的目标几何建池，几何/格式变化
             // 重建时旧池一并析构（未归还的缓冲由引用计数安全释放）。
             let pool = if self.pool_enabled {
-                Some(BufferPool::new(pooled_frame_buffer_size(
+                Some(AVBufferPool::new(pooled_frame_buffer_size(
                     dst_pix_fmt,
                     dst_width,
                     dst_height,
@@ -775,7 +761,7 @@ fn pooled_frame_buffer_size(fmt: PixelFormat, width: i32, height: i32) -> Result
 /// 远小于一次 malloc，换来与 `alloc_buffer` 完全一致的跨平台语义——帧的
 /// padding 字节内容确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。
 fn alloc_pooled_frame(
-    pool: &mut BufferPool,
+    pool: &mut AVBufferPool,
     width: i32,
     height: i32,
     fmt: PixelFormat,
@@ -785,7 +771,9 @@ fn alloc_pooled_frame(
     frame.set_height(height);
     frame.set_format(fmt.into());
 
-    let mut buffer = pool.get()?;
+    let mut buffer = pool
+        .get()
+        .context("Failed to get a buffer from the frame pool")?;
     // Safety: buffer.data 有效且长度为 buffer.size（FFmpeg 侧保证），
     // 整段清零写是合法的独占访问（引用计数为 1，无其他持有者）。
     unsafe {
@@ -938,42 +926,37 @@ mod tests {
         Ok(())
     }
 
-    /// 池化帧的缓冲复用与分配计数：归还后必须复用同一缓冲（同指针、
-    /// 不计数），持有中的帧强制池增长，全部归还后池回到初始集合。
+    /// 池化帧的缓冲复用：归还后必须复用同一缓冲（同指针），持有中的帧
+    /// 强制池拿新缓冲，全部归还后两次取回应恰好落回 b/c 的两个缓冲。
     #[test]
     fn test_scaler_frame_pool_recycles_buffers() -> Result<()> {
         let mut scaler = Scaler::new().with_buffer_pool(true);
         assert!(scaler.pool_enabled());
-        assert_eq!(scaler.pool_allocations(), None, "未绑定前无池统计");
 
         let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
 
-        // 第 1 帧：真实分配（计数 1）。
+        // 第 1 帧：真实分配。
         let a = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
-        assert_eq!(scaler.pool_allocations(), Some(1));
         assert!(!a.buf[0].is_null(), "池化帧必须持有 buf[0]");
         assert!(a.is_allocated());
         let ptr_a = a.data[0];
 
-        // 归还后第 2 帧：必须复用同一缓冲（计数不变）。
+        // 归还后第 2 帧：必须复用同一缓冲（同数据指针）。
         drop(a);
         let b = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
-        assert_eq!(scaler.pool_allocations(), Some(1), "归还的缓冲应被复用");
         assert_eq!(b.data[0], ptr_a, "复用的缓冲数据指针应与上一帧相同");
 
-        // b 仍存活：第 3 帧必须新分配（池增长，计数 2）。
+        // b 仍存活：第 3 帧必须拿新缓冲。
         let c = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
-        assert_eq!(scaler.pool_allocations(), Some(2));
         assert_ne!(c.data[0], b.data[0]);
 
-        // 全部归还后：两次取回应恰好是 b/c 的两个缓冲，且不再增长。
+        // 全部归还后：两次取回应恰好是 b/c 的两个缓冲。
         let ptr_b = b.data[0];
         let ptr_c = c.data[0];
         drop(b);
         drop(c);
         let d = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
         let e = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
-        assert_eq!(scaler.pool_allocations(), Some(2), "复用不应计数");
         let got = [d.data[0], e.data[0]];
         assert!(
             (got[0] == ptr_b && got[1] == ptr_c) || (got[0] == ptr_c && got[1] == ptr_b),
@@ -1030,7 +1013,7 @@ mod tests {
         let src_mid = create_test_frame(48, 48, PixelFormat::YUV420P)?;
 
         let a = scaler.scale_frame(&src_small, 32, 32, PixelFormat::YUV420P)?;
-        assert_eq!(scaler.pool_allocations(), Some(1));
+        let ptr_old = a.data[0];
         drop(a);
 
         // 几何变化：旧池析构、新池按 24x20 尺寸重建（计数从 1 重新开始）。
@@ -1039,10 +1022,9 @@ mod tests {
         assert_eq!(b.format, i32::from(PixelFormat::RGB24));
         let reference = plain.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
         assert_visible_pixels_equal(&b, &reference, 24, 20, PixelFormat::RGB24);
-        assert_eq!(
-            scaler.pool_allocations(),
-            Some(1),
-            "重建后的池应只统计新几何的分配"
+        assert_ne!(
+            b.data[0] as usize, ptr_old as usize,
+            "重建后的池应提供新缓冲，而不是复用旧池的指针"
         );
         Ok(())
     }
@@ -1054,15 +1036,17 @@ mod tests {
         let mut scaler = Scaler::new().with_buffer_pool(true);
         let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
 
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
             let frame = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
             assert_eq!((frame.width, frame.height), (32, 32));
+            seen.insert(frame.data[0] as usize);
             drop(frame); // 每帧用完即归还
         }
-        let allocations = scaler.pool_allocations().expect("pool enabled");
         assert!(
-            allocations <= 2,
-            "50 帧稳态流水的真实分配次数应 ≤2，实际 {allocations}"
+            seen.len() <= 2,
+            "50 帧稳态流水的去重缓冲指针数应 ≤2，实际 {}",
+            seen.len()
         );
         Ok(())
     }
