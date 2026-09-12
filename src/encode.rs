@@ -599,7 +599,13 @@ impl EncoderBuilder {
             )
         };
 
-        self.setup_codec_context(&mut encode_ctx, use_crf, pixel_format, sample_format, &config)?;
+        self.setup_codec_context(
+            &mut encode_ctx,
+            use_crf,
+            pixel_format,
+            sample_format,
+            &config,
+        )?;
 
         // 编码器输入时间基：与滤镜图 buffer 源（下方 FilterParams）和"滤镜未改写
         // 帧率时的编码器 time_base"同源。必须在 self 被部分 move 之前求值。
