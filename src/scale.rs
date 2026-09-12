@@ -1016,8 +1016,10 @@ mod tests {
         Ok(())
     }
 
-    /// 几何/格式变化时池随上下文重建：新旧两组几何的输出都正确，且
-    /// 计数只反映新池的分配。
+    /// 几何/格式变化时池随上下文重建：新旧两组几何的输出都正确。重建后
+    /// 新池按新尺寸重新分配，这里只做**内容/几何**的确定性校验——注意不能
+    /// 断言新缓冲指针与旧指针不同：旧池析构后其 malloc 地址会被系统分配器
+    /// 立即复用，指针相等与否不是池重建的可观测属性。
     #[test]
     fn test_scaler_pool_rebuilds_on_geometry_change() -> Result<()> {
         let mut scaler = Scaler::new().with_buffer_pool(true);
@@ -1025,20 +1027,22 @@ mod tests {
         let src_small = create_test_frame(64, 64, PixelFormat::YUV420P)?;
         let src_mid = create_test_frame(48, 48, PixelFormat::YUV420P)?;
 
+        // 建立旧池并产出小尺寸帧。
         let a = scaler.scale_frame(&src_small, 32, 32, PixelFormat::YUV420P)?;
-        let ptr_old = a.data[0];
+        assert_eq!((a.width, a.height), (32, 32));
         drop(a);
 
-        // 几何变化：旧池析构、新池按 24x20 尺寸重建（计数从 1 重新开始）。
+        // 几何变化：旧池析构、新池按 24x20 尺寸重建。
         let b = scaler.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
         assert_eq!((b.width, b.height), (24, 20));
         assert_eq!(b.format, i32::from(PixelFormat::RGB24));
         let reference = plain.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
         assert_visible_pixels_equal(&b, &reference, 24, 20, PixelFormat::RGB24);
-        assert_ne!(
-            b.data[0] as usize, ptr_old as usize,
-            "重建后的池应提供新缓冲，而不是复用旧池的指针"
-        );
+
+        // 新几何再取一帧，内容依旧正确（旧几何的缓冲不再影响新池）。
+        let c = scaler.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        assert_eq!((c.width, c.height), (24, 20));
+        assert_visible_pixels_equal(&c, &reference, 24, 20, PixelFormat::RGB24);
         Ok(())
     }
 
@@ -1102,8 +1106,17 @@ mod tests {
             };
             assert!(row_gap.iter().all(|&b| b == 0), "luma 行 {y} 的间隙非零");
         }
-        // 尾部留白（POOL_PADDING=64）必须全零。
-        let tail = unsafe { std::slice::from_raw_parts(second.data[0].add(buf_size - 64), 64) };
+        // 尾部留白（POOL_PADDING=64）必须全零。注意不能用 `second.data[0]`
+        // 定位尾部：`alloc_pooled_frame` 会把数据基准在缓冲内部偏移到 32 字节
+        // 边界（跨平台不保证池缓冲对齐），因此 `data[0]` 可能 ≠ 缓冲起始地址。
+        // 缓冲的尾部留白恒在 `buf[0].data + size - 64`，即池缓冲的物理末尾。
+        let second_buf_size = unsafe { (*second.buf[0]).size };
+        let tail = unsafe {
+            std::slice::from_raw_parts(
+                (*second.buf[0]).data.add(second_buf_size - 64),
+                64,
+            )
+        };
         assert!(tail.iter().all(|&b| b == 0), "缓冲尾部留白非零");
         Ok(())
     }
