@@ -344,19 +344,11 @@ impl EncoderBuilder {
     }
 
     pub fn with_nb_channels(mut self, nb_channels: i32) -> Self {
-        assert!(
-            nb_channels > 0 && nb_channels < 9,
-            "nb_channels should be in range [1, 8]"
-        );
         self.nb_channels = nb_channels;
         self
     }
 
     pub fn with_sample_rate(mut self, sample_rate: i32) -> Self {
-        assert!(
-            sample_rate > 0,
-            "sample_rate must be positive, got {sample_rate}"
-        );
         self.sample_rate = sample_rate;
         self
     }
@@ -420,6 +412,7 @@ impl EncoderBuilder {
         use_crf: bool,
         pixel_format: PixelFormat,
         sample_format: SampleFormat,
+        config: &CodecConfig,
     ) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != encoder.codec_type {
@@ -445,6 +438,20 @@ impl EncoderBuilder {
             encoder.set_pix_fmt(pixel_format.into());
             encoder.set_sample_aspect_ratio(time::new_rational(1, 1));
         } else if media_type == MediaType::AUDIO {
+            if !config.is_support_channel_count(self.nb_channels) {
+                return Err(RsmediaError::InvalidConfig(format!(
+                    "encoder '{}' does not support nb_channels {}",
+                    config.name().to_string_lossy(),
+                    self.nb_channels
+                )));
+            }
+            if !config.is_support_sample_rate(self.sample_rate) {
+                return Err(RsmediaError::InvalidConfig(format!(
+                    "encoder '{}' does not support sample rate {}",
+                    config.name().to_string_lossy(),
+                    self.sample_rate
+                )));
+            }
             encoder.set_ch_layout(AVChannelLayout::from_nb_channels(self.nb_channels).into_inner());
             encoder.set_bit_rate(self.effective_bit_rate());
             encoder.set_sample_rate(self.sample_rate);
@@ -592,7 +599,7 @@ impl EncoderBuilder {
             )
         };
 
-        self.setup_codec_context(&mut encode_ctx, use_crf, pixel_format, sample_format)?;
+        self.setup_codec_context(&mut encode_ctx, use_crf, pixel_format, sample_format, &config)?;
 
         // 编码器输入时间基：与滤镜图 buffer 源（下方 FilterParams）和"滤镜未改写
         // 帧率时的编码器 time_base"同源。必须在 self 被部分 move 之前求值。
@@ -1041,7 +1048,7 @@ impl Encoder {
             // `scaler`/重采样上下文），转换完成后再借用 `filter_graph` 处理。
             let converted = match graph_input_format {
                 FrameFormat::Pixel(dst) if frame.format != dst as i32 => {
-                    self.scale_encoder_frame(&frame, dst)?
+                    self.rescale_frame(&frame, dst)?
                 }
                 FrameFormat::Sample(dst) if frame.format != dst as i32 => {
                     resample::convert_frame(&frame, frame.ch_layout, dst as _, frame.sample_rate)?
@@ -1300,7 +1307,7 @@ impl Encoder {
                     self.pix_fmt()
                 };
                 if frame.format != i32::from(target_sw_pix_fmt) {
-                    self.scale_encoder_frame(&frame, target_sw_pix_fmt)?
+                    self.rescale_frame(&frame, target_sw_pix_fmt)?
                 } else {
                     frame
                 }
@@ -1338,17 +1345,16 @@ impl Encoder {
     /// The destination keeps the source geometry (size changes are the filter
     /// graph's job, see [`Filter`]); the scaler rebuilds its context by itself
     /// when the geometry or format changes mid-stream.
-    fn scale_encoder_frame(&mut self, frame: &AVFrame, dst_fmt: PixelFormat) -> Result<AVFrame> {
+    fn rescale_frame(&mut self, frame: &AVFrame, dst_fmt: PixelFormat) -> Result<AVFrame> {
         self.scaler
             .scale_frame(frame, frame.width, frame.height, dst_fmt)
     }
 
     /// Check if the frame is valid for encoding.
     fn check_frame(&self, frame: Option<&AVFrame>) -> Result<()> {
-        if frame.is_none() {
+        let Some(frame) = frame else {
             return Ok(());
-        }
-        let frame = frame.unwrap();
+        };
         match self.media_type {
             MediaType::VIDEO => {
                 // 硬件帧的像素格式（如 NV12/HW 私有格式）不在软件编码器的

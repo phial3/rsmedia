@@ -1745,4 +1745,133 @@ mod tests {
             "box missing: {f}"
         );
     }
+
+    /// 构造一个 GRAY8 单平面、已分配缓冲的测试帧。
+    fn make_gray8_frame(width: i32, height: i32) -> AVFrame {
+        use crate::error::Context;
+        use crate::pixel::PixelFormat;
+        let mut f = AVFrame::new();
+        f.set_width(width);
+        f.set_height(height);
+        f.set_format(PixelFormat::GRAY8.into());
+        f.alloc_buffer()
+            .context("alloc buffer for gray8 frame")
+            .unwrap();
+        f
+    }
+
+    /// `FilterGraph::process_frame` 独立路径测试（此前仅经 encode 间接覆盖）。
+    ///
+    /// 用真实的 `hflip` 滤镜：单帧进、单帧出；输出尺寸/格式保持，但整行像素
+    /// 顺序被反转。同时验证状态机 `is_initialized` 与 `output_size`。
+    #[test]
+    fn test_filtergraph_process_frame_hflip() -> Result<()> {
+        use crate::pixel::PixelFormat;
+
+        let (w, h) = (8, 4);
+        let src = make_gray8_frame(w, h);
+        // 给每行填入递增的像素值，用于检测 hflip 是否确实翻转了行内顺序。
+        unsafe {
+            let linesize = src.linesize[0] as usize;
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    // 像素值 = (y*w + x) % 256，行内单调递增。
+                    *src.data[0].cast::<u8>().add(y * linesize + x) =
+                        ((y * w as usize + x) % 256) as u8;
+                }
+            }
+        }
+
+        let params = FilterParams::Video(VideoParams {
+            width: w,
+            height: h,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: ffi::AVRational { num: 1, den: 25 },
+            frame_rate: ffi::AVRational { num: 25, den: 1 },
+            pixel_aspect: ffi::AVRational { num: 1, den: 1 },
+        });
+        let filter = video::hflip();
+
+        let mut graph = FilterGraph::new();
+        assert!(!graph.is_initialized(), "graph should start uninitialized");
+        graph.init(&params, &[filter])?;
+        assert!(graph.is_initialized(), "graph should be initialized after init");
+
+        // 输出链路尺寸应与输入一致。
+        assert_eq!(
+            graph.output_size(),
+            Some((w, h)),
+            "output_size should match input size"
+        );
+
+        // 单帧进 -> 单帧出，行被反转。
+        let out = graph
+            .process_frame(Some(src))?
+            .expect("one input frame should yield one output frame");
+        assert_eq!(out.width, w, "output width mismatch");
+        assert_eq!(out.height, h, "output height mismatch");
+
+        // 校验每个像素是否被水平翻转（逐行逆序）。
+        let linesize = out.linesize[0] as usize;
+        unsafe {
+            let out_ptr = out.data[0].cast::<u8>();
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let expected = ((y * w as usize + (w as usize - 1 - x)) % 256) as u8;
+                    let got = *out_ptr.add(y * linesize + x);
+                    assert_eq!(
+                        got, expected,
+                        "hflip mismatch at ({x},{y}): got {got}, expected {expected}"
+                    );
+                }
+            }
+        }
+
+        // 提交 EOF 后 graph 进入 drained/flushed 状态，flush 亦返回空。
+        assert!(
+            graph.process_frame(None)?.is_none(),
+            "EOF should eventually drain to None"
+        );
+        let remaining = graph.flush()?;
+        assert!(remaining.is_empty(), "no frames should remain after EOF");
+        Ok(())
+    }
+
+    /// 音频 `abuffer`/`abuffersink` 独立路径测试：aformat 把 FLTP 转成 S16。
+    #[test]
+    fn test_filter_graph_process_frame_audio() -> Result<()> {
+        use rsmpeg::avutil::AVChannelLayout;
+
+        let (channels, sample_rate, nb_samples) = (2i32, 44100i32, 1024i32);
+
+        let params = FilterParams::Audio(AudioParams {
+            nb_channels: channels,
+            sample_rate,
+            format: SampleFormat::S16,
+            src_format: SampleFormat::FLTP,
+            time_base: ffi::AVRational { num: 1, den: 44100 },
+        });
+
+        // aformat 把输入转为 S16（与 sink 约束一致）。
+        let mut graph = FilterGraph::new();
+        graph.init(&params, &[audio::format(channels as u32, sample_rate as u32, SampleFormat::S16)])?;
+
+        let mut frame = AVFrame::new();
+        frame.set_format(SampleFormat::FLTP as _);
+        frame.set_ch_layout(AVChannelLayout::from_nb_channels(channels).into_inner());
+        frame.set_sample_rate(sample_rate);
+        frame.set_nb_samples(nb_samples);
+        frame.alloc_buffer().context("alloc audio frame")?;
+
+        let out = graph
+            .process_frame(Some(frame))?
+            .expect("audio frame should flow through");
+        assert_eq!(out.sample_rate, sample_rate, "sample rate preserved");
+        assert_eq!(out.nb_samples, nb_samples, "sample count preserved");
+
+        graph.process_frame(None)?;
+        assert!(graph.flush()?.is_empty());
+        Ok(())
+    }
 }
