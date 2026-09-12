@@ -1701,6 +1701,30 @@ fn log_filter_hacks(line: &str) -> bool {
     !(line.contains(HACK_1_PELCO_NEEDLE_1) && line.contains(HACK_1_PELCO_NEEDLE_2))
 }
 
+/// 当前 FFmpeg 构建支持的**输入**协议名（`file`、`http`、`rtsp`、`rtp`、`tcp`…）。
+///
+/// 可用于构建前探测能力：URL 的协议不在列表中时，`avformat_open_input` 必然
+/// 失败。列表内容取决于 FFmpeg 编译配置。
+pub fn input_protocols() -> Vec<String> {
+    rsmpeg::avformat::AVIOProtocol::inputs()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// 当前 FFmpeg 构建支持的**输出**协议名。
+pub fn output_protocols() -> Vec<String> {
+    rsmpeg::avformat::AVIOProtocol::outputs()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// 返回将处理该 URL 的协议名（如 `"file"`、`"http"`），无匹配协议时为 `None`。
+pub fn find_protocol_name(url: &str) -> Option<String> {
+    let url_c = strutils::str_to_cstring(url);
+    rsmpeg::avformat::AVIOProtocol::find_protocol_name(&url_c)
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2001,5 +2025,25 @@ mod tests {
         assert!(!sink.is_empty(), "custom io writer produced no output");
 
         Ok(())
+    }
+
+    /// `file` 协议在任何 FFmpeg 构建中都存在。
+    #[test]
+    fn test_input_protocols_contain_file() {
+        let protocols = input_protocols();
+        assert!(
+            protocols.iter().any(|p| p == "file"),
+            "protocols: {protocols:?}"
+        );
+    }
+
+    /// URL 的协议识别与枚举结果一致。
+    #[test]
+    fn test_find_protocol_name() {
+        assert_eq!(find_protocol_name("/tmp/a.mp4").as_deref(), Some("file"));
+        assert_eq!(
+            find_protocol_name("http://example.com/a.mp4").as_deref(),
+            Some("http")
+        );
     }
 }

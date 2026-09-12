@@ -2,11 +2,13 @@
 mod macros;
 
 pub mod decode;
+pub mod device;
 pub mod encode;
 #[cfg(feature = "ndarray")]
 pub mod frame;
 #[cfg(feature = "ndarray")]
 pub use frame::{FrameSideData, MediaFrame, MediaFrameType};
+pub mod bsf;
 pub mod codec;
 pub mod colors;
 pub mod error;
@@ -17,10 +19,13 @@ pub mod imgutils;
 pub mod init;
 pub mod io;
 pub mod location;
+pub mod md5;
 pub mod mux;
 pub mod options;
+pub mod parser;
 pub mod pcm;
 pub mod pixel;
+pub mod pool;
 pub mod resample;
 pub mod resize;
 pub mod scale;
@@ -29,6 +34,7 @@ pub mod strutils;
 pub mod subtitle;
 pub mod time;
 
+pub use bsf::Bsf;
 pub use codec::{CodecConfig, FormatInfo, Profile};
 pub use colors::Color;
 pub use decode::{Decoder, DecoderBuilder, thumbnail};
@@ -41,10 +47,13 @@ pub use init::init;
 pub use io::{AVSeekFlag, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
+pub use md5::Md5;
 pub use mux::{Chapter, Demuxer, Muxer};
 pub use options::{Metadata, Options, Quality, VideoProfile};
+pub use parser::PacketParser;
 pub use pcm::{PcmSink, PcmSpec};
 pub use pixel::PixelFormat;
+pub use pool::BufferPool;
 pub use resample::Resampler;
 pub use resize::Resize;
 pub use scale::{ScaleAlgorithm, ScaleQuality, Scaler};

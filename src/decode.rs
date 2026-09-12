@@ -34,6 +34,8 @@ pub struct DecoderBuilder {
     scale_algorithm: ScaleAlgorithm,
     /// 缩放质量位（可多位，见 [`ScaleQuality`]）；构建 `Scaler` 时由 [`ScaleQuality::mask`] 合成为掩码
     scale_quality: Vec<ScaleQuality>,
+    /// 是否用 `AVBufferPool` 池化缩放输出的帧缓冲（默认关闭）。
+    scale_pool: bool,
     resize: Option<Resize>,
     /// 解码输出目标像素格式（仅视频），默认 [`PixelFormat::YUV420P`]。
     pix_fmt: Option<PixelFormat>,
@@ -56,6 +58,7 @@ impl DecoderBuilder {
             flags: AVCodecFlag::LOW_DELAY,
             scale_algorithm: ScaleAlgorithm::default(),
             scale_quality: ScaleQuality::default_quality().to_vec(),
+            scale_pool: false,
             resize: None,
             pix_fmt: None,
         }
@@ -124,6 +127,18 @@ impl DecoderBuilder {
     /// Defaults to [`ScaleQuality::default_mask`].
     pub fn with_scale_quality(mut self, quality: impl AsRef<[ScaleQuality]>) -> Self {
         self.scale_quality = quality.as_ref().to_vec();
+        self
+    }
+
+    /// Enable (`true`) or disable (`false`) pooled allocation of the scaler's
+    /// destination frames (see [`Scaler::with_buffer_pool`]).
+    ///
+    /// Off by default. With it on, frames this decoder scales are allocated from an
+    /// internal `AVBufferPool` instead of being freshly allocated per frame, so a
+    /// steady stream of same-geometry conversions stops allocating after a couple
+    /// of frames; buffers are zero-filled before use, matching `alloc_buffer`.
+    pub fn with_scale_pool(mut self, enabled: bool) -> Self {
+        self.scale_pool = enabled;
         self
     }
 
@@ -351,7 +366,8 @@ impl DecoderBuilder {
             filter_graph,
             context: decode_ctx,
             state: CodecContextState::Normal,
-            scaler: Scaler::new_with_options(self.scale_algorithm, self.scale_quality),
+            scaler: Scaler::new_with_options(self.scale_algorithm, self.scale_quality)
+                .with_buffer_pool(self.scale_pool),
             resize: self.resize,
             output_pix_fmt,
         })
@@ -1344,6 +1360,26 @@ mod tests {
             "resize+filter should compose to the filter size"
         );
 
+        Ok(())
+    }
+
+    /// builder 的 `with_scale_pool` 必须进入解码器持有的 [`Scaler`]：
+    /// 默认关闭，显式开启后为真（真实 build 路径）。
+    #[test]
+    fn test_builder_scale_pool_reaches_decoder_scaler() -> Result<()> {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+
+        let decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .build_from_reader(&StreamReader::new(video_path)?)?;
+        assert!(!decoder.scaler.pool_enabled(), "池化默认关闭");
+
+        let decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_scale_pool(true)
+            .build_from_reader(&StreamReader::new(video_path)?)?;
+        assert!(
+            decoder.scaler.pool_enabled(),
+            "with_scale_pool 应进入 Scaler"
+        );
         Ok(())
     }
 }

@@ -1,9 +1,10 @@
 use crate::error::{Context, Result, RsmediaError};
+use crate::pool::BufferPool;
 use crate::{PixelFormat, imgutils};
 
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
-use rsmpeg::swscale::SwsContext;
+use rsmpeg::{UnsafeDerefMut, swscale::SwsContext};
 
 // FFmpeg `SwsFlags` 定义参考: <https://ffmpeg.org/doxygen/trunk/group__libsws.html>
 //
@@ -451,6 +452,11 @@ fn scale_with_flags(
 /// each hold one, built inside the builder's `build` from the `with_scale_algorithm` /
 /// `with_scale_quality` options; the defaults are the policy below.
 ///
+/// Destination frames are allocated with `alloc_buffer` (a fresh allocation per call)
+/// unless pooling is enabled via [`Scaler::with_buffer_pool`]; the pool then recycles the
+/// buffers of previously dropped frames, so a steady stream of same-geometry output stops
+/// allocating after a couple of frames — see [`BufferPool`](crate::BufferPool).
+///
 /// The policy mirrors FFmpeg's own flag rules: [`ScaleAlgorithm`] selects exactly one
 /// scaling kernel (*"Only one may be active at a time."*), while the quality bits are a
 /// mask of which any subset may be set — see [`ScaleQuality`].
@@ -461,6 +467,9 @@ pub struct Scaler {
     quality: u32,
     /// Context bound on first use, together with the parameters it was created for.
     bound: Option<BoundScaler>,
+    /// Whether destination frames are allocated from an internal [`BufferPool`]
+    /// (created per bound context, see [`BoundScaler::pool`]).
+    pool_enabled: bool,
 }
 
 /// A live `SwsContext` plus the source/destination parameters it was created with.
@@ -468,6 +477,11 @@ pub struct Scaler {
 /// The parameters are needed to detect that a later frame requires a rebuild. On FFmpeg
 /// 6/7 the legacy context fixes them at creation; on FFmpeg 8+ the context derives them
 /// from the frames, and the comparison keeps both versions behaving identically.
+///
+/// The pool, when pooling is enabled, is created together with the context and sized for
+/// exactly these destination parameters — a geometry/format change rebuilds both, and the
+/// old pool is then dropped (`av_buffer_pool_uninit` marks it for destruction, so buffers
+/// still held by previously returned frames are freed instead of recycled).
 struct BoundScaler {
     sws: SwsContext,
     src_width: i32,
@@ -476,6 +490,7 @@ struct BoundScaler {
     dst_width: i32,
     dst_height: i32,
     dst_pix_fmt: PixelFormat,
+    pool: Option<BufferPool>,
 }
 
 impl Scaler {
@@ -511,7 +526,52 @@ impl Scaler {
             algorithm,
             quality: ScaleQuality::mask(quality),
             bound: None,
+            pool_enabled: false,
         }
+    }
+
+    /// Enable (`true`) or disable (`false`) pooled allocation of destination frames.
+    ///
+    /// With pooling on, the destination frame's pixel buffer is taken from an internal
+    /// [`BufferPool`](crate::BufferPool) instead of being freshly allocated per call; when
+    /// a previously returned frame is dropped, its buffer goes back to the pool and the
+    /// next same-geometry call reuses it. A steady stream of same-geometry output thus
+    /// stops allocating after a couple of frames, and the buffers are zero-filled exactly
+    /// like `alloc_buffer`'s, so padding bytes stay deterministic for the encoder.
+    ///
+    /// The pool is created lazily together with the scaling context and sized for the
+    /// bound destination geometry; a geometry/format change rebuilds it. Call this
+    /// before the first [`Self::scale_frame`] — it has no effect once bound.
+    ///
+    /// ```rust
+    /// use rsmedia::Scaler;
+    ///
+    /// let scaler = Scaler::new().with_buffer_pool(true);
+    /// assert!(scaler.pool_enabled());
+    /// assert_eq!(scaler.pool_allocations(), None); // not bound yet
+    /// ```
+    pub fn with_buffer_pool(mut self, enabled: bool) -> Self {
+        self.pool_enabled = enabled;
+        self
+    }
+
+    /// Whether pooled destination-frame allocation is enabled
+    /// (see [`Self::with_buffer_pool`]).
+    pub fn pool_enabled(&self) -> bool {
+        self.pool_enabled
+    }
+
+    /// Total buffers **actually allocated** by the internal frame pool so far, or
+    /// `None` when pooling is disabled or the context is not bound yet.
+    ///
+    /// Recycled buffers do not count, so on a steady stream this stalls at a small
+    /// number while the frame count keeps growing — the direct evidence that pooling
+    /// is working.
+    pub fn pool_allocations(&self) -> Option<u64> {
+        self.bound
+            .as_ref()
+            .and_then(|bound| bound.pool.as_ref())
+            .map(BufferPool::allocations)
     }
 
     /// The scaling kernel this scaler was configured with.
@@ -571,6 +631,17 @@ impl Scaler {
                 dst_pix_fmt.into(),
                 self.flags(),
             )?;
+            // 池与上下文同生命周期：按本次绑定的目标几何建池，几何/格式变化
+            // 重建时旧池一并析构（未归还的缓冲由引用计数安全释放）。
+            let pool = if self.pool_enabled {
+                Some(BufferPool::new(pooled_frame_buffer_size(
+                    dst_pix_fmt,
+                    dst_width,
+                    dst_height,
+                )?)?)
+            } else {
+                None
+            };
             self.bound = Some(BoundScaler {
                 sws,
                 src_width: src_frame.width,
@@ -579,17 +650,24 @@ impl Scaler {
                 dst_width,
                 dst_height,
                 dst_pix_fmt,
+                pool,
             });
         }
         let bound = self.bound.as_mut().expect("bound above");
 
-        let mut dst_frame = AVFrame::new();
-        dst_frame.set_width(dst_width);
-        dst_frame.set_height(dst_height);
-        dst_frame.set_format(dst_pix_fmt.into());
-        dst_frame
-            .alloc_buffer()
-            .context("Failed to allocate destination frame buffer")?;
+        let mut dst_frame = match bound.pool.as_mut() {
+            Some(pool) => alloc_pooled_frame(pool, dst_width, dst_height, dst_pix_fmt)?,
+            None => {
+                let mut dst_frame = AVFrame::new();
+                dst_frame.set_width(dst_width);
+                dst_frame.set_height(dst_height);
+                dst_frame.set_format(dst_pix_fmt.into());
+                dst_frame
+                    .alloc_buffer()
+                    .context("Failed to allocate destination frame buffer")?;
+                dst_frame
+            }
+        };
         imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
 
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
@@ -651,15 +729,100 @@ impl Default for Scaler {
 }
 
 /// Only the policy is caller-visible, so `Debug` reports it along with whether a context
-/// has been bound — `SwsContext` itself implements no `Debug`.
+/// has been bound and whether pooling is on — `SwsContext` itself implements no `Debug`.
 impl std::fmt::Debug for Scaler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scaler")
             .field("algorithm", &self.algorithm)
             .field("quality", &format!("{:#x}", self.quality))
             .field("bound", &self.bound.is_some())
+            .field("pool_enabled", &self.pool_enabled)
             .finish()
     }
+}
+
+/// 池化帧的 stride 对齐（字节）。与 `av_frame_get_buffer` 的默认视频对齐一致，
+/// 编码器内部的 SIMD 读取路径按此假设优化。
+const POOL_ALIGN: i32 = 32;
+
+/// 池化帧缓冲的额外留白（字节）。`av_image_fill_arrays` 只要求
+/// `av_image_get_buffer_size(align)` 的精确尺寸，多留一点以覆盖
+/// `av_frame_get_buffer` 同样会加的 padding 余量，防御 SIMD 越界读。
+const POOL_PADDING: usize = 64;
+
+/// 计算池化帧缓冲所需尺寸：`av_image_get_buffer_size`（与
+/// [`alloc_pooled_frame`] 使用的 `av_image_fill_arrays` 同一 `align`，
+/// 两者互为镜像）加上安全留白。
+fn pooled_frame_buffer_size(fmt: PixelFormat, width: i32, height: i32) -> Result<usize> {
+    let size = unsafe { ffi::av_image_get_buffer_size(fmt.into(), width, height, POOL_ALIGN) };
+    if size < 0 {
+        return Err(RsmediaError::invalid_config(format!(
+            "cannot size a pooled frame buffer for {fmt:?} {width}x{height}: \
+             av_image_get_buffer_size returned {size}"
+        )));
+    }
+    Ok(size as usize + POOL_PADDING)
+}
+
+/// 从池中取缓冲并组装一个可写入的目标帧。
+///
+/// 帧的所有平面指针由 `av_image_fill_arrays` 按 `POOL_ALIGN` 对齐指向池缓冲
+/// 内部；缓冲所有权移交给 `frame.buf[0]`——帧被 unref（或引用计数归零）时，
+/// 缓冲自动归还池（池已析构则直接释放）。
+///
+/// FFmpeg 的池在**复用**时不会重新清零缓冲（与 `av_frame_get_buffer` 的
+/// "每次清零分配"不同），这里在组装帧前显式清零整个缓冲：memset 的代价
+/// 远小于一次 malloc，换来与 `alloc_buffer` 完全一致的跨平台语义——帧的
+/// padding 字节内容确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。
+fn alloc_pooled_frame(
+    pool: &mut BufferPool,
+    width: i32,
+    height: i32,
+    fmt: PixelFormat,
+) -> Result<AVFrame> {
+    let mut frame = AVFrame::new();
+    frame.set_width(width);
+    frame.set_height(height);
+    frame.set_format(fmt.into());
+
+    let mut buffer = pool.get()?;
+    // Safety: buffer.data 有效且长度为 buffer.size（FFmpeg 侧保证），
+    // 整段清零写是合法的独占访问（引用计数为 1，无其他持有者）。
+    unsafe {
+        std::ptr::write_bytes((*buffer.as_mut_ptr()).data, 0, (*buffer.as_ptr()).size);
+    }
+    let mut data = [std::ptr::null_mut::<u8>(); 8];
+    let mut linesize = [0i32; 8];
+    // Safety: buffer 指向池缓冲（尺寸 ≥ pooled_frame_buffer_size 的结果），
+    // data/linesize 是本地数组，参数均为 FFmpeg 要求的合法值。
+    let ret = unsafe {
+        ffi::av_image_fill_arrays(
+            data.as_mut_ptr(),
+            linesize.as_mut_ptr(),
+            (*buffer.as_ptr()).data,
+            fmt.into(),
+            width,
+            height,
+            POOL_ALIGN,
+        )
+    };
+    if ret < 0 {
+        return Err(RsmediaError::custom(format!(
+            "av_image_fill_arrays failed for {fmt:?} {width}x{height}, ret: {ret}"
+        )));
+    }
+
+    // Safety: frame 由本函数刚构造，无其他引用；rsmpeg 的 wrap 不实现
+    // DerefMut，字段写入经 UnsafeDerefMut::deref_mut 完成。
+    let raw = unsafe { frame.deref_mut() };
+    raw.data = data;
+    raw.linesize = linesize;
+    // 视频帧约定 extended_data == data（av_frame_get_buffer 同样如此设置）。
+    raw.extended_data = raw.data.as_mut_ptr();
+    // Safety: 所有权整体移交（引用计数本就为 1），帧 Drop 时由
+    // av_frame_unref 归还/释放。
+    raw.buf[0] = buffer.into_raw().as_ptr();
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -703,6 +866,293 @@ mod tests {
         assert_eq!(dst.width, 32);
         assert_eq!(dst.height, 32);
         assert_eq!(dst.format, i32::from(PixelFormat::RGB24));
+        Ok(())
+    }
+
+    /// 逐平面比较两个同几何/同格式帧的**可见像素内容**（忽略 stride 与
+    /// padding 差异）：YUV420P 按 luma + 两个色度平面，RGB24 按行。
+    fn assert_visible_pixels_equal(
+        a: &AVFrame,
+        b: &AVFrame,
+        width: u32,
+        height: u32,
+        fmt: PixelFormat,
+    ) {
+        let rows = |frame: &AVFrame, plane: usize, rows: u32, row_bytes: u32| {
+            (0..rows as usize)
+                .map(|y| unsafe {
+                    std::slice::from_raw_parts(
+                        frame.data[plane].add(y * frame.linesize[plane] as usize),
+                        row_bytes as usize,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let planes: &[(usize, u32, u32)] = match fmt {
+            // (plane, rows, row_bytes)
+            PixelFormat::YUV420P => &[
+                (0, height, width),
+                (1, height / 2, width / 2),
+                (2, height / 2, width / 2),
+            ],
+            PixelFormat::RGB24 => &[(0, height, width * 3)],
+            other => panic!("unhandled format in test helper: {other:?}"),
+        };
+
+        for &(plane, rows_count, row_bytes) in planes {
+            let a_rows = rows(a, plane, rows_count, row_bytes);
+            let b_rows = rows(b, plane, rows_count, row_bytes);
+            for (y, (ra, rb)) in a_rows.iter().zip(b_rows.iter()).enumerate() {
+                assert_eq!(ra, rb, "plane {plane} row {y} differs");
+            }
+        }
+    }
+
+    /// 池化帧必须能被下游通过 `av_frame_ref` 安全引用（编码器
+    /// `avcodec_send_frame` 内部正是这样引用帧的）：引用后共享同一缓冲、
+    /// buf[0] 引用计数 +1，释放后恢复。
+    #[test]
+    fn test_scaler_pool_frame_supports_ffmpeg_ref() -> Result<()> {
+        let mut scaler = Scaler::new().with_buffer_pool(true);
+        let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
+        let frame = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        assert!(!frame.buf[0].is_null());
+
+        let mut retained = AVFrame::new();
+        // Safety: 两帧均为有效 AVFrame，av_frame_ref 的标准用法。
+        let ret = unsafe { ffi::av_frame_ref(retained.as_mut_ptr(), frame.as_ptr()) };
+        assert_eq!(ret, 0, "av_frame_ref failed: {ret}");
+        assert_eq!(retained.data[0], frame.data[0], "引用共享同一缓冲");
+        assert_eq!(retained.linesize[0], frame.linesize[0]);
+
+        // Safety: buf[0] 来自成功的 scale_frame，非空。
+        let count = unsafe { ffi::av_buffer_get_ref_count(frame.buf[0]) };
+        assert_eq!(count, 2, "frame + retained 应各持一个引用");
+
+        // Safety: retained 由 av_frame_ref 成功创建。
+        unsafe { ffi::av_frame_unref(retained.as_mut_ptr()) };
+        // Safety: 同上，buf[0] 仍被 frame 持有。
+        let count = unsafe { ffi::av_buffer_get_ref_count(frame.buf[0]) };
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    /// 池化帧的缓冲复用与分配计数：归还后必须复用同一缓冲（同指针、
+    /// 不计数），持有中的帧强制池增长，全部归还后池回到初始集合。
+    #[test]
+    fn test_scaler_frame_pool_recycles_buffers() -> Result<()> {
+        let mut scaler = Scaler::new().with_buffer_pool(true);
+        assert!(scaler.pool_enabled());
+        assert_eq!(scaler.pool_allocations(), None, "未绑定前无池统计");
+
+        let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
+
+        // 第 1 帧：真实分配（计数 1）。
+        let a = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        assert_eq!(scaler.pool_allocations(), Some(1));
+        assert!(!a.buf[0].is_null(), "池化帧必须持有 buf[0]");
+        assert!(a.is_allocated());
+        let ptr_a = a.data[0];
+
+        // 归还后第 2 帧：必须复用同一缓冲（计数不变）。
+        drop(a);
+        let b = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        assert_eq!(scaler.pool_allocations(), Some(1), "归还的缓冲应被复用");
+        assert_eq!(b.data[0], ptr_a, "复用的缓冲数据指针应与上一帧相同");
+
+        // b 仍存活：第 3 帧必须新分配（池增长，计数 2）。
+        let c = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        assert_eq!(scaler.pool_allocations(), Some(2));
+        assert_ne!(c.data[0], b.data[0]);
+
+        // 全部归还后：两次取回应恰好是 b/c 的两个缓冲，且不再增长。
+        let ptr_b = b.data[0];
+        let ptr_c = c.data[0];
+        drop(b);
+        drop(c);
+        let d = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        let e = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        assert_eq!(scaler.pool_allocations(), Some(2), "复用不应计数");
+        let got = [d.data[0], e.data[0]];
+        assert!(
+            (got[0] == ptr_b && got[1] == ptr_c) || (got[0] == ptr_c && got[1] == ptr_b),
+            "归还后的两次取回应复用 {ptr_b:?}/{ptr_c:?}，实际 {got:?}"
+        );
+        Ok(())
+    }
+
+    /// 池化输出与 `alloc_buffer` 输出的像素内容必须完全一致（同源帧、同
+    /// 缩放策略），覆盖 YUV420P（多平面）与 RGB24（packed）两种布局。
+    #[test]
+    fn test_scaler_pool_output_matches_non_pool() -> Result<()> {
+        for (src_fmt, dst_fmt, (sw, sh), (dw, dh)) in [
+            (
+                PixelFormat::YUV420P,
+                PixelFormat::YUV420P,
+                (64, 48),
+                (32, 24),
+            ),
+            (PixelFormat::YUV420P, PixelFormat::RGB24, (64, 48), (32, 24)),
+        ] {
+            let src = create_test_frame(sw, sh, src_fmt)?;
+            // 用非零图案填充，避免全零帧掩盖拷贝/错位问题。
+            unsafe {
+                let total = src.linesize[0] as usize * sh as usize;
+                std::ptr::write_bytes(src.data[0], 0x5A, total);
+            }
+
+            let mut pooled = Scaler::new().with_buffer_pool(true);
+            let mut plain = Scaler::new();
+
+            let a = pooled.scale_frame(&src, dw, dh, dst_fmt)?;
+            let b = plain.scale_frame(&src, dw, dh, dst_fmt)?;
+            assert_eq!((a.width, a.height), (dw, dh));
+            assert_eq!(a.format, b.format);
+            assert_eq!(a.linesize[0] % 32, 0, "池化帧 stride 应按 32 对齐");
+            assert_visible_pixels_equal(&a, &b, dw as u32, dh as u32, dst_fmt);
+
+            // 复用后的缓冲内容同样正确（先归还 a，再缩放一帧比对）。
+            drop(a);
+            let a2 = pooled.scale_frame(&src, dw, dh, dst_fmt)?;
+            assert_visible_pixels_equal(&a2, &b, dw as u32, dh as u32, dst_fmt);
+        }
+        Ok(())
+    }
+
+    /// 几何/格式变化时池随上下文重建：新旧两组几何的输出都正确，且
+    /// 计数只反映新池的分配。
+    #[test]
+    fn test_scaler_pool_rebuilds_on_geometry_change() -> Result<()> {
+        let mut scaler = Scaler::new().with_buffer_pool(true);
+        let mut plain = Scaler::new();
+        let src_small = create_test_frame(64, 64, PixelFormat::YUV420P)?;
+        let src_mid = create_test_frame(48, 48, PixelFormat::YUV420P)?;
+
+        let a = scaler.scale_frame(&src_small, 32, 32, PixelFormat::YUV420P)?;
+        assert_eq!(scaler.pool_allocations(), Some(1));
+        drop(a);
+
+        // 几何变化：旧池析构、新池按 24x20 尺寸重建（计数从 1 重新开始）。
+        let b = scaler.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        assert_eq!((b.width, b.height), (24, 20));
+        assert_eq!(b.format, i32::from(PixelFormat::RGB24));
+        let reference = plain.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        assert_visible_pixels_equal(&b, &reference, 24, 20, PixelFormat::RGB24);
+        assert_eq!(
+            scaler.pool_allocations(),
+            Some(1),
+            "重建后的池应只统计新几何的分配"
+        );
+        Ok(())
+    }
+
+    /// 稳态流水线特性：连续 50 帧同几何缩放，真实分配次数必须停留在
+    /// 极小值（≤2）——这是池化生效、热路径不再逐帧 malloc 的直接证据。
+    #[test]
+    fn test_scaler_pool_steady_state_stops_allocating() -> Result<()> {
+        let mut scaler = Scaler::new().with_buffer_pool(true);
+        let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
+
+        for _ in 0..50 {
+            let frame = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+            assert_eq!((frame.width, frame.height), (32, 32));
+            drop(frame); // 每帧用完即归还
+        }
+        let allocations = scaler.pool_allocations().expect("pool enabled");
+        assert!(
+            allocations <= 2,
+            "50 帧稳态流水的真实分配次数应 ≤2，实际 {allocations}"
+        );
+        Ok(())
+    }
+
+    /// 安全性：**复用的缓冲必须清零**。FFmpeg 的池归还时不重置内容，而
+    /// `alloc_buffer` 保证帧 padding 为零——池化路径在使用前显式清零整个
+    /// 缓冲，本测试把整个缓冲写满垃圾、归还、再缩放，断言可见像素正确且
+    /// 全部 padding（行间隙 + 平面间隙 + 尾部留白）为 0。
+    #[test]
+    fn test_scaler_pool_padding_zeroed_on_reuse() -> Result<()> {
+        let mut scaler = Scaler::new().with_buffer_pool(true);
+        let src = create_test_frame(64, 48, PixelFormat::YUV420P)?;
+        unsafe {
+            std::ptr::write_bytes(src.data[0], 0x3C, src.linesize[0] as usize * 48);
+        }
+
+        // 第一帧：把它的整个池缓冲写满垃圾再归还。
+        let first = scaler.scale_frame(&src, 32, 24, PixelFormat::YUV420P)?;
+        let buf_size = unsafe { (*first.buf[0]).size };
+        unsafe {
+            std::ptr::write_bytes((*first.buf[0]).data, 0xFF, buf_size);
+        }
+        assert!(buf_size > 0);
+        drop(first);
+
+        // 第二帧（复用同一缓冲）：可见像素必须正确，padding 必须为 0。
+        let second = scaler.scale_frame(&src, 32, 24, PixelFormat::YUV420P)?;
+        let mut plain = Scaler::new();
+        let reference = plain.scale_frame(&src, 32, 24, PixelFormat::YUV420P)?;
+        assert_visible_pixels_equal(&second, &reference, 32, 24, PixelFormat::YUV420P);
+
+        // 行间隙：YUV420P luma 行内 width..linesize 必须全零。
+        let (w, h) = (32usize, 24usize);
+        for y in 0..h {
+            let row_gap = unsafe {
+                std::slice::from_raw_parts(
+                    second.data[0].add(y * second.linesize[0] as usize + w),
+                    second.linesize[0] as usize - w,
+                )
+            };
+            assert!(row_gap.iter().all(|&b| b == 0), "luma 行 {y} 的间隙非零");
+        }
+        // 尾部留白（POOL_PADDING=64）必须全零。
+        let tail = unsafe { std::slice::from_raw_parts(second.data[0].add(buf_size - 64), 64) };
+        assert!(tail.iter().all(|&b| b == 0), "缓冲尾部留白非零");
+        Ok(())
+    }
+
+    /// 安全性：池化帧的缓冲指针至少 32 字节对齐（`av_malloc` 的跨平台
+    /// 保证下限），`av_image_fill_arrays` 的平面排布与编码器 SIMD 读取
+    /// 都依赖这一点。
+    #[test]
+    fn test_scaler_pool_frame_alignment() -> Result<()> {
+        let mut scaler = Scaler::new().with_buffer_pool(true);
+        let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
+        for _ in 0..4 {
+            let frame = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+            let addr = frame.data[0] as usize;
+            assert_eq!(addr % 32, 0, "pooled frame data at {addr:#x} not aligned");
+            // 平面 1/2 的指针同样对齐（fill_arrays 在缓冲内按 align 排布）。
+            let addr_uv = frame.data[1] as usize;
+            assert_eq!(addr_uv % 32, 0, "chroma plane at {addr_uv:#x} not aligned");
+        }
+        Ok(())
+    }
+
+    /// 安全性：几何变化重建池时，**旧池的未归还缓冲**必须安全存活到
+    /// 归零（av_buffer_pool_uninit 的延迟析构语义），随后新池继续工作。
+    #[test]
+    fn test_scaler_pool_outstanding_buffer_survives_rebuild() -> Result<()> {
+        let mut scaler = Scaler::new().with_buffer_pool(true);
+        let src_small = create_test_frame(64, 64, PixelFormat::YUV420P)?;
+        let src_mid = create_test_frame(48, 48, PixelFormat::YUV420P)?;
+
+        // 旧池的帧，故意不归还。
+        let outstanding = scaler.scale_frame(&src_small, 32, 32, PixelFormat::YUV420P)?;
+        let old_ptr = outstanding.data[0];
+
+        // 几何变化：旧池析构（outstanding 仍持有其缓冲），新池建立。
+        let b = scaler.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        assert_eq!((b.width, b.height), (24, 20));
+        drop(b);
+
+        // 旧帧此时才归还：缓冲不属于任何活池，直接释放（不回到新池）。
+        drop(outstanding);
+
+        // 新池继续正常工作：新几何的帧不受影响。
+        let c = scaler.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        assert_eq!((c.width, c.height), (24, 20));
+        assert_ne!(c.data[0], old_ptr, "新池的缓冲不应与旧池缓冲混淆");
         Ok(())
     }
 

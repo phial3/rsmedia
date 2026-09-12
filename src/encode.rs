@@ -62,6 +62,8 @@ pub struct EncoderBuilder {
     scale_algorithm: ScaleAlgorithm,
     /// 缩放质量位（可多位，见 [`ScaleQuality`]）；构建 `Scaler` 时由 [`ScaleQuality::mask`] 合成为掩码
     scale_quality: Vec<ScaleQuality>,
+    /// 是否用 `AVBufferPool` 池化缩放输出的帧缓冲（默认关闭）。
+    scale_pool: bool,
 }
 
 impl EncoderBuilder {
@@ -333,6 +335,18 @@ impl EncoderBuilder {
     /// Defaults to [`ScaleQuality::default_mask`].
     pub fn with_scale_quality(mut self, quality: impl AsRef<[ScaleQuality]>) -> Self {
         self.scale_quality = quality.as_ref().to_vec();
+        self
+    }
+
+    /// Enable (`true`) or disable (`false`) pooled allocation of the scaler's
+    /// destination frames (see [`Scaler::with_buffer_pool`]).
+    ///
+    /// Off by default. With it on, frames this encoder scales are allocated from an
+    /// internal `AVBufferPool` instead of being freshly allocated per frame, so a
+    /// steady stream of same-geometry conversions stops allocating after a couple
+    /// of frames; buffers are zero-filled before use, matching `alloc_buffer`.
+    pub fn with_scale_pool(mut self, enabled: bool) -> Self {
+        self.scale_pool = enabled;
         self
     }
 
@@ -788,7 +802,8 @@ impl EncoderBuilder {
             filter_graph,
             context: encode_ctx,
             state: CodecContextState::Normal,
-            scaler: Scaler::new_with_options(self.scale_algorithm, self.scale_quality),
+            scaler: Scaler::new_with_options(self.scale_algorithm, self.scale_quality)
+                .with_buffer_pool(self.scale_pool),
             pending_packets: VecDeque::new(),
             audio_fifo: None,
             next_pts: 0,
@@ -829,6 +844,7 @@ impl Default for EncoderBuilder {
             hw_device_config: None,
             scale_algorithm: ScaleAlgorithm::default(),
             scale_quality: ScaleQuality::default_quality().to_vec(),
+            scale_pool: false,
         }
     }
 }
@@ -2006,6 +2022,13 @@ mod tests {
             .with_scale_quality([ScaleQuality::BITEXACT])
             .build()?;
         assert_eq!(encoder.scaler.quality(), ScaleQuality::BITEXACT.as_raw());
+
+        // 池化开关进入 Scaler：默认关闭，with_scale_pool(true) 打开。
+        assert!(!encoder.scaler.pool_enabled());
+        let encoder = EncoderBuilder::new_video(320, 240)
+            .with_scale_pool(true)
+            .build()?;
+        assert!(encoder.scaler.pool_enabled());
         Ok(())
     }
 }
