@@ -198,6 +198,43 @@ impl CodecConfig {
         }
     }
 
+    fn supported_channel_counts(&self) -> Option<Vec<i32>> {
+        let layouts: &[ffi::AVChannelLayout] = {
+            #[cfg(feature = "ffmpeg6")]
+            {
+                // ffmpeg6 无 `AV_CODEC_CONFIG_CHANNEL_LAYOUT` 能力接口，改用旧式
+                // `AVCodec.ch_layouts` 字段（`*const AVChannelLayout`，以 zeroed layout 结尾）。
+                // `build_array` 依赖字节相等性判断终止，zeroed layout 即终止哨兵。
+                unsafe {
+                    rsmpeg::build_array::<ffi::AVChannelLayout>(
+                        self.codec.ch_layouts,
+                        std::mem::zeroed(),
+                    )?
+                }
+            }
+            #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+            {
+                unsafe {
+                    self.context.get_supported_config::<ffi::AVChannelLayout>(
+                        Some(&self.codec),
+                        ffi::AV_CODEC_CONFIG_CHANNEL_LAYOUT,
+                    )
+                }
+                .ok()?
+            }
+        };
+        let counts: Vec<i32> = layouts
+            .iter()
+            .map(|l| l.nb_channels)
+            .filter(|n| *n > 0)
+            .collect();
+        if counts.is_empty() {
+            None
+        } else {
+            Some(counts)
+        }
+    }
+
     ///////////////
     ///////////////
 
@@ -232,6 +269,15 @@ impl CodecConfig {
         match self.supported_sample_rates() {
             Ok(None) | Err(_) => true,
             Ok(Some(rates)) => rates.contains(&sample_rate),
+        }
+    }
+
+    /// 编码器是否支持指定声道数；未声明限制或查询失败时按"支持"处理，
+    /// 与 [`CodecConfig::is_support_sample_rate`] 语义一致。
+    pub(crate) fn is_support_channel_count(&self, nb_channels: i32) -> bool {
+        match self.supported_channel_counts() {
+            None => true,
+            Some(counts) => counts.contains(&nb_channels),
         }
     }
 }
@@ -528,6 +574,31 @@ mod tests {
         let h264 = CodecConfig::decoders_for(ffi::AV_CODEC_ID_H264);
         assert!(!h264.is_empty(), "h264 decoder missing");
         assert_eq!(h264[0].media_type(), MediaType::VIDEO);
+    }
+
+    #[test]
+    fn test_audio_supported_capabilities() {
+        // AAC 是最常见的软件音频编码器：断言其声道数/采样率能力可被
+        // is_support_channel_count / is_support_sample_rate 识别，且对
+        // 非法值返回 false（证明校验并非恒真 no-op）。
+        let Some(config) = AVCodec::find_encoder_by_name(c"aac") else {
+            eprintln!("aac encoder not available, skipping");
+            return;
+        };
+        let config = CodecConfig::from_codec(config);
+        // 常见合法组合必须被认定为支持。
+        assert!(
+            config.is_support_channel_count(2),
+            "aac should support stereo (2 channels)"
+        );
+        assert!(
+            config.is_support_sample_rate(44100),
+            "aac should support 44100 Hz"
+        );
+        assert!(
+            !config.is_support_sample_rate(-1),
+            "aac must not report support for negative sample rate"
+        );
     }
 
     #[test]

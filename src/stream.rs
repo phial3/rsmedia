@@ -10,7 +10,6 @@ use rsmpeg::avformat::AVStream;
 use rsmpeg::avutil::{self, AVChannelLayout};
 use rsmpeg::ffi;
 
-use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 
@@ -153,7 +152,7 @@ pub struct StreamInfo {
 
     // extra
     pub extra_data: Option<Vec<u8>>,
-    pub metadata: HashMap<String, String>,
+    pub metadata: Metadata,
     /// **owned 快照**：构建本 `StreamInfo` 时通过 `avcodec_parameters_copy`
     /// 深拷贝得到的 codec 参数，生命周期完全独立于源 reader/writer，可由
     /// [`Self::into_parts`] 取出透传给 mux。
@@ -199,7 +198,7 @@ impl StreamInfo {
         let codec_type = codecpar.codec_type();
         let metadata = stream
             .metadata()
-            .map_or(HashMap::new(), |d| Metadata::from_dict(&d).into());
+            .map_or_else(Metadata::new, |d| Metadata::from_dict(&d));
         // 统一格式：视频 → 像素格式，音频 → 采样格式，其他 → NONE 占位
         let format = if codec_type.is_video() {
             FrameFormat::Pixel(PixelFormat::from(codecpar.format))
@@ -341,7 +340,7 @@ impl StreamInfo {
     ///    `av_display_rotation_get` 返回**逆时针**角度，取负转为顺时针语义。
     /// 2. `rotate` metadata 标签：旧版 mov/mp4 demuxer 的写入方式（新版
     ///    demuxer 会同时写入 side_data，两者一致时优先 side_data）。
-    fn get_stream_display_rotation(stream: &AVStream, map: &HashMap<String, String>) -> f64 {
+    fn get_stream_display_rotation(stream: &AVStream, map: &Metadata) -> f64 {
         // 1. side_data display matrix（codecpar.coded_side_data，FFmpeg 6+）
         let codecpar = stream.codecpar();
         let nb_side_data = codecpar.nb_coded_side_data.max(0) as usize;
@@ -400,7 +399,7 @@ impl StreamInfo {
     /// 回退到通用软件解码器名。
     pub fn find_decoder_name(&self, hw_device_type: Option<HWDeviceType>) -> Option<String> {
         let codec_id = self.codec_id as ffi::AVCodecID;
-        let codec_name = strutils::cstr_to_string(AVCodec::find_decoder(codec_id)?.name()).unwrap();
+        let codec_name = strutils::cstr_to_string_lossy(AVCodec::find_decoder(codec_id)?.name());
         let hw_codec_name = hw_device_type
             .and_then(|hw| hw_decoder_name(hw, codec_id))
             .filter(|name| {
@@ -423,7 +422,7 @@ impl StreamInfo {
     /// 与 [`Self::find_decoder_name`] 对称：硬件编码器名同样经验证存在后才使用。
     pub fn find_encoder_name(&self, hw_device_type: Option<HWDeviceType>) -> Option<String> {
         let codec_id = self.codec_id as ffi::AVCodecID;
-        let codec_name = strutils::cstr_to_string(AVCodec::find_encoder(codec_id)?.name()).unwrap();
+        let codec_name = strutils::cstr_to_string_lossy(AVCodec::find_encoder(codec_id)?.name());
         let hw_codec_name = hw_device_type
             .and_then(|hw| hw_encoder_name(hw, codec_id))
             .filter(|name| {
