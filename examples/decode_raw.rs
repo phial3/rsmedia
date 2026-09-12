@@ -12,7 +12,6 @@ use rsmedia::{DecoderBuilder, MediaType, Reader, StreamReader};
 
 use anyhow::Result;
 use rsmpeg::avutil::AVFrame;
-use std::path::Path;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -20,10 +19,8 @@ fn main() -> Result<()> {
         .init();
     rsmedia::init()?;
 
-    let source = Path::new("/tmp/test.mp4");
-
     // 方式一：高层便捷路径，直接拿到原始 AVFrame
-    let mut reader = StreamReader::new(source)?;
+    let mut reader = StreamReader::new("/tmp/test.mp4")?;
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
     let mut raw_count = 0;
     while let Some(frame) = decoder.decode_raw(&mut reader)? {

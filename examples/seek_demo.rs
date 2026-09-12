@@ -44,11 +44,20 @@ fn main() -> Result<()> {
     let stream_index = decoder.stream_index();
 
     // 1. Seek to frame 3 (by frame number, with AVSEEK_FLAG_FRAME).
-    reader.seek_to_frame(stream_index, 3, AVSeekFlag::FRAME)?;
-    println!(
-        "seek_to_frame(3) -> pts={}",
-        next_pts(&mut decoder, &mut reader)?
-    );
+    //    Frame-precise seeking is source-dependent: MP4/AVC demuxers do not
+    //    support it, so `seek_to_frame` legitimately reports failure here while
+    //    raw formats (e.g. .h264) accept it. Treat it as fallible, not a panic.
+    match reader.seek_to_frame(stream_index, 3, AVSeekFlag::FRAME) {
+        Ok(()) => {
+            println!(
+                "seek_to_frame(3) -> pts={}",
+                next_pts(&mut decoder, &mut reader)?
+            );
+        }
+        Err(e) => {
+            println!("seek_to_frame(3) unsupported by this source: {e}");
+        }
+    }
 
     // 2. Seek to 10s (by timestamp, landing on the nearest keyframe).
     reader.seek_to_timestamp(10_000)?;

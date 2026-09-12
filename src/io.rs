@@ -171,33 +171,56 @@ pub trait Seekable: Reader {
 
     /// Seek to a specific frame in the video stream.
     ///
+    /// Wraps FFmpeg's `av_seek_frame`, which by default (without `AVSeekFlag::BYTE`
+    /// or `AVSeekFlag::FRAME`) treats `frame_ts` as a **timestamp in stream
+    /// time-base units**.
+    ///
+    /// # Frame-based seeking (`AVSeekFlag::FRAME`)
+    ///
+    /// Passing `AVSeekFlag::FRAME` asks for **frame-precise** seeking: `frame_ts`
+    /// is interpreted as a frame **index** (not a timestamp). Support is entirely
+    /// **source-dependent** and most containers cannot honour it:
+    ///
+    /// - **Not supported** by common containers like **MP4/MOV/MKV/AVI** (their
+    ///   demuxers index by timestamp, not by frame), nor by network/live sources.
+    ///   For these, `seek_to_frame(.., N, AVSeekFlag::FRAME)` returns `Err` with a
+    ///   negative FFmpeg code — even though [`Seekable::seek_to_timestamp`] works fine.
+    /// - **Supported** by a handful of raw / low-level demuxers such as **`.h264` /
+    ///   `.hevc` / raw PCM**, which are the intended consumers of frame-index seeking.
+    ///
+    /// So treat this call as **fallible** (propagate the `Result`, don't `.unwrap()`)
+    /// and prefer [`Seekable::seek_to_timestamp`] for container formats. Note also that
+    /// seeking is best-effort: it lands on the nearest **keyframe** unless
+    /// `AVSeekFlag::ANY` is combined.
+    ///
     /// # Arguments
     ///
     /// * `stream_index` - The index of the stream to seek to.
-    /// * `frame_ts` - The timestamp of the target frame. This is typically derived from the frame's presentation timestamp (PTS).
+    /// * `frame_ts` - The timestamp of the target frame, or a frame **index** when
+    ///   `AVSeekFlag::FRAME` is set. In the timestamp case this is typically derived
+    ///   from the frame's presentation timestamp (PTS) in the stream's time base.
     /// * `flags` - [`AVSeekFlag`] bit flags, combinable with `|`, e.g.
     ///   `AVSeekFlag::BACKWARD | AVSeekFlag::ANY` (or mixed with a raw mask:
-    ///   `AVSeekFlag::ANY | 2`); a raw `i32` is also accepted.
-    ///   [`AVSeekFlag::FRAME`] alone seeks by frame number,
+    ///   `AVSeekFlag::ANY` `| 2`); [`AVSeekFlag::FRAME`] seeks by frame index,
     ///   [`AVSeekFlag::BYTE`] seeks by byte position, and [`AVSeekFlag::ANY`]
     ///   allows landing on a non-keyframe.
     fn seek_to_frame(
         &mut self,
         stream_index: usize,
         frame_ts: i64,
-        flags: impl Into<i32>,
+        flags: AVSeekFlag,
     ) -> Result<()> {
-        let flags = flags.into();
         unsafe {
             let res = ffi::av_seek_frame(
                 self.input_mut().as_mut_ptr(),
                 stream_index as i32,
                 frame_ts,
-                flags,
+                flags.into(),
             );
             if res < 0 {
                 return Err(RsmediaError::custom(format!(
-                    "Seek to frame failed: stream={stream_index}, ts={frame_ts}, flags={flags}, err={res}"
+                    "Seek to frame failed: stream={stream_index}, ts={frame_ts}, flags={:?}, err={res}",
+                    flags
                 )));
             }
             Ok(())

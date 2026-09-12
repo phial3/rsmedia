@@ -13,7 +13,6 @@ use rsmedia::{DecoderBuilder, EncoderBuilder, mux::Muxer};
 use rsmedia::{FrameFormat, MediaFrame, MediaType, SampleFormat, StreamReader};
 
 use anyhow::Result;
-use std::path::Path;
 
 const SAMPLE_RATE: u32 = 44_100;
 const CHANNELS: u32 = 2;
@@ -28,10 +27,10 @@ fn main() -> Result<()> {
     rsmedia::init()?;
 
     // 1. 演示音频编码（生成 12 秒正弦波写入 m4a，aac 编码器的标准容器）
-    encode_audio(Path::new("/tmp/sine_12s.m4a"))?;
+    encode_audio("/tmp/sine_12s.m4a")?;
 
     // 2. 演示音频解码
-    decode_audio(Path::new("/tmp/sine_12s.m4a"))?;
+    decode_audio("/tmp/sine_12s.m4a")?;
 
     Ok(())
 }
@@ -40,7 +39,7 @@ fn main() -> Result<()> {
 ///
 /// 使用裸 `Encoder` + `Muxer`，pts 以样本数为单位按帧大小递增（音频的
 /// 时间基为 `1/sample_rate`）。
-fn encode_audio(output: &Path) -> Result<()> {
+fn encode_audio(output: &'static str) -> Result<()> {
     let encoder = EncoderBuilder::new_audio(
         128_000,
         CHANNELS as i32,
@@ -73,7 +72,7 @@ fn encode_audio(output: &Path) -> Result<()> {
 }
 
 /// 解码音频流，打印每帧的采样格式信息。
-fn decode_audio(source: &Path) -> Result<()> {
+fn decode_audio(source: &'static str) -> Result<()> {
     let mut reader = StreamReader::new(source)?;
     let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
 

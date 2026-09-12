@@ -112,8 +112,8 @@ required-features = ["ndarray"]
 test = false
 
 [[example]]
-name = "seek"
-path = "examples/seek.rs"
+name = "seek_demo"
+path = "examples/seek_demo.rs"
 required-features = ["ndarray"]
 test = false
 
