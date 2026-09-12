@@ -76,16 +76,19 @@ test = false
 [[bench]]
 name = "encode_pipeline"
 path = "benches/encode_pipeline.rs"
+required-features = ["ndarray"]
 harness = false
 
 [[bench]]
 name = "encode_single_thread"
 path = "benches/encode_single_thread.rs"
+required-features = ["ndarray"]
 harness = false
 
 [[bench]]
 name = "encode_mux_container"
 path = "benches/encode_mux_container.rs"
+required-features = ["ndarray"]
 harness = false
 
 [[example]]
@@ -144,5 +147,11 @@ test = false
 [[example]]
 name = "hw_vt_check"
 path = "examples/hw_vt_check.rs"
+required-features = ["ndarray"]
+test = false
+
+[[example]]
+name = "auto_pts"
+path = "examples/auto_pts.rs"
 required-features = ["ndarray"]
 test = false

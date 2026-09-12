@@ -15,11 +15,11 @@ It aims to provide a stable and Rusty interface to many common media tasks, such
 as reading, writing, muxing, encoding, decoding, filtering, scaling, resampling,
 subtitle handling, picture quality enhancement and image processing.
 
-Everything starts with a single `rsmedia::init()` call, after which sources are
-opened through one uniform abstraction: `Location` accepts a local path, a
-`PathBuf` or a URL, so `StreamReader::new("/tmp/a.mp4")` and
-`StreamReader::new("http://host/a.mp4")` are the same call — as are the write
-side (`Muxer::new(...)`, `StreamWriter::new(...)`) and the builders.
+No initialisation call is required — the crate is usable as soon as it is
+linked. Sources are opened through one uniform abstraction, `Location`, which
+accepts a local path, a `PathBuf` or a URL, so `StreamReader::new("/tmp/a.mp4")`
+and `StreamReader::new("http://host/a.mp4")` are the same call — as are the
+write side (`Muxer::new(...)`, `StreamWriter::new(...)`) and the builders.
 
 ## ✨ What's inside
 
@@ -110,15 +110,7 @@ documentation.
 
 ## 🚀 Quick start
 
-Every program starts by initialising the library once:
-
-```rust
-fn main() -> anyhow::Result<()> {
-    rsmedia::init()?;
-    // ...
-    Ok(())
-}
-```
+There is no setup call to make — reach for the type you need and go.
 
 ### 1. Decode frames
 
@@ -126,8 +118,6 @@ fn main() -> anyhow::Result<()> {
 use rsmedia::{DecoderBuilder, MediaType, StreamReader};
 
 fn main() -> anyhow::Result<()> {
-    rsmedia::init()?;
-
     // Local path or URL — the same call.
     let mut reader = StreamReader::new("/tmp/test.mp4")?;
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
@@ -164,8 +154,6 @@ use rsmedia::mux::Muxer;
 use rsmedia::{colors, EncoderBuilder, PixelFormat, frame::MediaFrame};
 
 fn main() -> anyhow::Result<()> {
-    rsmedia::init()?;
-
     let (width, height) = (640, 360);
 
     let encoder = EncoderBuilder::new_video(width, height)
@@ -210,8 +198,6 @@ stream:
 use rsmedia::{mux::{Demuxer, Muxer}, EncoderBuilder, MediaType, SampleFormat};
 
 fn main() -> anyhow::Result<()> {
-    rsmedia::init()?;
-
     let mut demuxer = Demuxer::new("/tmp/test.mp4")?;
     let mut muxer = Muxer::new("/tmp/output.mov")?;
 
@@ -578,10 +564,15 @@ cargo bench                    # criterion: encode / mux pipelines
 cargo clippy --all-targets
 ```
 
-The encode-side suites generate their own media (gradient video, sine audio)
-into temporary files; the decode/transcode ones read the small samples in
-[`assets/`](assets) (`mp4.mp4`, `wav.wav`, `cat.jpg`), and hardware suites are
-`#[ignore]`d by default (run them with `cargo test -- --ignored`).
+The suites are split by what they need. **Unit tests** live next to the code in
+`src/**` and cover the core methods in isolation — format negotiation, time
+base/bit rate derivation, frame validation, PTS assignment — with no disk I/O;
+they compile without the `ndarray` feature. **Functional tests** live in
+`tests/**` and drive the public API end to end; the encode-side ones generate
+their own media (gradient video, sine audio) into temporary files, the
+decode/transcode ones read the small samples in [`assets/`](assets)
+(`mp4.mp4`, `wav.wav`, `cat.jpg`), and hardware suites are `#[ignore]`d by
+default (run them with `cargo test -- --ignored`).
 
 ## 🪲 Debugging
 
