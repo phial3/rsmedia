@@ -34,19 +34,6 @@ impl Color {
         Self { r, g, b, a }
     }
 
-    /// Returns `(r, g, b)`.
-    #[inline]
-    #[must_use]
-    pub const fn as_tuple(&self) -> (u8, u8, u8, u8) {
-        (self.r, self.g, self.b, self.a)
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn into_tuple(self) -> (u8, u8, u8, u8) {
-        self.as_tuple()
-    }
-
     /// Returns `[r, g, b, a]`.
     #[inline]
     #[must_use]
@@ -54,17 +41,18 @@ impl Color {
         [self.r, self.g, self.b, self.a]
     }
 
+    /// Returns `(r, g, b, a)`.
     #[inline]
     #[must_use]
-    pub fn into_array(self) -> [u8; 4] {
-        self.as_array()
+    pub const fn as_tuple(&self) -> (u8, u8, u8, u8) {
+        (self.r, self.g, self.b, self.a)
     }
 
     /// Returns `(r, g, b, a)`.
     #[inline]
     #[must_use]
     pub const fn rgba(&self) -> (u8, u8, u8, u8) {
-        (self.r, self.g, self.b, self.a)
+        self.as_tuple()
     }
 
     /// Returns `(r, g, b)`.

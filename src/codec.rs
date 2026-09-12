@@ -458,37 +458,33 @@ mod tests {
 
     /// 断言视频编码/解码器支持的非空像素格式列表非空。
     /// 若 FFmpeg 返回 `None`（表示"所有值均支持"）则视为通过。
-    fn assert_video_config(config: &CodecConfig, name: &str) {
-        let pix = config
-            .supported_pixel_formats()
-            .unwrap_or_else(|e| panic!("{name}: query pixel formats failed: {e}"));
+    fn assert_video_config(config: &CodecConfig, name: &str) -> Result<()> {
+        let pix = config.supported_pixel_formats()?;
         assert!(
             pix.map(|v| !v.is_empty()).unwrap_or(true),
             "{name}: expected non-empty supported pixel formats"
         );
+        Ok(())
     }
 
     /// 断言音频编码/解码器支持的采样率、采样格式列表非空。
-    fn assert_audio_config(config: &CodecConfig, name: &str) {
-        let rates = config
-            .supported_sample_rates()
-            .unwrap_or_else(|e| panic!("{name}: query sample rates failed: {e}"));
+    fn assert_audio_config(config: &CodecConfig, name: &str) -> Result<()> {
+        let rates = config.supported_sample_rates()?;
         assert!(
             rates.map(|v| !v.is_empty()).unwrap_or(true),
             "{name}: sample rates should be non-empty if specified"
         );
 
-        let fmts = config
-            .supported_sample_formats()
-            .unwrap_or_else(|e| panic!("{name}: query sample formats failed: {e}"));
+        let fmts = config.supported_sample_formats()?;
         assert!(
             fmts.map(|v| !v.is_empty()).unwrap_or(true),
             "{name}: expected non-empty supported sample formats"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_supported_video_codec() {
+    fn test_supported_video_codec() -> Result<()> {
         for id in [
             ffi::AV_CODEC_ID_H264,
             ffi::AV_CODEC_ID_MPEG4,
@@ -497,18 +493,18 @@ mod tests {
             ffi::AV_CODEC_ID_HEVC,
             ffi::AV_CODEC_ID_AV1,
         ] {
-            let config = CodecConfig::new(id).unwrap();
-            assert_video_config(&config, &format!("video codec {id}"));
+            let config = CodecConfig::new(id)?;
+            assert_video_config(&config, &format!("video codec {id}"))?;
             assert!(
                 config.is_encoder() || config.is_decoder(),
                 "video codec {id} should be encoder or decoder"
             );
         }
+        Ok(())
     }
 
     #[test]
-    #[cfg(unix)]
-    fn test_supported_video_codec_name() {
+    fn test_supported_video_codec_name() -> Result<()> {
         for name in [
             c"libx264",
             c"libx265",
@@ -516,14 +512,14 @@ mod tests {
             c"mpeg1video",
             c"mpeg2video",
         ] {
-            let config = CodecConfig::new_with_name(name)
-                .unwrap_or_else(|e| panic!("could not find codec {name:?}: {e}"));
-            assert_video_config(&config, &format!("video codec {name:?}"));
+            let config = CodecConfig::new_with_name(name)?;
+            assert_video_config(&config, &format!("video codec {name:?}"))?;
         }
+        Ok(())
     }
 
     #[test]
-    fn test_supported_audio_codec() {
+    fn test_supported_audio_codec() -> Result<()> {
         for id in [
             ffi::AV_CODEC_ID_AAC,
             ffi::AV_CODEC_ID_FLAC,
@@ -531,18 +527,18 @@ mod tests {
             ffi::AV_CODEC_ID_OPUS,
             ffi::AV_CODEC_ID_VORBIS,
         ] {
-            let config = CodecConfig::new(id).unwrap();
-            assert_audio_config(&config, &format!("audio codec {id}"));
+            let config = CodecConfig::new(id)?;
+            assert_audio_config(&config, &format!("audio codec {id}"))?;
             assert!(
                 config.is_encoder() || config.is_decoder(),
                 "audio codec {id} should be encoder or decoder"
             );
         }
+        Ok(())
     }
 
     #[test]
-    #[cfg(unix)]
-    fn test_supported_audio_codec_name() {
+    fn test_supported_audio_codec_name() -> Result<()> {
         // 外部编码器是否存在取决于 FFmpeg 编译配置（如 libvorbis 并非总是启用），
         // 缺失时跳过该编码器；但至少要有一个可用，否则视为构建异常。
         let mut available = 0;
@@ -551,12 +547,12 @@ mod tests {
                 println!("skip codec {name:?}: not available in this FFmpeg build");
                 continue;
             }
-            let config = CodecConfig::new_with_name(name)
-                .unwrap_or_else(|e| panic!("could not find codec {name:?}: {e}"));
-            assert_audio_config(&config, &format!("audio codec {name:?}"));
+            let config = CodecConfig::new_with_name(name)?;
+            assert_audio_config(&config, &format!("audio codec {name:?}"))?;
             available += 1;
         }
         assert!(available > 0, "no external audio codecs available");
+        Ok(())
     }
 
     #[test]
@@ -650,7 +646,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn test_libx264_profiles() {
         let config = CodecConfig::new_with_name(c"libx264").expect("libx264 missing");
         let profiles = config.profiles();

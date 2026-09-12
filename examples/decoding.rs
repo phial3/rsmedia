@@ -1,7 +1,7 @@
 use image::{ImageBuffer, Rgb};
 
-use rsmedia::io::{AVSeekFlag, Seekable};
-use rsmedia::{DecoderBuilder, FrameFormat, MediaFrame, MediaType, StreamReader, filter};
+use rsmedia::io::{Seekable, StreamReader};
+use rsmedia::{DecoderBuilder, FrameFormat, HWDeviceConfig, MediaFrame, MediaType, filter};
 
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -27,12 +27,10 @@ async fn main() -> Result<()> {
 
     rsmedia::init().unwrap();
 
-    let source = std::path::Path::new("/tmp/test.mp4");
-
     // 640x360 mp4
     // let source = "https://img.qunliao.info/4oEGX68t_9505974551.mp4"
-    //     .parse::<url::Url>()
-    //     .unwrap();
+
+    let source = "/tmp/test.mp4";
 
     let filters = vec![
         filter::video::scale(640, 360, None),
@@ -42,7 +40,8 @@ async fn main() -> Result<()> {
     let mut reader = StreamReader::new(source)?;
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
         // decoder with CUDA acceleration
-        // .with_hardware_device(Some(HWDeviceType::CUDA.auto_best_config().unwrap()))
+        .with_hardware_device(Some(HWDeviceConfig::auto_platform()?))
+        // h264_cuvid decoder name
         // .with_codec_name("h264_cuvid".to_string())
         .with_filters(filters)
         .build_from_reader(&reader)
@@ -50,10 +49,12 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(OUTPUT_DIR).context("failed to create output directory")?;
 
-    // seek to the 20th frame
+    // Seek near the 20th frame. MP4/AAC containers do not support frame-based
+    // seeking (`AVSeekFlag::FRAME`), so use the reliable timestamp seek which
+    // lands on the nearest keyframe (≈666ms at 30fps → before the 20th frame).
     reader
-        .seek_to_frame(decoder.stream_index(), 20, AVSeekFlag::FRAME)
-        .unwrap();
+        .seek_to_timestamp(20 * 1000 / 30)
+        .context("failed to seek to the 20th frame")?;
 
     loop {
         match decoder.decode_frame(&mut reader) {

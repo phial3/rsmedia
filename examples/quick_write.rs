@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
         .with_fps(fps)
         .build()?;
     let enc_tb = encoder.time_base();
-    let mut muxer = Muxer::new(std::path::Path::new("/tmp/quick_write.mp4"))?;
+    let mut muxer = Muxer::new("/tmp/quick_write.mp4")?;
     let v_idx = muxer.add_encoder(encoder)?;
 
     for i in 0..60 {

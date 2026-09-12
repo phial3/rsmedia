@@ -865,7 +865,7 @@ pub mod audio {
     /// 44.1kHz 下 H=177 样本）。当输入总样本数不是 H 的整数倍时会越界写堆内存，
     /// 可能导致进程随机崩溃。上游尚未修复；若使用本滤镜，建议保证输入总样本数为
     /// 窗口尺寸（`H = 2*round(pd*sample_rate/1e6)+1`，默认参数 44.1kHz 下为 177）
-    /// 的整数倍，或改用 [`fft_denoise`](Self::fft_denoise) / [`denoise`](Self::denoise)。
+    /// 的整数倍，或改用 `Filter::fft_denoise` / `Filter::denoise`。
     pub fn anlm_denoise(
         strength: Option<f32>,
         patch_size: Option<i32>,

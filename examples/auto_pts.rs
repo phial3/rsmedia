@@ -39,7 +39,7 @@ fn encode_video() -> anyhow::Result<()> {
     let encoder = EncoderBuilder::new_video(WIDTH, HEIGHT)
         .with_fps(FPS)
         .build()?;
-    let mut muxer = Muxer::new(std::path::Path::new("/tmp/rsmedia_auto_pts.mp4"))?;
+    let mut muxer = Muxer::new("/tmp/rsmedia_auto_pts.mp4")?;
     let v_idx = muxer.add_encoder(encoder)?;
 
     for i in 0..VIDEO_FRAMES {
@@ -61,7 +61,7 @@ fn encode_audio() -> anyhow::Result<()> {
         SampleFormat::FLTP,
     )
     .build()?;
-    let mut muxer = Muxer::new(std::path::Path::new("/tmp/rsmedia_auto_pts.m4a"))?;
+    let mut muxer = Muxer::new("/tmp/rsmedia_auto_pts.m4a")?;
     let a_idx = muxer.add_encoder(encoder)?;
 
     // Deliberately irregular sizes around the aac frame size (1024).

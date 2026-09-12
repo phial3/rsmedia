@@ -7,6 +7,11 @@
 //! every platform/FFmpeg combination and still fails loudly for codecs that
 //! must exist everywhere (h264/aac/mpeg4/flac/ffv1). The per-case timing and
 //! OK/SKIP lines form the codec matrix report in the CI log.
+//!
+//! The whole file needs the `ndarray` feature: it drives the high-level
+//! `MediaFrame` API, whose frame generators live in `common` behind that gate.
+
+#![cfg(feature = "ndarray")]
 
 mod common;
 

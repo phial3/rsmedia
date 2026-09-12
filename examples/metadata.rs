@@ -11,7 +11,6 @@ use rsmedia::stream::StreamInfo;
 use rsmedia::{DecoderBuilder, MediaType, StreamReader};
 
 use anyhow::Result;
-use std::path::Path;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -19,8 +18,7 @@ fn main() -> Result<()> {
         .init();
     rsmedia::init()?;
 
-    let source = Path::new("/tmp/test.mp4");
-    let reader = StreamReader::new(source)?;
+    let reader = StreamReader::new("/tmp/test.mp4")?;
     let decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
 
     // 1. 通过 StreamInfo 读取流的整体信息
