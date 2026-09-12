@@ -771,23 +771,36 @@ fn alloc_pooled_frame(
     frame.set_height(height);
     frame.set_format(fmt.into());
 
-    let mut buffer = pool
+    let buffer = pool
         .get()
         .context("Failed to get a buffer from the frame pool")?;
-    // Safety: buffer.data 有效且长度为 buffer.size（FFmpeg 侧保证），
+    // Safety: buffer.data 有效且长度为 buffer.size
     // 整段清零写是合法的独占访问（引用计数为 1，无其他持有者）。
     unsafe {
-        std::ptr::write_bytes((*buffer.as_mut_ptr()).data, 0, (*buffer.as_ptr()).size);
+        std::ptr::write_bytes((*buffer.as_ptr()).data, 0, (*buffer.as_ptr()).size);
     }
+
+    // 池缓冲的起始地址对齐由 FFmpeg 的 pool allocator 决定，跨平台不保证
+    // 32 字节（Windows 上 `av_malloc` 通常仅 16 对齐）。而编码器的 SIMD
+    // 读取依赖平面指针 32 字节对齐（与 `av_frame_get_buffer` 的默认一致），
+    // 故在缓冲内部把数据基准偏移到下一个 32 字节边界后，再交给
+    // `av_image_fill_arrays` 铺排平面——这样 `data[0]` 恒为 32 对齐。
+    // offset ∈ [0, 31]，`POOL_PADDING` 足以覆盖；`av_image_fill_arrays` 的
+    // 排布随之从对齐后的起点延续，不越界。
+    let base = unsafe { (*buffer.as_ptr()).data as usize };
+    let offset = (POOL_ALIGN as usize - (base % POOL_ALIGN as usize)) % POOL_ALIGN as usize;
+    // Safety: offset ∈ [0,31] 落在池缓冲内部（POOL_PADDING=64 足够覆盖）。
+    let aligned = unsafe { (*buffer.as_ptr()).data.add(offset) as *const u8 };
+
     let mut data = [std::ptr::null_mut::<u8>(); 8];
     let mut linesize = [0i32; 8];
-    // Safety: buffer 指向池缓冲（尺寸 ≥ pooled_frame_buffer_size 的结果），
-    // data/linesize 是本地数组，参数均为 FFmpeg 要求的合法值。
+    // Safety: aligned 指向池缓冲内部（尺寸 ≥ pooled_frame_buffer_size 的结果
+    // + 对齐偏移），data/linesize 是本地数组，参数均为 FFmpeg 要求的合法值。
     let ret = unsafe {
         ffi::av_image_fill_arrays(
             data.as_mut_ptr(),
             linesize.as_mut_ptr(),
-            (*buffer.as_ptr()).data,
+            aligned,
             fmt.into(),
             width,
             height,
