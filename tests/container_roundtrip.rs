@@ -546,12 +546,21 @@ fn roundtrip(spec: &ContainerSpec) -> Result<()> {
     Ok(())
 }
 
-/// The library reports a codec it cannot find with this phrasing, which is the
-/// only condition under which a container is skipped rather than failed.
+/// A codec missing from the linked FFmpeg build surfaces as `CodecNotFound` —
+/// possibly wrapped in context layers — which is the only condition under
+/// which a container is skipped rather than failed.
 fn is_encoder_unavailable(error: &RsmediaError) -> bool {
-    error
-        .to_string()
-        .contains("not available in this FFmpeg build")
+    let mut source: Option<&dyn std::error::Error> = Some(error);
+    while let Some(err) = source {
+        if matches!(
+            err.downcast_ref::<RsmediaError>(),
+            Some(RsmediaError::CodecNotFound(_))
+        ) {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// Walks the matrix; a codec missing from this FFmpeg build skips its container,

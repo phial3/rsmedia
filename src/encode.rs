@@ -610,8 +610,10 @@ impl EncoderBuilder {
                 }
             },
         };
+        // `find_encoder_by_name` 不区分"名字拼错"与"该 FFmpeg 构建未编译此编码器",
+        // 都归入 CodecNotFound —— 调用方据此跳过当前构建不可用的编码器。
         let codec = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(&codec_name))
-            .context(format!("Failed to find encoder by name: '{codec_name}'"))?;
+            .ok_or_else(|| RsmediaError::codec_not_found(codec_name.clone()))?;
 
         // CRF 速率控制：仅对支持 crf 私有选项的视频编码器生效，其余编码器
         // 回退到 bit_rate 控制（与 ffmpeg CLI 行为一致，只是多一个警告）。
@@ -1752,6 +1754,22 @@ mod tests {
             "expected InvalidConfig, got {err:?}"
         );
         Ok(())
+    }
+
+    /// 编码器名在此 FFmpeg 构建中不存在时返回 `CodecNotFound`(而不是普通
+    /// Other 错误):调用方靠该变体跳过当前构建不可用的编码器。
+    #[test]
+    fn test_missing_encoder_reports_codec_not_found() {
+        let Err(err) = EncoderBuilder::new_video(64, 64)
+            .with_codec_name("no_such_encoder".to_string())
+            .build()
+        else {
+            panic!("unknown codec name must fail");
+        };
+        assert!(
+            matches!(err, RsmediaError::CodecNotFound(ref name) if name == "no_such_encoder"),
+            "expected CodecNotFound, got {err:?}"
+        );
     }
 
     /// 采样格式协商：未指定时优先 FLTP，编码器不支持 FLTP 时取支持列表首个；

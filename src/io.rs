@@ -1784,9 +1784,12 @@ mod tests {
 
     /// 图片序列写入（image2 muxer + png 编码器）：写入 N 帧 => 磁盘上生成
     /// N 个按 `%03d` 模式编号的 PNG 文件。
+    ///
+    /// 输出目录独占（`images_write`）：image2 会按编号截断重建文件，与其它
+    /// 测试共用目录时，并行调度下会互相把对方已写完的文件截成 0 字节。
     #[test]
     fn test_write_image_sequence() -> Result<()> {
-        let pattern = crate::test_support::test_output_path("images", "img_%03d.png");
+        let pattern = crate::test_support::test_output_path("images_write", "img_%03d.png");
         let n_frames = 8;
 
         let writer = StreamWriterBuilder::new(&pattern)
@@ -1823,11 +1826,13 @@ mod tests {
 
     /// 图片序列读取（image2 demuxer）：按 `%03d` 模式打开序列，解码帧数应与
     /// 写入帧数一致，且尺寸正确。
+    ///
+    /// 序列在自己独占的 `images_read` 目录中现场生成：不复用写入测试的产物
+    /// —— 那样两个测试会争用同一组文件名（见 [`test_write_image_sequence`]）。
     #[test]
     fn test_read_image_sequence() -> Result<()> {
-        // 复用写入测试生成的序列；若不存在则现场生成
-        let pattern = crate::test_support::test_output_path("images", "img_%03d.png");
-        if !pattern.with_file_name("img_001.png").exists() {
+        let pattern = crate::test_support::test_output_path("images_read", "img_%03d.png");
+        {
             let writer = StreamWriterBuilder::new(&pattern)
                 .with_format("image2")
                 .build()?;
