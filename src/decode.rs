@@ -206,6 +206,25 @@ impl DecoderBuilder {
         self
     }
 
+    /// 校验像素格式能否以数据平面承载（非位流/调色板/硬件格式）。
+    fn ensure_pix_fmt_storable(fmt: PixelFormat) -> Result<()> {
+        if !fmt.has_data_layout() {
+            return Err(RsmediaError::msg(format!(
+                "Unsupported output pixel format: {fmt:?}; it cannot be stored as sample planes \
+                 (bitstream, paletted and hardware formats are not supported)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 某个仅对视频解码器生效的配置项被用于其它媒体类型时构造的错误。
+    fn option_only_for(opt: &'static str, value: String, media_type: MediaType) -> RsmediaError {
+        RsmediaError::msg(format!(
+            "{opt}({value}) is only valid for {} decoders, got media type: {media_type:?}",
+            media_type.get_media_name()
+        ))
+    }
+
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
@@ -330,21 +349,17 @@ impl DecoderBuilder {
         // 非视频类型配置了 pix_fmt 视为调用方错误，快速失败而非静默忽略。
         let output_pix_fmt = match (media_type, self.pix_fmt) {
             (MediaType::VIDEO, Some(fmt)) => {
-                if !fmt.has_data_layout() {
-                    return Err(RsmediaError::msg(format!(
-                        "Unsupported output pixel format: {fmt:?}; it cannot be stored as sample \
-                         planes (bitstream, paletted and hardware formats are not supported)"
-                    )));
-                }
+                Self::ensure_pix_fmt_storable(fmt)?;
                 fmt
             }
-            (MediaType::VIDEO, None) => PixelFormat::YUV420P,
-            (media_type, Some(fmt)) => {
-                return Err(RsmediaError::msg(format!(
-                    "with_pix_fmt({fmt:?}) is only valid for video decoders, got media type: {media_type:?}"
-                )));
-            }
             (_, None) => PixelFormat::YUV420P,
+            (media_type, Some(fmt)) => {
+                return Err(Self::option_only_for(
+                    "with_pix_fmt",
+                    format!("{fmt:?}"),
+                    media_type,
+                ));
+            }
         };
 
         // 输出采样格式：仅音频有效。`None` = 保留编解码器原生格式（默认），
@@ -359,10 +374,11 @@ impl DecoderBuilder {
                 )));
             }
             (media_type, Some(fmt)) => {
-                return Err(RsmediaError::msg(format!(
-                    "with_sample_fmt({fmt:?}) is only valid for audio decoders, got media type: \
-                     {media_type:?}"
-                )));
+                return Err(Self::option_only_for(
+                    "with_sample_fmt",
+                    format!("{fmt:?}"),
+                    media_type,
+                ));
             }
             (_, None) => None,
         };

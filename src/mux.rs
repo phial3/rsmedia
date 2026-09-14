@@ -533,6 +533,19 @@ impl<W: Writer> Muxer<W> {
         self.refresh_stream_info()
     }
 
+    /// 将已调整好流索引与时间戳的 packet 写入输出容器，返回容器的写入结果。
+    ///
+    /// `interleaved` 决定走 `write_interleaved`（需 DTS 递增，适合 MP4 等多包
+    /// 交错容器）还是 `write_frame`（直接顺序写，如 mkv 等）。二者是三条 mux
+    /// 路径（编码流 / 字幕流 / 复制流）收尾共用的唯一写入出口。
+    fn write_packet(&mut self, packet: &mut AVPacket, interleaved: bool) -> Result<W::Out> {
+        if interleaved {
+            self.writer.write_interleaved(packet)
+        } else {
+            self.writer.write_frame(packet)
+        }
+    }
+
     /// Mux a single frame through an encoder stream.
     ///
     /// 只适用于通过 [`Self::add_encoder`] 添加的编码流；若目标是透传流
@@ -572,11 +585,7 @@ impl<W: Writer> Muxer<W> {
             // encode_ctx_timebase => out_stream_time_base
             packet.rescale_ts(enc_time_base, out_time_base);
 
-            last_out = if interleaved {
-                Some(self.writer.write_interleaved(&mut packet)?)
-            } else {
-                Some(self.writer.write_frame(&mut packet)?)
-            };
+            last_out = Some(self.write_packet(&mut packet, interleaved)?);
         }
         Ok(last_out)
     }
@@ -625,11 +634,7 @@ impl<W: Writer> Muxer<W> {
             packet.set_pos(-1);
             packet.set_stream_index(stream_idx as i32);
             packet.rescale_ts(enc_time_base, out_time_base);
-            last_out = if interleaved {
-                Some(self.writer.write_interleaved(&mut packet)?)
-            } else {
-                Some(self.writer.write_frame(&mut packet)?)
-            };
+            last_out = Some(self.write_packet(&mut packet, interleaved)?);
         }
         Ok(last_out)
     }
@@ -670,11 +675,7 @@ impl<W: Writer> Muxer<W> {
         // 因此只在我们自己保存的源时间基与输出时间基之间进行一次换算）
         packet.rescale_ts(src_time_base, out_time_base);
 
-        if self.interleaved {
-            self.writer.write_interleaved(packet).map(Some)
-        } else {
-            self.writer.write_frame(packet).map(Some)
-        }
+        self.write_packet(packet, self.interleaved).map(Some)
     }
 
     /// Signal to the muxer that writing has finished. This will cause a trailer to be written if
@@ -712,6 +713,19 @@ impl<W: Writer> Muxer<W> {
         }
     }
 
+    /// 若 header 已写而 trailer 未写，则补写 trailer 兜底收尾（幂等）。
+    ///
+    /// 这是 `finish()` 之外用于 `into_writer` / `Drop` 的统一兜底入口：
+    /// 避免二者各自复制一遍「已写 header && 未写 trailer」的判定。
+    fn flush_if_needed(&mut self) {
+        if self.have_written_header
+            && !self.have_written_trailer
+            && let Err(err) = self.finish()
+        {
+            log::error!("Failed to auto-flush muxer: {err:#}");
+        }
+    }
+
     /// Consumes the muxer and returns the underlying writer.
     ///
     /// 应在 [`Self::finish`] 之后调用；此时 trailer 已写出，可从 writer 中
@@ -720,12 +734,7 @@ impl<W: Writer> Muxer<W> {
     /// 此处会自动补写 trailer（与 `Drop` 的兜底行为一致）。
     pub fn into_writer(mut self) -> W {
         // 先补写 trailer，使 Drop 的自动 flush 逻辑成为空操作。
-        if self.have_written_header
-            && !self.have_written_trailer
-            && let Err(err) = self.finish()
-        {
-            log::error!("Failed to auto-flush muxer on into_writer: {err:#}");
-        }
+        self.flush_if_needed();
         // SAFETY: `Muxer` 实现了 `Drop`，不能直接 move 字段。此处用
         // `ManuallyDrop` 跳过 `Muxer::Drop`（此时其逻辑已是空操作），
         // 取走 writer 后手动析构其余字段，保证 encoder 等资源正常释放。
@@ -750,12 +759,7 @@ impl<W: Writer> Drop for Muxer<W> {
         // 用户忘记调用 finish() 时（尤其是错误提前返回/panic），
         // 自动 flush 编码器延迟缓冲并写 trailer，避免生成损坏的容器文件。
         // 仅当已写过 header 时才处理，未 mux 过的空文件不做无意义写入。
-        if self.have_written_header
-            && !self.have_written_trailer
-            && let Err(err) = self.finish()
-        {
-            log::error!("Failed to auto-flush muxer on drop: {err:#}");
-        }
+        self.flush_if_needed();
     }
 }
 

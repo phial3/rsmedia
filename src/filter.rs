@@ -94,11 +94,15 @@ fn escape_filter_str(input: &str) -> String {
         return String::new();
     }
 
+    // FFmpeg 无法处理 NUL 字节；同时在 `av_escape` 失败/返回空指针时，
+    // 退化为「剥离 NUL 后原样放行」。这是有意的降级：宁可未转义，也不拒绝输出。
+    let fallback = || input.replace('\0', "");
+
     unsafe {
         // Create a C string from our input
         let c_input = match CString::new(input) {
             Ok(s) => s,
-            Err(_) => return input.replace('\0', "").to_string(), // Handle null bytes
+            Err(_) => return fallback(), // Handle null bytes
         };
 
         // Characters that need escaping in filtergraph descriptions
@@ -122,14 +126,14 @@ fn escape_filter_str(input: &str) -> String {
         if result < 0 {
             eprintln!("av_escape failed with error code: {}", result);
             // 使用安全的回退方案
-            return input.replace('\0', "").to_string();
+            return fallback();
         }
 
         // 检查返回的指针是否为空
         if escaped_ptr.is_null() {
             eprintln!("av_escape returned null pointer");
             // 使用安全的回退方案
-            return input.replace('\0', "").to_string();
+            return fallback();
         }
 
         // Convert back to Rust String and free the memory
@@ -910,20 +914,28 @@ pub mod audio {
     }
 }
 
+/// 按媒体类型选择同名滤镜：音频滤镜在视频滤镜名前加 `a` 前缀
+/// （如 `asetpts`/`setpts`、`atrim`/`trim`）。
+fn audio_or_video_filter_name(
+    audio: &'static str,
+    video: &'static str,
+    mt: MediaType,
+) -> &'static str {
+    if mt == MediaType::AUDIO { audio } else { video }
+}
+
 /// 修改时间戳表达式（加速、减速、对齐等）。
 /// 典型值：`"0.5*PTS"`（2倍速）、`"1.5*PTS"`（慢放）、`"PTS-STARTPTS"`。
 /// `expr`: FFmpeg expression (e.g., "0.5*PTS", "PTS-STARTPTS").
 pub fn setpts(media_type: MediaType, expr: &str) -> Filter {
-    #[rustfmt::skip]
-    let name = if media_type == MediaType::AUDIO { "asetpts" } else { "setpts" };
+    let name = audio_or_video_filter_name("asetpts", "setpts", media_type);
     let escaped_expr = escape_filter_str(expr);
     Filter::new(name, media_type, format!("{name}={escaped_expr}"))
 }
 
 /// 将视频/音频裁剪到指定的时间范围。
 pub fn trim(media_type: MediaType, start: f32, end: f32) -> Filter {
-    #[rustfmt::skip]
-    let name = if media_type == MediaType::AUDIO { "atrim" } else { "trim" };
+    let name = audio_or_video_filter_name("atrim", "trim", media_type);
     Filter::new(name, media_type, format!("{name}={start}:{end}"))
 }
 

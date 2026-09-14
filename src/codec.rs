@@ -77,7 +77,7 @@ impl CodecConfig {
     pub fn new(id: ffi::AVCodecID) -> Result<Self> {
         let codec = AVCodec::find_encoder(id)
             .or_else(|| AVCodec::find_decoder(id))
-            .ok_or_else(|| RsmediaError::msg(format!("Codec id:{id} not found.")))?;
+            .ok_or_else(|| RsmediaError::codec_not_found(format!("{id}")))?;
         #[cfg(feature = "ffmpeg6")]
         {
             Ok(Self { codec })
@@ -93,7 +93,7 @@ impl CodecConfig {
         let codec = AVCodec::find_encoder_by_name(codec_name)
             .or_else(|| AVCodec::find_decoder_by_name(codec_name))
             .ok_or_else(|| {
-                RsmediaError::msg(format!("Codec not found by name: '{codec_name:?}'"))
+                RsmediaError::codec_not_found(codec_name.to_string_lossy().into_owned())
             })?;
         #[cfg(feature = "ffmpeg6")]
         {
@@ -404,22 +404,24 @@ impl FormatInfo {
         self.name.split(',').next().unwrap_or(&self.name)
     }
 
-    fn from_output(fmt: AVOutputFormatRef<'static>) -> Self {
-        let extensions = unsafe { strutils::c_char_to_str_list(fmt.extensions) };
+    fn new_info(
+        name: impl AsRef<CStr>,
+        long_name: impl AsRef<CStr>,
+        extensions: *const std::os::raw::c_char,
+    ) -> Self {
         Self {
-            name: fmt.name().to_string_lossy().into_owned(),
-            long_name: fmt.long_name().to_string_lossy().into_owned(),
-            extensions,
+            name: name.as_ref().to_string_lossy().into_owned(),
+            long_name: long_name.as_ref().to_string_lossy().into_owned(),
+            extensions: unsafe { strutils::c_char_to_str_list(extensions) },
         }
     }
 
-    fn from_input(fmt: AVInputFormatRef<'static>) -> Self {
-        let extensions = unsafe { strutils::c_char_to_str_list(fmt.extensions) };
-        Self {
-            name: fmt.name().to_string_lossy().into_owned(),
-            long_name: fmt.long_name().to_string_lossy().into_owned(),
-            extensions,
-        }
+    fn from_output(outfmt: AVOutputFormatRef<'static>) -> Self {
+        Self::new_info(outfmt.name(), outfmt.long_name(), outfmt.extensions)
+    }
+
+    fn from_input(infmt: AVInputFormatRef<'static>) -> Self {
+        Self::new_info(infmt.name(), infmt.long_name(), infmt.extensions)
     }
 
     /// All muxers (output container formats) in this FFmpeg build.
@@ -436,19 +438,27 @@ impl FormatInfo {
             .collect()
     }
 
+    /// Whether a short name (or one of its aliases) matches `short_name`.
+    ///
+    /// A format's `name` field is a comma-separated alias list (e.g.
+    /// `"matroska,webm"`), so a lookup must also check each alias.
+    fn name_matches(name: &str, short_name: &str) -> bool {
+        name == short_name || name.split(',').any(|alias| alias.trim() == short_name)
+    }
+
     /// Look up a muxer by its short name (or one of its aliases),
     /// e.g. "mp4", "mkv", "matroska".
     pub fn find_muxer(short_name: &str) -> Option<Self> {
-        Self::muxers().into_iter().find(|f| {
-            f.name == short_name || f.name.split(',').any(|alias| alias.trim() == short_name)
-        })
+        Self::muxers()
+            .into_iter()
+            .find(|f| Self::name_matches(&f.name, short_name))
     }
 
     /// Look up a demuxer by its short name (or one of its aliases).
     pub fn find_demuxer(short_name: &str) -> Option<Self> {
-        Self::demuxers().into_iter().find(|f| {
-            f.name == short_name || f.name.split(',').any(|alias| alias.trim() == short_name)
-        })
+        Self::demuxers()
+            .into_iter()
+            .find(|f| Self::name_matches(&f.name, short_name))
     }
 }
 
