@@ -48,9 +48,10 @@ fn make_source_frame(width: i32, height: i32, seed: u8) -> Result<AVFrame> {
     Ok(frame)
 }
 
-/// 编码器缺失（FFmpeg 构建不含 libx264 等）时跳过而不是失败。
+/// 编码器缺失（FFmpeg 构建不含 libx264 等）时跳过而不是失败：匹配类型化
+/// [`RsmediaError::CodecNotFound`] 变体，而非错误字符串。
 fn is_encoder_unavailable(e: &RsmediaError) -> bool {
-    e.to_string().contains("not available in this FFmpeg build")
+    e.is_codec_not_found()
 }
 
 #[test]

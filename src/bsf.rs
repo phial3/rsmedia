@@ -253,6 +253,6 @@ mod tests {
             ffi::AVRational { num: 1, den: 30 },
         )
         .expect_err("unknown filter must be rejected");
-        assert!(err.to_string().contains("not found"), "{err}");
+        assert!(err.is_invalid_config(), "{err}");
     }
 }

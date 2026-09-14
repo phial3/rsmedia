@@ -19,6 +19,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use rsmedia::error::Context;
 use rsmedia::strutils;
@@ -35,19 +36,25 @@ use rsmpeg::ffi;
 // 公共测试辅助
 // ====================================================================
 
-/// 滤镜因 FFmpeg 构建配置缺失（如 `drawtext` 依赖 libfreetype、`gamma` 等）
-/// 初始化失败时优雅跳过，避免环境差异导致测试失败。
-fn is_filter_unavailable(e: &RsmediaError) -> bool {
-    let low = format!("{e}").to_lowercase();
-    low.contains("no such filter")
-        || low.contains("filter not found")
-        || low.contains("not found")
-        || low.contains("freetype")
+/// 滤镜在当前 FFmpeg 构建中不存在（如 `drawtext` 依赖 libfreetype、
+/// `fft_denoise`/`loudnorm` 依赖特定编译配置）时优雅跳过：**前置**探测滤镜
+/// 是否存在（`avfilter_get_by_name`），而非匹配 FFmpeg 运行时错误字符串。
+fn skip_if_filter_unavailable(filter: &Filter, path: &Path) -> bool {
+    if rsmedia::filter::is_available(filter.name()) {
+        return false;
+    }
+    println!(
+        "SKIP: filter `{}` not available in this FFmpeg build",
+        filter.name()
+    );
+    common::remove_test_output(path);
+    true
 }
 
-/// 编码器因 FFmpeg 构建配置缺失（如 libmp3lame/libtheora/libx265）时跳过
+/// 编码器因 FFmpeg 构建配置缺失（如 libmp3lame/libtheora/libx265）时跳过：
+/// 匹配类型化 [`RsmediaError::CodecNotFound`] 变体。
 fn is_encoder_unavailable(e: &RsmediaError) -> bool {
-    e.to_string().contains("not available in this FFmpeg build")
+    e.is_codec_not_found()
 }
 
 /// 汇总容器遍历测试结果：任何非跳过失败都断言失败；至少一个容器成功，
@@ -1025,21 +1032,15 @@ mod video {
             println!("VIDFILT {name}");
             let path = common::test_output_path("encode", &format!("rsmedia_vfilt_{name}.mp4"));
             common::remove_test_output(&path);
+            if skip_if_filter_unavailable(&filter, &path) {
+                continue;
+            }
 
-            // 编码（应用该滤镜）；滤镜缺失时优雅跳过
-            let enc = match EncoderBuilder::new_video(width, height)
+            // 编码（应用该滤镜）
+            let enc = EncoderBuilder::new_video(width, height)
                 .with_fps(fps)
                 .with_filters(vec![filter])
-                .build()
-            {
-                Ok(enc) => enc,
-                Err(e) if is_filter_unavailable(&e) => {
-                    println!("SKIP {name}: not available ({e:#})");
-                    common::remove_test_output(&path);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
+                .build()?;
             let enc_tb = enc.time_base();
             let video_idx = {
                 let mut muxer = rsmedia::mux::Muxer::new(&path)?;
@@ -1940,26 +1941,14 @@ mod audio {
             println!("AUDFILT {name}");
             let path = common::test_output_path("encode", &format!("rsmedia_afilter_{name}.m4a"));
             common::remove_test_output(&path);
+            if skip_if_filter_unavailable(&audio_filter, &path) {
+                continue;
+            }
 
-            let enc = match EncoderBuilder::new_audio(
-                128_000,
-                channels as i32,
-                sample_rate as i32,
-                format,
-            )
-            .with_filters(vec![audio_filter])
-            .build()
-            {
-                Ok(enc) => enc,
-                // 部分滤镜（如 `fft_denoise`/`loudnorm`）依赖特定 FFmpeg 编译配置，
-                // 未编译时初始化失败，这里优雅跳过，避免环境差异导致测试失败。
-                Err(e) if is_filter_unavailable(&e) => {
-                    println!("SKIP {name}: not available ({e:#})");
-                    common::remove_test_output(&path);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
+            let enc =
+                EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
+                    .with_filters(vec![audio_filter])
+                    .build()?;
             let enc_tb = enc.time_base();
             let mut total_pts: i64 = 0;
             {

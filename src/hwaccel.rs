@@ -613,7 +613,7 @@ impl HWDeviceType {
             None => Self::platform_preference(),
         };
         if preference.is_empty() {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::unsupported(format!(
                 "No hardware acceleration preference defined for platform: {}",
                 std::env::consts::OS
             )));
@@ -625,7 +625,7 @@ impl HWDeviceType {
             .find(|ty| ty.is_available())
             .copied()
             .ok_or_else(|| {
-                RsmediaError::msg(format!(
+                RsmediaError::unsupported(format!(
                     "No available hardware acceleration device on {} (candidates probed: {preference:?})",
                     std::env::consts::OS
                 ))
@@ -897,11 +897,7 @@ mod tests {
                 );
             }
             Err(err) => {
-                let message = format!("{err:#}");
-                assert!(
-                    message.contains("No available hardware acceleration"),
-                    "unexpected error: {message}"
-                );
+                assert!(err.is_unsupported(), "unexpected error: {err:#}");
             }
         }
     }
@@ -917,11 +913,7 @@ mod tests {
                 assert_eq!(config.sw_pixel_format, PixelFormat::NV12);
             }
             Err(err) => {
-                let message = format!("{err:#}");
-                assert!(
-                    message.contains("No available hardware acceleration"),
-                    "unexpected error: {message}"
-                );
+                assert!(err.is_unsupported(), "unexpected error: {err:#}");
             }
         }
     }

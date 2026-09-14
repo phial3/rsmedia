@@ -89,6 +89,44 @@ impl RsmediaError {
     pub fn invalid_config(reason: impl Into<String>) -> Self {
         RsmediaError::InvalidConfig(reason.into())
     }
+
+    /// Peel off all [`Context`] wrappers and return the root error, so callers
+    /// can match on the originating variant even when the error passed through
+    /// several `context(...)` layers.
+    pub fn root(&self) -> &Self {
+        let mut current = self;
+        while let RsmediaError::Context { source, .. } = current {
+            current = source;
+        }
+        current
+    }
+
+    /// Whether the root cause is a codec/encoder/decoder missing from this
+    /// FFmpeg build ([`RsmediaError::CodecNotFound`]) — e.g. a distro build
+    /// without libx264. Use this to skip gracefully instead of matching
+    /// error strings.
+    pub fn is_codec_not_found(&self) -> bool {
+        matches!(self.root(), RsmediaError::CodecNotFound(_))
+    }
+
+    /// Whether the root cause is a container format missing from this FFmpeg
+    /// build ([`RsmediaError::FormatNotFound`]).
+    pub fn is_format_not_found(&self) -> bool {
+        matches!(self.root(), RsmediaError::FormatNotFound(_))
+    }
+
+    /// Whether the root cause is an operation unsupported on this platform,
+    /// build or environment ([`RsmediaError::Unsupported`]) — e.g. no GPU
+    /// device is available.
+    pub fn is_unsupported(&self) -> bool {
+        matches!(self.root(), RsmediaError::Unsupported(_))
+    }
+
+    /// Whether the root cause is an invalid or contradictory configuration
+    /// ([`RsmediaError::InvalidConfig`]).
+    pub fn is_invalid_config(&self) -> bool {
+        matches!(self.root(), RsmediaError::InvalidConfig(_))
+    }
 }
 
 impl fmt::Display for RsmediaError {

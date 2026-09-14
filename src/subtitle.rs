@@ -597,7 +597,7 @@ mod tests {
         let err = encoder
             .encode_subtitle_segment(&SubtitleSegment::new(0, 1000, "x"))
             .unwrap_err();
-        assert!(err.to_string().contains("subtitle encoder"));
+        assert!(err.is_unsupported(), "{err}");
         Ok(())
     }
 
@@ -609,7 +609,12 @@ mod tests {
             Err(e) => e,
             Ok(_) => return Err(RsmediaError::msg("build should fail without header")),
         };
-        assert!(err.to_string().contains("header"));
+        // 编码器缺失的环境（构建不含 mov_text）跳过，环境差异不算失败。
+        if err.is_codec_not_found() {
+            println!("SKIP: subtitle encoder unavailable: {err}");
+            return Ok(());
+        }
+        assert!(err.is_invalid_config(), "{err}");
         Ok(())
     }
 }

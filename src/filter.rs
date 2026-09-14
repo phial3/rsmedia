@@ -7,6 +7,7 @@ use crate::MediaType;
 use crate::error::{Context, Result, RsmediaError};
 use crate::fmt::{FrameFormat, SampleFormat};
 use crate::pixel::PixelFormat;
+use crate::strutils;
 
 use rsmpeg::avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut};
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
@@ -64,6 +65,15 @@ impl Filter {
     pub fn input_format(&self) -> Option<FrameFormat> {
         self.input_format
     }
+}
+
+/// Whether the named FFmpeg filter exists in this build（如 `drawtext` 依赖
+/// libfreetype，许多发行版构建不含）。用于**前置**跳过不可用滤镜，避免依赖
+/// FFmpeg 运行时错误字符串来判断。
+pub fn is_available(name: &str) -> bool {
+    let name_c = strutils::str_to_cstring(name);
+    // SAFETY: `name_c` 是合法的 NUL 结尾 C 字符串；查询函数只读且线程安全。
+    unsafe { !ffi::avfilter_get_by_name(name_c.as_ptr()).is_null() }
 }
 
 /// Escapes characters that are special within FFmpeg filtergraph descriptions.

@@ -810,7 +810,7 @@ impl EncoderBuilder {
         // [`EncoderBuilder::with_subtitle_header`] 显式给出。
         if media_type == MediaType::SUBTITLE {
             let Some(header) = &self.subtitle_header else {
-                return Err(RsmediaError::msg(
+                return Err(RsmediaError::invalid_config(
                     "subtitle encoder requires an ASS script header: provide it via \
                      EncoderBuilder::with_subtitle_header, or forward it from the decoded \
                      subtitle stream in a transcode pipeline",
@@ -1022,7 +1022,7 @@ impl Encoder {
     /// time_base（1/1000 毫秒精度）设置。
     pub fn encode_subtitle_segment(&mut self, segment: &SubtitleSegment) -> Result<Vec<AVPacket>> {
         if self.media_type != MediaType::SUBTITLE {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::unsupported(format!(
                 "encode_subtitle_segment requires a subtitle encoder, got media type: {:?}",
                 self.media_type
             )));
@@ -2057,7 +2057,7 @@ mod tests {
             .with_codec_name(Some("mov_text".to_string()))
             .build()
         {
-            Err(e) if e.to_string().contains("ASS script header") => {}
+            Err(e) if e.is_invalid_config() => {}
             Err(e) => {
                 println!("SKIP: mov_text encoder unavailable in this build ({e})");
             }

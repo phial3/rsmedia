@@ -1255,26 +1255,23 @@ mod tests {
     fn test_decode_video() -> Result<()> {
         let video_path = std::path::Path::new("assets/mp4.mp4");
 
-        // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用，失败时降级为仅 scale。
+        // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用：前置探测
+        // 滤镜是否存在，缺失时降级为仅 scale，而非匹配错误字符串。
         let scale = filter::video::scale(1280, 720, None);
-        let drawtext = filter::video::DrawText::new("Hello", 10, 10, 24, "white").build();
         let mut reader = StreamReader::new(video_path)?;
+        let filters = if filter::is_available("drawtext") {
+            let drawtext = filter::video::DrawText::new("Hello", 10, 10, 24, "white").build();
+            vec![scale, drawtext]
+        } else {
+            println!("SKIP drawtext (libfreetype not available)");
+            vec![scale]
+        };
         let build_decoder = |filters: Vec<Filter>| -> Result<Decoder> {
             DecoderBuilder::new(MediaType::VIDEO)
                 .with_filters(filters)
                 .build_from_reader(&reader)
         };
-        let mut decoder = match build_decoder(vec![scale, drawtext]) {
-            Ok(d) => d,
-            Err(e)
-                if format!("{e:#}").to_lowercase().contains("no such filter")
-                    || format!("{e:#}").to_lowercase().contains("not found") =>
-            {
-                println!("SKIP drawtext (libfreetype not available): {e:#}");
-                build_decoder(vec![filter::video::scale(1280, 720, None)])?
-            }
-            Err(e) => return Err(e),
-        };
+        let mut decoder = build_decoder(filters)?;
 
         loop {
             match decoder.decode_raw(&mut reader) {
