@@ -19,7 +19,7 @@ pub fn fill_linesizes(pix_fmt: PixelFormat, width: i32) -> Result<[i32; 4]> {
 
     // >= 0 in case of success, a negative error code otherwise
     if ret < 0 {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "Failed to fill linesizes: {ret}"
         )));
     }
@@ -41,7 +41,7 @@ pub fn get_linesize(pix_fmt: PixelFormat, width: u32, plane: usize) -> Result<us
 
     // returns the computed size in bytes
     if ret <= 0 {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "Failed to get line size, ret: {ret}"
         )));
     }
@@ -86,7 +86,7 @@ pub fn fill_plane_sizes<I: IntoIterator<Item = u32>>(
 
     // >= 0 in case of success, a negative error code otherwise
     if ret < 0 {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "Failed to fill plane sizes, ret: {ret}"
         )));
     }
@@ -113,9 +113,7 @@ pub fn copy_frame_to_buffer(frame: &AVFrame) -> Result<Vec<u8>> {
         buffer.truncate(bytes);
         Ok(buffer)
     } else {
-        Err(RsmediaError::custom(format!(
-            "Failed to copy image:{bytes}"
-        )))
+        Err(RsmediaError::msg(format!("Failed to copy image:{bytes}")))
     }
 }
 
@@ -274,10 +272,10 @@ pub fn fill_plane_from_buffer(
 ) -> Result<()> {
     // 基本参数检查
     if frame.width * frame.height <= 0 {
-        return Err(RsmediaError::custom("Invalid frame dimensions"));
+        return Err(RsmediaError::msg("Invalid frame dimensions"));
     }
     if !frame.is_writable()? {
-        return Err(RsmediaError::custom("Frame is not writable"));
+        return Err(RsmediaError::msg("Frame is not writable"));
     }
 
     // 获取平面数量并检查平面索引
@@ -285,14 +283,14 @@ pub fn fill_plane_from_buffer(
 
     // 检查平面索引
     if plane_idx >= planes as usize {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "Invalid plane index: {plane_idx}, max planes: {planes}"
         )));
     }
 
     // 检查目标平面指针是否有效
     if frame.data[plane_idx].is_null() {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "Null plane data pointer for plane {plane_idx}"
         )));
     }
@@ -392,12 +390,12 @@ pub unsafe fn fill_plane_with<F>(
 pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()> {
     // 1. Basic validation
     if !frame.is_writable()? {
-        return Err(RsmediaError::custom("Frame is not writable"));
+        return Err(RsmediaError::msg("Frame is not writable"));
     }
     if frame.data[0].is_null() {
         // This check implies the frame buffer hasn't been allocated properly
         // alloc_buffer should have been called before passing the frame here.
-        return Err(RsmediaError::custom(
+        return Err(RsmediaError::msg(
             "Frame buffer is not allocated (frame.data is null)",
         ));
     }
@@ -407,7 +405,7 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
 
     // 3. Validate input buffer size
     if buffer.len() < expected_size {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "Input buffer size mismatch. Expected at least {} bytes, got {}",
             expected_size,
             buffer.len()
@@ -441,7 +439,7 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
         );
 
         if ret_fill < 0 {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Failed to calculate source layout using av_image_fill_arrays: {ret_fill}"
             )));
         }
@@ -593,7 +591,7 @@ pub fn apply_cropping(frame: &mut AVFrame, flags: i32) -> Result<()> {
 pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
     let (width, height) = (frame.width as u32, frame.height as u32);
     if width == 0 || height == 0 {
-        return Err(RsmediaError::custom("Invalid frame dimensions"));
+        return Err(RsmediaError::msg("Invalid frame dimensions"));
     }
 
     let build =
@@ -614,7 +612,7 @@ pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
         PixelFormat::RGB24 | PixelFormat::RGBA | PixelFormat::GRAY8 => {
             let buf = copy_frame_to_buffer(frame)?;
             build(pix_fmt, buf)
-                .ok_or_else(|| RsmediaError::custom("Failed to build image from frame data"))
+                .ok_or_else(|| RsmediaError::msg("Failed to build image from frame data"))
         }
         _ => {
             // 其他格式（YUV/BGR 族等）：swscale 统一转 RGB24
@@ -623,7 +621,7 @@ pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
             let buf = copy_frame_to_buffer(&rgb)?;
             image::RgbImage::from_raw(width, height, buf)
                 .map(image::DynamicImage::ImageRgb8)
-                .ok_or_else(|| RsmediaError::custom("Failed to build image from RGB24 data"))
+                .ok_or_else(|| RsmediaError::msg("Failed to build image from RGB24 data"))
         }
     }
 }

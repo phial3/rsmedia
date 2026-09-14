@@ -66,7 +66,7 @@ impl RsmediaError {
     }
 
     /// Build an [`RsmediaError::Other`] from any displayable value.
-    pub fn custom(msg: impl Into<String>) -> Self {
+    pub fn msg(msg: impl Into<String>) -> Self {
         RsmediaError::Other(msg.into())
     }
 
@@ -155,10 +155,6 @@ impl From<image::ImageError> for RsmediaError {
 
 /// Library-level `Result` alias used by all public APIs.
 pub type Result<T> = std::result::Result<T, RsmediaError>;
-
-/// Alias so call sites written as `Result<T, Error>` keep working, and so
-/// downstream users can `use rsmedia::Error`.
-pub type Error = RsmediaError;
 
 /// Internal convenience macro: build an [`RsmediaError::Other`] with
 /// `format!`-style arguments (migrates `anyhow!` call sites).
@@ -249,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_nested_context_joins() {
-        let err = RsmediaError::custom("inner failure");
+        let err = RsmediaError::msg("inner failure");
         let wrapped = err.with_context("outer").with_context("outermost");
         assert_eq!(wrapped.to_string(), "outermost: outer: inner failure");
     }

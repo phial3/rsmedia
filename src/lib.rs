@@ -35,7 +35,7 @@ pub use codec::{CodecConfig, FormatInfo, Profile};
 pub use colors::Color;
 pub use decode::{Decoder, DecoderBuilder, thumbnail};
 pub use encode::{Encoder, EncoderBuilder};
-pub use error::{Error, Result, RsmediaError};
+pub use error::{Result, RsmediaError};
 pub use filter::Filter;
 pub use fmt::{DataLayout, FrameFormat, SampleFormat};
 pub use hwaccel::{HWDeviceConfig, HWDeviceType};

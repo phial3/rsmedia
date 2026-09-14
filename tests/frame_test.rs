@@ -11,10 +11,9 @@
 #![cfg(feature = "ndarray")]
 
 use rsmedia::colors::Color;
-use rsmedia::error::Context;
+use rsmedia::error::{Context, Result};
 use rsmedia::{
-    DataLayout, FrameFormat, FrameSideData, MediaFrame, MediaType, PixelFormat, Result,
-    SampleFormat,
+    DataLayout, FrameFormat, FrameSideData, MediaFrame, MediaType, PixelFormat, SampleFormat,
 };
 
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};

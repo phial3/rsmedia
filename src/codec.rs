@@ -77,7 +77,7 @@ impl CodecConfig {
     pub fn new(id: ffi::AVCodecID) -> Result<Self> {
         let codec = AVCodec::find_encoder(id)
             .or_else(|| AVCodec::find_decoder(id))
-            .ok_or_else(|| RsmediaError::custom(format!("Codec id:{id} not found.")))?;
+            .ok_or_else(|| RsmediaError::msg(format!("Codec id:{id} not found.")))?;
         #[cfg(feature = "ffmpeg6")]
         {
             Ok(Self { codec })
@@ -93,7 +93,7 @@ impl CodecConfig {
         let codec = AVCodec::find_encoder_by_name(codec_name)
             .or_else(|| AVCodec::find_decoder_by_name(codec_name))
             .ok_or_else(|| {
-                RsmediaError::custom(format!("Codec not found by name: '{codec_name:?}'"))
+                RsmediaError::msg(format!("Codec not found by name: '{codec_name:?}'"))
             })?;
         #[cfg(feature = "ffmpeg6")]
         {

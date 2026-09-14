@@ -407,7 +407,7 @@ fn scale_with_flags(
             )
         };
         if ret < 0 {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Failed to call sws_scale_frame, ret: {ret}"
             )));
         }
@@ -666,7 +666,7 @@ impl Scaler {
                 )
             };
             if ret < 0 {
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "Failed to call sws_scale_frame, ret: {ret}"
                 )));
             }
@@ -808,7 +808,7 @@ fn alloc_pooled_frame(
         )
     };
     if ret < 0 {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "av_image_fill_arrays failed for {fmt:?} {width}x{height}, ret: {ret}"
         )));
     }

@@ -130,7 +130,7 @@ impl<W: Writer> PcmSink<W> {
                 )));
             }
             let encoder = mux_stream.encoder.as_ref().ok_or_else(|| {
-                RsmediaError::custom(format!(
+                RsmediaError::msg(format!(
                     "stream {stream_index} is a copy stream; PCM playback requires an encoder stream"
                 ))
             })?;

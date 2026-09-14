@@ -775,7 +775,7 @@ pub mod audio {
     /// See: <https://ffmpeg.org/ffmpeg-filters.html#acompressor>
     pub fn compressor(ratio: f32, attack: Option<f32>, release: Option<f32>) -> Result<Filter> {
         if ratio < 1.0 {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Compressor ratio must be >= 1.0: {ratio}"
             )));
         }
@@ -1003,13 +1003,13 @@ impl FilterGraph {
     /// 初始化过滤器图表
     pub fn init(&mut self, params: &FilterParams, filters: &[Filter]) -> Result<()> {
         if self.is_initialized() {
-            return Err(RsmediaError::custom("Filter graph already initialized"));
+            return Err(RsmediaError::msg("Filter graph already initialized"));
         }
 
         // check
         for filter in filters {
             if filter.media_type() != params.media_type() {
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "Filter media type mismatch: expected {:?}, got {:?}",
                     params.media_type(),
                     filter.media_type()
@@ -1197,7 +1197,7 @@ impl FilterGraph {
     /// 处理单帧
     pub fn process_frame(&mut self, frame: Option<AVFrame>) -> Result<Option<AVFrame>> {
         if !self.is_initialized() {
-            return Err(RsmediaError::custom("Filter graph not initialized"));
+            return Err(RsmediaError::msg("Filter graph not initialized"));
         }
 
         {
@@ -1227,7 +1227,7 @@ impl FilterGraph {
                 self.state = FilterGraphState::Flushed;
                 Ok(None)
             }
-            Err(e) => Err(RsmediaError::custom(format!(
+            Err(e) => Err(RsmediaError::msg(format!(
                 "Get frame from buffer sink Error: {e}"
             ))),
         }
@@ -1236,7 +1236,7 @@ impl FilterGraph {
     /// 刷新过滤器链
     pub fn flush(&mut self) -> Result<Vec<AVFrame>> {
         if !self.is_initialized() {
-            return Err(RsmediaError::custom("Filter graph not initialized"));
+            return Err(RsmediaError::msg("Filter graph not initialized"));
         }
         if self.is_flushed() {
             log::debug!("Filter graph already flushed.");

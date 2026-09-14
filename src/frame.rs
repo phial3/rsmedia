@@ -263,18 +263,16 @@ impl<T: ElementType> FrameData<T> {
                 let (rows, cols, components) = array.dim();
                 let view = ArrayView2::from_shape(
                     (rows, cols * components),
-                    array.as_slice().ok_or_else(|| {
-                        RsmediaError::custom("Interleaved frame must be contiguous")
-                    })?,
+                    array
+                        .as_slice()
+                        .ok_or_else(|| RsmediaError::msg("Interleaved frame must be contiguous"))?,
                 )
-                .map_err(|e| {
-                    RsmediaError::custom(format!("Failed to view interleaved plane: {e}"))
-                })?;
+                .map_err(|e| RsmediaError::msg(format!("Failed to view interleaved plane: {e}")))?;
                 let mapped = f(0, view)?;
                 let samples: Vec<U> = mapped.iter().cloned().collect();
                 Ok(FrameData::Packed(
                     Array3::from_shape_vec((rows, cols, components), samples).map_err(|e| {
-                        RsmediaError::custom(format!("Failed to rebuild interleaved frame: {e}"))
+                        RsmediaError::msg(format!("Failed to rebuild interleaved frame: {e}"))
                     })?,
                 ))
             }
@@ -292,11 +290,11 @@ impl<T: ElementType> FrameData<T> {
     pub fn plane_samples<U: ElementType>(&self, plane: usize) -> Result<Vec<U>> {
         let plane = self
             .plane(plane)
-            .ok_or_else(|| RsmediaError::custom(format!("Frame has no plane {plane}")))?;
+            .ok_or_else(|| RsmediaError::msg(format!("Frame has no plane {plane}")))?;
         let standard = plane.as_standard_layout();
         let slice = standard
             .as_slice()
-            .ok_or_else(|| RsmediaError::custom("Frame plane is not contiguous"))?;
+            .ok_or_else(|| RsmediaError::msg("Frame plane is not contiguous"))?;
         Ok(slice
             .iter()
             .map(|&value| num_traits::cast::<T, U>(value).unwrap_or(U::zero()))
@@ -317,7 +315,7 @@ fn rgb24_to_yuv420p<T: ElementType>(
 ) -> Result<FrameData<T>> {
     let (height, width) = rgb24_extent(data)?;
     if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "RGB24 -> YUV420P requires even dimensions, got {width}x{height}"
         )));
     }
@@ -359,7 +357,7 @@ fn rgb24_to_yuv420p<T: ElementType>(
             matrix,
             YuvConversionMode::Professional,
         )
-        .map_err(|e| RsmediaError::custom(format!("convert rgb24 to yuv420p error:{e}")))?;
+        .map_err(|e| RsmediaError::msg(format!("convert rgb24 to yuv420p error:{e}")))?;
     }
 
     Ok(FrameData::Planar(vec![
@@ -388,7 +386,7 @@ fn yuv420p_to_rgb24<T: ElementType>(
         let rgb = yuv420_to_rgb_16bit(&y, &u, &v, width, height, matrix)?;
         return Ok(FrameData::Packed(
             Array3::from_shape_vec((height, width, 3), cast_samples::<u16, T>(rgb))
-                .map_err(|e| RsmediaError::custom(format!("Failed to build RGB24 frame: {e}")))?,
+                .map_err(|e| RsmediaError::msg(format!("Failed to build RGB24 frame: {e}")))?,
         ));
     }
 
@@ -397,7 +395,7 @@ fn yuv420p_to_rgb24<T: ElementType>(
     let v = data.plane_samples::<u8>(2)?;
     if y.len() < width * height || u.len() < uv_width * uv_height || v.len() < uv_width * uv_height
     {
-        return Err(RsmediaError::custom("YUV420P plane buffer too small"));
+        return Err(RsmediaError::msg("YUV420P plane buffer too small"));
     }
 
     let planar = YuvPlanarImage {
@@ -418,11 +416,11 @@ fn yuv420p_to_rgb24<T: ElementType>(
         YuvRange::Full,
         matrix,
     )
-    .map_err(|e| RsmediaError::custom(format!("convert yuv420p to rgb24 error:{e}")))?;
+    .map_err(|e| RsmediaError::msg(format!("convert yuv420p to rgb24 error:{e}")))?;
 
     Ok(FrameData::Packed(
         Array3::from_shape_vec((height, width, 3), cast_samples::<u8, T>(rgb))
-            .map_err(|e| RsmediaError::custom(format!("Failed to build RGB24 frame: {e}")))?,
+            .map_err(|e| RsmediaError::msg(format!("Failed to build RGB24 frame: {e}")))?,
     ))
 }
 
@@ -678,9 +676,9 @@ where
             let format = self
                 .format
                 .into_pixel()
-                .ok_or_else(|| RsmediaError::custom("Video frame needs a pixel format"))?;
+                .ok_or_else(|| RsmediaError::msg("Video frame needs a pixel format"))?;
             format.data_layout(self.width, self.height).ok_or_else(|| {
-                RsmediaError::custom(format!(
+                RsmediaError::msg(format!(
                     "Pixel format {} cannot be stored as sample planes at {}x{}",
                     format.get_pix_fmt_name(),
                     self.width,
@@ -691,7 +689,7 @@ where
             let format = self
                 .format
                 .into_sample()
-                .ok_or_else(|| RsmediaError::custom("Audio frame needs a sample format"))?;
+                .ok_or_else(|| RsmediaError::msg("Audio frame needs a sample format"))?;
             Ok(format.data_layout(self.nb_channels as usize, self.nb_samples as usize))
         }
     }
@@ -728,7 +726,7 @@ where
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
     pub fn new_video_frame(width: usize, height: usize, format: PixelFormat) -> Result<Self> {
         let layout = format.data_layout(width, height).ok_or_else(|| {
-            RsmediaError::custom(format!(
+            RsmediaError::msg(format!(
                 "Pixel format {} cannot be stored as sample planes at {width}x{height}",
                 format.get_pix_fmt_name()
             ))
@@ -784,7 +782,7 @@ where
         sample_rate: u32,
     ) -> Result<Self> {
         if nb_channels == 0 || nb_samples == 0 {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Audio frame needs a positive sample and channel count, got {nb_samples} samples x {nb_channels} channels"
             )));
         }
@@ -807,7 +805,7 @@ where
     fn validated(self) -> Result<Self> {
         let layout = self.data_layout()?;
         if !self.data.matches(&layout) {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Frame data does not match its format: expected planes {:?}, got {:?}",
                 layout.shapes(),
                 self.data.shapes()
@@ -829,12 +827,12 @@ where
             self.format
                 .into_pixel()
                 .and_then(PixelFormat::bytes_per_component)
-                .ok_or_else(|| RsmediaError::custom("Unsupported pixel format"))
+                .ok_or_else(|| RsmediaError::msg("Unsupported pixel format"))
         } else {
             self.format
                 .into_sample()
                 .and_then(|format| format.get_bytes_per_sample())
-                .ok_or_else(|| RsmediaError::custom("Unsupported sample format"))
+                .ok_or_else(|| RsmediaError::msg("Unsupported sample format"))
         }
     }
 
@@ -869,7 +867,7 @@ where
     /// and audio planes are read contiguously.
     pub fn from_avframe(frame: &AVFrame) -> Result<Self> {
         if plane_ptr(frame, 0).is_null() {
-            return Err(RsmediaError::custom("Invalid frame data"));
+            return Err(RsmediaError::msg("Invalid frame data"));
         }
 
         let (width, height) = (frame.width as usize, frame.height as usize);
@@ -901,7 +899,7 @@ where
             let frame_format = FrameFormat::Sample(sample_format);
             let element_bytes = sample_format
                 .get_bytes_per_sample()
-                .ok_or_else(|| RsmediaError::custom("Unsupported sample format"))?;
+                .ok_or_else(|| RsmediaError::msg("Unsupported sample format"))?;
             validate_element_size::<T>(frame_format, element_bytes)?;
 
             let mut media = Self {
@@ -926,7 +924,7 @@ where
             let frame_format = FrameFormat::Pixel(pixel_format);
             let element_bytes = pixel_format
                 .bytes_per_component()
-                .ok_or_else(|| RsmediaError::custom("Unsupported pixel format"))?;
+                .ok_or_else(|| RsmediaError::msg("Unsupported pixel format"))?;
             validate_element_size::<T>(frame_format, element_bytes)?;
 
             let mut media = Self {
@@ -947,7 +945,7 @@ where
             media.copy_avframe_meta(frame);
             Ok(media)
         } else {
-            Err(RsmediaError::custom("Unsupported frame format"))
+            Err(RsmediaError::msg("Unsupported frame format"))
         }
     }
 
@@ -1073,7 +1071,7 @@ where
     pub fn to_avframe(&self) -> Result<AVFrame> {
         let layout = self.data_layout()?;
         if !self.data.matches(&layout) {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Frame data does not match its format: expected planes {:?}, got {:?}",
                 layout.shapes(),
                 self.data.shapes()
@@ -1123,14 +1121,14 @@ where
     /// 校验当前帧为视频帧，且像素格式为 `expected`；否则返回可读的错误信息。
     fn check_format(&self, expected: FrameFormat, expected_desc: &str) -> Result<()> {
         if self.media_type != MediaType::VIDEO {
-            return Err(RsmediaError::custom("Only video frames are supported"));
+            return Err(RsmediaError::msg("Only video frames are supported"));
         }
         if self.format != expected {
             let got = match self.format {
                 FrameFormat::Pixel(p) => p.get_pix_fmt_name(),
                 FrameFormat::Sample(_) => "<audio format>",
             };
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Expected {expected_desc} format, got {got}"
             )));
         }
@@ -1218,7 +1216,7 @@ impl MediaFrame<u8> {
         let rgb = self.data.plane_samples::<u8>(0)?;
         image::RgbImage::from_raw(width as u32, height as u32, rgb)
             .map(image::DynamicImage::ImageRgb8)
-            .ok_or_else(|| RsmediaError::custom("Failed to build image from RGB24 data"))
+            .ok_or_else(|| RsmediaError::msg("Failed to build image from RGB24 data"))
     }
 
     /// Builds an RGB24 video frame from an [`image::DynamicImage`].
@@ -1230,9 +1228,8 @@ impl MediaFrame<u8> {
         let rgb = img.to_rgb8();
         let (width, height) = rgb.dimensions();
         let (width, height) = (width as usize, height as usize);
-        let array = Array3::from_shape_vec((height, width, 3), rgb.into_raw()).map_err(|e| {
-            RsmediaError::custom(format!("Failed to build ndarray from image: {e}"))
-        })?;
+        let array = Array3::from_shape_vec((height, width, 3), rgb.into_raw())
+            .map_err(|e| RsmediaError::msg(format!("Failed to build ndarray from image: {e}")))?;
         Self::new_video(width, height, PixelFormat::RGB24, array)
     }
 }
@@ -1267,7 +1264,7 @@ fn read_plane<T: ElementType>(
 ) -> Result<Vec<T>> {
     let source = plane_ptr(frame, plane) as *const T;
     if source.is_null() {
-        return Err(RsmediaError::custom(format!("Frame plane {plane} is null")));
+        return Err(RsmediaError::msg(format!("Frame plane {plane} is null")));
     }
     let stride = frame.linesize[plane] as i64 / std::mem::size_of::<T>() as i64;
 
@@ -1294,7 +1291,7 @@ fn write_plane<T: ElementType>(
     samples: &[T],
 ) -> Result<()> {
     if samples.len() < rows * row_len {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "Plane {plane} needs {} samples, got {}",
             rows * row_len,
             samples.len()
@@ -1329,7 +1326,7 @@ fn read_samples<T: ElementType>(frame: &AVFrame, layout: &DataLayout) -> Result<
                 (*rows, *cols, *components),
                 read_plane::<T>(frame, 0, *rows, cols * components)?,
             )
-            .map_err(|e| RsmediaError::custom(format!("Failed to build frame samples: {e}")))?,
+            .map_err(|e| RsmediaError::msg(format!("Failed to build frame samples: {e}")))?,
         )),
         DataLayout::Planar(shapes) => {
             let mut planes = Vec::with_capacity(shapes.len());
@@ -1339,9 +1336,7 @@ fn read_samples<T: ElementType>(frame: &AVFrame, layout: &DataLayout) -> Result<
                         (rows, cols),
                         read_plane::<T>(frame, plane, rows, cols)?,
                     )
-                    .map_err(|e| {
-                        RsmediaError::custom(format!("Failed to build frame plane: {e}"))
-                    })?,
+                    .map_err(|e| RsmediaError::msg(format!("Failed to build frame plane: {e}")))?,
                 );
             }
             Ok(FrameData::Planar(planes))
@@ -1356,7 +1351,7 @@ fn write_samples<T: ElementType>(frame: &mut AVFrame, data: &FrameData<T>) -> Re
             let (rows, cols, components) = array.dim();
             let samples = array
                 .as_slice()
-                .ok_or_else(|| RsmediaError::custom("Frame plane is not contiguous"))?;
+                .ok_or_else(|| RsmediaError::msg("Frame plane is not contiguous"))?;
             write_plane(frame, 0, rows, cols * components, samples)
         }
         FrameData::Planar(planes) => {
@@ -1364,7 +1359,7 @@ fn write_samples<T: ElementType>(frame: &mut AVFrame, data: &FrameData<T>) -> Re
                 let (rows, cols) = array.dim();
                 let samples = array
                     .as_slice()
-                    .ok_or_else(|| RsmediaError::custom("Frame plane is not contiguous"))?;
+                    .ok_or_else(|| RsmediaError::msg("Frame plane is not contiguous"))?;
                 write_plane(frame, plane, rows, cols, samples)?;
             }
             Ok(())
@@ -1376,7 +1371,7 @@ fn write_samples<T: ElementType>(frame: &mut AVFrame, data: &FrameData<T>) -> Re
 /// `RGB24` implies.
 fn rgb24_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
     let packed = data.as_packed().ok_or_else(|| {
-        RsmediaError::custom("RGB24 samples must be interleaved (packed), not planar")
+        RsmediaError::msg("RGB24 samples must be interleaved (packed), not planar")
     })?;
     let (height, width, _) = packed.dim();
     check_layout(data, PixelFormat::RGB24, width, height)?;
@@ -1388,11 +1383,11 @@ fn rgb24_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
 fn yuv420p_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
     let planes = data
         .as_planes()
-        .ok_or_else(|| RsmediaError::custom("YUV420P samples must be planar, not interleaved"))?;
+        .ok_or_else(|| RsmediaError::msg("YUV420P samples must be planar, not interleaved"))?;
     let (height, width) = planes
         .first()
         .map(|plane| plane.dim())
-        .ok_or_else(|| RsmediaError::custom("YUV420P frame has no luma plane"))?;
+        .ok_or_else(|| RsmediaError::msg("YUV420P frame has no luma plane"))?;
     check_layout(data, PixelFormat::YUV420P, width, height)?;
     Ok((height, width))
 }
@@ -1405,7 +1400,7 @@ fn check_layout<T>(
     height: usize,
 ) -> Result<()> {
     let layout = format.data_layout(width, height).ok_or_else(|| {
-        RsmediaError::custom(format!(
+        RsmediaError::msg(format!(
             "Pixel format {} has no data layout at {width}x{height}",
             format.get_pix_fmt_name()
         ))
@@ -1413,7 +1408,7 @@ fn check_layout<T>(
     if data.matches(&layout) {
         Ok(())
     } else {
-        Err(RsmediaError::custom(format!(
+        Err(RsmediaError::msg(format!(
             "{} expects planes {:?}, got {:?}",
             format.get_pix_fmt_name(),
             layout.shapes(),
@@ -1429,7 +1424,7 @@ fn plane_from<S: ElementType, T: ElementType>(
     cols: usize,
 ) -> Result<Array2<T>> {
     Array2::from_shape_vec((rows, cols), cast_samples::<S, T>(samples))
-        .map_err(|e| RsmediaError::custom(format!("Failed to build frame plane: {e}")))
+        .map_err(|e| RsmediaError::msg(format!("Failed to build frame plane: {e}")))
 }
 
 /// Casts flat samples from `S` to `T`, falling back to zero for values the
@@ -1468,12 +1463,12 @@ fn rgb_to_yuv420_16bit(
     matrix: YuvStandardMatrix,
 ) -> Result<(Vec<u16>, Vec<u16>, Vec<u16>)> {
     if rgb16.len() < width * height * 3 {
-        return Err(RsmediaError::custom(
+        return Err(RsmediaError::msg(
             "RGB data too short for 16-bit conversion",
         ));
     }
     if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "YUV420P requires even dimensions, got {width}x{height}"
         )));
     }
@@ -1520,7 +1515,7 @@ fn yuv420_to_rgb_16bit(
     let (uv_w, uv_h) = (width / 2, height / 2);
     if y_plane.len() < width * height || u_plane.len() < uv_w * uv_h || v_plane.len() < uv_w * uv_h
     {
-        return Err(RsmediaError::custom("YUV420P plane buffer too small"));
+        return Err(RsmediaError::msg("YUV420P plane buffer too small"));
     }
 
     let (kr, _kg, kb) = yuv_primaries(matrix);
@@ -1552,7 +1547,7 @@ fn yuv420_to_rgb_16bit(
 fn validate_element_size<T>(format: FrameFormat, expected_size: usize) -> Result<()> {
     let type_size = std::mem::size_of::<T>();
     if type_size != expected_size {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "format:{format}, expected {expected_size}, got {type_size}"
         )));
     }

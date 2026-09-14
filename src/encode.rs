@@ -452,7 +452,7 @@ impl EncoderBuilder {
     ) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != encoder.codec_type {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Encoder codec type not supported: {:?} vs. {:?}",
                 media_type, encoder.codec_type
             )));
@@ -505,7 +505,7 @@ impl EncoderBuilder {
             // 字幕编码器只需 time_base（毫秒精度），无像素/采样格式、码率等概念
             encoder.set_time_base(self.effective_time_base());
         } else {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Unsupported media type: {media_type:?}"
             )));
         }
@@ -604,7 +604,7 @@ impl EncoderBuilder {
                 MediaType::AUDIO => Self::AUDIO_CODEC_NAME.to_string(),
                 MediaType::SUBTITLE => Self::SUBTITLE_CODEC_NAME.to_string(),
                 _ => {
-                    return Err(RsmediaError::custom(format!(
+                    return Err(RsmediaError::msg(format!(
                         "Unsupported media type:{media_type:?}",
                     )));
                 }
@@ -693,7 +693,7 @@ impl EncoderBuilder {
                     })
                 }
                 _ => {
-                    return Err(RsmediaError::custom(format!(
+                    return Err(RsmediaError::msg(format!(
                         "Unsupported filter for media type: {media_type:?}"
                     )));
                 }
@@ -701,7 +701,7 @@ impl EncoderBuilder {
             let mut graph = FilterGraph::new();
             // check Filter media type
             if !filters.iter().all(|f| f.media_type() == media_type) {
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "Filter media type mismatch for encoder type {media_type:?}"
                 )));
             }
@@ -810,14 +810,14 @@ impl EncoderBuilder {
         // [`EncoderBuilder::with_subtitle_header`] 显式给出。
         if media_type == MediaType::SUBTITLE {
             let Some(header) = &self.subtitle_header else {
-                return Err(RsmediaError::custom(
+                return Err(RsmediaError::msg(
                     "subtitle encoder requires an ASS script header: provide it via \
                      EncoderBuilder::with_subtitle_header, or forward it from the decoded \
                      subtitle stream in a transcode pipeline",
                 ));
             };
             let header_c = std::ffi::CString::new(header.as_str())
-                .map_err(|e| RsmediaError::custom(format!("Invalid subtitle header: {e}")))?;
+                .map_err(|e| RsmediaError::msg(format!("Invalid subtitle header: {e}")))?;
             encode_ctx
                 .set_subtitle_header(header_c.as_c_str())
                 .context("Failed to set subtitle header")?;
@@ -1022,7 +1022,7 @@ impl Encoder {
     /// time_base（1/1000 毫秒精度）设置。
     pub fn encode_subtitle_segment(&mut self, segment: &SubtitleSegment) -> Result<Vec<AVPacket>> {
         if self.media_type != MediaType::SUBTITLE {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "encode_subtitle_segment requires a subtitle encoder, got media type: {:?}",
                 self.media_type
             )));
@@ -1042,7 +1042,7 @@ impl Encoder {
         let mut subtitle = AVSubtitle::new();
         let dialogue = format!("0,0,Default,,0,0,0,,{}", segment.text);
         let dialogue_c = std::ffi::CString::new(dialogue)
-            .map_err(|e| RsmediaError::custom(format!("Subtitle text contains NUL byte: {e}")))?;
+            .map_err(|e| RsmediaError::msg(format!("Subtitle text contains NUL byte: {e}")))?;
         subtitle
             .push_ass_rect(dialogue_c.as_c_str())
             .context("Failed to build subtitle rect")?;
@@ -1407,7 +1407,7 @@ impl Encoder {
             }
             _ => {
                 // do nothing
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "Unsupported encode frame media type: {:?}",
                     self.media_type
                 )));
@@ -1440,7 +1440,7 @@ impl Encoder {
                     return Ok(());
                 }
                 if !self.config.is_support_pixel_format(frame.format) {
-                    return Err(RsmediaError::custom(format!(
+                    return Err(RsmediaError::msg(format!(
                         "Unsupported video encoder frame pixel format: {:?}",
                         frame.format
                     )));
@@ -1449,21 +1449,21 @@ impl Encoder {
 
             MediaType::AUDIO => {
                 if !self.config.is_support_sample_format(frame.format) {
-                    return Err(RsmediaError::custom(format!(
+                    return Err(RsmediaError::msg(format!(
                         "Unsupported encode audio frame sample format: {:?}",
                         frame.format
                     )));
                 }
 
                 if !self.config.is_support_frame_rates(self.context.framerate) {
-                    return Err(RsmediaError::custom(format!(
+                    return Err(RsmediaError::msg(format!(
                         "Unsupported encode audio frame rate: {:?}",
                         self.context.framerate
                     )));
                 }
 
                 if !self.config.is_support_sample_rate(frame.sample_rate) {
-                    return Err(RsmediaError::custom(format!(
+                    return Err(RsmediaError::msg(format!(
                         "Unsupported encode audio frame sample rate: {:?}",
                         frame.sample_rate
                     )));

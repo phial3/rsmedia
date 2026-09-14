@@ -374,7 +374,7 @@ mod tests {
 
         // 3) Decode roundtrip: demux packets -> decode_subtitle -> rect payload
         let decoder = AVCodec::find_decoder(codec_id)
-            .ok_or_else(|| RsmediaError::custom("mov_text decoder not available"))?;
+            .ok_or_else(|| RsmediaError::msg("mov_text decoder not available"))?;
         let mut dctx = AVCodecContext::new(&decoder);
         dctx.open(None)?;
 
@@ -551,7 +551,7 @@ mod tests {
 
         // 3) Decode roundtrip: demux packets -> decode_subtitle -> rect payload
         let decoder = AVCodec::find_decoder(codec_id)
-            .ok_or_else(|| RsmediaError::custom("ass decoder not available"))?;
+            .ok_or_else(|| RsmediaError::msg("ass decoder not available"))?;
         let mut dctx = AVCodecContext::new(&decoder);
         dctx.open(None)?;
 
@@ -607,7 +607,7 @@ mod tests {
     fn test_missing_subtitle_header_is_rejected() -> Result<()> {
         let err = match EncoderBuilder::new_subtitle().build() {
             Err(e) => e,
-            Ok(_) => return Err(RsmediaError::custom("build should fail without header")),
+            Ok(_) => return Err(RsmediaError::msg("build should fail without header")),
         };
         assert!(err.to_string().contains("header"));
         Ok(())

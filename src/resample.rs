@@ -41,7 +41,7 @@ fn check_resampler_input(src_frame: &AVFrame) -> Result<()> {
     }
 
     if src_frame.sample_rate < 1 || src_frame.nb_samples < 1 {
-        return Err(RsmediaError::custom("Invalid input frame."));
+        return Err(RsmediaError::msg("Invalid input frame."));
     }
     Ok(())
 }
@@ -277,7 +277,7 @@ impl Resampler {
         };
 
         if ret < 0 {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Failed to convert input samples, ret: {ret}"
             )));
         }
@@ -436,7 +436,7 @@ mod tests {
             ffi::AV_SAMPLE_FMT_S64 | ffi::AV_SAMPLE_FMT_S64P => {
                 fill_samples!(i64, i64::MAX)
             }
-            _ => return Err(RsmediaError::custom("Unsupported sample format")),
+            _ => return Err(RsmediaError::msg("Unsupported sample format")),
         }
         Ok(())
     }

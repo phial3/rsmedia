@@ -355,7 +355,7 @@ impl HWContext {
 
         // Check if input frame is actually in hardware memory
         if !self.is_hw_frame(hw_frame) {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Input frame is not a valid hardware frame: format={:?}, expected={:?}, hw_frames_ctx={:p}",
                 hw_frame.format, self.config.hw_pixel_format, hw_frame.hw_frames_ctx
             )));
@@ -406,7 +406,7 @@ impl HWContext {
 
         // Check if input frame format matches our software format
         if !self.is_sw_frame(sw_frame) {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Input frame format ({:?}) doesn't match expected software format ({:?})",
                 sw_frame.format, self.config.sw_pixel_format
             )));
@@ -415,7 +415,7 @@ impl HWContext {
         // 确保编码器上下文有硬件帧上下文
         let mut hw_frames_ctx = encoder
             .hw_frames_ctx_mut()
-            .ok_or_else(|| RsmediaError::custom("Encoder has no hardware frames context"))?;
+            .ok_or_else(|| RsmediaError::msg("Encoder has no hardware frames context"))?;
 
         // 创建硬件帧
         let mut hw_frame = AVFrame::new();
@@ -613,7 +613,7 @@ impl HWDeviceType {
             None => Self::platform_preference(),
         };
         if preference.is_empty() {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "No hardware acceleration preference defined for platform: {}",
                 std::env::consts::OS
             )));
@@ -625,7 +625,7 @@ impl HWDeviceType {
             .find(|ty| ty.is_available())
             .copied()
             .ok_or_else(|| {
-                RsmediaError::custom(format!(
+                RsmediaError::msg(format!(
                     "No available hardware acceleration device on {} (candidates probed: {preference:?})",
                     std::env::consts::OS
                 ))

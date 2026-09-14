@@ -105,7 +105,7 @@ impl Bsf {
     pub fn send_packet(&mut self, packet: &mut AVPacket) -> Result<()> {
         match self.inner.send_packet(Some(packet)) {
             Ok(()) => Ok(()),
-            Err(RsmpegError::BitstreamFullError) => Err(RsmediaError::custom(
+            Err(RsmpegError::BitstreamFullError) => Err(RsmediaError::msg(
                 "bitstream filter is full: drain received packets first",
             )),
             Err(e) => Err(e.into()),

@@ -209,7 +209,7 @@ impl DecoderBuilder {
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Decoder codec type not supported: {:?} vs. {:?}",
                 media_type, decoder.codec_type
             )));
@@ -247,14 +247,13 @@ impl DecoderBuilder {
     pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
-        let input_stream =
-            reader
-                .input()
-                .streams()
-                .get(stream_index)
-                .ok_or(RsmediaError::custom(format!(
-                    "stream: {stream_index} not found!"
-                )))?;
+        let input_stream = reader
+            .input()
+            .streams()
+            .get(stream_index)
+            .ok_or(RsmediaError::msg(format!(
+                "stream: {stream_index} not found!"
+            )))?;
 
         let codec = {
             let codec_name = if let Some(ref codec_name) = self.codec_name {
@@ -293,7 +292,7 @@ impl DecoderBuilder {
                     .find_hw_pixel_format_with_codec(&codec)
                     .ok_or_else(|| {
                         let codec_name = strutils::cstr_to_string(codec.name()).unwrap();
-                        RsmediaError::custom(format!(
+                        RsmediaError::msg(format!(
                             "Decoder with HW acceleration is not supported for codec: {codec_name}"
                         ))
                     })?;
@@ -332,7 +331,7 @@ impl DecoderBuilder {
         let output_pix_fmt = match (media_type, self.pix_fmt) {
             (MediaType::VIDEO, Some(fmt)) => {
                 if !fmt.has_data_layout() {
-                    return Err(RsmediaError::custom(format!(
+                    return Err(RsmediaError::msg(format!(
                         "Unsupported output pixel format: {fmt:?}; it cannot be stored as sample \
                          planes (bitstream, paletted and hardware formats are not supported)"
                     )));
@@ -341,7 +340,7 @@ impl DecoderBuilder {
             }
             (MediaType::VIDEO, None) => PixelFormat::YUV420P,
             (media_type, Some(fmt)) => {
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "with_pix_fmt({fmt:?}) is only valid for video decoders, got media type: {media_type:?}"
                 )));
             }
@@ -355,12 +354,12 @@ impl DecoderBuilder {
             (MediaType::AUDIO, None) => None,
             (MediaType::AUDIO, Some(fmt)) if fmt != SampleFormat::NONE => Some(fmt),
             (MediaType::AUDIO, Some(fmt)) => {
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "Unsupported output sample format: {fmt:?}"
                 )));
             }
             (media_type, Some(fmt)) => {
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "with_sample_fmt({fmt:?}) is only valid for audio decoders, got media type: \
                      {media_type:?}"
                 )));
@@ -391,7 +390,7 @@ impl DecoderBuilder {
                     time_base: decode_ctx.time_base,
                 }),
                 _ => {
-                    return Err(RsmediaError::custom(format!(
+                    return Err(RsmediaError::msg(format!(
                         "Unsupported filter for media type: {media_type:?}"
                     )));
                 }
@@ -400,7 +399,7 @@ impl DecoderBuilder {
             let mut graph = FilterGraph::new();
             // 验证 Filter 链的媒体类型是否与当前流匹配
             if !filters.iter().all(|f| f.media_type() == media_type) {
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "Filter media type mismatch for stream type {media_type:?}"
                 )));
             }
@@ -702,13 +701,13 @@ impl Decoder {
         R: Reader,
     {
         if self.media_type != MediaType::SUBTITLE {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "decode_subtitle_segment requires a subtitle decoder, got media type: {:?}",
                 self.media_type
             )));
         }
         if self.is_flushed() {
-            return Err(RsmediaError::custom(
+            return Err(RsmediaError::msg(
                 "Decoder cannot decode after flushed. Call reset().",
             ));
         }
@@ -930,7 +929,7 @@ impl Decoder {
                         .compute_for((sw_frame.width as u32, sw_frame.height as u32))
                         .ok_or_else(|| {
                             let (w, h) = (sw_frame.width, sw_frame.height);
-                            RsmediaError::custom(format!(
+                            RsmediaError::msg(format!(
                                 "Cannot resize frame {w}x{h} into {resize:?}"
                             ))
                         })?,
@@ -1033,7 +1032,7 @@ where
     OD: FnMut(&mut Decoder) -> Result<Option<O>>,
 {
     if decoder.is_complete() {
-        return Err(RsmediaError::custom(
+        return Err(RsmediaError::msg(
             "Decoder cannot decode after flushed. Call reset().",
         ));
     }
@@ -1221,7 +1220,7 @@ pub fn thumbnail(
         }
         decoder.decode_raw(&mut reader)?
     }
-    .ok_or_else(|| RsmediaError::custom("No video frame decoded for thumbnail"))?;
+    .ok_or_else(|| RsmediaError::msg("No video frame decoded for thumbnail"))?;
 
     crate::imgutils::to_dynamic_image(&frame).context("Failed to convert AVFrame to image")
 }

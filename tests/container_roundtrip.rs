@@ -189,7 +189,7 @@ fn negotiate_audio(codec: &str, preferred_rate: u32) -> Result<(SampleFormat, u3
         .and_then(|formats| formats.first().copied())
         .map(SampleFormat::from)
         .ok_or_else(|| {
-            RsmediaError::custom(format!("encoder {codec} has no supported sample format"))
+            RsmediaError::msg(format!("encoder {codec} has no supported sample format"))
         })?;
 
     let sample_rate = match config.supported_sample_rates()? {
@@ -239,7 +239,7 @@ fn audio_summary(path: &Path, written: &Written) -> Result<(u64, f32)> {
             summarize::<i32>(path, written, i32::MAX as f32, None)
         }
         SampleFormat::FLT | SampleFormat::FLTP => summarize::<f32>(path, written, 1.0, None),
-        other => Err(RsmediaError::custom(format!(
+        other => Err(RsmediaError::msg(format!(
             "the matrix has no element type for decoded audio format {other:?}"
         ))),
     }

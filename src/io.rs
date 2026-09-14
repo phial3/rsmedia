@@ -61,7 +61,7 @@ pub trait Reader {
         self.input()
             .find_best_stream(media_type as _)?
             .map(|(index, codec)| (index, strutils::cstr_to_string_lossy(codec.name())))
-            .ok_or(RsmediaError::custom(format!(
+            .ok_or(RsmediaError::msg(format!(
                 "No stream found for MediaType:{media_type:?}"
             )))
     }
@@ -218,7 +218,7 @@ pub trait Seekable: Reader {
                 flags.into(),
             );
             if res < 0 {
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "Seek to frame failed: stream={stream_index}, ts={frame_ts}, flags={:?}, err={res}",
                     flags
                 )));
@@ -251,7 +251,7 @@ fn seek_file(
     let res = unsafe { ffi::avformat_seek_file(input.as_mut_ptr(), stream_index, min, ts, max, 0) };
     if res < 0 {
         // >=0 on success, error code otherwise
-        return Err(RsmediaError::custom(format!("Seek file failed: {res}")));
+        return Err(RsmediaError::msg(format!("Seek file failed: {res}")));
     }
     Ok(())
 }
@@ -500,7 +500,7 @@ impl<'a> StreamReaderBuilder<'a> {
         let filename = strutils::path_to_cstring(&self.source.as_path());
         let protocol = unsafe { ffi::avio_find_protocol_name(filename.as_ptr()) };
         if protocol.is_null() {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "Unsupported input source protocol: {}",
                 self.source
             )));
@@ -1814,7 +1814,7 @@ mod tests {
         for i in 1..=n_frames {
             let file = dir.join(format!("img_{i:03}.png"));
             let meta = std::fs::metadata(&file).map_err(|e| {
-                RsmediaError::custom(format!("expected sequence file {}: {e}", file.display()))
+                RsmediaError::msg(format!("expected sequence file {}: {e}", file.display()))
             })?;
             assert!(meta.len() > 0, "sequence file {} is empty", file.display());
         }

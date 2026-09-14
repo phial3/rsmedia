@@ -174,7 +174,7 @@ impl StreamInfo {
             .input()
             .streams()
             .get(stream_index)
-            .ok_or(RsmediaError::custom(format!(
+            .ok_or(RsmediaError::msg(format!(
                 "reader stream: {stream_index} not found!"
             )))?;
 
@@ -186,7 +186,7 @@ impl StreamInfo {
             .output()
             .streams()
             .get(stream_index)
-            .ok_or(RsmediaError::custom(format!(
+            .ok_or(RsmediaError::msg(format!(
                 "writer stream: {stream_index} not found!"
             )))?;
 
@@ -645,7 +645,7 @@ mod tests {
         for hw in [HWDeviceType::CUDA, HWDeviceType::VULKAN, HWDeviceType::QSV] {
             let name = info
                 .find_decoder_name(Some(hw))
-                .ok_or_else(|| RsmediaError::custom(format!("lookup for {hw:?} failed")))?;
+                .ok_or_else(|| RsmediaError::msg(format!("lookup for {hw:?} failed")))?;
             let registered = if let Some(codec) =
                 AVCodec::find_decoder_by_name(&strutils::str_to_cstring(&name))
             {

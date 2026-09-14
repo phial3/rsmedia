@@ -226,14 +226,14 @@ impl<W: Writer> Muxer<W> {
         self.streams
             .iter()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::msg(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut MuxerStream> {
         self.streams
             .iter_mut()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::msg(format!("Stream index: {index} not found")))
     }
 
     /// Sets a container-level metadata entry, e.g. `title`, `artist`,
@@ -392,7 +392,7 @@ impl<W: Writer> Muxer<W> {
         let streams =
             unsafe { std::slice::from_raw_parts_mut(ctx.streams, ctx.nb_streams as usize) };
         let Some(stream) = streams.get_mut(stream_idx) else {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "cover art stream index {stream_idx} out of range (nb_streams={})",
                 ctx.nb_streams
             )));
@@ -548,7 +548,7 @@ impl<W: Writer> Muxer<W> {
         let interleaved = self.interleaved;
         let mux_stream = self.get_stream_mut(stream_idx)?;
         let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
-            RsmediaError::custom(format!(
+            RsmediaError::msg(format!(
                 "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
             ))
         })?;
@@ -606,7 +606,7 @@ impl<W: Writer> Muxer<W> {
         let interleaved = self.interleaved;
         let mux_stream = self.get_stream_mut(stream_idx)?;
         let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
-            RsmediaError::custom(format!(
+            RsmediaError::msg(format!(
                 "Stream {stream_idx} is a copy stream: subtitle segments require an encoder stream"
             ))
         })?;
@@ -655,7 +655,7 @@ impl<W: Writer> Muxer<W> {
         let (src_time_base, out_time_base) = {
             let mux_stream = self.get_stream(stream_idx)?;
             let src_time_base = mux_stream.src_time_base.ok_or_else(|| {
-                RsmediaError::custom(format!(
+                RsmediaError::msg(format!(
                     "Stream {stream_idx} is not a copy stream: use mux() instead of mux_packet()"
                 ))
             })?;
@@ -820,7 +820,7 @@ impl<R: Reader> Demuxer<R> {
         let media_type = stream_info.media_type;
         let device_type = device_config.as_ref().map(|c| c.device_type);
         let Some(codec_name) = stream_info.find_decoder_name(device_type) else {
-            return Err(RsmediaError::custom(format!(
+            return Err(RsmediaError::msg(format!(
                 "No decoder found for codec_id {:#x} (stream {})",
                 stream_info.codec_id, stream_info.index
             )));
@@ -848,9 +848,7 @@ impl<R: Reader> Demuxer<R> {
                     .build_from_reader(reader)
                     .context("Failed to build decoder (hw and software both failed)")
             }
-            Err(e) => Err(RsmediaError::custom(format!(
-                "Failed to build decoder: {e:#}"
-            ))),
+            Err(e) => Err(RsmediaError::msg(format!("Failed to build decoder: {e:#}"))),
         }
     }
 
@@ -925,7 +923,7 @@ impl<R: Reader> Demuxer<R> {
             }
         }
         let stream_info = selected.ok_or_else(|| {
-            RsmediaError::custom(format!("No stream of type {media_type:?} found in input"))
+            RsmediaError::msg(format!("No stream of type {media_type:?} found in input"))
         })?;
         let decoder = Self::build_decoder(&reader, &stream_info, &device_config, &filter_map)?;
 
@@ -999,14 +997,14 @@ impl<R: Reader> Demuxer<R> {
         self.streams
             .iter()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::msg(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut DemuxerStream> {
         self.streams
             .iter_mut()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| RsmediaError::custom(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::msg(format!("Stream index: {index} not found")))
     }
 
     /// 返回输入容器第 `index` 个流的 [`StreamInfo`]（从 reader 实时读取）。
@@ -1259,7 +1257,7 @@ mod tests {
             let data_ptr = unsafe {
                 let ptr = (*frame.as_mut_ptr()).data[ch] as *mut f32;
                 if ptr.is_null() {
-                    return Err(RsmediaError::custom("Audio data pointer is null"));
+                    return Err(RsmediaError::msg("Audio data pointer is null"));
                 }
                 std::slice::from_raw_parts_mut(ptr, nb_samples)
             };

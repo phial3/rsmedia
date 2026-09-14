@@ -1,5 +1,6 @@
 use rsmedia::{
     EncoderBuilder, MediaType, Options, PixelFormat, SampleFormat, StreamWriterBuilder,
+    error::RsmediaError,
     mux::{Demuxer, Muxer},
 };
 
@@ -79,7 +80,7 @@ fn main() -> anyhow::Result<()> {
                     .find(|(i, _)| *i == in_index)
                     .map(|&(_, o)| o)
                     .ok_or_else(|| {
-                        rsmedia::Error::custom(format!(
+                        RsmediaError::msg(format!(
                             "decoded frame of unmapped input stream {in_index}"
                         ))
                     })?;
