@@ -5,10 +5,9 @@
 //! 本文件不依赖 `ndarray`（源帧直接在 `AVFrame` 上构造图案），也不使用
 //! `tests/common`，以保持对非默认 feature 组合可用。
 
-use rsmedia::error::Result;
+use rsmedia::error::{Result, RsmediaError};
 use rsmedia::{
-    DecoderBuilder, EncoderBuilder, MediaType, Muxer, PixelFormat, RsmediaError, Scaler,
-    StreamReader,
+    DecoderBuilder, EncoderBuilder, MediaType, Muxer, PixelFormat, Scaler, StreamReader,
 };
 use rsmpeg::avutil::AVFrame;
 
@@ -20,7 +19,7 @@ fn make_source_frame(width: i32, height: i32, seed: u8) -> Result<AVFrame> {
     frame.set_format(PixelFormat::YUV420P.into());
     frame
         .alloc_buffer()
-        .map_err(|e| RsmediaError::custom(format!("alloc_buffer failed: {e}")))?;
+        .map_err(|e| RsmediaError::msg(format!("alloc_buffer failed: {e}")))?;
 
     unsafe {
         // luma：随 seed 变化的斜纹图案（每行字节已知，保证跨几何一致）。
@@ -49,9 +48,10 @@ fn make_source_frame(width: i32, height: i32, seed: u8) -> Result<AVFrame> {
     Ok(frame)
 }
 
-/// 编码器缺失（FFmpeg 构建不含 libx264 等）时跳过而不是失败。
+/// 编码器缺失（FFmpeg 构建不含 libx264 等）时跳过而不是失败：匹配类型化
+/// [`RsmediaError::CodecNotFound`] 变体，而非错误字符串。
 fn is_encoder_unavailable(e: &RsmediaError) -> bool {
-    e.to_string().contains("not available in this FFmpeg build")
+    e.is_codec_not_found()
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn make_rgb_frame(width: i32, height: i32, seed: u8) -> Result<AVFrame> {
     frame.set_format(PixelFormat::RGB24.into());
     frame
         .alloc_buffer()
-        .map_err(|e| RsmediaError::custom(format!("alloc_buffer failed: {e}")))?;
+        .map_err(|e| RsmediaError::msg(format!("alloc_buffer failed: {e}")))?;
     unsafe {
         let row_bytes = width as usize * 3;
         for y in 0..height as usize {

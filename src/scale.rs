@@ -152,7 +152,7 @@ impl ScaleQuality {
 
     /// [`ScaleQuality::default_quality`] as a raw mask
     /// (`FULL_CHR_H_INT | ACCURATE_RND | BITEXACT`) — the baseline that
-    /// [`Scaler::new`] uses and [`ScaleAlgorithm::default_mask`] appends.
+    /// [`Scaler::new`] uses and [`ScaleQuality::default_mask`] appends.
     pub fn default_mask() -> u32 {
         Self::mask(Self::default_quality())
     }
@@ -333,107 +333,26 @@ fn setup_scaler(
     Ok(sws_ctx)
 }
 
-/// # Safety
+/// Scales one frame into a new frame, with the default kernel and quality mask.
 ///
-/// ffi::sws_scale_frame
+/// Free-function form for a single conversion; a stream should keep a [`Scaler`]
+/// instead, which reuses its `SwsContext` (and, optionally, the output buffers)
+/// across frames. See [`Scaler::scale_frame`] for the details.
 pub fn scale_frame(
     src_frame: &AVFrame,
     dst_width: i32,
     dst_height: i32,
     dst_pix_fmt: PixelFormat,
 ) -> Result<AVFrame> {
-    scale_with_flags(
-        src_frame,
-        dst_width,
-        dst_height,
-        dst_pix_fmt,
-        ScaleAlgorithm::default(),
-        ScaleQuality::default_quality(),
-    )
-}
-
-/// # Safety
-///
-/// ffi::sws_scale_frame
-///
-/// `quality` is the set of quality/behaviour bits to apply — the algorithm is one bit,
-/// the quality flags are a combinable set, so this takes a list of [`ScaleQuality`]
-/// values (empty for none).
-fn scale_with_flags(
-    src_frame: &AVFrame,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: PixelFormat,
-    algorithm: ScaleAlgorithm,
-    quality: impl AsRef<[ScaleQuality]>,
-) -> Result<AVFrame> {
-    if !src_frame.hw_frames_ctx.is_null() {
-        return Err(RsmediaError::unsupported(
-            "Hardware frames are not supported in this software scaler",
-        ));
-    }
-
-    let flags = algorithm.as_raw() | ScaleQuality::mask(quality);
-    let mut dst_frame = AVFrame::new();
-    dst_frame.set_width(dst_width);
-    dst_frame.set_height(dst_height);
-    dst_frame.set_format(dst_pix_fmt.into());
-    dst_frame
-        .alloc_buffer()
-        .context("Failed to allocate destination frame buffer")?;
-    imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
-    let mut sws_ctx = setup_scaler(
-        src_frame.width,
-        src_frame.height,
-        src_frame.format,
-        dst_width,
-        dst_height,
-        dst_pix_fmt.into(),
-        flags,
-    )
-    .context("Failed to create swscale context.")?;
-
-    // FFmpeg 6/7：legacy 初始化的上下文直调 `sws_scale_frame`（对已初始化上下文属
-    // 向后兼容用法）；FFmpeg 8+：全动态上下文必须走 modern 封装
-    // [`SwsContext::scale_full_frame`]，FFmpeg 9 起对未初始化的上下文直调底层
-    // `sws_scale` 会因新旧 API 混用而拒绝（AVERROR EINVAL）。
-    #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-    {
-        let ret = unsafe {
-            ffi::sws_scale_frame(
-                sws_ctx.as_mut_ptr(),
-                dst_frame.as_mut_ptr(),
-                src_frame.as_ptr(),
-            )
-        };
-        if ret < 0 {
-            return Err(RsmediaError::custom(format!(
-                "Failed to call sws_scale_frame, ret: {ret}"
-            )));
-        }
-    }
-
-    #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-    sws_ctx
-        .scale_full_frame(&mut dst_frame, src_frame)
-        .context("Failed to scale frame.")?;
-
-    log::debug!(
-        "Sws scale from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
-        src_frame.width,
-        src_frame.height,
-        PixelFormat::from(src_frame.format),
-        dst_width,
-        dst_height,
-        dst_pix_fmt
-    );
-
-    Ok(dst_frame)
+    // Delegates to a one-off `Scaler` so there is exactly one implementation of
+    // the actual scaling; a caller who needs another kernel builds a `Scaler`
+    // itself (`Scaler::new_with_options`).
+    Scaler::new().scale_frame(src_frame, dst_width, dst_height, dst_pix_fmt)
 }
 
 /// Persistent streaming video scaler, held by the encoder and the decoder.
 ///
-/// Unlike the free functions [`scale_frame`] / [`scale_with_flags`] (which create a
+/// Unlike the free functions [`scale_frame`] / `scale_with_flags` (which create a
 /// temporary `SwsContext` on every call), `Scaler` owns the scaling **policy** — one
 /// [`ScaleAlgorithm`] kernel plus a mask of [`ScaleQuality`] bits — and keeps a matching
 /// `SwsContext` alive across calls, so a continuous stream does not pay for a context
@@ -455,7 +374,7 @@ fn scale_with_flags(
 /// Destination frames are allocated with `alloc_buffer` (a fresh allocation per call)
 /// unless pooling is enabled via [`Scaler::with_buffer_pool`]; the pool then recycles the
 /// buffers of previously dropped frames, so a steady stream of same-geometry output stops
-/// allocating after a couple of frames — see [`BufferPool`](crate::BufferPool).
+/// allocating after a couple of frames — see [`BufferPool`](rsmpeg::avutil::AVBufferPool).
 ///
 /// The policy mirrors FFmpeg's own flag rules: [`ScaleAlgorithm`] selects exactly one
 /// scaling kernel (*"Only one may be active at a time."*), while the quality bits are a
@@ -467,7 +386,7 @@ pub struct Scaler {
     quality: u32,
     /// Context bound on first use, together with the parameters it was created for.
     bound: Option<BoundScaler>,
-    /// Whether destination frames are allocated from an internal [`BufferPool`]
+    /// Whether destination frames are allocated from an internal [`BufferPool`](rsmpeg::avutil::AVBufferPool)
     /// (created per bound context, see [`BoundScaler::pool`]).
     pool_enabled: bool,
 }
@@ -533,15 +452,16 @@ impl Scaler {
     /// Enable (`true`) or disable (`false`) pooled allocation of destination frames.
     ///
     /// With pooling on, the destination frame's pixel buffer is taken from an internal
-    /// [`BufferPool`](crate::BufferPool) instead of being freshly allocated per call; when
+    /// [`BufferPool`](rsmpeg::avutil::AVBufferPool) instead of being freshly allocated per call; when
     /// a previously returned frame is dropped, its buffer goes back to the pool and the
     /// next same-geometry call reuses it. A steady stream of same-geometry output thus
     /// stops allocating after a couple of frames, and the buffers are zero-filled exactly
     /// like `alloc_buffer`'s, so padding bytes stay deterministic for the encoder.
     ///
     /// The pool is created lazily together with the scaling context and sized for the
-    /// bound destination geometry; a geometry/format change rebuilds it. Call this
-    /// before the first [`Self::scale_frame`] — it has no effect once bound.
+    /// bound destination geometry; a geometry/format change rebuilds it. This is a
+    /// construction-time setting — it consumes and returns the scaler — so the pool is
+    /// always in place before the first [`Self::scale_frame`].
     ///
     /// ```rust
     /// use rsmedia::Scaler;
@@ -595,7 +515,13 @@ impl Scaler {
             ));
         }
 
-        let src_pix_fmt = PixelFormat::from(src_frame.format);
+        // 帧的格式来自解码器，可能超出本 crate 收录的范围：报错而不是 panic。
+        let src_pix_fmt = PixelFormat::from_ffi_checked(src_frame.format).ok_or_else(|| {
+            RsmediaError::unsupported(format!(
+                "Unsupported source pixel format {} on a {}x{} frame",
+                src_frame.format, src_frame.width, src_frame.height
+            ))
+        })?;
         let reusable = self.bound.as_ref().is_some_and(|bound| {
             bound.src_width == src_frame.width
                 && bound.src_height == src_frame.height
@@ -666,7 +592,7 @@ impl Scaler {
                 )
             };
             if ret < 0 {
-                return Err(RsmediaError::custom(format!(
+                return Err(RsmediaError::msg(format!(
                     "Failed to call sws_scale_frame, ret: {ret}"
                 )));
             }
@@ -677,6 +603,16 @@ impl Scaler {
             .sws
             .scale_full_frame(&mut dst_frame, src_frame)
             .context("Failed to scale frame.")?;
+
+        log::debug!(
+            "Sws scale from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
+            src_frame.width,
+            src_frame.height,
+            src_pix_fmt,
+            dst_width,
+            dst_height,
+            dst_pix_fmt
+        );
 
         Ok(dst_frame)
     }
@@ -808,7 +744,7 @@ fn alloc_pooled_frame(
         )
     };
     if ret < 0 {
-        return Err(RsmediaError::custom(format!(
+        return Err(RsmediaError::msg(format!(
             "av_image_fill_arrays failed for {fmt:?} {width}x{height}, ret: {ret}"
         )));
     }
