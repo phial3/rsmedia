@@ -26,7 +26,7 @@ fn picture_types(
     file: &str,
     gop_size: Option<i32>,
     max_b_frames: Option<i32>,
-) -> Result<Option<Vec<u32>>> {
+) -> Result<Option<Vec<ffi::AVPictureType>>> {
     let path = test_output_path("encoder_options", file);
 
     let mut builder = EncoderBuilder::new_video(WIDTH, HEIGHT)
@@ -68,12 +68,18 @@ fn picture_types(
     Ok(Some(types))
 }
 
-/// `AVPictureType` is an unsigned enum in the FFmpeg 9 bindings, so the
-/// constants compare directly against `AVFrame.pict_type`.
-const fn is_i(ty: u32) -> bool {
+/// The picture type of a decoded frame, and the two kinds these tests look for.
+///
+/// These are spelled `ffi::AVPictureType` — the alias FFmpeg's own header uses —
+/// rather than a concrete integer width. bindgen maps a C enum to the target's
+/// C `int`, and that differs between platforms (`c_uint` on Unix, `c_int` under
+/// MSVC), so naming `u32` compiles on one and not the other. The alias resolves
+/// per target, and the constants are declared with it too, so both sides of the
+/// comparison always agree.
+const fn is_i(ty: ffi::AVPictureType) -> bool {
     ty == ffi::AV_PICTURE_TYPE_I
 }
-const fn is_b(ty: u32) -> bool {
+const fn is_b(ty: ffi::AVPictureType) -> bool {
     ty == ffi::AV_PICTURE_TYPE_B
 }
 
