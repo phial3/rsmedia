@@ -1732,20 +1732,30 @@ mod tests {
     /// `flush_buffers()`（seek 后使用）必须把**滤镜图里**的缓冲帧一起丢掉。
     ///
     /// `avcodec_flush_buffers` 只管编解码器；带缓冲的滤镜（如 `fps`）会把 seek
-    /// 之前的帧留在图里，下一次解码就会把它们当新帧吐出来 —— 于是"seek 到 2s"
+    /// 之前的帧留在图里，下一次解码就会把它们当新帧吐出来 —— 于是"seek 到 3s"
     /// 之后拿到的是 0.5s 的画面。这里用一个 GOP 已知的自造文件验证。
+    ///
+    /// 断言的是**不变量**而不是精确落点：默认的 BACKWARD seek 落在**目标位置或其
+    /// 之前的最后一个关键帧**上，所以落点在 `[目标 - 一个 GOP, 目标]` 之间，具体
+    /// 取决于容器时间基的取整（实测 seek 2s 在 macOS 上落在 2.0s，在 Linux/ffmpeg 7.1
+    /// 上落在 1.6s —— 两者都合法）。而泄漏帧来自 seek 之前读到的位置（约 0.5s），
+    /// 与合法区间相隔一个 GOP 以上，所以下面用"目标减一个 GOP"当界限即可区分两者。
     #[test]
     fn test_flush_buffers_drops_frames_buffered_by_the_filter_graph() -> Result<()> {
         const FPS: f64 = 25.0;
         const FILTER_FPS: f64 = 10.0;
         const FRAMES: i64 = 100;
+        const GOP_FRAMES: i32 = 10;
+        // 4s 的素材、seek 到 3s：seek 前的读取位置（~0.2s）与目标相隔很远，
+        // 泄漏帧与合法落点因此有很宽的间隔。
+        const SEEK_MS: i64 = 3_000;
         let path = crate::test_support::test_output_path("decode", "test_flush_filter.mp4");
 
         {
             let mut muxer = crate::Muxer::new(&path)?;
             let encoder = crate::EncoderBuilder::new_video(64, 64)
                 .with_fps(FPS as f32)
-                .with_gop_size(10)
+                .with_gop_size(GOP_FRAMES)
                 .build()?;
             let index = muxer.add_encoder(encoder)?;
             for frame_index in 0..FRAMES {
@@ -1768,25 +1778,38 @@ mod tests {
             .build_from_reader(&reader)?;
 
         // 从头解几帧，让滤镜图里真正开始有缓冲
+        let mut decoded_before_seek = 0i64;
         for _ in 0..5 {
-            let _ = decoder.decode_raw(&mut reader)?;
+            if decoder.decode_raw(&mut reader)?.is_some() {
+                decoded_before_seek += 1;
+            }
         }
+        assert!(
+            decoded_before_seek > 0,
+            "the filter graph must have produced frames before the seek for this test to mean anything"
+        );
 
-        reader.seek_to_timestamp(2_000)?;
+        reader.seek_to_timestamp(SEEK_MS)?;
         decoder.flush_buffers()?;
 
         let first = decoder
             .decode_raw(&mut reader)?
             .ok_or_else(|| RsmediaError::msg("no frame decoded after the seek"))?;
-        // 滤镜图输出帧的 pts 以 `1/fps` 为时间基（解码器不填 AVFrame.time_base），
-        // 所以 seek 到 2.0s 之后的第一帧应该是 2.0 * 10 = 20。缓冲帧泄漏时会退回
-        // 到 seek 前的位置（约 0.5s，即 pts≈5）。
-        let seek_pts = (2.0 * FILTER_FPS) as i64;
+
+        // 滤镜图输出帧的 pts 以 `1/fps` 为时间基（解码器不填 AVFrame.time_base）。
+        // 落点最多比目标早一个 GOP；再放宽一帧输出网格的取整。泄漏帧（seek 前的位置，
+        // 约 0.5s → pts≈5）远在界限之下，所以这个界限仍能抓住回归。
+        let seek_secs = SEEK_MS as f64 / 1000.0;
+        let gop_secs = f64::from(GOP_FRAMES) / FPS;
+        let earliest_pts = ((seek_secs - gop_secs) * FILTER_FPS) as i64 - 1;
         assert!(
-            first.pts >= seek_pts - 1,
-            "the first frame after seeking to 2s is at graph pts {} (expected ~{seek_pts}): \
+            first.pts >= earliest_pts,
+            "the first frame after seeking to {seek_secs}s is at graph pts {} \
+             (a legitimate BACKWARD seek lands between {} and {}, one GOP early at worst): \
              the filter graph is still holding pre-seek frames",
-            first.pts
+            first.pts,
+            earliest_pts,
+            (seek_secs * FILTER_FPS) as i64
         );
 
         crate::test_support::remove_test_output(&path);
