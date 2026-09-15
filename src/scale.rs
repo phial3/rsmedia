@@ -604,7 +604,7 @@ impl Scaler {
             .scale_full_frame(&mut dst_frame, src_frame)
             .context("Failed to scale frame.")?;
 
-        log::debug!(
+        tracing::debug!(
             "Sws scale from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
             src_frame.width,
             src_frame.height,

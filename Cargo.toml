@@ -24,7 +24,6 @@ link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg"]
 
 [dependencies]
 libc = "0.2"
-log = "0.4"
 url = "2.5"
 bytes = "1"
 thiserror = "2"

@@ -260,7 +260,7 @@ impl<W: Writer> Muxer<W> {
         value: impl Into<String>,
     ) -> Result<&mut Self> {
         if self.have_written_header {
-            log::warn!("set_metadata after header write has no effect");
+            tracing::warn!("set_metadata after header write has no effect");
         }
         self.metadata.insert(key.into(), value.into());
         Ok(self)
@@ -287,7 +287,7 @@ impl<W: Writer> Muxer<W> {
             )));
         }
         if self.have_written_header {
-            log::warn!(
+            tracing::warn!(
                 "set_stream_metadata({stream_index}, {key:?}) after header write has no effect"
             );
         }
@@ -321,7 +321,7 @@ impl<W: Writer> Muxer<W> {
             unsafe { std::slice::from_raw_parts_mut(ctx.streams, ctx.nb_streams as usize) };
         for (idx, entries) in &self.stream_metadata {
             let Some(stream) = streams.get_mut(*idx) else {
-                log::warn!(
+                tracing::warn!(
                     "stream metadata: index {idx} out of range (nb_streams={})",
                     ctx.nb_streams
                 );
@@ -341,7 +341,7 @@ impl<W: Writer> Muxer<W> {
     /// Requires a container with chapter support (MP4, MKV, ...).
     pub fn add_chapter(&mut self, chapter: Chapter) -> Result<&mut Self> {
         if self.have_written_header {
-            log::warn!(
+            tracing::warn!(
                 "add_chapter({:?}) after header write has no effect",
                 chapter.title
             );
@@ -453,7 +453,7 @@ impl<W: Writer> Muxer<W> {
                 ffi::av_mallocz(std::mem::size_of::<ffi::AVChapter>()) as *mut ffi::AVChapter
             };
             if chapter_ptr.is_null() {
-                log::error!("av_mallocz for chapter {i} failed; chapters are dropped");
+                tracing::error!("av_mallocz for chapter {i} failed; chapters are dropped");
                 Self::free_chapter_nodes(&mut chapter_nodes);
                 return;
             }
@@ -481,7 +481,7 @@ impl<W: Writer> Muxer<W> {
                 as *mut *mut ffi::AVChapter
         };
         if chapters_ptr.is_null() {
-            log::error!("av_calloc for {count} chapters failed; chapters are dropped");
+            tracing::error!("av_calloc for {count} chapters failed; chapters are dropped");
             Self::free_chapter_nodes(&mut chapter_nodes);
             return;
         }
@@ -522,7 +522,7 @@ impl<W: Writer> Muxer<W> {
             let tb_changed = stream_info.time_base.num != mux_stream.stream_info.time_base.num
                 || stream_info.time_base.den != mux_stream.stream_info.time_base.den;
             if tb_changed {
-                log::debug!(
+                tracing::debug!(
                     "Muxer changed stream {} time_base: {:?} -> {:?}",
                     mux_stream.stream_index,
                     mux_stream.stream_info.time_base,
@@ -754,7 +754,7 @@ impl<W: Writer> Muxer<W> {
             && !self.have_written_trailer
             && let Err(err) = self.finish()
         {
-            log::error!("Failed to auto-flush muxer: {err:#}");
+            tracing::error!("Failed to auto-flush muxer: {err:#}");
         }
     }
 
@@ -885,7 +885,7 @@ impl<R: Reader> Demuxer<R> {
             Err(e) if device_type.is_some() => {
                 // 硬件解码器构建失败（如 hw 初始化失败）：回退软件解码器重试，
                 // 与 find_decoder_name 的回退语义对齐；再失败才让错误上抛。
-                log::warn!(
+                tracing::warn!(
                     "HW decoder '{codec_name}' failed to build: {e:#}; \
                      falling back to software decoder"
                 );
@@ -920,7 +920,7 @@ impl<R: Reader> Demuxer<R> {
                 // Streams without a registered decoder (chapter tracks,
                 // attached pictures, binary data, ...) are skipped instead of
                 // failing the whole demuxer.
-                log::debug!(
+                tracing::debug!(
                     "Skipping stream {stream_idx}: no decoder for codec_id {:#x}",
                     stream_info.codec_id
                 );
@@ -1115,7 +1115,7 @@ impl<R: Reader> Demuxer<R> {
                             // Packets of skipped streams (chapter tracks,
                             // unselected streams in single-stream mode, ...)
                             // are dropped.
-                            log::debug!("Dropping packet of undecodable stream {stream_idx}");
+                            tracing::debug!("Dropping packet of undecodable stream {stream_idx}");
                             continue;
                         };
                         if let Some(frame) = demux_stream.decoder.decode_raw_packet(&packet)? {
@@ -1123,12 +1123,12 @@ impl<R: Reader> Demuxer<R> {
                         }
                     }
                     Ok(None) => {
-                        log::debug!("No more packets, Reader exhausted.");
+                        tracing::debug!("No more packets, Reader exhausted.");
                         read_exhausted = true;
                         continue;
                     }
                     Err(e) => {
-                        log::error!("Error reading packet: {e}");
+                        tracing::error!("Error reading packet: {e}");
                         return Err(e);
                     }
                 }
@@ -1148,10 +1148,10 @@ impl<R: Reader> Demuxer<R> {
                     match demux_stream.decoder.drain_raw() {
                         Ok(Some(frame)) => return Ok(Some((stream_idx, frame))),
                         Ok(None) => {
-                            log::debug!("Stream: [{stream_idx}] produced no frame this pass.");
+                            tracing::debug!("Stream: [{stream_idx}] produced no frame this pass.");
                         }
                         Err(e) => {
-                            log::error!("Stream: [{stream_idx}] Decoder Drain Error: {e}");
+                            tracing::error!("Stream: [{stream_idx}] Decoder Drain Error: {e}");
                             return Err(e);
                         }
                     }

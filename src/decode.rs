@@ -312,7 +312,7 @@ impl DecoderBuilder {
                         ))
                     })?;
 
-                log::info!(
+                tracing::info!(
                     "Video decoder with HW acceleration codec: {:?}, hw_pixel: {:?}, config: {:#?}",
                     codec.name(),
                     PixelFormat::from(hw_pixel),
@@ -336,7 +336,7 @@ impl DecoderBuilder {
             .context("Failed to open decoder for stream")?;
 
         let stream_info = StreamInfo::from_stream(input_stream)?;
-        log::info!("{stream_info}");
+        tracing::info!("{stream_info}");
 
         // 输出像素格式：仅视频有效。任何能表示为数据平面的格式都接受
         // （布局由描述符推导，见 `PixelFormat::data_layout`）；位流 / 调色板 /
@@ -766,7 +766,7 @@ impl Decoder {
                 match reader.read_packet()? {
                     Some((stream_index, mut packet)) => {
                         if stream_index != self.stream_index {
-                            log::trace!("skip stream index: {stream_index}");
+                            tracing::trace!("skip stream index: {stream_index}");
                             continue;
                         }
                         if let Some(subtitle) = self.decode_subtitle_packet(Some(&mut packet))?
@@ -776,7 +776,7 @@ impl Decoder {
                         }
                     }
                     None => {
-                        log::debug!("No more packets, Reader exhausted.");
+                        tracing::debug!("No more packets, Reader exhausted.");
                         read_exhausted = true;
                     }
                 }
@@ -790,7 +790,7 @@ impl Decoder {
                     }
                     None => {
                         self.state = CodecContextState::Flushed;
-                        log::debug!("Subtitle decoder flushed. EOF reached.");
+                        tracing::debug!("Subtitle decoder flushed. EOF reached.");
                         return Ok(None);
                     }
                 }
@@ -1064,7 +1064,7 @@ impl Decoder {
                 // `Flushed`（EOF）之后才返回 `None`，因此这里没有第三种情况：
                 // 返回 `None` 让外层循环继续驱动解码器，或就此收尾。
                 None => {
-                    log::debug!(
+                    tracing::debug!(
                         "Filter graph produced no frame (drained: {}, flushed: {})",
                         chain.graph.is_drained(),
                         chain.graph.is_flushed()
@@ -1088,17 +1088,17 @@ impl Decoder {
                 // - read 阶段：表示"该包暂未解出帧，需继续喂包"，此时不应置 Drained，
                 //   否则会使后续 drain_raw 误判已进入 draining 而跳过 EOS 发送（见 drain_raw）。
                 // - drain 阶段：Drained 已在 drain_raw 中置位，这里保持即可。
-                log::debug!("Decoder drained. try send new packet again.");
+                tracing::debug!("Decoder drained. try send new packet again.");
                 // self.state = DecoderState::Drained;
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::DecoderFlushedError) => {
-                log::debug!("Decoder flushed. EOF reached.");
+                tracing::debug!("Decoder flushed. EOF reached.");
                 self.state = CodecContextState::Flushed;
                 Ok(None)
             }
             Err(e) => {
-                log::warn!("Failed to receive frame from decoder: {e}");
+                tracing::warn!("Failed to receive frame from decoder: {e}");
                 Err(RsmediaError::from(e))
             }
         }
@@ -1132,7 +1132,7 @@ where
                 Ok(Some((stream_index, packet))) => {
                     if stream_index != decoder.stream_index() {
                         // 跳过其它流
-                        log::trace!("skip stream index: {}, {:?}", stream_index, packet);
+                        tracing::trace!("skip stream index: {}, {:?}", stream_index, packet);
                         continue;
                     }
                     if let Some(out) = on_packet(decoder, &packet)? {
@@ -1140,12 +1140,12 @@ where
                     }
                 }
                 Ok(None) => {
-                    log::debug!("No more packets, Reader exhausted.");
+                    tracing::debug!("No more packets, Reader exhausted.");
                     read_exhausted = true;
                     continue;
                 }
                 Err(e) => {
-                    log::error!("Error reading packet: {e}");
+                    tracing::error!("Error reading packet: {e}");
                     return Err(e);
                 }
             }
@@ -1160,7 +1160,7 @@ where
                         // 有上限的继续排空：解码器若一直回 EAGAIN 而从不报 EOF，
                         // 这里必须收尾，否则公开的 decode() 会永远转下去。
                         if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
-                            log::error!(
+                            tracing::error!(
                                 "Decoder keeps returning EAGAIN after EOF, giving up after \
                                  {} iterations",
                                 crate::MAX_DRAIN_ITERATIONS
@@ -1168,16 +1168,16 @@ where
                             break None;
                         }
                         drained_iterations += 1;
-                        log::debug!("Decoder drained, keep draining.");
+                        tracing::debug!("Decoder drained, keep draining.");
                         continue;
                     }
-                    log::debug!("Decoder flushed. EOF reached.");
+                    tracing::debug!("Decoder flushed. EOF reached.");
                     // self.reset();
                     // read_exhausted = false;
                     break None;
                 }
                 Err(e) => {
-                    log::error!("Error to drain decoder: {e}");
+                    tracing::error!("Error to drain decoder: {e}");
                     return Err(e);
                 }
             }
@@ -1200,14 +1200,14 @@ impl Drop for Decoder {
             match chain.graph.flush() {
                 Ok(frames) => {
                     if !frames.is_empty() {
-                        log::warn!(
+                        tracing::warn!(
                             "{} frames dropped during Decoder drop filter flush.",
                             frames.len()
                         );
                     }
-                    log::debug!("Filter graph flushed during Decoder drop.");
+                    tracing::debug!("Filter graph flushed during Decoder drop.");
                 }
-                Err(e) => log::error!("Failed to flush filter graph during Decoder drop: {e}"),
+                Err(e) => tracing::error!("Failed to flush filter graph during Decoder drop: {e}"),
             }
         }
 
@@ -1218,7 +1218,7 @@ impl Drop for Decoder {
                 let mut iterations = 0usize;
                 loop {
                     if iterations >= crate::MAX_DRAIN_ITERATIONS {
-                        log::warn!(
+                        tracing::warn!(
                             "Decoder drain exceeded {} iterations, forcing EOF.",
                             crate::MAX_DRAIN_ITERATIONS
                         );
@@ -1228,27 +1228,27 @@ impl Drop for Decoder {
                     match self.decoder_receive_frame() {
                         Ok(Some(_frame)) => {
                             // If receive a frame, we continue to drain the queue.
-                            log::debug!("continue draining decoder queue.");
+                            tracing::debug!("continue draining decoder queue.");
                         }
                         Ok(None) => {
                             if self.is_drained() {
                                 // If we need more, we continue to drain the queue.
-                                log::debug!("Decoder draining. continue...");
+                                tracing::debug!("Decoder draining. continue...");
                                 continue;
                             } else {
-                                log::debug!("Decoder flushed. EOF reached.");
+                                tracing::debug!("Decoder flushed. EOF reached.");
                                 break;
                             }
                         }
                         Err(e) => {
-                            log::error!("Failed to drain decoder: {e}");
+                            tracing::error!("Failed to drain decoder: {e}");
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                log::warn!("Failed to send flush packet to decoder: {e}")
+                tracing::warn!("Failed to send flush packet to decoder: {e}")
             }
         }
     }
@@ -1312,7 +1312,7 @@ pub fn thumbnail(
         // 定位到目标时间之前最近的关键帧，并刷新解码器以丢弃旧缓冲。
         // seek 失败不视为错误：退化为从当前位置解码第一帧。
         if reader.seek_to_timestamp(ts).is_err() {
-            log::debug!("seek to {ts}ms failed, decoding from the current position");
+            tracing::debug!("seek to {ts}ms failed, decoding from the current position");
         } else {
             decoder.flush_buffers()?;
         }
@@ -1381,7 +1381,7 @@ mod tests {
                     break;
                 }
                 Err(e) => {
-                    log::error!("Error decoding frame: {}", e);
+                    tracing::error!("Error decoding frame: {}", e);
                     return Err(e);
                 }
             }
@@ -1414,7 +1414,7 @@ mod tests {
                     break;
                 }
                 Err(e) => {
-                    log::error!("Error decoding frame: {}", e);
+                    tracing::error!("Error decoding frame: {}", e);
                     return Err(e);
                 }
             }

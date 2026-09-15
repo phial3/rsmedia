@@ -104,7 +104,7 @@ impl Options {
         let mut dict: Option<AVDictionary> = None;
         for (k, v) in self.0 {
             if k.contains('\0') || v.contains('\0') {
-                log::warn!("Skip option with interior NUL: {k:?}={v:?}");
+                tracing::warn!("Skip option with interior NUL: {k:?}={v:?}");
                 continue;
             }
             let (key, value) = (strutils::str_to_cstring(&k), strutils::str_to_cstring(&v));
@@ -126,7 +126,7 @@ impl Options {
                 ) {
                     (Ok(key), Ok(value)) => Some((key, value)),
                     (bad_key, bad_value) => {
-                        log::warn!("Skip non-UTF8 option: {bad_key:?}={bad_value:?}");
+                        tracing::warn!("Skip non-UTF8 option: {bad_key:?}={bad_value:?}");
                         None
                     }
                 }

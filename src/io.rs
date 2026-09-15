@@ -520,7 +520,7 @@ impl<'a> StreamReaderBuilder<'a> {
                 self.source
             )));
         }
-        log::debug!(
+        tracing::debug!(
             "Using input protocol: [{}], source: {}",
             unsafe { strutils::c_char_to_str(protocol) },
             self.source
@@ -801,7 +801,7 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
                     Ok(n) => return n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        log::error!("IoReader read error: {e}");
+                        tracing::error!("IoReader read error: {e}");
                         return AVERROR_EIO;
                     }
                 }
@@ -1587,7 +1587,7 @@ impl<'a, W: std::io::Write + Send + 'static> CustomIoWriterBuilder<'a, W> {
             match w.write_all(buf) {
                 Ok(()) => buf.len() as i32,
                 Err(e) => {
-                    log::error!("CustomIoWriter write error: {e}");
+                    tracing::error!("CustomIoWriter write error: {e}");
                     AVERROR_EIO
                 }
             }
@@ -1712,7 +1712,7 @@ pub fn init_logging(level: AVLogLevel, flag: AVLogFlag) {
 }
 
 /// Internal function with C-style callback behavior that receives all log messages from ffmpeg and
-/// handles them with the `log` crate, the Rust way.
+/// handles them with the `tracing` crate, the Rust way.
 ///
 /// # Arguments
 ///
