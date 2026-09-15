@@ -570,6 +570,7 @@ fn test_audio_interleaved_frame_conversion() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "image")]
 fn test_dynamic_image_conversion() -> Result<()> {
     let mut frame = MediaFrame::<u8>::new_video_frame(TEST_WIDTH, TEST_HEIGHT, PixelFormat::RGB24)?;
     let (r, g, b) = fill_rgb_data(&mut frame, TEST_WIDTH, TEST_HEIGHT);

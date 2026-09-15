@@ -1370,6 +1370,7 @@ where
     }
 }
 
+#[cfg(feature = "image")]
 impl MediaFrame<u8> {
     /// Converts this video frame into an [`image::DynamicImage`].
     ///

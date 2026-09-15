@@ -36,7 +36,7 @@ pub mod time;
 pub use bsf::Bsf;
 pub use codec::{CodecConfig, FormatInfo, Profile};
 pub use colors::Color;
-pub use decode::{Decoder, DecoderBuilder, thumbnail};
+pub use decode::{Decoder, DecoderBuilder};
 pub use encode::{Encoder, EncoderBuilder};
 pub use error::{Result, RsmediaError};
 pub use filter::Filter;
@@ -57,6 +57,9 @@ pub use scale::{ScaleAlgorithm, ScaleQuality, Scaler};
 pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
 pub use time::Time;
+
+#[cfg(feature = "image")]
+pub use imgutils::thumbnail;
 
 pub use rsmpeg::avutil;
 

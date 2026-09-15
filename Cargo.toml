@@ -34,9 +34,9 @@ num_cpus = "1.17"
 colorous = "1.0"
 bytemuck = "1.25"
 num-traits = "0.2"
-image = "0.25"
 palette = "0.7"
 colorutils-rs = "0.8"
+image = { version = "0.25", optional = true }
 yuv = { version = "0.8", features = ["rayon", "professional_mode"] }
 ndarray = { version = "0.17", features = ["rayon"] }
 rsmpeg = { git = "https://github.com/phial3/rsmpeg", branch = "main", default-features = false }
@@ -45,6 +45,7 @@ rsmpeg = { git = "https://github.com/phial3/rsmpeg", branch = "main", default-fe
 anyhow = "1.0"
 criterion = "0.8"
 camino = "1.2"
+tempfile = "3"
 chrono = "0.4"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
 #pix = "1.0"
@@ -72,6 +73,7 @@ features = ["default"]
 [[example]]
 name = "decoding"
 path = "examples/decoding.rs"
+required-features = ["image"]
 test = false
 
 [[bench]]
@@ -122,6 +124,13 @@ test = false
 [[example]]
 name = "filter_demo"
 path = "examples/filter_demo.rs"
+required-features = ["image"]
+test = false
+
+[[example]]
+name = "colorous_render"
+path = "examples/colorous_render.rs"
+required-features = ["image"]
 test = false
 
 [[example]]

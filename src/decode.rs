@@ -3,7 +3,7 @@ use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
-use crate::io::{Reader, Seekable};
+use crate::io::Reader;
 use crate::options::Options;
 use crate::resample;
 use crate::resize::Resize;
@@ -1261,93 +1261,11 @@ impl Drop for Decoder {
 ///   无线程局部句柄。
 unsafe impl Send for Decoder {}
 
-/// 一站式从输入获取一帧视频缩略图，返回 `image::DynamicImage`。
-///
-/// 内部流程：构建视频解码器（RGB24 输出 + [`Resize::Fit`] 保持纵横比缩放）
-/// → seek 到目标时间 → 解码一帧原始 `AVFrame` → 转为
-/// [`image::DynamicImage`](crate::imgutils::to_dynamic_image)。
-/// 不依赖 `MediaFrame`，适合生成封面图 / 视频预览等场景。
-///
-/// # Arguments
-///
-/// * `source` - 输入（文件路径 / URL 等，见 [`Location`]）
-/// * `timestamp_milliseconds` - 取帧时间点；`None` 时取**流中点**
-///   （视频开头往往是黑帧/淡入，中点更容易取到有代表性的画面；
-///   时长未知的流退化为取第一帧）
-/// * `max_dims` - 缩略图最大 (宽, 高)；实际尺寸按纵横比缩放，
-///   源小于该尺寸时不放大
-///
-/// # Example
-///
-/// ```rust,no_run
-/// # use rsmedia::thumbnail;
-/// # use std::path::Path;
-/// let img = thumbnail(Path::new("assets/mp4.mp4"), None, (320, 240)).unwrap();
-/// println!("thumbnail: {}x{}", img.width(), img.height());
-/// img.save("thumbnail.png").unwrap();
-/// ```
-pub fn thumbnail(
-    source: impl Into<Location>,
-    timestamp_ms: Option<i64>,
-    max_dims: (u32, u32),
-) -> Result<image::DynamicImage> {
-    let mut reader = StreamReader::new(source).context("Failed to open thumbnail source")?;
-    let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-        .with_pix_fmt(PixelFormat::RGB24)
-        .with_resize(Resize::Fit(max_dims.0, max_dims.1))
-        .build_from_reader(&reader)
-        .context("Failed to build thumbnail decoder")?;
-
-    // None → 流中点；时长未知（0）→ 第一帧
-    let ts = match timestamp_ms {
-        Some(ts) => ts,
-        None => {
-            let info = StreamInfo::from_reader(&reader, decoder.stream_index())?;
-            let mid_secs = info.duration as f64 * avutil::av_q2d(info.time_base) / 2.0;
-            (mid_secs * 1000.0).round().max(0.0) as i64
-        }
-    };
-
-    let frame = {
-        // 定位到目标时间之前最近的关键帧，并刷新解码器以丢弃旧缓冲。
-        // seek 失败不视为错误：退化为从当前位置解码第一帧。
-        if reader.seek_to_timestamp(ts).is_err() {
-            tracing::debug!("seek to {ts}ms failed, decoding from the current position");
-        } else {
-            decoder.flush_buffers()?;
-        }
-        decoder.decode_raw(&mut reader)?
-    }
-    .ok_or_else(|| RsmediaError::msg("No video frame decoded for thumbnail"))?;
-
-    crate::imgutils::to_dynamic_image(&frame).context("Failed to convert AVFrame to image")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::filter;
     use std::collections::HashSet;
-
-    #[test]
-    fn test_thumbnail() -> Result<()> {
-        let video_path = std::path::Path::new("assets/mp4.mp4");
-        // 默认取流中点，Fit 缩放保持纵横比
-        let img = thumbnail(video_path, None, (320, 240))?;
-        assert!(img.width() > 0 && img.height() > 0);
-        assert!(
-            img.width() <= 320 && img.height() <= 240,
-            "thumbnail dims {}x{} exceed 320x240",
-            img.width(),
-            img.height()
-        );
-        assert_eq!(img.color().channel_count(), 3, "expected RGB output");
-
-        // 指定时间点
-        let img = thumbnail(video_path, Some(1000), (64, 64))?;
-        assert!(img.width() > 0 && img.height() > 0);
-        Ok(())
-    }
 
     #[test]
     fn test_decode_video() -> Result<()> {
@@ -1784,6 +1702,7 @@ mod tests {
             "the filter graph must have produced frames before the seek for this test to mean anything"
         );
 
+        use crate::io::Seekable;
         reader.seek_to_timestamp(SEEK_MS)?;
         decoder.flush_buffers()?;
 
