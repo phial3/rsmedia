@@ -36,8 +36,9 @@ pub trait ElementType:
     'static
     + Send
     + Sync
-    + bytemuck::Pod
     + std::fmt::Debug
+    + bytemuck::Pod
+    + bytemuck::Zeroable
     + num_traits::Zero
     + num_traits::NumCast
     + num_traits::NumAssign

@@ -16,7 +16,7 @@ use std::sync::Arc;
 /// The sw / hw frames conversion process includes the following steps:
 ///
 /// CPU(NV12) -> GPU(CUDA) -> transform -> GPU(CUDA) -> CPU(NV12)
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct HWDeviceConfig {
     pub device_type: HWDeviceType,
     pub hw_pixel_format: PixelFormat,
