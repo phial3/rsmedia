@@ -1267,13 +1267,11 @@ impl FilterGraph {
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::BufferSinkEofError) => {
-                tracing::warn!("filter graph: buffer sink eof error");
+                tracing::debug!("filter graph: buffer sink eof error");
                 self.state = FilterGraphState::Flushed;
                 Ok(None)
             }
-            Err(e) => Err(RsmediaError::msg(format!(
-                "Get frame from buffer sink Error: {e}"
-            ))),
+            Err(e) => Err(RsmediaError::FFmpeg(e)),
         }
     }
 

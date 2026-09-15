@@ -1078,7 +1078,7 @@ impl Encoder {
         let mut packet = AVPacket::new();
         let ret = unsafe { ffi::av_new_packet(packet.as_mut_ptr(), len as i32) };
         if ret < 0 {
-            return Err(RsmediaError::from(rsmpeg::error::RsmpegError::from(ret)));
+            return Err(RsmediaError::FFmpeg(rsmpeg::error::RsmpegError::from(ret)));
         }
         unsafe {
             std::ptr::copy_nonoverlapping(buf.as_ptr(), (*packet.as_mut_ptr()).data, len);
@@ -1151,9 +1151,10 @@ impl Encoder {
                 match self.context.send_frame(None) {
                     Ok(()) => break,
                     Err(rsmpeg::error::RsmpegError::SendFrameAgainError) => {
+                        tracing::debug!("send_frame_to_encoder EAGAIN error!");
                         self.drain_encoder_packets()?;
                     }
-                    Err(e) => return Err(RsmediaError::from(e)),
+                    Err(e) => return Err(RsmediaError::FFmpeg(e)),
                 }
             }
             Ok(())
@@ -1371,9 +1372,10 @@ impl Encoder {
             match self.context.send_frame(Some(&frame)) {
                 Ok(()) => break,
                 Err(rsmpeg::error::RsmpegError::SendFrameAgainError) => {
+                    tracing::debug!("send_ready_frame EAGAIN error!");
                     self.drain_encoder_packets()?;
                 }
-                Err(e) => return Err(RsmediaError::from(e)),
+                Err(e) => return Err(RsmediaError::FFmpeg(e)),
             }
         }
         Ok(())
@@ -1387,7 +1389,7 @@ impl Encoder {
                 Ok(pkt) => self.pending_packets.push_back(pkt),
                 Err(rsmpeg::error::RsmpegError::EncoderDrainError) => break,
                 Err(rsmpeg::error::RsmpegError::EncoderFlushedError) => break,
-                Err(e) => return Err(RsmediaError::from(e)),
+                Err(e) => return Err(RsmediaError::FFmpeg(e)),
             }
         }
         Ok(())
@@ -1604,7 +1606,7 @@ impl Encoder {
                 self.state = CodecContextState::Flushed;
                 Ok(None)
             }
-            Err(err) => Err(RsmediaError::from(err)),
+            Err(err) => Err(RsmediaError::FFmpeg(err)),
         }
     }
 

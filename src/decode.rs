@@ -1099,7 +1099,7 @@ impl Decoder {
             }
             Err(e) => {
                 tracing::warn!("Failed to receive frame from decoder: {e}");
-                Err(RsmediaError::from(e))
+                Err(RsmediaError::FFmpeg(e))
             }
         }
     }

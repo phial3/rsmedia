@@ -50,7 +50,7 @@ pub trait Reader {
         match self.input_mut().read_packet() {
             Ok(Some(pkt)) => Ok(Some((pkt.stream_index as usize, pkt))),
             Ok(None) => Ok(None),
-            Err(e) => Err(RsmediaError::from(e)),
+            Err(e) => Err(RsmediaError::FFmpeg(e)),
         }
     }
 
