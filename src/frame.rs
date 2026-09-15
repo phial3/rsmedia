@@ -36,8 +36,9 @@ pub trait ElementType:
     'static
     + Send
     + Sync
-    + bytemuck::Pod
     + std::fmt::Debug
+    + bytemuck::Pod
+    + bytemuck::Zeroable
     + num_traits::Zero
     + num_traits::NumCast
     + num_traits::NumAssign
@@ -167,7 +168,7 @@ impl<T> FrameData<T> {
                     .as_slice()
                     .ok_or_else(|| not_contiguous(plane, "interleaved"))?;
                 ArrayView2::from_shape((rows, cols * components), flat)
-                    .map_err(|error| RsmediaError::msg(format!("Plane {plane}: {error}")))
+                    .context(format!("Plane {plane}"))
             }
             Self::Planar(planes) => planes
                 .get(plane)
@@ -188,7 +189,7 @@ impl<T> FrameData<T> {
                     .as_slice_mut()
                     .ok_or_else(|| not_contiguous(plane, "interleaved"))?;
                 ArrayViewMut2::from_shape((rows, cols * components), flat)
-                    .map_err(|error| RsmediaError::msg(format!("Plane {plane}: {error}")))
+                    .context(format!("Plane {plane}"))
             }
             Self::Planar(planes) => {
                 let count = planes.len();
@@ -290,7 +291,7 @@ impl<T: ElementType> FrameData<T> {
                         .as_slice()
                         .ok_or_else(|| RsmediaError::msg("Interleaved frame must be contiguous"))?,
                 )
-                .map_err(|e| RsmediaError::msg(format!("Failed to view interleaved plane: {e}")))?;
+                .context("Failed to view interleaved plane")?;
                 let mapped = f(0, view)?;
                 let samples: Vec<U> = mapped.iter().cloned().collect();
                 Ok(FrameData::Packed(
@@ -397,7 +398,7 @@ fn rgb24_to_yuv420p<T: ElementType>(
             matrix,
             YuvConversionMode::Professional,
         )
-        .map_err(|e| RsmediaError::msg(format!("convert rgb24 to yuv420p error:{e}")))?;
+        .context("Failed to convert RGB24 to YUV420P")?;
     }
 
     Ok(FrameData::Planar(vec![
@@ -444,11 +445,11 @@ fn yuv420p_to_rgb24<T: ElementType>(
         YuvRange::Full,
         matrix,
     )
-    .map_err(|e| RsmediaError::msg(format!("convert yuv420p to rgb24 error:{e}")))?;
+    .context("Failed to convert YUV420P to RGB24")?;
 
     Ok(FrameData::Packed(
         Array3::from_shape_vec((height, width, 3), cast_samples::<u8, T>(rgb))
-            .map_err(|e| RsmediaError::msg(format!("Failed to build RGB24 frame: {e}")))?,
+            .context("Failed to build RGB24 frame")?,
     ))
 }
 
@@ -915,7 +916,7 @@ where
             if frame.nb_samples > 0 && frame.sample_rate > 0 {
                 time::new_rational(1, frame.sample_rate)
             } else {
-                log::warn!(
+                tracing::warn!(
                     "AVFrame has no valid time_base ({:?}); call MediaFrame::set_time_base",
                     frame.time_base
                 );
@@ -1369,6 +1370,7 @@ where
     }
 }
 
+#[cfg(feature = "image")]
 impl MediaFrame<u8> {
     /// Converts this video frame into an [`image::DynamicImage`].
     ///
@@ -1392,7 +1394,7 @@ impl MediaFrame<u8> {
         let (width, height) = rgb.dimensions();
         let (width, height) = (width as usize, height as usize);
         let array = Array3::from_shape_vec((height, width, 3), rgb.into_raw())
-            .map_err(|e| RsmediaError::msg(format!("Failed to build ndarray from image: {e}")))?;
+            .context("Failed to build ndarray from image")?;
         Self::new_video(width, height, PixelFormat::RGB24, array)
     }
 }
@@ -1489,7 +1491,7 @@ fn read_samples<T: ElementType>(frame: &AVFrame, layout: &DataLayout) -> Result<
                 (*rows, *cols, *components),
                 read_plane::<T>(frame, 0, *rows, cols * components)?,
             )
-            .map_err(|e| RsmediaError::msg(format!("Failed to build frame samples: {e}")))?,
+            .context("Failed to build frame samples")?,
         )),
         DataLayout::Planar(shapes) => {
             let mut planes = Vec::with_capacity(shapes.len());
@@ -1499,7 +1501,7 @@ fn read_samples<T: ElementType>(frame: &AVFrame, layout: &DataLayout) -> Result<
                         (rows, cols),
                         read_plane::<T>(frame, plane, rows, cols)?,
                     )
-                    .map_err(|e| RsmediaError::msg(format!("Failed to build frame plane: {e}")))?,
+                    .context("Failed to build frame plane")?,
                 );
             }
             Ok(FrameData::Planar(planes))
@@ -1660,7 +1662,7 @@ fn write_side_data(frame: &mut AVFrame, entries: &[FrameSideData]) {
             ffi::av_frame_new_side_data(frame.as_mut_ptr(), entry.type_, entry.data.len())
         };
         if raw.is_null() {
-            log::warn!(
+            tracing::warn!(
                 "Failed to allocate side data of type {} ({} bytes)",
                 entry.type_,
                 entry.data.len()

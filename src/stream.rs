@@ -210,7 +210,7 @@ impl StreamInfo {
         // 真正解码时，`PixelFormat::data_layout` 会再给出明确错误。
         let format = if codec_type.is_video() {
             let pix_fmt = PixelFormat::from_ffi_checked(codecpar.format).unwrap_or_else(|| {
-                log::warn!(
+                tracing::warn!(
                     "Stream {} has an unsupported pixel format {} ({}); reporting it as unknown",
                     stream.index,
                     codecpar.format,
@@ -222,7 +222,7 @@ impl StreamInfo {
         } else if codec_type.is_audio() {
             FrameFormat::Sample(
                 SampleFormat::from_ffi_checked(codecpar.format).unwrap_or_else(|| {
-                    log::warn!(
+                    tracing::warn!(
                         "Stream {} has an unsupported sample format {}; reporting it as unknown",
                         stream.index,
                         codecpar.format
@@ -270,7 +270,7 @@ impl StreamInfo {
             index: stream.index as usize,
             // 同样来自外部数据：未列出的媒体类型退化为 `UNKNOWN` 而不是 panic。
             media_type: MediaType::from_ffi_checked(codecpar.codec_type).unwrap_or_else(|| {
-                log::warn!(
+                tracing::warn!(
                     "Stream {} has an unsupported media type {}; reporting it as unknown",
                     stream.index,
                     codecpar.codec_type
@@ -435,7 +435,7 @@ impl StreamInfo {
                 let exists =
                     AVCodec::find_decoder_by_name(&strutils::str_to_cstring(name)).is_some();
                 if !exists {
-                    log::debug!(
+                    tracing::debug!(
                         "HW decoder '{name}' not registered in this FFmpeg build, \
                          falling back to software decoder '{codec_name}'"
                     );
@@ -458,7 +458,7 @@ impl StreamInfo {
                 let exists =
                     AVCodec::find_encoder_by_name(&strutils::str_to_cstring(name)).is_some();
                 if !exists {
-                    log::debug!(
+                    tracing::debug!(
                         "HW encoder '{name}' not registered in this FFmpeg build, \
                          falling back to software encoder '{codec_name}'"
                     );

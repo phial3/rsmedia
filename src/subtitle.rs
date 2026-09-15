@@ -156,7 +156,7 @@ impl SubtitleSegment {
         // `AVSubtitle.pts` 可能是 `AV_NOPTS_VALUE`（换算出来约 -9.2e12 ms）：没有
         // 可用的时间信息，按"无段落"处理，而不是产出一个荒谬的时间戳。
         if subtitle.pts == ffi::AV_NOPTS_VALUE {
-            log::warn!("Subtitle has no presentation timestamp; skipping it");
+            tracing::warn!("Subtitle has no presentation timestamp; skipping it");
             return None;
         }
         let pts_ms = subtitle.pts / 1000;
@@ -182,7 +182,7 @@ impl SubtitleSegment {
                 }
                 ty => {
                     // SUBTITLE_BITMAP / SUBTITLE_NONE：无法表示为文本
-                    log::debug!("Skip non-text subtitle rect type: {ty}");
+                    tracing::debug!("Skip non-text subtitle rect type: {ty}");
                 }
             }
         }

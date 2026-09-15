@@ -61,19 +61,167 @@ jobs:
           - arch: linux/amd64
             runner: ubuntu-latest
             ffmpeg_version: "6.1"
-            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+            feature: "ffmpeg6,link_system_ffmpeg,image"
           - arch: linux/amd64
             runner: ubuntu-latest
             ffmpeg_version: "7.1"
-            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            feature: "ffmpeg7,link_system_ffmpeg,image"
           - arch: linux/amd64
             runner: ubuntu-latest
             ffmpeg_version: "8.1"
-            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            feature: "ffmpeg8,link_system_ffmpeg,image"
           - arch: linux/amd64
             runner: ubuntu-latest
             ffmpeg_version: "9.0"
-            feature: "ndarray,ffmpeg9,link_system_ffmpeg"
+            feature: "ffmpeg9,link_system_ffmpeg,image"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          nasm \
+          yasm \
+          curl \
+          wget \
+          unzip \
+          gnupg \
+          clang \
+          cmake \
+          libtool \
+          autoconf \
+          automake \
+          binutils \
+          xz-utils \
+          pkg-config \
+          llvm-dev \
+          libc++1 \
+          libva2 \
+          libva-drm2 \
+          libva-x11-2 \
+          libvdpau1 \
+          libxv1 \
+          libclang-dev \
+          linux-libc-dev \
+          build-essential \
+          ca-certificates \
+          libva-dev \
+          libvpx-dev \
+          libaom-dev \
+          libass-dev \
+          libdrm-dev \
+          libv4l-dev \
+          libx264-dev \
+          libx264-164 \
+          libx265-dev \
+          libx265-199 \
+          libzimg-dev \
+          libdav1d-dev \
+          libwebp-dev \
+          libbluray-dev \
+          libtheora-dev \
+          libvidstab-dev \
+          libsvtav1-dev \
+          libxvidcore-dev \
+          libopenjp2-7-dev \
+          libgsm1-dev \
+          libsoxr-dev \
+          libopus-dev \
+          libpulse-dev \
+          libshine-dev \
+          libspeex-dev \
+          libbs2b-dev \
+          libvorbis-dev \
+          libfdk-aac-dev \
+          libasound2-dev \
+          libmp3lame-dev \
+          libmp3lame0 \
+          libtwolame-dev \
+          libjack-jackd2-dev \
+          libopencore-amrnb-dev \
+          libopencore-amrwb-dev \
+          libva-dev \
+          libdrm-dev \
+          libnuma-dev \
+          libvdpau-dev \
+          ocl-icd-opencl-dev \
+          libass-dev \
+          libxml2-dev \
+          libfribidi-dev \
+          libfreetype6-dev \
+          libfontconfig1-dev \
+          libssh-dev \
+          libzmq5-dev \
+          libssl-dev \
+          librtmp-dev \
+          libiec61883-dev \
+          libgnutls28-dev \
+          libsmbclient-dev \
+          libtiff-dev \
+          libpng-dev \
+          libraw-dev \
+          libjpeg-dev \
+          zlib1g-dev \
+          libsdl2-dev \
+          liblzma-dev \
+          libzvbi-dev \
+          libpostproc-dev \
+          librubberband-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
+
+      - name: Verify FFmpeg version
+        run: |
+          ldconfig
+          ffmpeg -version
+
+      - name: Check
+        run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+
+      - name: Doc Test
+        run: cargo test --doc --workspace --no-default-features --features ${{ matrix.feature }} --verbose
+
+  clippy-only-ffmpeg:
+    name: clippy (only ffmpeg) / ${{ matrix.arch }} / ffmpeg-${{ matrix.ffmpeg_version }}
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: jrottenberg/ffmpeg:${{ matrix.ffmpeg_version }}-ubuntu2404
+      options: --pull always
+
+    env:
+      FFMPEG_INCLUDE_DIR: /usr/local/include
+      FFMPEG_PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "6.1"
+            feature: "ffmpeg6,link_system_ffmpeg"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "7.1"
+            feature: "ffmpeg7,link_system_ffmpeg"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "8.1"
+            feature: "ffmpeg8,link_system_ffmpeg"
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            ffmpeg_version: "9.0"
+            feature: "ffmpeg9,link_system_ffmpeg"
 
     steps:
       - name: Checkout
@@ -201,16 +349,16 @@ jobs:
         ffmpeg_version: ["6", "7", "8", "9"]
         include:
           - ffmpeg_version: "6"
-            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+            feature: "ffmpeg6,link_system_ffmpeg,image"
             brew_formula: "ffmpeg@6"
           - ffmpeg_version: "7"
-            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            feature: "ffmpeg7,link_system_ffmpeg,image"
             brew_formula: "ffmpeg@7"
           - ffmpeg_version: "8"
-            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            feature: "ffmpeg8,link_system_ffmpeg,image"
             brew_formula: "ffmpeg@8"
           - ffmpeg_version: "9"
-            feature: "ndarray,ffmpeg9,link_system_ffmpeg"
+            feature: "ffmpeg9,link_system_ffmpeg,image"
             brew_formula: "ffmpeg"
 
     env:
@@ -262,45 +410,45 @@ jobs:
           - arch: linux/amd64
             runner: ubuntu-latest
             ffmpeg_version: "6.1"
-            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+            feature: "ffmpeg6,link_system_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-08-31-13-00/ffmpeg-n6.1.3-linux64-gpl-shared-6.1.tar.xz"
           - arch: linux/arm64
             runner: ubuntu-24.04-arm
             ffmpeg_version: "6.1"
-            feature: "ndarray,ffmpeg6,link_system_ffmpeg"
+            feature: "ffmpeg6,link_system_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-08-31-13-00/ffmpeg-n6.1.3-linuxarm64-gpl-shared-6.1.tar.xz"
 
           - arch: linux/amd64
             runner: ubuntu-latest
             ffmpeg_version: "7.1"
-            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            feature: "ffmpeg7,link_system_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1.tar.xz"
           - arch: linux/arm64
             runner: ubuntu-24.04-arm
             ffmpeg_version: "7.1"
-            feature: "ndarray,ffmpeg7,link_system_ffmpeg"
+            feature: "ffmpeg7,link_system_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linuxarm64-gpl-shared-7.1.tar.xz"
 
           - arch: linux/amd64
             runner: ubuntu-latest
             ffmpeg_version: "8.1"
-            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            feature: "ffmpeg8,link_system_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-shared-8.1.tar.xz"
           - arch: linux/arm64
             runner: ubuntu-24.04-arm
             ffmpeg_version: "8.1"
-            feature: "ndarray,ffmpeg8,link_system_ffmpeg"
+            feature: "ffmpeg8,link_system_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linuxarm64-gpl-shared-8.1.tar.xz"
 
           - arch: linux/amd64
             runner: ubuntu-latest
             ffmpeg_version: "9.0"
-            feature: "ndarray,ffmpeg9,link_system_ffmpeg"
+            feature: "ffmpeg9,link_system_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linux64-gpl-shared-9.0.tar.xz"
           - arch: linux/arm64
             runner: ubuntu-24.04-arm
             ffmpeg_version: "9.0"
-            feature: "ndarray,ffmpeg9,link_system_ffmpeg"
+            feature: "ffmpeg9,link_system_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-linuxarm64-gpl-shared-9.0.tar.xz"
 
     env:
@@ -505,45 +653,45 @@ jobs:
           - arch: windows/amd64
             runner: windows-latest
             ffmpeg_version: "6.1"
-            feature: "ndarray,ffmpeg6,link_vcpkg_ffmpeg"
+            feature: "ffmpeg6,link_vcpkg_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-08-31-13-00/ffmpeg-n6.1.3-win64-gpl-shared-6.1.zip"
           - arch: windows/arm64
             runner: windows-11-arm
             ffmpeg_version: "6.1"
-            feature: "ndarray,ffmpeg6,link_vcpkg_ffmpeg"
+            feature: "ffmpeg6,link_vcpkg_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2025-08-31-13-00/ffmpeg-n6.1.3-winarm64-gpl-shared-6.1.zip"
 
           - arch: windows/amd64
             runner: windows-latest
             ffmpeg_version: "7.1"
-            feature: "ndarray,ffmpeg7,link_vcpkg_ffmpeg"
+            feature: "ffmpeg7,link_vcpkg_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-shared-7.1.zip"
           - arch: windows/arm64
             runner: windows-11-arm
             ffmpeg_version: "7.1"
-            feature: "ndarray,ffmpeg7,link_vcpkg_ffmpeg"
+            feature: "ffmpeg7,link_vcpkg_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-winarm64-gpl-shared-7.1.zip"
 
           - arch: windows/amd64
             runner: windows-latest
             ffmpeg_version: "8.1"
-            feature: "ndarray,ffmpeg8,link_vcpkg_ffmpeg"
+            feature: "ffmpeg8,link_vcpkg_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
           - arch: windows/arm64
             runner: windows-11-arm
             ffmpeg_version: "8.1"
-            feature: "ndarray,ffmpeg8,link_vcpkg_ffmpeg"
+            feature: "ffmpeg8,link_vcpkg_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-winarm64-gpl-shared-8.1.zip"
 
           - arch: windows/amd64
             runner: windows-latest
             ffmpeg_version: "9.0"
-            feature: "ndarray,ffmpeg9,link_vcpkg_ffmpeg"
+            feature: "ffmpeg9,link_vcpkg_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip"
           - arch: windows/arm64
             runner: windows-11-arm
             ffmpeg_version: "9.0"
-            feature: "ndarray,ffmpeg9,link_vcpkg_ffmpeg"
+            feature: "ffmpeg9,link_vcpkg_ffmpeg,image"
             download_url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-winarm64-gpl-shared-9.0.zip"
 
     steps:

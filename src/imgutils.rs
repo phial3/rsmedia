@@ -636,8 +636,9 @@ pub fn apply_cropping(frame: &mut AVFrame, flags: i32) -> Result<()> {
 ///
 /// packed 8bit 格式（RGB24/RGBA/GRAY8）直接从帧数据构建，其他格式
 /// （YUV 系列、BGR 族等）经 swscale 统一转为 RGB24 再构建。
-/// 不依赖 `ndarray` feature。硬件帧需先下载到内存（见
+/// 不依赖 `MediaFrame`。硬件帧需先下载到内存（见
 /// `HWContext::hw_download`）。
+#[cfg(feature = "image")]
 pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
     let (width, height) = (frame.width as u32, frame.height as u32);
     if width == 0 || height == 0 {
@@ -676,21 +677,89 @@ pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
     }
 }
 
+/// 一站式从输入获取一帧视频缩略图，返回 `image::DynamicImage`。
+///
+/// 内部流程：构建视频解码器（RGB24 输出 + [`Resize::Fit`] 保持纵横比缩放）
+/// → seek 到目标时间 → 解码一帧原始 `AVFrame` → 转为
+/// [`image::DynamicImage`](crate::imgutils::to_dynamic_image)。
+/// 不依赖 `MediaFrame`，适合生成封面图 / 视频预览等场景。
+///
+/// # Arguments
+///
+/// * `source` - 输入（文件路径 / URL 等，见 [`Location`]）
+/// * `timestamp_milliseconds` - 取帧时间点；`None` 时取**流中点**
+///   （视频开头往往是黑帧/淡入，中点更容易取到有代表性的画面；
+///   时长未知的流退化为取第一帧）
+/// * `max_dims` - 缩略图最大 (宽, 高)；实际尺寸按纵横比缩放，
+///   源小于该尺寸时不放大
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use rsmedia::thumbnail;
+/// # use std::path::Path;
+/// let img = thumbnail(Path::new("assets/mp4.mp4"), None, (320, 240)).unwrap();
+/// println!("thumbnail: {}x{}", img.width(), img.height());
+/// img.save("thumbnail.png").unwrap();
+/// ```
+#[cfg(feature = "image")]
+pub fn thumbnail(
+    source: impl Into<crate::Location>,
+    timestamp_ms: Option<i64>,
+    max_dims: (u32, u32),
+) -> Result<image::DynamicImage> {
+    use crate::error::Context;
+    use crate::io::Seekable;
+    use crate::stream::StreamInfo;
+    use rsmpeg::avutil;
+
+    let mut reader = crate::StreamReader::new(source).context("Failed to open thumbnail source")?;
+    let mut decoder = crate::DecoderBuilder::new(crate::MediaType::VIDEO)
+        .with_pix_fmt(PixelFormat::RGB24)
+        .with_resize(crate::Resize::Fit(max_dims.0, max_dims.1))
+        .build_from_reader(&reader)
+        .context("Failed to build thumbnail decoder")?;
+
+    // None → 流中点；时长未知（0）→ 第一帧
+    let ts = match timestamp_ms {
+        Some(ts) => ts,
+        None => {
+            let info = StreamInfo::from_reader(&reader, decoder.stream_index())?;
+            let mid_secs = info.duration as f64 * avutil::av_q2d(info.time_base) / 2.0;
+            (mid_secs * 1000.0).round().max(0.0) as i64
+        }
+    };
+
+    let frame = {
+        // 定位到目标时间之前最近的关键帧，并刷新解码器以丢弃旧缓冲。
+        // seek 失败不视为错误：退化为从当前位置解码第一帧。
+        if reader.seek_to_timestamp(ts).is_err() {
+            tracing::debug!("seek to {ts}ms failed, decoding from the current position");
+        } else {
+            decoder.flush_buffers()?;
+        }
+        decoder.decode_raw(&mut reader)?
+    }
+    .ok_or_else(|| RsmediaError::msg("No video frame decoded for thumbnail"))?;
+
+    to_dynamic_image(&frame).context("Failed to convert AVFrame to image")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::Context;
-    use ab_glyph::PxScale;
-    use image::{ImageBuffer, Rgb};
 
     /// Create an image with the given text and a gradient color.
+    #[cfg(feature = "image")]
     fn create_image_with_text(
         width: u32,
         height: u32,
         text: &str,
-    ) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
-        let mut img = ImageBuffer::new(width, height);
+    ) -> image::ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+        let mut img = image::ImageBuffer::new(width, height);
 
+        use ab_glyph::PxScale;
         use palette::IntoColor;
 
         // create a gradient color
@@ -703,7 +772,7 @@ mod tests {
                 img.put_pixel(
                     x,
                     y,
-                    Rgb([
+                    image::Rgb([
                         (rgb.red * 255.0) as u8,
                         (rgb.green * 255.0) as u8,
                         (rgb.blue * 255.0) as u8,
@@ -719,7 +788,7 @@ mod tests {
         // add text to the image
         imageproc::drawing::draw_text_mut(
             &mut img,
-            Rgb([255, 255, 255]),
+            image::Rgb([255, 255, 255]),
             10,
             10,
             PxScale::from(24.0),
@@ -731,10 +800,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "image")]
     fn test_image_text() -> Result<()> {
         let output_path = crate::test_support::test_output_path("imgutils", "image_with_text.png");
         let rgb = create_image_with_text(640, 480, "Hello, world!");
         rgb.save(output_path)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "image")]
+    fn test_thumbnail() -> Result<()> {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+        // 默认取流中点，Fit 缩放保持纵横比
+        let img = thumbnail(video_path, None, (320, 240))?;
+        assert!(img.width() > 0 && img.height() > 0);
+        assert!(
+            img.width() <= 320 && img.height() <= 240,
+            "thumbnail dims {}x{} exceed 320x240",
+            img.width(),
+            img.height()
+        );
+        assert_eq!(img.color().channel_count(), 3, "expected RGB output");
+
+        // 指定时间点
+        let img = thumbnail(video_path, Some(1000), (64, 64))?;
+        assert!(img.width() > 0 && img.height() > 0);
         Ok(())
     }
 
@@ -1118,7 +1209,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "ndarray")]
     #[test]
     fn test_fill_frame_from_buffer() -> Result<()> {
         let mut frame = create_test_frame(320, 240, ffi::AV_PIX_FMT_RGB24)?;

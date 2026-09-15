@@ -11,8 +11,6 @@
 //! The whole file needs the `ndarray` feature: it drives the high-level
 //! `MediaFrame` API, whose frame generators live in `common` behind that gate.
 
-#![cfg(feature = "ndarray")]
-
 mod common;
 
 use common::{gradient_video_frame, sine_audio_frame, test_output_path};
@@ -218,21 +216,18 @@ fn audio_roundtrip(
 
 /// H.264 is the project's default video codec — must exist everywhere.
 #[test]
-#[cfg(feature = "ndarray")]
 fn matrix_video_h264() -> anyhow::Result<()> {
     video_roundtrip("h264", "libx264", "mp4", Some(Quality::Crf(23)), None)
 }
 
 /// HEVC via libx265 (optional external library).
 #[test]
-#[cfg(feature = "ndarray")]
 fn matrix_video_hevc() -> anyhow::Result<()> {
     video_roundtrip("hevc", "libx265", "mkv", Some(Quality::Crf(28)), None)
 }
 
 /// MPEG-4 part 2 — native encoder, always present.
 #[test]
-#[cfg(feature = "ndarray")]
 fn matrix_video_mpeg4() -> anyhow::Result<()> {
     video_roundtrip(
         "mpeg4",
@@ -246,7 +241,6 @@ fn matrix_video_mpeg4() -> anyhow::Result<()> {
 /// VP9 via libvpx (optional external library). `cpu-used`/`row-mt` keep the
 /// tiny round-trip fast.
 #[test]
-#[cfg(feature = "ndarray")]
 fn matrix_video_vp9() -> anyhow::Result<()> {
     let mut opts = Options::new();
     opts.insert("cpu-used", "8").insert("row-mt", "1");
@@ -261,7 +255,6 @@ fn matrix_video_vp9() -> anyhow::Result<()> {
 
 /// FFV1 — native lossless video codec, always present.
 #[test]
-#[cfg(feature = "ndarray")]
 fn matrix_video_ffv1_lossless() -> anyhow::Result<()> {
     video_roundtrip("ffv1", "ffv1", "mkv", None, None)
 }
@@ -272,7 +265,6 @@ fn matrix_video_ffv1_lossless() -> anyhow::Result<()> {
 
 /// AAC is the project's default audio codec — must exist everywhere.
 #[test]
-#[cfg(feature = "ndarray")]
 fn matrix_audio_aac() -> anyhow::Result<()> {
     audio_roundtrip(
         "aac",
@@ -286,7 +278,6 @@ fn matrix_audio_aac() -> anyhow::Result<()> {
 
 /// MP3 via libmp3lame (optional external library); frame size 1152.
 #[test]
-#[cfg(feature = "ndarray")]
 fn matrix_audio_mp3() -> anyhow::Result<()> {
     audio_roundtrip(
         "mp3",
@@ -300,7 +291,6 @@ fn matrix_audio_mp3() -> anyhow::Result<()> {
 
 /// FLAC — native lossless audio codec, always present.
 #[test]
-#[cfg(feature = "ndarray")]
 fn matrix_audio_flac_lossless() -> anyhow::Result<()> {
     audio_roundtrip("flac", "flac", "flac", SAMPLE_RATE, 1024, None)
 }
@@ -308,7 +298,6 @@ fn matrix_audio_flac_lossless() -> anyhow::Result<()> {
 /// Opus via libopus (optional external library); frame size 960.
 /// libopus only supports 8/12/16/24/48 kHz, so use 48 kHz.
 #[test]
-#[cfg(feature = "ndarray")]
 fn matrix_audio_opus() -> anyhow::Result<()> {
     audio_roundtrip(
         "opus",

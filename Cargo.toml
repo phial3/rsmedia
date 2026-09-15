@@ -12,7 +12,7 @@ repository = "https://github.com/dromara/rsmedia.git"
 exclude = [".github/*", "assets/*", "data/*", "examples/*", "tests/*", "benches/*", "docs/*", ]
 
 [features]
-default = ["ndarray", "ffmpeg9", "link_system_ffmpeg"]
+default = ["ffmpeg9", "link_system_ffmpeg"]
 ffmpeg6 = ["rsmpeg/ffmpeg6_1"]
 ffmpeg7 = ["rsmpeg/ffmpeg7_1"]
 ffmpeg8 = ["rsmpeg/ffmpeg8_1"]
@@ -24,8 +24,9 @@ link_vcpkg_ffmpeg = ["rsmpeg/link_vcpkg_ffmpeg"]
 
 [dependencies]
 libc = "0.2"
-log = "0.4"
 url = "2.5"
+bytes = "1"
+thiserror = "2"
 tracing = "0.1"
 dashmap = "6.1"
 once_cell = "1.21"
@@ -33,17 +34,18 @@ num_cpus = "1.17"
 colorous = "1.0"
 bytemuck = "1.25"
 num-traits = "0.2"
-image = "0.25"
 palette = "0.7"
 colorutils-rs = "0.8"
+image = { version = "0.25", optional = true }
 yuv = { version = "0.8", features = ["rayon", "professional_mode"] }
-ndarray = { version = "0.17", optional = true }
+ndarray = { version = "0.17", features = ["rayon"] }
 rsmpeg = { git = "https://github.com/phial3/rsmpeg", branch = "main", default-features = false }
 
 [dev-dependencies]
 anyhow = "1.0"
 criterion = "0.8"
 camino = "1.2"
+tempfile = "3"
 chrono = "0.4"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
 #pix = "1.0"
@@ -66,36 +68,32 @@ wavers = "1.5"
 rodio = { version = "0.22", features = ["symphonia-all", "tracing"] }
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["default"]
 
 [[example]]
 name = "decoding"
 path = "examples/decoding.rs"
-required-features = ["ndarray"]
+required-features = ["image"]
 test = false
 
 [[bench]]
 name = "encode_pipeline"
 path = "benches/encode_pipeline.rs"
-required-features = ["ndarray"]
 harness = false
 
 [[bench]]
 name = "encode_single_thread"
 path = "benches/encode_single_thread.rs"
-required-features = ["ndarray"]
 harness = false
 
 [[bench]]
 name = "encode_mux_container"
 path = "benches/encode_mux_container.rs"
-required-features = ["ndarray"]
 harness = false
 
 [[example]]
 name = "encoding"
 path = "examples/encoding.rs"
-required-features = ["ndarray"]
 test = false
 
 [[example]]
@@ -106,53 +104,51 @@ test = false
 [[example]]
 name = "audio_encoding"
 path = "examples/audio_encoding.rs"
-required-features = ["ndarray"]
 test = false
 
 [[example]]
 name = "decode_streams"
 path = "examples/decode_streams.rs"
-required-features = ["ndarray"]
 test = false
 
 [[example]]
 name = "seek_demo"
 path = "examples/seek_demo.rs"
-required-features = ["ndarray"]
 test = false
 
 [[example]]
 name = "metadata"
 path = "examples/metadata.rs"
-required-features = ["ndarray"]
 test = false
 
 [[example]]
 name = "filter_demo"
 path = "examples/filter_demo.rs"
-required-features = ["ndarray"]
+required-features = ["image"]
+test = false
+
+[[example]]
+name = "colorous_render"
+path = "examples/colorous_render.rs"
+required-features = ["image"]
 test = false
 
 [[example]]
 name = "color_professional"
 path = "examples/color_professional.rs"
-required-features = ["ndarray"]
 test = false
 
 [[example]]
 name = "quick_write"
 path = "examples/quick_write.rs"
-required-features = ["ndarray"]
 test = false
 
 [[example]]
 name = "hw_vt_check"
 path = "examples/hw_vt_check.rs"
-required-features = ["ndarray"]
 test = false
 
 [[example]]
 name = "auto_pts"
 path = "examples/auto_pts.rs"
-required-features = ["ndarray"]
 test = false

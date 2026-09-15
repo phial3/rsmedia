@@ -152,7 +152,7 @@ pub fn convert_frame(
         .convert_frame(src_frame, &mut dst_frame)
         .context("Failed to convert frame.")?;
 
-    log::debug!(
+    tracing::debug!(
         "Swr convert_frame from src:[{}, {:?}, {}] to dst:[{}, {:?}, {}]",
         src_frame.ch_layout.nb_channels,
         SampleFormat::from(src_frame.format),

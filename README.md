@@ -65,7 +65,6 @@ Pick **exactly one** FFmpeg version feature;
 
 | Feature | Default | Effect |
 |---|---|---|
-| `ndarray` | ✅ | `MediaFrame` (ndarray-backed frames), `frame::*`, `MediaFrame` conversions, the `decoding`/`encoding` examples |
 | `ffmpeg6` | | build against FFmpeg 6.x |
 | `ffmpeg7` | | build against FFmpeg 7.x |
 | `ffmpeg8` | | build against FFmpeg 8.x |
@@ -78,10 +77,10 @@ Pick **exactly one** FFmpeg version feature;
 rsmedia = "0.7"
 
 # FFmpeg 7 on unix
-rsmedia = { version = "0.7", default-features = false, features = ["ndarray", "ffmpeg7", "link_system_ffmpeg"] }
+rsmedia = { version = "0.7", default-features = false, features = ["ffmpeg7", "link_system_ffmpeg"] }
 
 # FFmpeg 6 on windows, linking with vcpkg
-rsmedia = { version = "0.7", default-features = false, features = ["ndarray", "ffmpeg6", "link_vcpkg_ffmpeg"] }
+rsmedia = { version = "0.7", default-features = false, features = ["ffmpeg6", "link_vcpkg_ffmpeg"] }
 ```
 
 ## 📦 Setup
@@ -141,7 +140,7 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-Need the raw FFmpeg frame instead? Use the raw path — same builder, no ndarray:
+Need the raw FFmpeg frame instead? Use the raw path — same builder, no `MediaFrame`:
 
 ```rust
 let mut reader = StreamReader::new("/tmp/test.mp4")?;
@@ -281,7 +280,7 @@ color science:
 ```bash
 cargo run --example quick_write     # write /tmp/quick_write.mp4
 cargo run --example muxing          # needs /tmp/test.mp4 as input
-cargo run --example decoding        # needs the `ndarray` feature (default)
+cargo run --example decoding
 cargo run --example seek_demo -- assets/mp4.mp4
 ```
 

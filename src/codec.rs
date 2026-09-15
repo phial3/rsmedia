@@ -326,12 +326,8 @@ impl CodecConfig {
     /// Works on all supported FFmpeg versions, even when [`CodecConfig::profiles`]
     /// returns an empty list.
     pub fn profile_name(&self, profile_id: i32) -> Option<String> {
-        let p = unsafe { ffi::avcodec_profile_name(self.codec.id, profile_id) };
-        if p.is_null() {
-            None
-        } else {
-            Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
-        }
+        let pname = unsafe { ffi::avcodec_profile_name(self.codec.id, profile_id) };
+        unsafe { Some(strutils::c_char_to_str(pname)) }
     }
 
     /// All codecs registered in this FFmpeg build (encoders and decoders).

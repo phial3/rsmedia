@@ -5,17 +5,34 @@
 // Note: library unit tests (`src/`) keep their own `test_support` module and do
 // not include this file, so there is no dependency between the two test suites.
 
-/// Returns a standardized test output path under `tests/output/{category}/`,
-/// creating the directory if needed. The path is relative to the package root,
-/// which `cargo test` uses as the working directory on all platforms
-/// (macOS / Linux / Windows).
+/// A per-test-crate temporary output root, created lazily and kept alive for the
+/// lifetime of the test binary. Using `tempfile` instead of a fixed `tests/output`
+/// directory isolates each integration-test crate (they run in separate processes,
+/// possibly in parallel) and guarantees the files are cleaned up on exit, so no
+/// crate can observe or clobber another crate's outputs.
+static OUTPUT_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+fn output_root() -> &'static tempfile::TempDir {
+    OUTPUT_ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("rsmedia-test-output-")
+            .tempdir()
+            .expect("failed to create test output tempdir")
+    })
+}
+
+/// Returns a standardized test output path under `{tempdir}/{category}/`,
+/// creating the directory if needed. The directory is private to the running
+/// test binary and is automatically removed when the process exits.
 ///
 /// # Arguments
-/// * `category` - The subdirectory name (e.g., "encode_video", "transcode")
-/// * `filename` - The output filename
+/// * `category` - The subdirectory name (e.g., "encode", "transcode")
+/// * `filename` - The output filename. May be empty to obtain the directory
+///   itself (useful when a helper writes multiple files into a target dir).
 pub fn test_output_path(category: &str, filename: &str) -> std::path::PathBuf {
-    let output_dir = std::path::PathBuf::from("tests/output").join(category);
-    std::fs::create_dir_all(&output_dir).ok();
+    let output_dir = output_root().path().join(category);
+    std::fs::create_dir_all(&output_dir)
+        .unwrap_or_else(|e| panic!("failed to create test output directory {output_dir:?}: {e}"));
     output_dir.join(filename)
 }
 
@@ -27,15 +44,14 @@ pub fn remove_test_output(path: &std::path::Path) {
 }
 
 // ---------------------------------------------------------------------------
-// Synthetic frame generators (ndarray-gated, used by integration tests that
+// Synthetic frame generators (used by integration tests that
 // drive the high-level MediaFrame API, e.g. tests/codec_matrix.rs).
 // ---------------------------------------------------------------------------
 
 /// Generates a video test frame (RGB24): horizontal red / vertical green
 /// gradients plus a phase-shifted blue channel, so round-trips exercise every
-/// plane. Requires the `ndarray` feature.
+/// plane.
 #[allow(dead_code)]
-#[cfg(feature = "ndarray")]
 pub fn gradient_video_frame(width: usize, height: usize, phase: f32) -> rsmedia::MediaFrame<u8> {
     let mut frame =
         rsmedia::MediaFrame::<u8>::new_video_frame(width, height, rsmedia::PixelFormat::RGB24)
@@ -57,9 +73,7 @@ pub fn gradient_video_frame(width: usize, height: usize, phase: f32) -> rsmedia:
 /// Generates one stereo sine-wave audio frame (FLTP, f32 samples).
 /// The encoder's native sample format is negotiated and converted
 /// automatically, so this single layout feeds every audio codec.
-/// Requires the `ndarray` feature.
 #[allow(dead_code)]
-#[cfg(feature = "ndarray")]
 pub fn sine_audio_frame(
     freq: f32,
     channels: u32,

@@ -124,14 +124,14 @@ fn escape_filter_str(input: &str) -> String {
 
         // 检查返回值是否为错误
         if result < 0 {
-            log::warn!("av_escape failed with error code: {result}");
+            tracing::warn!("av_escape failed with error code: {result}");
             // 使用安全的回退方案
             return fallback();
         }
 
         // 检查返回的指针是否为空
         if escaped_ptr.is_null() {
-            log::warn!("av_escape returned null pointer");
+            tracing::warn!("av_escape returned null pointer");
             // 使用安全的回退方案
             return fallback();
         }
@@ -346,7 +346,7 @@ pub mod video {
     pub fn drawbox(x: i32, y: i32, w: u32, h: u32, color: &str, thickness: i32) -> Filter {
         if thickness < 0 {
             // FFmpeg 't=fill' is also possible
-            log::warn!("Box thickness is negative ({thickness}), using absolute value.",);
+            tracing::warn!("Box thickness is negative ({thickness}), using absolute value.",);
         }
         Filter::new(
             "drawbox",
@@ -469,7 +469,7 @@ pub mod video {
     pub fn transpose(mode: i32) -> Filter {
         // Common range is 0-3, but ffmpeg might support more
         if !(0..=7).contains(&mode) {
-            log::warn!("Transpose mode {mode} might be invalid.");
+            tracing::warn!("Transpose mode {mode} might be invalid.");
         }
         Filter::new("transpose", MediaType::VIDEO, format!("transpose={mode}"))
     }
@@ -1262,18 +1262,16 @@ impl FilterGraph {
         match filter_result {
             Ok(frame) => Ok(Some(frame)),
             Err(rsmpeg::error::RsmpegError::BufferSinkDrainError) => {
-                log::debug!("filter graph: buffer sink drain error");
+                tracing::debug!("filter graph: buffer sink drain error");
                 self.state = FilterGraphState::Drained;
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::BufferSinkEofError) => {
-                log::warn!("filter graph: buffer sink eof error");
+                tracing::debug!("filter graph: buffer sink eof error");
                 self.state = FilterGraphState::Flushed;
                 Ok(None)
             }
-            Err(e) => Err(RsmediaError::msg(format!(
-                "Get frame from buffer sink Error: {e}"
-            ))),
+            Err(e) => Err(RsmediaError::FFmpeg(e)),
         }
     }
 
@@ -1283,7 +1281,7 @@ impl FilterGraph {
             return Err(RsmediaError::msg("Filter graph not initialized"));
         }
         if self.is_flushed() {
-            log::debug!("Filter graph already flushed.");
+            tracing::debug!("Filter graph already flushed.");
             return Ok(Vec::new());
         }
 
@@ -1303,7 +1301,7 @@ impl FilterGraph {
                     // EAGAIN：图里仍有缓冲帧要出，继续拉取；但个别滤镜可能一直回
                     // EAGAIN 而不进入 Flushed，故设上限收尾（与解码/编码排空一致）。
                     if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
-                        log::error!(
+                        tracing::error!(
                             "Filter graph keeps returning EAGAIN while flushing; \
                              giving up after {} iterations",
                             crate::MAX_DRAIN_ITERATIONS
@@ -1311,10 +1309,10 @@ impl FilterGraph {
                         break;
                     }
                     drained_iterations += 1;
-                    log::trace!("Filter graph draining during flush...");
+                    tracing::trace!("Filter graph draining during flush...");
                 }
                 Err(e) => {
-                    log::error!("Error encountered during filter graph flush: {e}");
+                    tracing::error!("Error encountered during filter graph flush: {e}");
                     return Err(e);
                 }
             }

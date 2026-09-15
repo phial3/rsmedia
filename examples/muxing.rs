@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
                 muxer.mux(frame, out_index)?;
             }
             Ok(None) => {
-                log::info!("End of input file");
+                println!("End of input file");
                 break;
             }
             Err(e) => {

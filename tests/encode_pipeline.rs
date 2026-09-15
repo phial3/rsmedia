@@ -14,8 +14,6 @@
 //! The whole file requires the `ndarray` feature, because the frames handed to
 //! the encoders are built with the high-level `MediaFrame` API.
 
-#![cfg(feature = "ndarray")]
-
 mod common;
 
 use std::collections::HashMap;

@@ -133,7 +133,7 @@ macro_rules! ffi_enum_wrap_from {
     ) => {
         $(#[$em])*
         #[repr($repr)]
-        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
         #[non_exhaustive]
         pub enum $enum {
             $(
@@ -209,7 +209,7 @@ macro_rules! ffi_enum_wrap_from {
     ) => {
         $(#[$em])*
         #[repr($repr)]
-        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
         #[non_exhaustive]
         pub enum $enum {
             $(
@@ -329,7 +329,7 @@ macro_rules! ffi_enum_wrap {
     ) => {
         $(#[$em])*
         #[repr($repr)]
-        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
         #[non_exhaustive]
         pub enum $enum {
             $(
@@ -416,7 +416,7 @@ macro_rules! ffi_enum {
     ) => {
         $(#[$enum_doc])*
         #[repr($repr_ty)]
-        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+        #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
         #[non_exhaustive]
         pub enum $enum_ident {
             $(

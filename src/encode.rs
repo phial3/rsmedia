@@ -2,7 +2,6 @@ use crate::codec::{CodecConfig, CodecContextState};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::fmt::FrameFormat;
-#[cfg(feature = "ndarray")]
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
@@ -537,7 +536,9 @@ impl EncoderBuilder {
                     Ok(Some(list)) if !list.is_empty() => PixelFormat::from(list[0]),
                     _ => PixelFormat::YUV420P,
                 };
-                log::debug!("negotiated pixel format {negotiated:?} for encoder '{codec_name}'");
+                tracing::debug!(
+                    "negotiated pixel format {negotiated:?} for encoder '{codec_name}'"
+                );
                 Ok(negotiated)
             }
         }
@@ -572,7 +573,9 @@ impl EncoderBuilder {
                     }
                     _ => SampleFormat::FLTP,
                 };
-                log::debug!("negotiated sample format {negotiated:?} for encoder '{codec_name}'");
+                tracing::debug!(
+                    "negotiated sample format {negotiated:?} for encoder '{codec_name}'"
+                );
                 Ok(negotiated)
             }
         }
@@ -621,7 +624,7 @@ impl EncoderBuilder {
                 Some(Quality::Crf(_)) => {
                     let capable = CRF_CAPABLE_CODECS.contains(&codec_name.as_str());
                     if !capable {
-                        log::warn!(
+                        tracing::warn!(
                             "codec '{codec_name}' has no CRF support, falling back to bit rate control"
                         );
                     }
@@ -729,7 +732,7 @@ impl EncoderBuilder {
                 let changed =
                     out_fr.num != self.frame_rate.num || out_fr.den != self.frame_rate.den;
                 if out_fr.num > 0 && out_fr.den > 0 && changed {
-                    log::info!(
+                    tracing::info!(
                         "Filter changes frame rate: {}/{} -> {}/{}",
                         self.frame_rate.num,
                         self.frame_rate.den,
@@ -745,7 +748,7 @@ impl EncoderBuilder {
                 && fh > 0
                 && (fw != encode_ctx.width || fh != encode_ctx.height)
             {
-                log::info!(
+                tracing::info!(
                     "Filter changes size: {}x{} -> {}x{}",
                     encode_ctx.width,
                     encode_ctx.height,
@@ -765,7 +768,7 @@ impl EncoderBuilder {
             })
             .map(|cfg| {
                 // codec support or not for hardware acceleration
-                log::info!(
+                tracing::info!(
                     "Video Encoder with HW acceleration codec: {:?}, config: {:#?}",
                     self.codec_name,
                     cfg
@@ -815,8 +818,8 @@ impl EncoderBuilder {
                      subtitle stream in a transcode pipeline",
                 ));
             };
-            let header_c = std::ffi::CString::new(header.as_str())
-                .map_err(|e| RsmediaError::msg(format!("Invalid subtitle header: {e}")))?;
+            let header_c =
+                std::ffi::CString::new(header.as_str()).context("Invalid subtitle header")?;
             encode_ctx
                 .set_subtitle_header(header_c.as_c_str())
                 .context("Failed to set subtitle header")?;
@@ -991,7 +994,6 @@ impl Encoder {
     /// # Arguments
     ///
     /// * `frame` - Frame to encode in `HWC` format and standard layout.
-    #[cfg(feature = "ndarray")]
     pub fn encode<T>(&mut self, frame: MediaFrame<T>) -> Result<Vec<AVPacket>>
     where
         T: ElementType,
@@ -1058,8 +1060,8 @@ impl Encoder {
         // decoded text plus a spurious zero-style record.
         let mut subtitle = AVSubtitle::new();
         let dialogue = format!("0,0,Default,,0,0,0,,{}", segment.text);
-        let dialogue_c = std::ffi::CString::new(dialogue)
-            .map_err(|e| RsmediaError::msg(format!("Subtitle text contains NUL byte: {e}")))?;
+        let dialogue_c =
+            std::ffi::CString::new(dialogue).context("Subtitle text contains NUL byte")?;
         subtitle
             .push_ass_rect(dialogue_c.as_c_str())
             .context("Failed to build subtitle rect")?;
@@ -1076,7 +1078,7 @@ impl Encoder {
         let mut packet = AVPacket::new();
         let ret = unsafe { ffi::av_new_packet(packet.as_mut_ptr(), len as i32) };
         if ret < 0 {
-            return Err(RsmediaError::from(rsmpeg::error::RsmpegError::from(ret)));
+            return Err(RsmediaError::FFmpeg(rsmpeg::error::RsmpegError::from(ret)));
         }
         unsafe {
             std::ptr::copy_nonoverlapping(buf.as_ptr(), (*packet.as_mut_ptr()).data, len);
@@ -1134,7 +1136,7 @@ impl Encoder {
                     Some(filtered) => self.send_frame_post_filter(filtered)?,
                     None => {
                         // filter 暂未输出（内部缓冲中），等待后续帧驱动
-                        log::debug!("Filter graph drained, waiting for more input.");
+                        tracing::debug!("Filter graph drained, waiting for more input.");
                     }
                 }
             } else {
@@ -1149,9 +1151,10 @@ impl Encoder {
                 match self.context.send_frame(None) {
                     Ok(()) => break,
                     Err(rsmpeg::error::RsmpegError::SendFrameAgainError) => {
+                        tracing::debug!("send_frame_to_encoder EAGAIN error!");
                         self.drain_encoder_packets()?;
                     }
-                    Err(e) => return Err(RsmediaError::from(e)),
+                    Err(e) => return Err(RsmediaError::FFmpeg(e)),
                 }
             }
             Ok(())
@@ -1270,7 +1273,7 @@ impl Encoder {
         } else {
             self.check_frame(Some(&hw_frame))?;
 
-            log::debug!(
+            tracing::debug!(
                 "Send frame to encoder: {:?}, time_base: {:?}, media_type: {:?}",
                 hw_frame,
                 self.time_base(),
@@ -1369,9 +1372,10 @@ impl Encoder {
             match self.context.send_frame(Some(&frame)) {
                 Ok(()) => break,
                 Err(rsmpeg::error::RsmpegError::SendFrameAgainError) => {
+                    tracing::debug!("send_ready_frame EAGAIN error!");
                     self.drain_encoder_packets()?;
                 }
-                Err(e) => return Err(RsmediaError::from(e)),
+                Err(e) => return Err(RsmediaError::FFmpeg(e)),
             }
         }
         Ok(())
@@ -1385,7 +1389,7 @@ impl Encoder {
                 Ok(pkt) => self.pending_packets.push_back(pkt),
                 Err(rsmpeg::error::RsmpegError::EncoderDrainError) => break,
                 Err(rsmpeg::error::RsmpegError::EncoderFlushedError) => break,
-                Err(e) => return Err(RsmediaError::from(e)),
+                Err(e) => return Err(RsmediaError::FFmpeg(e)),
             }
         }
         Ok(())
@@ -1594,15 +1598,15 @@ impl Encoder {
                 // （已送出 EOS）。这里**不能**改状态——read 阶段同样会走到这里，
                 // 置成 `Drained` 会让 `is_drained()` 在流中段就永久为真
                 // （见 `Encoder::state` 的说明）。
-                log::debug!("Encoder drained, try send new frame again.");
+                tracing::debug!("Encoder drained, try send new frame again.");
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::EncoderFlushedError) => {
-                log::debug!("Encoder flushed, EOF reached.");
+                tracing::debug!("Encoder flushed, EOF reached.");
                 self.state = CodecContextState::Flushed;
                 Ok(None)
             }
-            Err(err) => Err(RsmediaError::from(err)),
+            Err(err) => Err(RsmediaError::FFmpeg(err)),
         }
     }
 
@@ -1620,9 +1624,10 @@ impl Encoder {
     ///
     /// # Returns
     ///
-    /// `Ok(Some(out))` with every flushed packet's output folded together, so a
-    /// byte-sink writer sees its tail bytes too; `Ok(None)` when nothing was
-    /// written (a subtitle stream, or a writer whose `Out` is `()`).
+    /// An accumulator (`W::Accum`) holding every flushed packet's output merged
+    /// via [`Writer::merge_out`], so a buffering writer sees its tail bytes too;
+    /// an empty accumulator when nothing was written (a subtitle stream, or a
+    /// writer whose output carries no data).
     /// May return an error if writing fails or encoder returns an error.
     pub fn flush<W: Writer>(
         &mut self,
@@ -1630,13 +1635,13 @@ impl Encoder {
         interleaved: bool,
         index: usize,
         out_stream_time_base: ffi::AVRational,
-    ) -> Result<Option<W::Out>> {
+    ) -> Result<W::Accum> {
         // 已经 flush 过就幂等返回：EOS 只能送一次，重复送会拿到 FFmpeg 的
         // `EncoderFlushedError`。`Muxer::finish` 每个流都会调用本方法，而它自己
         // 承诺可重复调用，所以第二次必须是 no-op 而不是错误。
         if self.state != CodecContextState::Normal {
-            log::debug!("Encoder already flushed ({:?}), nothing to do.", self.state);
-            return Ok(None);
+            tracing::debug!("Encoder already flushed ({:?}), nothing to do.", self.state);
+            return Ok(W::Accum::default());
         }
 
         // 字幕编码器走同步 API（avcodec_encode_subtitle），无内部缓冲，
@@ -1645,7 +1650,7 @@ impl Encoder {
         // "未 flush" 告警只应针对真的丢了缓冲的编码器。
         if self.media_type == MediaType::SUBTITLE {
             self.state = CodecContextState::Flushed;
-            return Ok(None);
+            return Ok(W::Accum::default());
         }
 
         if let Some(filter) = self.filter_graph.as_mut() {
@@ -1670,7 +1675,7 @@ impl Encoder {
         // EOF 已发送，理论上编码器最终会返回 EOF；但为防御个别编码器在 EOS 后
         // 持续返回 EAGAIN（Drained）而不返回 EOF，增加迭代上限，避免死循环。
         let mut drained_iterations = 0usize;
-        let mut flushed_output: Option<W::Out> = None;
+        let mut flushed_output = W::Accum::default();
         loop {
             match self.receive_packet() {
                 Ok(Some(mut packet)) => {
@@ -1691,26 +1696,26 @@ impl Encoder {
                     } else {
                         writer.write_frame(&mut packet)?
                     };
-                    W::fold_out(&mut flushed_output, out);
+                    W::merge_out(&mut flushed_output, out);
                 }
                 Ok(None) => {
                     if self.is_drained() {
-                        log::debug!("Encoder drained, try send new frame again.");
+                        tracing::debug!("Encoder drained, try send new frame again.");
                         drained_iterations += 1;
                         if drained_iterations > crate::MAX_DRAIN_ITERATIONS {
-                            log::error!(
+                            tracing::error!(
                                 "Encoder keeps returning EAGAIN after EOF, aborting flush."
                             );
                             break;
                         }
                         continue;
                     } else {
-                        log::debug!("Encoder flushed, EOF reached.");
+                        tracing::debug!("Encoder flushed, EOF reached.");
                         break;
                     }
                 }
                 Err(e) => {
-                    log::debug!("Encode packet error: {e}");
+                    tracing::debug!("Encode packet error: {e}");
                     break;
                 }
             }
@@ -1729,7 +1734,7 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         //! let _ = self.flush();
         if !self.is_flushed() {
-            log::error!("Encoder dropped without flushing, data may be lost.");
+            tracing::error!("Encoder dropped without flushing, data may be lost.");
         }
     }
 }
@@ -1749,7 +1754,7 @@ mod tests {
     // 核心方法单元测试
     //
     // 只覆盖编码器自身的决策逻辑 —— 格式协商、时间基/码率推导、pts 自动编号、
-    // 帧校验、builder 选项落点 —— 不落盘、不做编解码往返，因此不需要 ndarray，
+    // 帧校验、builder 选项落点 —— 不落盘、不做编解码往返，因此不需要 `MediaFrame`，
     // 也不依赖任何测试媒体文件。
     //
     // 需要真实文件的端到端功能测试（容器矩阵 / 编解码往返 / 滤镜 / 转码 /

@@ -16,7 +16,7 @@ use std::sync::Arc;
 /// The sw / hw frames conversion process includes the following steps:
 ///
 /// CPU(NV12) -> GPU(CUDA) -> transform -> GPU(CUDA) -> CPU(NV12)
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct HWDeviceConfig {
     pub device_type: HWDeviceType,
     pub hw_pixel_format: PixelFormat,
@@ -166,13 +166,13 @@ fn prune_hw_ctx_cache(keep: &HWDeviceConfig) {
         }
     });
     if HW_CTX_CACHE.len() > HW_CTX_CACHE_MAX_ENTRIES {
-        log::warn!(
+        tracing::warn!(
             "HW context cache still holds {} entries (> {HW_CTX_CACHE_MAX_ENTRIES}) \
              after pruning {removed}: all in use, will shrink once released.",
             HW_CTX_CACHE.len()
         );
     } else if removed > 0 {
-        log::debug!("Pruned {removed} unused hardware device context(s) (cache over cap).");
+        tracing::debug!("Pruned {removed} unused hardware device context(s) (cache over cap).");
     }
 }
 
@@ -200,7 +200,7 @@ pub(crate) fn clear_hw_ctx_cache() -> usize {
         }
     });
     if removed > 0 {
-        log::debug!("Cleared {removed} unused hardware device context(s).");
+        tracing::debug!("Cleared {removed} unused hardware device context(s).");
     }
     removed
 }
@@ -225,7 +225,7 @@ impl HWContext {
     pub(crate) fn new(config: HWDeviceConfig) -> Result<Arc<HWContext>> {
         // Try to get existing context from cache (lock-free read)
         if let Some(ctx) = HW_CTX_CACHE.get(&config) {
-            log::debug!("Reusing existing hardware device context. config:{config:?}");
+            tracing::debug!("Reusing existing hardware device context. config:{config:?}");
             return Ok(ctx.clone());
         }
 
@@ -242,7 +242,7 @@ impl HWContext {
             .context("Failed to create hardware device context")?
         };
 
-        log::debug!("Created hardware device context successfully. config:{config}");
+        tracing::debug!("Created hardware device context successfully. config:{config}");
 
         let ctx = Arc::new(Self {
             config: config.clone(),
@@ -382,7 +382,7 @@ impl HWContext {
         // 复制帧属性
         self.copy_frame_props(hw_frame, &mut sw_frame)?;
 
-        log::debug!(
+        tracing::debug!(
             "Downloaded from GPU: format={:?}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
             PixelFormat::from(sw_frame.format),
             sw_frame.width,
@@ -448,7 +448,7 @@ impl HWContext {
         // 复制帧属性
         self.copy_frame_props(sw_frame, &mut hw_frame)?;
 
-        log::debug!(
+        tracing::debug!(
             "Uploaded to GPU: format={:?}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
             PixelFormat::from(hw_frame.format),
             hw_frame.width,
@@ -494,7 +494,7 @@ impl HWContext {
     pub(crate) fn is_hw_frame(&self, frame: &AVFrame) -> bool {
         // 检查硬件帧上下文是否为空
         if frame.hw_frames_ctx.is_null() {
-            log::debug!("Frame hardware context is null");
+            tracing::debug!("Frame hardware context is null");
             return false;
         }
 
@@ -638,7 +638,7 @@ impl HWDeviceType {
                     std::env::consts::OS
                 ))
             })?;
-        log::info!("Auto-selected hardware device: {device:?}");
+        tracing::info!("Auto-selected hardware device: {device:?}");
         Ok(HWDeviceConfig::new(
             device,
             device.default_hw_pixel_format(),

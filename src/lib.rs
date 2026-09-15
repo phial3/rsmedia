@@ -7,18 +7,15 @@ mod macros;
 /// 回 EAGAIN 而不报 EOF；没有上限就是挂死（`Drop` 里更不能卡住），故统一收尾。
 pub(crate) const MAX_DRAIN_ITERATIONS: usize = 1_000;
 
-pub mod decode;
-pub mod encode;
-#[cfg(feature = "ndarray")]
-pub mod frame;
-#[cfg(feature = "ndarray")]
-pub use frame::{ElementType, FrameData, FrameSideData, MediaFrame};
 pub mod bsf;
 pub mod codec;
 pub mod colors;
+pub mod decode;
+pub mod encode;
 pub mod error;
 pub mod filter;
 pub mod fmt;
+pub mod frame;
 pub mod hwaccel;
 pub mod imgutils;
 pub mod init;
@@ -39,13 +36,14 @@ pub mod time;
 pub use bsf::Bsf;
 pub use codec::{CodecConfig, FormatInfo, Profile};
 pub use colors::Color;
-pub use decode::{Decoder, DecoderBuilder, thumbnail};
+pub use decode::{Decoder, DecoderBuilder};
 pub use encode::{Encoder, EncoderBuilder};
 pub use error::{Result, RsmediaError};
 pub use filter::Filter;
 pub use fmt::{DataLayout, FrameFormat, SampleFormat};
+pub use frame::{ElementType, FrameData, FrameSideData, MediaFrame};
 pub use hwaccel::{HWDeviceConfig, HWDeviceType};
-pub use init::init;
+pub use init::{AVLogFlag, AVLogLevel, init, init_with, init_with_level};
 pub use io::{AVSeekFlag, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
@@ -59,6 +57,9 @@ pub use scale::{ScaleAlgorithm, ScaleQuality, Scaler};
 pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
 pub use time::Time;
+
+#[cfg(feature = "image")]
+pub use imgutils::thumbnail;
 
 pub use rsmpeg::avutil;
 
