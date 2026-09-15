@@ -1089,7 +1089,6 @@ impl Decoder {
                 //   否则会使后续 drain_raw 误判已进入 draining 而跳过 EOS 发送（见 drain_raw）。
                 // - drain 阶段：Drained 已在 drain_raw 中置位，这里保持即可。
                 tracing::debug!("Decoder drained. try send new packet again.");
-                // self.state = DecoderState::Drained;
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::DecoderFlushedError) => {
