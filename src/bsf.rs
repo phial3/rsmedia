@@ -102,7 +102,9 @@ impl Bsf {
     }
 
     /// 送入一个输入包。EOF 后（[`Self::flush_packets`] 之后）再送入会报错。
-    pub fn send_packet(&mut self, packet: &mut AVPacket) -> Result<()> {
+    ///
+    /// 低层步骤：外部入口是 [`Self::filter_packet`]（送入并抽干，一次完成）。
+    fn send_packet(&mut self, packet: &mut AVPacket) -> Result<()> {
         match self.inner.send_packet(Some(packet)) {
             Ok(()) => Ok(()),
             Err(RsmpegError::BitstreamFullError) => Err(RsmediaError::msg(
@@ -152,8 +154,14 @@ impl Bsf {
             match self.inner.receive_packet(holder) {
                 Ok(()) => {
                     let mut owned = AVPacket::new();
-                    unsafe {
-                        ffi::av_packet_ref(owned.as_mut_ptr(), holder.as_ptr());
+                    // SAFETY: `holder` was filled in by `receive_packet` above.
+                    // `av_packet_ref` can still fail (OOM); ignoring that would
+                    // push an empty packet downstream as if it were real data.
+                    let ret = unsafe { ffi::av_packet_ref(owned.as_mut_ptr(), holder.as_ptr()) };
+                    if ret < 0 {
+                        return Err(RsmediaError::msg(format!(
+                            "av_packet_ref failed while draining the bitstream filter: {ret}"
+                        )));
                     }
                     out.push(owned);
                 }

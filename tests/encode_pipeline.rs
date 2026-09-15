@@ -518,7 +518,7 @@ mod video {
         // 显式指定编码器不支持的像素格式：build() 应 fail fast
         let result = EncoderBuilder::new_video(width, height)
             .with_codec_name("mjpeg".to_string())
-            .with_pixel_format(PixelFormat::RGB24)
+            .with_pix_fmt(PixelFormat::RGB24)
             .build();
         assert!(
             result.is_err(),
@@ -1380,7 +1380,7 @@ mod audio {
             .with_nb_channels(channels as i32)
             .with_sample_rate(sample_rate as i32)
             .with_codec_name("pcm_s16le".to_string())
-            .with_sample_format(SampleFormat::FLTP)
+            .with_sample_fmt(SampleFormat::FLTP)
             .build();
         assert!(
             result.is_err(),

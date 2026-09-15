@@ -116,7 +116,7 @@ fn main() -> Result<()> {
 
 /// 把处理后的帧另存为 PNG（RGB 转换后再写）。
 fn save_frame(frame: &MediaFrame<u8>, index: usize) -> Result<()> {
-    let rgb = frame.convert_yuv_to_rgb()?;
+    let rgb = frame.convert_yuv420p_to_rgb24()?;
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(
         frame.width as u32,
         frame.height as u32,

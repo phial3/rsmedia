@@ -208,7 +208,7 @@ impl DecoderBuilder {
 
     /// 校验像素格式能否以数据平面承载（非位流/调色板/硬件格式）。
     fn ensure_pix_fmt_storable(fmt: PixelFormat) -> Result<()> {
-        if !fmt.has_data_layout() {
+        if !fmt.is_plane_storable() {
             return Err(RsmediaError::msg(format!(
                 "Unsupported output pixel format: {fmt:?}; it cannot be stored as sample planes \
                  (bitstream, paletted and hardware formats are not supported)"
@@ -274,15 +274,12 @@ impl DecoderBuilder {
                 "stream: {stream_index} not found!"
             )))?;
 
-        let codec = {
-            let codec_name = if let Some(ref codec_name) = self.codec_name {
-                codec_name.as_str()
-            } else {
-                codec_name.as_str()
-            };
-            AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name))
-                .context(format!("Failed to find decoder by name: '{codec_name}'"))?
-        };
+        // 优先用调用方指定的解码器名，否则用流自带的名字（`find_best_stream`
+        // 的返回值）。这两个名字来自不同来源，不要写在同名绑定里——那样两个分支
+        // 看起来一模一样，实际解析到不同的变量。
+        let codec_name = self.codec_name.as_deref().unwrap_or(&codec_name);
+        let codec = AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name))
+            .context(format!("Failed to find decoder by name: '{codec_name}'"))?;
 
         let duration = Time::new(Some(input_stream.duration), input_stream.time_base);
         let nb_frames = input_stream.nb_frames;
@@ -423,7 +420,12 @@ impl DecoderBuilder {
                 .init(&filter_params, filters.as_slice())
                 .context("Failed to initialize filter graph")?;
 
-            Some(graph)
+            // 参数随图一起留下：重启流水线时必须重建一张新图。
+            Some(DecodeFilterChain {
+                graph,
+                params: filter_params,
+                filters,
+            })
         } else {
             None
         };
@@ -447,6 +449,18 @@ impl DecoderBuilder {
     }
 }
 
+/// The decode pipeline's filter graph **together with what it was built from**.
+///
+/// The graph and its inputs are one unit on purpose: the pipeline can only be
+/// restarted by rebuilding the graph (see `FilterGraph::rebuild`), which needs
+/// those exact parameters, so keeping them apart would let them drift. The same
+/// reasoning as `CodecContextState`: one fact, one place.
+struct DecodeFilterChain {
+    graph: FilterGraph,
+    params: FilterParams,
+    filters: Vec<Filter>,
+}
+
 /// Decode video files and streams.
 ///
 /// # Example
@@ -460,7 +474,7 @@ impl DecoderBuilder {
 /// ```
 pub struct Decoder {
     context: AVCodecContext,
-    filter_graph: Option<FilterGraph>,
+    filter_graph: Option<DecodeFilterChain>,
     hw_context: Option<Arc<HWContext>>,
     /// (r_frame_rate, avg_frame_rate)
     frame_rate: (f32, f32),
@@ -523,9 +537,15 @@ impl Decoder {
         self.context.height
     }
 
+    /// The pixel format of the frames this decoder **yields**.
+    ///
+    /// With [`DecoderBuilder::with_pix_fmt`] that is the configured output format
+    /// (decoding converts to it); without it, video still comes out as
+    /// [`PixelFormat::YUV420P`]. The codec's own internal format is not what this
+    /// reports — read it from the container's stream parameters if needed.
     #[inline]
     pub fn pix_fmt(&self) -> PixelFormat {
-        self.context.pix_fmt.into()
+        self.output_pix_fmt
     }
 
     #[inline]
@@ -533,9 +553,17 @@ impl Decoder {
         self.context.sample_rate
     }
 
+    /// The sample format of the frames this decoder **yields**, which is the
+    /// element type `T` [`decode`](Self::decode) must be called with.
+    ///
+    /// Audio keeps the codec's native format unless
+    /// [`DecoderBuilder::with_sample_fmt`] unifies the output, in which case this
+    /// reports that target format — so the value always matches the frames that
+    /// actually arrive.
     #[inline]
     pub fn sample_fmt(&self) -> SampleFormat {
-        SampleFormat::from(self.context.sample_fmt)
+        self.output_sample_fmt
+            .unwrap_or_else(|| SampleFormat::from(self.context.sample_fmt))
     }
 
     #[inline]
@@ -555,22 +583,20 @@ impl Decoder {
         self.duration.time_base
     }
 
-    /// Get the decoders input stream number of frames
+    /// Number of frames in the input stream (`AVStream.nb_frames`).
+    ///
+    /// `0` when the container does not state a count.
     #[inline(always)]
-    pub fn frames(&self) -> i64 {
+    pub fn nb_frames(&self) -> i64 {
         self.nb_frames
     }
 
-    /// Get the decoders input frame rate
+    /// The input stream's frame rates, as `(r_frame_rate, avg_frame_rate)`.
     ///
-    /// # Return
-    /// A tuple of the frame rate of float values
-    ///
-    /// `0`: r_frame_rate
-    /// `1`: avg_frame_rate
-    ///
+    /// Two rates, not one: `r_frame_rate` is the lowest rate that can represent
+    /// all timestamps exactly, `avg_frame_rate` the average over the stream.
     #[inline(always)]
-    pub fn frame_rate(&self) -> (f32, f32) {
+    pub fn frame_rates(&self) -> (f32, f32) {
         self.frame_rate
     }
 
@@ -589,18 +615,27 @@ impl Decoder {
         self.state == CodecContextState::Drained
     }
 
+    /// Whether the decoder itself has reached EOF.
+    ///
+    /// This is **not** the "may I stop?" predicate: with a filter graph attached
+    /// the graph may still hold buffered frames after the decoder is done (a
+    /// delayed filter such as `framerate`), so stopping here would drop them. Use
+    /// [`is_finished`](Self::is_finished) for that.
     pub fn is_flushed(&self) -> bool {
         self.state == CodecContextState::Flushed
     }
 
-    /// 解码器是否已完全结束：解码器到达 EOF，且 filter（如有）内部缓冲帧也已全部
-    /// 冲刷完毕。仅当二者都满足时，才禁止继续调用 `decode`/`decode_raw`。否则
-    /// （解码器已 Flushed 但 filter 仍有多余缓冲帧待冲刷，如延迟滤镜 `framerate`），
-    /// 仍需允许继续调用以取回剩余帧，否则会丢帧或报"cannot decode after flushed"。
-    fn is_complete(&self) -> bool {
+    /// Whether the decode pipeline is fully done: the decoder reached EOF **and**
+    /// the filter graph (when present) has flushed its buffered frames.
+    ///
+    /// This is the predicate a caller loop should stop on. Stopping at
+    /// [`is_flushed`](Self::is_flushed) instead would cut off frames a delayed
+    /// filter still has to emit; calling `decode`/`decode_raw` after *this* is
+    /// true is what returns "cannot decode after flushed".
+    pub fn is_finished(&self) -> bool {
         self.is_flushed()
             && match &self.filter_graph {
-                Some(graph) => graph.is_flushed(),
+                Some(chain) => chain.graph.is_flushed(),
                 None => true,
             }
     }
@@ -723,7 +758,7 @@ impl Decoder {
             )));
         }
         if self.is_flushed() {
-            return Err(RsmediaError::msg(
+            return Err(RsmediaError::invalid_config(
                 "Decoder cannot decode after flushed. Call reset().",
             ));
         }
@@ -766,14 +801,14 @@ impl Decoder {
         }
     }
 
-    /// Decode a [`Packet`].
+    /// Decode one [`AVPacket`].
     ///
     /// Feeds the packet to the decoder and returns a frame if there is one available. The caller
     /// should keep feeding packets until the decoder returns a frame.
     ///
     /// # Return value
     ///
-    /// A tuple of the [`Frame`] and timestamp (relative to the stream) and the frame itself if the
+    /// A tuple of the [`AVFrame`] and timestamp (relative to the stream) and the frame itself if the
     /// decoder has a frame available, [`None`] if not.
     #[cfg(feature = "ndarray")]
     pub fn decode_packet<T>(&mut self, packet: &AVPacket) -> Result<Option<MediaFrame<T>>>
@@ -781,37 +816,46 @@ impl Decoder {
         T: ElementType,
     {
         match self.decode_raw_packet(packet) {
-            Ok(Some(raw_frame)) => Ok(Some(self.raw_frame_to_media_frame(raw_frame)?)),
+            Ok(Some(raw_frame)) => Ok(Some(MediaFrame::<T>::from_avframe(&raw_frame)?)),
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// Decode a [`Packet`].
+    /// Decode one [`AVPacket`].
     ///
     /// Feeds the packet to the decoder and returns a frame if there is one available. The caller
     /// should keep feeding packets until the decoder returns a frame.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if in draining mode.
+    /// Returns an error once the decoder has been flushed (`reset` is required before
+    /// decoding again) or when the decoder itself fails.
     ///
     /// # Return value
     ///
     /// The decoded raw frame as [`AVFrame`] if the decoder has a frame available, [`None`] if not.
     pub fn decode_raw_packet(&mut self, packet: &AVPacket) -> Result<Option<AVFrame>> {
+        // 与 `decode`/`decode_raw` 同一阶段守卫：解码器 flush 之后再送包，FFmpeg
+        // 只会回一句 "Decoder is already flushed"，调用方看不出该怎么办。
+        if self.is_finished() {
+            return Err(RsmediaError::invalid_config(
+                "Decoder cannot decode after flushed. Call reset().",
+            ));
+        }
         self.send_packet_to_decoder(Some(packet))?;
-        self.receive_frame_from_decoder()
+        self.receive_normalized_frame()
     }
 
     /// Drain one frame from the decoder.
     ///
-    /// After calling drain once the decoder is in draining mode and the caller may not use normal
-    /// decode anymore, or it will panic.
+    /// The first call sends end-of-stream and puts the decoder in draining mode;
+    /// afterwards the normal decode path returns an error until
+    /// [`reset`](Self::reset) is called.
     ///
     /// # Return value
     ///
-    /// A tuple of the [`Frame`] and timestamp (relative to the stream) and the frame itself if the
+    /// A tuple of the [`AVFrame`] and timestamp (relative to the stream) and the frame itself if the
     /// decoder has a frame available, [`None`] if not.
     #[cfg(feature = "ndarray")]
     pub fn drain<T>(&mut self) -> Result<Option<MediaFrame<T>>>
@@ -819,25 +863,17 @@ impl Decoder {
         T: ElementType,
     {
         match self.drain_raw() {
-            Ok(Some(raw_frame)) => Ok(Some(self.raw_frame_to_media_frame(raw_frame)?)),
+            Ok(Some(raw_frame)) => Ok(Some(MediaFrame::<T>::from_avframe(&raw_frame)?)),
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    #[cfg(feature = "ndarray")]
-    fn raw_frame_to_media_frame<T>(&self, frame: AVFrame) -> Result<MediaFrame<T>>
-    where
-        T: ElementType,
-    {
-        // Video Frame: YUV420P 专用分支 + packed 8bit 格式（GRAY8/YUYV422/UYVY422/RGB24/BGR24/RGBA/BGRA/ARGB/ABGR）
-        MediaFrame::<T>::from_avframe(&frame)
-    }
-
     /// Drain one frame from the decoder.
     ///
-    /// After calling drain once the decoder is in draining mode and the caller may not use normal
-    /// decode anymore, or it will panic.
+    /// The first call sends end-of-stream and puts the decoder in draining mode;
+    /// afterwards the normal decode path returns an error until
+    /// [`reset`](Self::reset) is called.
     ///
     /// # Return value
     ///
@@ -853,23 +889,59 @@ impl Decoder {
             // 而非 read 阶段缺包，因此在此处显式置位。
             self.state = CodecContextState::Drained;
         }
-        self.receive_frame_from_decoder()
+        self.receive_normalized_frame()
     }
 
-    /// Reset the decoder to be used again after draining.
-    pub fn reset(&mut self) {
-        self.flush();
-        self.state = CodecContextState::Normal;
-    }
-
-    /// Flush the decoder's internal decoding buffers.
+    /// Restarts the whole decode pipeline so the decoder can be used again after
+    /// draining (or after a seek).
     ///
-    /// Called after a seek so the decoder discards stale buffered frames and
-    /// starts cleanly from the newly positioned point.
-    pub fn flush(&mut self) {
+    /// This is [`flush_buffers`](Self::flush_buffers) — codec buffers *and* the
+    /// filter graph — plus the phase reset. Restoring only the codec would leave a
+    /// filtered decoder in a state that reports "ready" while every frame is
+    /// rejected by the graph.
+    pub fn reset(&mut self) -> Result<()> {
+        self.flush_buffers()?;
+        self.state = CodecContextState::Normal;
+        Ok(())
+    }
+
+    /// Discards the decoder's buffered frames and resets it to a clean state.
+    ///
+    /// This is `avcodec_flush_buffers`: after a seek the decoder still holds
+    /// frames from the old position, and this drops them so decoding restarts at
+    /// the new one. It is deliberately **not** named `flush` — on an
+    /// [`Encoder`](crate::encode::Encoder), `flush` *drains* everything that is
+    /// still buffered towards the writer, the opposite direction.
+    ///
+    /// The filter graph is part of the pipeline and holds frames of its own
+    /// (a delay filter such as `fps` keeps one, and anything queued behind it
+    /// stays inside the graph). `avcodec_flush_buffers` knows nothing about it, so
+    /// this rebuilds the graph as well; without that, frames from **before** the
+    /// seek would be emitted after it.
+    pub fn flush_buffers(&mut self) -> Result<()> {
         unsafe {
             ffi::avcodec_flush_buffers(self.context.as_mut_ptr());
         }
+        self.rebuild_filter_graph()
+    }
+
+    /// Rebuilds the filter graph (if any) so it forgets every buffered frame.
+    ///
+    /// See [`FilterGraph::rebuild`] for why a rebuild is the only way to do this.
+    /// The graph's build parameters were kept at construction for exactly this
+    /// call, so a rebuilt graph is identical to the original one.
+    fn rebuild_filter_graph(&mut self) -> Result<()> {
+        let Some(chain) = self.filter_graph.as_mut() else {
+            return Ok(());
+        };
+        let DecodeFilterChain {
+            graph,
+            params,
+            filters,
+        } = chain;
+        graph
+            .rebuild(params, filters)
+            .context("Failed to rebuild the filter graph")
     }
 
     /// Send packet to decoder.
@@ -881,8 +953,14 @@ impl Decoder {
         Ok(())
     }
 
-    /// Receive packet from decoder. Will handle hwaccel conversions and scaling as well.
-    fn receive_frame_from_decoder(&mut self) -> Result<Option<AVFrame>> {
+    /// Pulls one frame out of the decoder and returns it in a uniform shape.
+    ///
+    /// This is the single place where a decoded frame is normalised, in this
+    /// order: download hardware frames to system memory, convert the video pixel
+    /// format / resize through swscale, convert the audio sample format through
+    /// swresample, and finally run the result through the filter graph (when one
+    /// is configured). Callers above see only the resulting software frame.
+    fn receive_normalized_frame(&mut self) -> Result<Option<AVFrame>> {
         // 1. 从解码器获取原始帧
         let decoded_frame = match self.decoder_receive_frame() {
             Ok(Some(f)) => f,
@@ -897,14 +975,14 @@ impl Decoder {
                 match self.state {
                     CodecContextState::Normal | CodecContextState::Drained => return Ok(None),
                     CodecContextState::Flushed => {
-                        if let Some(graph) = self.filter_graph.as_mut()
-                            && !graph.is_flushed()
+                        if let Some(chain) = self.filter_graph.as_mut()
+                            && !chain.graph.is_flushed()
                         {
-                            match graph.process_frame(None)? {
+                            match chain.graph.process_frame(None)? {
                                 Some(frame) => return Ok(Some(frame)),
                                 None => {
                                     // 已无更多缓冲帧（graph 此时已 Flushed）
-                                    debug_assert!(graph.is_flushed());
+                                    debug_assert!(chain.graph.is_flushed());
                                 }
                             }
                         }
@@ -983,21 +1061,19 @@ impl Decoder {
         };
 
         // 4. 应用 Filter Graph
-        if let Some(graph) = self.filter_graph.as_mut() {
+        if let Some(chain) = self.filter_graph.as_mut() {
             // filter process
-            match graph.process_frame(Some(raw_frame))? {
+            match chain.graph.process_frame(Some(raw_frame))? {
                 Some(filtered_frame) => Ok(Some(filtered_frame)),
+                // `process_frame` 只在把图置为 `Drained`（还要更多输入）或
+                // `Flushed`（EOF）之后才返回 `None`，因此这里没有第三种情况：
+                // 返回 `None` 让外层循环继续驱动解码器，或就此收尾。
                 None => {
-                    if graph.is_drained() {
-                        // Filter graph 当前输入帧未能产生输出帧，需要继续尝试拉取
-                        log::debug!("Filter graph drained, trying again.");
-                        // 在这种情况下，我们应该返回 Ok(None)，让外层循环继续驱动解码器 或 filter graph
-                    } else if graph.is_flushed() {
-                        // Filter graph 当前输入帧未能产生输出帧，已经到达 EOF
-                        log::error!("Filter graph flushed. EOF reached, should not happened.");
-                    } else {
-                        log::warn!("Filter graph did not output a frame.");
-                    }
+                    log::debug!(
+                        "Filter graph produced no frame (drained: {}, flushed: {})",
+                        chain.graph.is_drained(),
+                        chain.graph.is_flushed()
+                    );
                     Ok(None)
                 }
             }
@@ -1047,13 +1123,14 @@ where
     OP: FnMut(&mut Decoder, &AVPacket) -> Result<Option<O>>,
     OD: FnMut(&mut Decoder) -> Result<Option<O>>,
 {
-    if decoder.is_complete() {
-        return Err(RsmediaError::msg(
+    if decoder.is_finished() {
+        return Err(RsmediaError::invalid_config(
             "Decoder cannot decode after flushed. Call reset().",
         ));
     }
 
     let mut read_exhausted = false;
+    let mut drained_iterations = 0usize;
     Ok(loop {
         if !read_exhausted {
             match reader.read_packet() {
@@ -1085,6 +1162,17 @@ where
                     // Flushed（EOF）。若是 Drained 需继续 drain，否则会丢失尾部帧
                     // （多见于含 B 帧的码流）。
                     if decoder.is_drained() {
+                        // 有上限的继续排空：解码器若一直回 EAGAIN 而从不报 EOF，
+                        // 这里必须收尾，否则公开的 decode() 会永远转下去。
+                        if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
+                            log::error!(
+                                "Decoder keeps returning EAGAIN after EOF, giving up after \
+                                 {} iterations",
+                                crate::MAX_DRAIN_ITERATIONS
+                            );
+                            break None;
+                        }
+                        drained_iterations += 1;
                         log::debug!("Decoder drained, keep draining.");
                         continue;
                     }
@@ -1113,8 +1201,8 @@ impl Drop for Decoder {
         }
 
         // 1. Flush Filter Graph if exists.
-        if let Some(graph) = self.filter_graph.as_mut() {
-            match graph.flush() {
+        if let Some(chain) = self.filter_graph.as_mut() {
+            match chain.graph.flush() {
                 Ok(frames) => {
                     if !frames.is_empty() {
                         log::warn!(
@@ -1131,14 +1219,13 @@ impl Drop for Decoder {
         // We need to drain the items still in the decoders queue.
         match self.send_packet_to_decoder(None) {
             Ok(_) => {
-                // 兜底上限：个别解码器可能持续返回 EAGAIN 而迟迟不结束，
-                // 与 encode.rs 的 1_000 保护一致，防止 Drop 排空无限循环。
-                const MAX_DRAIN_ITERATIONS: usize = 1_000;
+                // 兜底上限见 `MAX_DRAIN_ITERATIONS`。
                 let mut iterations = 0usize;
                 loop {
-                    if iterations >= MAX_DRAIN_ITERATIONS {
+                    if iterations >= crate::MAX_DRAIN_ITERATIONS {
                         log::warn!(
-                            "Decoder drain exceeded {MAX_DRAIN_ITERATIONS} iterations, forcing EOF."
+                            "Decoder drain exceeded {} iterations, forcing EOF.",
+                            crate::MAX_DRAIN_ITERATIONS
                         );
                         break;
                     }
@@ -1183,7 +1270,7 @@ unsafe impl Send for Decoder {}
 ///
 /// 内部流程：构建视频解码器（RGB24 输出 + [`Resize::Fit`] 保持纵横比缩放）
 /// → seek 到目标时间 → 解码一帧原始 `AVFrame` → 转为
-/// [`image::DynamicImage`](imgutils::to_dynamic_image)。
+/// [`image::DynamicImage`](crate::imgutils::to_dynamic_image)。
 /// 不依赖 `ndarray` feature，适合生成封面图 / 视频预览等场景。
 ///
 /// # Arguments
@@ -1232,7 +1319,7 @@ pub fn thumbnail(
         if reader.seek_to_timestamp(ts).is_err() {
             log::debug!("seek to {ts}ms failed, decoding from the current position");
         } else {
-            decoder.flush();
+            decoder.flush_buffers()?;
         }
         decoder.decode_raw(&mut reader)?
     }
@@ -1566,6 +1653,164 @@ mod tests {
             decoder.scaler.pool_enabled(),
             "with_scale_pool 应进入 Scaler"
         );
+        Ok(())
+    }
+
+    /// 解码到尾：`is_flushed` 只说解码器自己到 EOF，`is_finished` 才是整条流水线
+    /// （含滤镜图）结束。此后继续解码必须报错，而不是静默返回 `None`。
+    #[test]
+    fn test_decode_reaches_finished_state() -> Result<()> {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+        let mut reader = StreamReader::new(video_path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+
+        let mut decoded = 0usize;
+        while decoder.decode::<u8>(&mut reader)?.is_some() {
+            decoded += 1;
+            assert!(
+                !decoder.is_finished(),
+                "reported finished after {decoded} frames, with more still arriving"
+            );
+        }
+
+        assert!(decoded > 0, "decoded nothing from {}", video_path.display());
+        assert!(decoder.is_flushed(), "EOF must leave the decoder flushed");
+        assert!(
+            decoder.is_finished(),
+            "decoder and its (absent) filter graph must both be finished at EOF"
+        );
+        assert!(
+            decoder.decode::<u8>(&mut reader).is_err(),
+            "decoding after the end must error, not silently return None"
+        );
+
+        // `reset` 之后可以重新解码（用于 seek 后的复用）。
+        decoder.reset()?;
+        assert!(!decoder.is_flushed());
+        assert!(!decoder.is_finished());
+        Ok(())
+    }
+
+    /// 带滤镜图的解码器读到 EOF 之后，`reset()` 必须能把**整条流水线**（解码器
+    /// + 滤镜图）一起复位。
+    ///
+    /// 只复位解码器是不够的：滤镜图没有"回退"，一旦见过 EOF 就永久停在 EOF，
+    /// 之后每一帧提交都会得到 `AVERROR_EOF` —— 而 `is_finished()` 却会报告
+    /// "可以继续"，正是"状态在说谎"。
+    #[test]
+    fn test_reset_restarts_the_filtered_pipeline() -> Result<()> {
+        let path = std::path::Path::new("assets/mp4.mp4");
+
+        let mut reader = StreamReader::new(path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_filters(vec![crate::filter::video::fps(10.0)])
+            .build_from_reader(&reader)?;
+
+        let mut first_pass = 0usize;
+        while decoder.decode::<u8>(&mut reader)?.is_some() {
+            first_pass += 1;
+        }
+        assert!(first_pass > 0, "the filtered decode produced nothing");
+        assert!(decoder.is_finished(), "EOF must finish the whole pipeline");
+
+        decoder.reset()?;
+        assert!(!decoder.is_flushed() && !decoder.is_finished());
+
+        // 重新读同一个文件：必须能正常出帧，而不是 AVERROR_EOF。
+        let mut reader = StreamReader::new(path)?;
+        let mut second_pass = 0usize;
+        while decoder.decode::<u8>(&mut reader)?.is_some() {
+            second_pass += 1;
+        }
+        assert_eq!(
+            second_pass, first_pass,
+            "a restarted pipeline must decode the same stream again"
+        );
+        Ok(())
+    }
+
+    /// `flush_buffers()`（seek 后使用）必须把**滤镜图里**的缓冲帧一起丢掉。
+    ///
+    /// `avcodec_flush_buffers` 只管编解码器；带缓冲的滤镜（如 `fps`）会把 seek
+    /// 之前的帧留在图里，下一次解码就会把它们当新帧吐出来 —— 于是"seek 到 2s"
+    /// 之后拿到的是 0.5s 的画面。这里用一个 GOP 已知的自造文件验证。
+    #[test]
+    fn test_flush_buffers_drops_frames_buffered_by_the_filter_graph() -> Result<()> {
+        const FPS: f64 = 25.0;
+        const FILTER_FPS: f64 = 10.0;
+        const FRAMES: i64 = 100;
+        let path = crate::test_support::test_output_path("decode", "test_flush_filter.mp4");
+
+        {
+            let mut muxer = crate::Muxer::new(&path)?;
+            let encoder = crate::EncoderBuilder::new_video(64, 64)
+                .with_fps(FPS as f32)
+                .with_gop_size(10)
+                .build()?;
+            let index = muxer.add_encoder(encoder)?;
+            for frame_index in 0..FRAMES {
+                let mut frame = AVFrame::new();
+                frame.set_width(64);
+                frame.set_height(64);
+                frame.set_format(i32::from(PixelFormat::YUV420P));
+                frame
+                    .alloc_buffer()
+                    .context("Failed to allocate frame buffer")?;
+                frame.set_pts(frame_index);
+                muxer.mux(frame, index)?;
+            }
+            muxer.finish()?;
+        }
+
+        let mut reader = StreamReader::new(&path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_filters(vec![crate::filter::video::fps(FILTER_FPS as f32)])
+            .build_from_reader(&reader)?;
+
+        // 从头解几帧，让滤镜图里真正开始有缓冲
+        for _ in 0..5 {
+            let _ = decoder.decode_raw(&mut reader)?;
+        }
+
+        reader.seek_to_timestamp(2_000)?;
+        decoder.flush_buffers()?;
+
+        let first = decoder
+            .decode_raw(&mut reader)?
+            .ok_or_else(|| RsmediaError::msg("no frame decoded after the seek"))?;
+        // 滤镜图输出帧的 pts 以 `1/fps` 为时间基（解码器不填 AVFrame.time_base），
+        // 所以 seek 到 2.0s 之后的第一帧应该是 2.0 * 10 = 20。缓冲帧泄漏时会退回
+        // 到 seek 前的位置（约 0.5s，即 pts≈5）。
+        let seek_pts = (2.0 * FILTER_FPS) as i64;
+        assert!(
+            first.pts >= seek_pts - 1,
+            "the first frame after seeking to 2s is at graph pts {} (expected ~{seek_pts}): \
+             the filter graph is still holding pre-seek frames",
+            first.pts
+        );
+
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// flush 之后再走低层入口（`decode_raw_packet`）也要拿到同一个清晰的错误。
+    #[test]
+    fn test_decode_raw_packet_rejects_a_finished_decoder() -> Result<()> {
+        let path = std::path::Path::new("assets/mp4.mp4");
+        let mut reader = StreamReader::new(path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        while decoder.decode_raw(&mut reader)?.is_some() {}
+        assert!(decoder.is_finished());
+
+        let mut source = StreamReader::new(path)?;
+        if let Some((_index, packet)) = source.read_packet()? {
+            let err = match decoder.decode_raw_packet(&packet) {
+                Ok(_) => panic!("a finished decoder must reject a packet"),
+                Err(e) => e,
+            };
+            assert!(err.is_invalid_config(), "{err}");
+            assert!(err.to_string().contains("reset()"), "{err}");
+        }
         Ok(())
     }
 }

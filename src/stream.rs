@@ -13,8 +13,10 @@ use rsmpeg::ffi;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 
-// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值，
-// 未知/版本差异的 `AVMEDIA_TYPE_*` 回退为 `UNKNOWN`（而非 panic）。
+// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值。
+// 未列出的值走 `fallback`（此处为 panic，fail fast），需要"报告而非中止"时用
+// 宏另外生成的 `from_ffi_checked`（见本文件 `StreamInfo::from_stream` 对
+// 未知像素格式的处理）。
 // 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）——
 // 挂在宏调用外部的 doc 注释 rustdoc 不认，会触发 unused_doc_comments 警告。
 ffi_enum_wrap_from!(
@@ -154,8 +156,8 @@ pub struct StreamInfo {
     pub extra_data: Option<Vec<u8>>,
     pub metadata: Metadata,
     /// **owned 快照**：构建本 `StreamInfo` 时通过 `avcodec_parameters_copy`
-    /// 深拷贝得到的 codec 参数，生命周期完全独立于源 reader/writer，可由
-    /// [`Self::into_parts`] 取出透传给 mux。
+    /// 深拷贝得到的 codec 参数，生命周期完全独立于源 reader/writer，透传
+    /// （copy/remux）时直接交给 muxer 即可。
     ///
     /// rsmpeg 的 [`AVCodecParameters`] 在 `Drop` 时调用
     /// `avcodec_parameters_free` 释放，故不会泄漏，也不存在 use-after-free。
@@ -199,11 +201,35 @@ impl StreamInfo {
         let metadata = stream
             .metadata()
             .map_or_else(Metadata::new, |d| Metadata::from_dict(&d));
-        // 统一格式：视频 → 像素格式，音频 → 采样格式，其他 → NONE 占位
+        // 统一格式：视频 → 像素格式，音频 → 采样格式，其他 → NONE 占位。
+        //
+        // 这里的值来自**任意媒体文件**，因此用 `from_ffi_checked` 而不是会 panic
+        // 的 `From`：本 crate 只收录了常用的像素格式，遇到不认识的（如某个冷门
+        // 分量排布）应退化为 `NONE` 占位并告警 —— `StreamInfo` 提供的是元数据，
+        // 不该因为一个不认识的格式就让整个文件打不开（透传/探测场景尤其如此）。
+        // 真正解码时，`PixelFormat::data_layout` 会再给出明确错误。
         let format = if codec_type.is_video() {
-            FrameFormat::Pixel(PixelFormat::from(codecpar.format))
+            let pix_fmt = PixelFormat::from_ffi_checked(codecpar.format).unwrap_or_else(|| {
+                log::warn!(
+                    "Stream {} has an unsupported pixel format {} ({}); reporting it as unknown",
+                    stream.index,
+                    codecpar.format,
+                    PixelFormat::from(codecpar.format).get_pix_fmt_name()
+                );
+                PixelFormat::NONE
+            });
+            FrameFormat::Pixel(pix_fmt)
         } else if codec_type.is_audio() {
-            FrameFormat::Sample(SampleFormat::from(codecpar.format))
+            FrameFormat::Sample(
+                SampleFormat::from_ffi_checked(codecpar.format).unwrap_or_else(|| {
+                    log::warn!(
+                        "Stream {} has an unsupported sample format {}; reporting it as unknown",
+                        stream.index,
+                        codecpar.format
+                    );
+                    SampleFormat::NONE
+                }),
+            )
         } else {
             FrameFormat::Pixel(PixelFormat::NONE)
         };
@@ -212,13 +238,12 @@ impl StreamInfo {
 
         // A video stream may legitimately carry no pixel format at all — a bare
         // elementary stream such as `.h264` reports `AV_PIX_FMT_NONE`, which has
-        // no descriptor. That is the same "unknown but valid" placeholder the
-        // `format` computation above already accepts, so the derived bit counts
+        // no descriptor. `format` above already degraded such a value (and any
+        // format this crate does not list) to `NONE`, so the derived bit counts
         // degrade to 0 instead of the stream failing to open.
-        let pix_fmt_desc = if codec_type.is_video() {
-            PixelFormat::from(codecpar.format).descriptor().ok()
-        } else {
-            None
+        let pix_fmt_desc = match format {
+            FrameFormat::Pixel(pix_fmt) => pix_fmt.descriptor().ok(),
+            FrameFormat::Sample(_) => None,
         };
 
         let (bits_per_sample, exact_bits_per_sample, bits_per_pixel, padded_bits_per_pixel) = unsafe {
@@ -243,7 +268,15 @@ impl StreamInfo {
         Ok(Self {
             id: stream.id,
             index: stream.index as usize,
-            media_type: MediaType::from(codecpar.codec_type),
+            // 同样来自外部数据：未列出的媒体类型退化为 `UNKNOWN` 而不是 panic。
+            media_type: MediaType::from_ffi_checked(codecpar.codec_type).unwrap_or_else(|| {
+                log::warn!(
+                    "Stream {} has an unsupported media type {}; reporting it as unknown",
+                    stream.index,
+                    codecpar.codec_type
+                );
+                MediaType::UNKNOWN
+            }),
             #[allow(clippy::unnecessary_cast)]
             codec_id: codecpar.codec_id as u32,
             codec_tag: codecpar.codec_tag,
@@ -387,14 +420,6 @@ impl StreamInfo {
     ///
     /// # Return value
     ///
-    /// A tuple consisting of:
-    /// * The stream index.
-    /// * Owned codec parameters snapshot.
-    /// * Original stream time base.
-    pub fn into_parts(self) -> (usize, AVCodecParameters, ffi::AVRational) {
-        (self.index, self.codec_parameters, self.time_base)
-    }
-
     /// find codec name, if have hw_device_type, will use hw accelerated codec name
     /// if not, will use current stream codec name
     ///

@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
 
     // 容器（MP4 的 movenc）可能在 `write_header` 时重设流时间基，因此写包前
     // 实时取一次输出流时间基。
-    let out_stream_time_base = writer.stream_time_base(stream_idx);
+    let out_stream_time_base = writer.stream_time_base(stream_idx)?;
 
     let mut total_bytes = 0u64;
     let mut lost = 0usize;

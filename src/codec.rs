@@ -5,7 +5,6 @@ use crate::strutils;
 #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
 use rsmpeg::avcodec::AVCodecContext;
 use rsmpeg::avcodec::{AVCodec, AVCodecRef};
-use rsmpeg::avformat::{AVInputFormatRef, AVOutputFormatRef};
 use rsmpeg::ffi;
 
 use std::ffi::CStr;
@@ -138,13 +137,16 @@ impl CodecConfig {
         unsafe { ffi::av_codec_is_decoder(self.codec.as_ptr()) != 0 }
     }
 
-    /// for audio codec, check if it supports variable frame size
-    pub fn is_support_variable_frame_size(&self) -> bool {
+    /// `AV_CODEC_CAP_VARIABLE_FRAME_SIZE`: an audio encoder may be handed any
+    /// frame size, rather than multiples of one fixed value.
+    pub fn supports_variable_frame_size(&self) -> bool {
         self.codec.capabilities & ffi::AV_CODEC_CAP_VARIABLE_FRAME_SIZE as i32 != 0
     }
 
-    /// for codec, check if it supports delay
-    pub fn is_support_delayed_frame(&self) -> bool {
+    /// `AV_CODEC_CAP_DELAY`: the codec buffers input and emits packets only
+    /// later, so the encoder must be flushed (and the decoder drained) to get the
+    /// tail out.
+    pub fn supports_delay(&self) -> bool {
         self.codec.capabilities & ffi::AV_CODEC_CAP_DELAY as i32 != 0
     }
 }
@@ -416,25 +418,17 @@ impl FormatInfo {
         }
     }
 
-    fn from_output(outfmt: AVOutputFormatRef<'static>) -> Self {
-        Self::new_info(outfmt.name(), outfmt.long_name(), outfmt.extensions)
-    }
-
-    fn from_input(infmt: AVInputFormatRef<'static>) -> Self {
-        Self::new_info(infmt.name(), infmt.long_name(), infmt.extensions)
-    }
-
     /// All muxers (output container formats) in this FFmpeg build.
     pub fn muxers() -> Vec<Self> {
         rsmpeg::avformat::AVOutputFormat::iterate()
-            .map(Self::from_output)
+            .map(|outfmt| Self::new_info(outfmt.name(), outfmt.long_name(), outfmt.extensions))
             .collect()
     }
 
     /// All demuxers (input container formats) in this FFmpeg build.
     pub fn demuxers() -> Vec<Self> {
         rsmpeg::avformat::AVInputFormat::iterate()
-            .map(Self::from_input)
+            .map(|infmt| Self::new_info(infmt.name(), infmt.long_name(), infmt.extensions))
             .collect()
     }
 

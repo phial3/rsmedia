@@ -170,8 +170,10 @@ impl DataLayout {
     ///
     /// The component axis of an interleaved layout is folded into
     /// `samples_per_row`, which is exactly what a row-wise copy of the plane
-    /// needs.
-    pub fn plane_extent(&self, plane: usize) -> Option<(usize, usize)> {
+    /// needs. Note the difference from [`Self::shapes`], which reports the array
+    /// shape [`FrameData`](crate::frame::FrameData) stores (components kept as a
+    /// separate axis).
+    pub fn plane_row_extent(&self, plane: usize) -> Option<(usize, usize)> {
         match self {
             Self::Interleaved {
                 rows,
@@ -183,8 +185,9 @@ impl DataLayout {
     }
 
     /// The shape of the array [`FrameData`](crate::frame::FrameData) stores plane
-    /// `plane` as.
-    pub fn plane_shape(&self, plane: usize) -> Option<(usize, usize)> {
+    /// `plane` as: the counterpart of [`Self::plane_row_extent`] that keeps the
+    /// component axis separate instead of folding it into the columns.
+    fn plane_shape(&self, plane: usize) -> Option<(usize, usize)> {
         match self {
             Self::Interleaved { rows, cols, .. } => (plane == 0).then_some((*rows, *cols)),
             Self::Planar(planes) => planes.get(plane).copied(),

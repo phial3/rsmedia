@@ -34,9 +34,9 @@ fn main() -> anyhow::Result<()> {
             samples[[y, x, 2]] = 255 - t;
         }
     }
-    let auto = rgb.convert_rgb_to_yuv()?; // SD resolution -> BT.601 (automatic)
-    let bt709 = rgb.convert_rgb_to_yuv_with_matrix(yuv::YuvStandardMatrix::Bt709)?;
-    let bt2020 = rgb.convert_rgb_to_yuv_with_matrix(yuv::YuvStandardMatrix::Bt2020)?;
+    let auto = rgb.convert_rgb24_to_yuv420p()?; // SD resolution -> BT.601 (automatic)
+    let bt709 = rgb.convert_rgb24_to_yuv420p_with_matrix(yuv::YuvStandardMatrix::Bt709)?;
+    let bt2020 = rgb.convert_rgb24_to_yuv420p_with_matrix(yuv::YuvStandardMatrix::Bt2020)?;
     println!("auto   -> {:?}", auto.format());
     println!("BT709  -> {:?}", bt709.format());
     println!("BT2020 -> {:?}", bt2020.format());

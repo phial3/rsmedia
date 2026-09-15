@@ -287,4 +287,39 @@ mod tests {
         let wrapped = err.with_context("outer").with_context("outermost");
         assert_eq!(wrapped.to_string(), "outermost: outer: inner failure");
     }
+
+    /// 每个 `is_*` 谓词都要认出自己的变体，且**穿透 context 链**识别根因——
+    /// 新增变体时这张表会跟着漏掉，所以逐条对着变体列出来。
+    #[test]
+    fn test_is_predicates_track_their_variants() {
+        for (error, test) in [
+            (
+                RsmediaError::format_not_found("nope"),
+                RsmediaError::is_format_not_found as fn(&RsmediaError) -> bool,
+            ),
+            (
+                RsmediaError::codec_not_found("nope"),
+                RsmediaError::is_codec_not_found as fn(&RsmediaError) -> bool,
+            ),
+            (
+                RsmediaError::unsupported("nope"),
+                RsmediaError::is_unsupported as fn(&RsmediaError) -> bool,
+            ),
+            (
+                RsmediaError::invalid_config("nope"),
+                RsmediaError::is_invalid_config as fn(&RsmediaError) -> bool,
+            ),
+        ] {
+            assert!(
+                test(&error),
+                "{error:?} must be recognised by its predicate"
+            );
+            // 加了 context 之后根因仍是同一个，谓词必须继续生效。
+            let wrapped = error.with_context("outer");
+            assert!(
+                test(&wrapped),
+                "context must not hide the root cause: {wrapped:?}"
+            );
+        }
+    }
 }

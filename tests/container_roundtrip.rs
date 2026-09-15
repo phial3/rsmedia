@@ -23,7 +23,6 @@ mod common;
 
 use std::path::Path;
 
-use rsmedia::fmt::AVFormatFlag;
 use rsmedia::strutils;
 use rsmedia::{
     CodecConfig, DecoderBuilder, ElementType, EncoderBuilder, MediaType, Muxer, Reader, Result,
@@ -298,12 +297,13 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
 
     let video_index = match spec.video {
         Some(codec) => {
-            // A raw elementary stream has no global header, so the encoder has to
-            // keep its parameter sets (SPS/PPS) in-band; NOTIMESTAMPS is the flag
-            // the raw muxer itself declares, and it implies "no global header".
+            // A raw elementary stream has no extradata to carry the parameter
+            // sets, so the encoder has to keep SPS/PPS in-band with every
+            // keyframe. `with_global_header(false)` is exactly that switch —
+            // without it the file has no SPS/PPS at all and cannot be decoded.
             let mut builder = EncoderBuilder::new_video(WIDTH, HEIGHT).with_fps(FPS);
             if spec.raw {
-                builder = builder.with_oformat_flags(AVFormatFlag::NO_TIMESTAMPS);
+                builder = builder.with_global_header(false);
             }
             let encoder = builder.with_codec_name(Some(codec.to_string())).build()?;
             Some(muxer.add_encoder(encoder)?)

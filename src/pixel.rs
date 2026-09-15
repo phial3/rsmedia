@@ -340,6 +340,19 @@ ffi_enum_wrap_from!(
 //////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////
 
+/// Formats whose samples cannot be expressed as whole sample planes.
+///
+/// Bitstream formats pack components into sub-byte fields, paletted formats
+/// address a separate palette, and hardware formats keep their samples on the
+/// device. Both [`PixelFormat::data_layout`] and
+/// [`PixelFormat::is_plane_storable`] turn on this one predicate, so the two
+/// cannot disagree about which formats are storable.
+fn has_no_sample_planes(desc: &AVPixFmtDescriptorRef) -> bool {
+    const UNSUPPORTED: u32 =
+        ffi::AV_PIX_FMT_FLAG_BITSTREAM | ffi::AV_PIX_FMT_FLAG_PAL | ffi::AV_PIX_FMT_FLAG_HWACCEL;
+    desc.flags as u32 & UNSUPPORTED != 0
+}
+
 impl PixelFormat {
     /// 获取像素格式描述符；未知/无效格式返回错误而非 panic。
     pub fn descriptor(&self) -> Result<AVPixFmtDescriptorRef> {
@@ -352,13 +365,15 @@ impl PixelFormat {
     }
 
     /// 获取像素格式名称（FFmpeg 返回静态字符串，借用即可，避免每次分配 String）
-    pub fn get_pix_fmt_name(&self) -> &'static str {
+    pub fn get_pix_fmt_name(&self) -> String {
         unsafe {
             let name = ffi::av_get_pix_fmt_name((*self).into());
             if name.is_null() {
-                "unknown"
+                "unknown".to_string()
             } else {
-                std::ffi::CStr::from_ptr(name).to_str().unwrap_or("unknown")
+                std::ffi::CStr::from_ptr(name)
+                    .to_string_lossy()
+                    .into_owned()
             }
         }
     }
@@ -374,14 +389,14 @@ impl PixelFormat {
         Ok(cnt)
     }
 
-    /// Whether this format has a data layout at all.
+    /// Whether this format can be stored as whole sample planes at all.
     ///
-    /// The size-independent form of [`Self::data_layout`], for callers that must
-    /// judge a format before a frame size is known: bitstream, paletted and
-    /// hardware formats have no host samples in planes and are rejected whatever
-    /// the size, while every other format has a layout at every non-zero size.
-    pub fn has_data_layout(self) -> bool {
-        self.data_layout(2, 2).is_some()
+    /// The size-independent counterpart of [`Self::data_layout`], for callers
+    /// judging a format before a frame size is known: bitstream, paletted and
+    /// hardware formats have no host samples per plane whatever the size, while
+    /// every other format does at every non-zero size.
+    pub fn is_plane_storable(self) -> bool {
+        AVPixFmtDescriptorRef::get(self.into()).is_some_and(|desc| !has_no_sample_planes(&desc))
     }
 
     /// The data layout this pixel format uses at `width` x `height`.
@@ -405,13 +420,7 @@ impl PixelFormat {
             return None;
         }
         let desc = AVPixFmtDescriptorRef::get(self.into())?;
-
-        // Bitstream formats pack components into sub-byte fields, paletted formats
-        // address a separate palette, and hardware formats have no host samples.
-        let unsupported = ffi::AV_PIX_FMT_FLAG_BITSTREAM
-            | ffi::AV_PIX_FMT_FLAG_PAL
-            | ffi::AV_PIX_FMT_FLAG_HWACCEL;
-        if desc.flags as u32 & unsupported != 0 {
+        if has_no_sample_planes(&desc) {
             return None;
         }
 
@@ -509,8 +518,9 @@ pub fn find_best_pix_fmt(
 ) -> Result<PixelFormat> {
     let alpha = if has_alpha { 1 } else { 0 };
 
-    // Combination of flags informing you what kind of losses will occur (maximum loss for an invalid dst_pix_fmt).
-    let flags = unsafe {
+    // 返回的是**选中的像素格式**（`AV_PIX_FMT_NONE` 表示无法选择）。`loss_ptr`
+    // 才承载"会损失什么"的位掩码，这里不需要，故传 NULL。
+    let best = unsafe {
         ffi::av_find_best_pix_fmt_of_2(
             dst_pix_fmt1.into(),
             dst_pix_fmt2.into(),
@@ -520,11 +530,12 @@ pub fn find_best_pix_fmt(
         )
     };
 
-    match PixelFormat::from(flags) {
-        PixelFormat::NONE => Err(RsmediaError::msg(format!(
-            "Failed to find best pix fmt:{flags}"
+    match PixelFormat::from_ffi_checked(best) {
+        // 返回 `AV_PIX_FMT_NONE`（或本 crate 未收录的值）都表示"没有可用的目标格式"。
+        None | Some(PixelFormat::NONE) => Err(RsmediaError::msg(format!(
+            "Failed to find a best pixel format among the candidates (got {best})"
         ))),
-        fmt => Ok(fmt),
+        Some(fmt) => Ok(fmt),
     }
 }
 

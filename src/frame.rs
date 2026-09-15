@@ -131,7 +131,7 @@ impl<T> FrameData<T> {
     }
 
     /// The planes, mutably.
-    pub fn as_planes_mut(&mut self) -> Option<&mut Vec<Array2<T>>> {
+    pub fn as_planes_mut(&mut self) -> Option<&mut [Array2<T>]> {
         match self {
             Self::Packed(_) => None,
             Self::Planar(planes) => Some(planes),
@@ -149,31 +149,54 @@ impl<T> FrameData<T> {
     /// Plane `plane` as a flat `rows x (cols x components)` view.
     ///
     /// This is the shape a row-wise copy needs, and it is the same for every
-    /// layout and media kind. `None` when the frame has no such plane.
-    pub fn plane(&self, plane: usize) -> Option<ArrayView2<'_, T>> {
+    /// layout and media kind. Borrowing a plane requires the underlying array to
+    /// be contiguous, so the two ways this can fail are reported separately
+    /// instead of collapsing into one `None`:
+    ///
+    /// * there is no such plane (an interleaved frame has exactly one, index 0);
+    /// * the plane's array is not contiguous, so no flat view exists — use
+    ///   [`plane_samples`](Self::plane_samples) when a copy is acceptable.
+    pub fn plane(&self, plane: usize) -> Result<ArrayView2<'_, T>> {
         match self {
             Self::Packed(array) => {
                 if plane != 0 {
-                    return None;
+                    return Err(no_such_plane(plane, 1));
                 }
                 let (rows, cols, components) = array.dim();
-                ArrayView2::from_shape((rows, cols * components), array.as_slice()?).ok()
+                let flat = array
+                    .as_slice()
+                    .ok_or_else(|| not_contiguous(plane, "interleaved"))?;
+                ArrayView2::from_shape((rows, cols * components), flat)
+                    .map_err(|error| RsmediaError::msg(format!("Plane {plane}: {error}")))
             }
-            Self::Planar(planes) => planes.get(plane).map(|plane| plane.view()),
+            Self::Planar(planes) => planes
+                .get(plane)
+                .map(|plane| plane.view())
+                .ok_or_else(|| no_such_plane(plane, planes.len())),
         }
     }
 
     /// Plane `plane` as a flat mutable view; see [`plane`](Self::plane).
-    pub fn plane_mut(&mut self, plane: usize) -> Option<ArrayViewMut2<'_, T>> {
+    pub fn plane_mut(&mut self, plane: usize) -> Result<ArrayViewMut2<'_, T>> {
         match self {
             Self::Packed(array) => {
                 if plane != 0 {
-                    return None;
+                    return Err(no_such_plane(plane, 1));
                 }
                 let (rows, cols, components) = array.dim();
-                ArrayViewMut2::from_shape((rows, cols * components), array.as_slice_mut()?).ok()
+                let flat = array
+                    .as_slice_mut()
+                    .ok_or_else(|| not_contiguous(plane, "interleaved"))?;
+                ArrayViewMut2::from_shape((rows, cols * components), flat)
+                    .map_err(|error| RsmediaError::msg(format!("Plane {plane}: {error}")))
             }
-            Self::Planar(planes) => planes.get_mut(plane).map(|plane| plane.view_mut()),
+            Self::Planar(planes) => {
+                let count = planes.len();
+                planes
+                    .get_mut(plane)
+                    .map(|plane| plane.view_mut())
+                    .ok_or_else(|| no_such_plane(plane, count))
+            }
         }
     }
 
@@ -287,19 +310,44 @@ impl<T: ElementType> FrameData<T> {
     }
 
     /// Reads plane `plane` as a contiguous `Vec<U>`, casting every sample.
+    ///
+    /// Unlike [`plane`](Self::plane) this **tolerates a non-contiguous array**:
+    /// the samples are copied out anyway, and `as_standard_layout` materialises
+    /// them in row-major order on demand.
     pub fn plane_samples<U: ElementType>(&self, plane: usize) -> Result<Vec<U>> {
-        let plane = self
-            .plane(plane)
-            .ok_or_else(|| RsmediaError::msg(format!("Frame has no plane {plane}")))?;
-        let standard = plane.as_standard_layout();
-        let slice = standard
-            .as_slice()
-            .ok_or_else(|| RsmediaError::msg("Frame plane is not contiguous"))?;
-        Ok(slice
-            .iter()
-            .map(|&value| num_traits::cast::<T, U>(value).unwrap_or(U::zero()))
+        let samples: Vec<T> = match self {
+            Self::Packed(array) => {
+                if plane != 0 {
+                    return Err(no_such_plane(plane, 1));
+                }
+                array.as_standard_layout().iter().copied().collect()
+            }
+            Self::Planar(planes) => planes
+                .get(plane)
+                .ok_or_else(|| no_such_plane(plane, planes.len()))?
+                .as_standard_layout()
+                .iter()
+                .copied()
+                .collect(),
+        };
+        Ok(samples
+            .into_iter()
+            .map(|value| num_traits::cast::<T, U>(value).unwrap_or(U::zero()))
             .collect())
     }
+}
+
+/// The error for a plane index a layout does not have.
+fn no_such_plane(plane: usize, count: usize) -> RsmediaError {
+    RsmediaError::msg(format!("Frame has no plane {plane}: it has {count}"))
+}
+
+/// The error for borrowing a plane whose array is not stored contiguously.
+fn not_contiguous(plane: usize, layout: &str) -> RsmediaError {
+    RsmediaError::msg(format!(
+        "Plane {plane} of a {layout} frame is not contiguous, so it has no flat view; \
+         use `plane_samples` (which copies) or make the array standard layout"
+    ))
 }
 
 /// Converts a packed `RGB24` frame into a planar `YUV420P` frame.
@@ -307,8 +355,12 @@ impl<T: ElementType> FrameData<T> {
 /// The size comes from the packed array, which `RGB24`'s layout fixes at
 /// `(height, width, 3)`, and both dimensions must be even because YUV420P
 /// chroma is a 2x2 downsample. `matrix` is the luma/chroma matrix to use;
-/// [`MediaFrame::convert_rgb_to_yuv`] picks one from the frame's colour
+/// [`MediaFrame::convert_rgb24_to_yuv420p`] picks one from the frame's colour
 /// metadata.
+///
+/// Samples are read as `u8`, which is what both of these formats mean — an 8-bit
+/// component. A 9..16-bit picture is a *different* pixel format (e.g.
+/// `YUV420P10LE`), and goes through the scaler instead.
 fn rgb24_to_yuv420p<T: ElementType>(
     data: &FrameData<T>,
     matrix: YuvStandardMatrix,
@@ -318,18 +370,6 @@ fn rgb24_to_yuv420p<T: ElementType>(
         return Err(RsmediaError::msg(format!(
             "RGB24 -> YUV420P requires even dimensions, got {width}x{height}"
         )));
-    }
-
-    // Wide samples cannot go through the `yuv` crate (u8 only); run the matrix
-    // in f32 and keep the full 16-bit result.
-    if std::mem::size_of::<T>() > 1 {
-        let rgb = data.plane_samples::<u16>(0)?;
-        let (y, u, v) = rgb_to_yuv420_16bit(&rgb, width, height, matrix)?;
-        return Ok(FrameData::Planar(vec![
-            plane_from(y, height, width)?,
-            plane_from(u, height / 2, width / 2)?,
-            plane_from(v, height / 2, width / 2)?,
-        ]));
     }
 
     let (uv_width, uv_height) = (width / 2, height / 2);
@@ -377,18 +417,6 @@ fn yuv420p_to_rgb24<T: ElementType>(
 ) -> Result<FrameData<T>> {
     let (height, width) = yuv420p_extent(data)?;
     let (uv_width, uv_height) = (width / 2, height / 2);
-
-    // Wide samples bypass the `yuv` crate (u8 only) and keep full precision.
-    if std::mem::size_of::<T>() > 1 {
-        let y = data.plane_samples::<u16>(0)?;
-        let u = data.plane_samples::<u16>(1)?;
-        let v = data.plane_samples::<u16>(2)?;
-        let rgb = yuv420_to_rgb_16bit(&y, &u, &v, width, height, matrix)?;
-        return Ok(FrameData::Packed(
-            Array3::from_shape_vec((height, width, 3), cast_samples::<u16, T>(rgb))
-                .map_err(|e| RsmediaError::msg(format!("Failed to build RGB24 frame: {e}")))?,
-        ));
-    }
 
     let y = data.plane_samples::<u8>(0)?;
     let u = data.plane_samples::<u8>(1)?;
@@ -781,11 +809,6 @@ where
         nb_samples: u32,
         sample_rate: u32,
     ) -> Result<Self> {
-        if nb_channels == 0 || nb_samples == 0 {
-            return Err(RsmediaError::msg(format!(
-                "Audio frame needs a positive sample and channel count, got {nb_samples} samples x {nb_channels} channels"
-            )));
-        }
         let layout = format.data_layout(nb_channels as usize, nb_samples as usize);
         Self::new_audio(
             format,
@@ -799,10 +822,20 @@ where
     /// 校验 [`data`](Self::data) 的形状与格式要求的布局一致，且 `T` 的宽度与该格式
     /// 的每样本字节数一致。
     ///
-    /// 两项都在**构造点**校验：形状不符、或元素宽度不符（例如把 `u8` 样本放进 10bit
+    /// 多项都在**构造点**校验：形状不符、或元素宽度不符（例如把 `u8` 样本放进 10bit
     /// 格式）都会让跨 FFI 的拷贝越界，因此必须在能造出这种帧的地方就拒绝，而不是等到
     /// [`to_avframe`](Self::to_avframe)。
     fn validated(self) -> Result<Self> {
+        // 音频的声道数/采样数必须为正。否则平面布局是空列表、`matches` 会接受，
+        // 一个"没有声道"的帧就能一路走到 FFmpeg。视频侧的等价约束由
+        // `PixelFormat::data_layout` 对 0 尺寸返回 `None` 覆盖，无需在此重复。
+        if self.media_type == MediaType::AUDIO && (self.nb_channels == 0 || self.nb_samples == 0) {
+            return Err(RsmediaError::msg(format!(
+                "Audio frame needs a positive sample and channel count, got {} samples x {} channels",
+                self.nb_samples, self.nb_channels
+            )));
+        }
+
         let layout = self.data_layout()?;
         if !self.data.matches(&layout) {
             return Err(RsmediaError::msg(format!(
@@ -987,7 +1020,15 @@ where
     fn write_metadata(&self, frame: &mut AVFrame) {
         unsafe {
             let raw = frame.as_mut_ptr();
-            (*raw).flags = self.flags;
+            // `key_frame` 是 `AV_FRAME_FLAG_KEY` 的便捷镜像（读入方向见
+            // `copy_avframe_meta`），因此写出时也要让它生效：否则
+            // `frame.key_frame = true` 会被静默丢弃，两个字段互相矛盾。
+            let key = ffi::AV_FRAME_FLAG_KEY as i32;
+            (*raw).flags = if self.key_frame {
+                self.flags | key
+            } else {
+                self.flags & !key
+            };
             (*raw).quality = self.quality;
             (*raw).repeat_pict = self.repeat_pict;
             (*raw).colorspace = self.colorspace;
@@ -1018,53 +1059,87 @@ where
         write_side_data(frame, &self.side_data);
     }
 
-    /// 仅拷贝标量元数据（不含数据平面），用于产出基于当前帧元数据的转换结果。
-    /// 避免 `self.clone()` 连同一整块图像/音频缓冲一起复制，减少转换的中间分配。
-    fn meta_only(&self) -> Self {
-        Self {
-            pts: self.pts,
-            pkt_dts: self.pkt_dts,
-            duration: self.duration,
-            format: self.format, // 调用方随后按需覆盖
-            data: FrameData::default(),
-            time_base: self.time_base,
-            media_type: self.media_type,
-            width: self.width,
-            height: self.height,
-            pict_type: self.pict_type,
-            sample_rate: self.sample_rate,
-            nb_samples: self.nb_samples,
-            nb_channels: self.nb_channels,
-            key_frame: self.key_frame,
-            flags: self.flags,
-            quality: self.quality,
-            repeat_pict: self.repeat_pict,
-            colorspace: self.colorspace,
-            color_primaries: self.color_primaries,
-            color_trc: self.color_trc,
-            color_range: self.color_range,
-            chroma_location: self.chroma_location,
-            sample_aspect_ratio: self.sample_aspect_ratio,
-            crop_top: self.crop_top,
-            crop_bottom: self.crop_bottom,
-            crop_left: self.crop_left,
-            crop_right: self.crop_right,
-            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-            alpha_mode: self.alpha_mode,
-            pkt_duration: self.pkt_duration,
-            best_effort_timestamp: self.best_effort_timestamp,
-            decode_error_flags: self.decode_error_flags,
-            metadata: self.metadata.clone(),
-            side_data: self.side_data.clone(),
-        }
-    }
-
-    /// A copy of this frame's metadata carrying different samples.
+    /// A copy of this frame's metadata, carrying different samples.
+    ///
+    /// The destination format is the only metadata a conversion changes; every
+    /// other field is carried over verbatim. The field list is written out
+    /// exhaustively (rather than `..self.clone()`) so that adding a field to
+    /// [`MediaFrame`] fails to compile here until it is considered — and the
+    /// samples are *not* cloned, which is the point of the method.
     fn with_data(&self, data: FrameData<T>, format: PixelFormat) -> Self {
-        let mut result = self.meta_only();
-        result.format = FrameFormat::Pixel(format);
-        result.data = data;
-        result
+        let Self {
+            pts,
+            pkt_dts,
+            duration,
+            media_type,
+            width,
+            height,
+            pict_type,
+            sample_rate,
+            nb_samples,
+            nb_channels,
+            key_frame,
+            flags,
+            quality,
+            repeat_pict,
+            colorspace,
+            color_primaries,
+            color_trc,
+            color_range,
+            chroma_location,
+            sample_aspect_ratio,
+            crop_top,
+            crop_bottom,
+            crop_left,
+            crop_right,
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+            alpha_mode,
+            pkt_duration,
+            best_effort_timestamp,
+            decode_error_flags,
+            // 这两个由调用方给出，其余字段直接搬运。
+            format: _,
+            data: _,
+            time_base,
+            metadata,
+            side_data,
+        } = self;
+        Self {
+            pts: *pts,
+            pkt_dts: *pkt_dts,
+            duration: *duration,
+            format: FrameFormat::Pixel(format),
+            data,
+            time_base: *time_base,
+            media_type: *media_type,
+            width: *width,
+            height: *height,
+            pict_type: *pict_type,
+            sample_rate: *sample_rate,
+            nb_samples: *nb_samples,
+            nb_channels: *nb_channels,
+            key_frame: *key_frame,
+            flags: *flags,
+            quality: *quality,
+            repeat_pict: *repeat_pict,
+            colorspace: *colorspace,
+            color_primaries: *color_primaries,
+            color_trc: *color_trc,
+            color_range: *color_range,
+            chroma_location: *chroma_location,
+            sample_aspect_ratio: *sample_aspect_ratio,
+            crop_top: *crop_top,
+            crop_bottom: *crop_bottom,
+            crop_left: *crop_left,
+            crop_right: *crop_right,
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+            alpha_mode: *alpha_mode,
+            pkt_duration: *pkt_duration,
+            best_effort_timestamp: *best_effort_timestamp,
+            decode_error_flags: *decode_error_flags,
+            metadata: metadata.clone(),
+            side_data: side_data.clone(),
+        }
     }
 
     /// 转换为新 `AVFrame`：采样按布局拷进 FFmpeg 分配的带对齐缓冲。
@@ -1118,15 +1193,17 @@ where
     ///////////////////////////// convert //////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////
 
-    /// 校验当前帧为视频帧，且像素格式为 `expected`；否则返回可读的错误信息。
-    fn check_format(&self, expected: FrameFormat, expected_desc: &str) -> Result<()> {
+    /// 校验当前帧为视频帧、且像素格式恰为 `expected`；否则返回可读的错误信息。
+    ///
+    /// `expected_desc` 只用于错误消息（FFmpeg 的格式名，如 `RGB24`）。
+    fn ensure_video_format(&self, expected: FrameFormat, expected_desc: &str) -> Result<()> {
         if self.media_type != MediaType::VIDEO {
             return Err(RsmediaError::msg("Only video frames are supported"));
         }
         if self.format != expected {
             let got = match self.format {
                 FrameFormat::Pixel(p) => p.get_pix_fmt_name(),
-                FrameFormat::Sample(_) => "<audio format>",
+                FrameFormat::Sample(_) => "<audio format>".to_string(),
             };
             return Err(RsmediaError::msg(format!(
                 "Expected {expected_desc} format, got {got}"
@@ -1135,9 +1212,12 @@ where
         Ok(())
     }
 
-    /// 选择标准色彩矩阵：优先读取帧携带的 `colorspace` 元数据，未标记时
-    /// 回退到按分辨率启发式（SD -> BT.601 / HD -> BT.709 / UHD -> BT.2020）
-    fn auto_colorspace(&self) -> YuvStandardMatrix {
+    /// 选择 RGB <-> YUV 转换用的标准色彩矩阵。
+    ///
+    /// 优先读帧携带的 `colorspace` 元数据；未标记时按分辨率启发式
+    /// （SD -> BT.601 / HD -> BT.709 / UHD -> BT.2020），与 ffmpeg 的
+    /// `sws_getCoefficients` 缺省行为一致。
+    fn yuv_matrix(&self) -> YuvStandardMatrix {
         let colorspace = self.colorspace;
         if colorspace == ffi::AVCOL_SPC_BT709 {
             return YuvStandardMatrix::Bt709;
@@ -1165,58 +1245,141 @@ where
         }
     }
 
-    /// 用帧自身的色彩元数据选择矩阵，把 RGB24 帧转换为 YUV420P。
+    /// Converts an `RGB24` video frame to planar `YUV420P`.
     ///
-    /// 格式的判定与色彩矩阵的选择都在这里完成（后者需要 `colorspace` 与分辨率，
-    /// 是 [`FrameData`] 拿不到的信息），采样转换本身由模块内的自由函数承担。
-    pub fn convert_rgb_to_yuv(&self) -> Result<Self> {
-        self.convert_rgb_to_yuv_with_matrix(self.auto_colorspace())
+    /// The YUV matrix comes from the frame's own colour metadata
+    /// (`colorspace`, falling back to a resolution heuristic) — see
+    /// [`convert_rgb24_to_yuv420p_with_matrix`](Self::convert_rgb24_to_yuv420p_with_matrix)
+    /// to pin it. Samples are always full-range.
+    ///
+    /// This is the fast path for exactly this pair: it runs in the `yuv` crate
+    /// rather than through a scaler, and sits next to
+    /// [`convert_to`](Self::convert_to), which handles every other format pair.
+    /// `BGR24`, `NV12`, ... are rejected — use `convert_to` for those.
+    pub fn convert_rgb24_to_yuv420p(&self) -> Result<Self> {
+        self.convert_rgb24_to_yuv420p_with_matrix(self.yuv_matrix())
     }
 
-    /// 用**指定**的色彩矩阵将 RGB24 帧转换为 YUV420P。
+    /// [`convert_rgb24_to_yuv420p`](Self::convert_rgb24_to_yuv420p) with an
+    /// explicit YUV matrix instead of the one derived from colour metadata.
     ///
-    /// 相比自动按分辨率判断的 [`convert_rgb_to_yuv`](Self::convert_rgb_to_yuv)，
-    /// 此方法允许用户显式选择 BT.601 / BT.709 / BT.2020，用于需要精确控制
-    /// 色彩矩阵的专业场景（例如与源视频的色彩标准保持一致）。
+    /// Pick BT.601 / BT.709 / BT.2020 explicitly to match a source video's own
+    /// standard, rather than relying on the resolution heuristic.
     ///
     /// # Examples
     ///
     /// ```
     /// # use rsmedia::MediaFrame;
     /// # fn d(mut f: MediaFrame<u8>) -> rsmedia::Result<()> {
-    /// let yuv = f.convert_rgb_to_yuv_with_matrix(yuv::YuvStandardMatrix::Bt709)?;
+    /// let yuv = f.convert_rgb24_to_yuv420p_with_matrix(yuv::YuvStandardMatrix::Bt709)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn convert_rgb_to_yuv_with_matrix(&self, matrix: YuvStandardMatrix) -> Result<Self> {
-        self.check_format(FrameFormat::Pixel(PixelFormat::RGB24), "RGB24")?;
+    pub fn convert_rgb24_to_yuv420p_with_matrix(&self, matrix: YuvStandardMatrix) -> Result<Self> {
+        self.ensure_video_format(FrameFormat::Pixel(PixelFormat::RGB24), "RGB24")?;
         let data = rgb24_to_yuv420p(&self.data, matrix)?;
         Ok(self.with_data(data, PixelFormat::YUV420P))
     }
 
-    /// 将 YUV420P 帧转换为 RGB24（色度按原生平面尺寸读取，不做 2x2 展开）。
-    pub fn convert_yuv_to_rgb(&self) -> Result<Self> {
-        self.check_format(FrameFormat::Pixel(PixelFormat::YUV420P), "YUV420P")?;
-        let data = yuv420p_to_rgb24(&self.data, self.auto_colorspace())?;
+    /// Converts a planar `YUV420P` video frame to packed `RGB24`.
+    ///
+    /// The inverse of [`convert_rgb24_to_yuv420p`](Self::convert_rgb24_to_yuv420p);
+    /// chroma is read at its native (half) size and the matrix is derived from
+    /// colour metadata.
+    pub fn convert_yuv420p_to_rgb24(&self) -> Result<Self> {
+        self.ensure_video_format(FrameFormat::Pixel(PixelFormat::YUV420P), "YUV420P")?;
+        let data = yuv420p_to_rgb24(&self.data, self.yuv_matrix())?;
         Ok(self.with_data(data, PixelFormat::RGB24))
+    }
+
+    /// Converts this video frame to any pixel format FFmpeg's swscale can reach.
+    ///
+    /// This is the general conversion: it runs through swscale, so it covers
+    /// every pair of pixel formats swscale supports — the whole YUV (planar and
+    /// packed), NV, RGB/BGR and GRAY families, at 8 bit as well as 10/12/16 bit
+    /// — and it honours the frame's colour metadata (`colorspace`,
+    /// `color_range`, `color_primaries`, `color_trc`), exactly like a `scale`
+    /// filter with matching input and output sizes. Formats that have no host
+    /// samples (palette, bitstream, hardware) are rejected.
+    ///
+    /// `T` fixes the component width: pass an 8-bit destination format for
+    /// [`MediaFrame<u8>`] and a 16-bit one for [`MediaFrame<u16>`]. Asking for a
+    /// different width (e.g. `YUV420P10LE` out of a `MediaFrame<u8>`) is an error
+    /// rather than a silent reinterpretation of the bytes.
+    ///
+    /// For the `RGB24` <-> `YUV420P` pair specifically,
+    /// [`convert_rgb24_to_yuv420p`](Self::convert_rgb24_to_yuv420p) and
+    /// [`convert_yuv420p_to_rgb24`](Self::convert_yuv420p_to_rgb24) do the same
+    /// job without a scaler and let you pin the YUV matrix.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsmedia::{MediaFrame, PixelFormat};
+    /// # fn d(frame: MediaFrame<u8>) -> rsmedia::Result<()> {
+    /// let nv12 = frame.convert_to(PixelFormat::NV12)?;
+    /// assert_eq!(nv12.format().unwrap(), rsmedia::FrameFormat::Pixel(PixelFormat::NV12));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails for audio frames, for a destination the source's element width or
+    /// swscale cannot serve, and for `dst` formats with no sample planes.
+    pub fn convert_to(&self, dst: PixelFormat) -> Result<Self> {
+        if self.media_type != MediaType::VIDEO {
+            return Err(RsmediaError::msg(
+                "Only video frames have a pixel format to convert",
+            ));
+        }
+        if self.format == FrameFormat::Pixel(dst) {
+            return Ok(self.clone());
+        }
+        let dst_layout = dst.data_layout(self.width, self.height).ok_or_else(|| {
+            RsmediaError::msg(format!(
+                "Pixel format {} cannot be stored as sample planes at {}x{}",
+                dst.get_pix_fmt_name(),
+                self.width,
+                self.height
+            ))
+        })?;
+        // `read_samples::<T>` reads `size_of::<T>()`-wide elements, so a target
+        // with a different component width must be rejected here rather than
+        // reinterpreted: asking for `YUV420P10LE` out of a `MediaFrame<u8>`
+        // would otherwise read half a plane of garbage.
+        let element_bytes = dst.bytes_per_component().ok_or_else(|| {
+            RsmediaError::msg(format!(
+                "Pixel format {} has no per-component size",
+                dst.get_pix_fmt_name()
+            ))
+        })?;
+        validate_element_size::<T>(FrameFormat::Pixel(dst), element_bytes)?;
+
+        let src = self.to_avframe()?;
+        // 尺寸不变，只换格式：swscale 的同一上下文即可完成格式与色彩空间转换。
+        let converted = crate::scale::Scaler::new().scale_frame(
+            &src,
+            self.width as i32,
+            self.height as i32,
+            dst,
+        )?;
+        let data = read_samples::<T>(&converted, &dst_layout)?;
+        Ok(self.with_data(data, dst))
     }
 }
 
 impl MediaFrame<u8> {
-    /// Converts an RGB24 video frame into an [`image::DynamicImage`].
+    /// Converts this video frame into an [`image::DynamicImage`].
     ///
-    /// The format is checked rather than inferred from the samples: `RGB24` and
-    /// `BGR24` have the same `(height, width, 3)` shape, so the arrays alone
-    /// cannot tell them apart and a silent channel swap would be undetectable.
-    /// Which format a frame carries is [`MediaFrame`]'s business, so this
-    /// conversion lives here rather than on [`FrameData`].
+    /// Every pixel format FFmpeg can decode to RGB is accepted: `RGB24`, `RGBA`
+    /// and `GRAY8` are built straight from the samples, anything else (YUV, BGR,
+    /// NV, ...) goes through swscale first. That is
+    /// [`imgutils::to_dynamic_image`](crate::imgutils::to_dynamic_image) on this
+    /// frame's `AVFrame`, so the free function and this method cannot disagree
+    /// about which formats they handle.
     pub fn to_dynamic_image(&self) -> Result<image::DynamicImage> {
-        self.check_format(FrameFormat::Pixel(PixelFormat::RGB24), "RGB24")?;
-        let (height, width) = rgb24_extent(&self.data)?;
-        let rgb = self.data.plane_samples::<u8>(0)?;
-        image::RgbImage::from_raw(width as u32, height as u32, rgb)
-            .map(image::DynamicImage::ImageRgb8)
-            .ok_or_else(|| RsmediaError::msg("Failed to build image from RGB24 data"))
+        crate::imgutils::to_dynamic_image(&self.to_avframe()?)
     }
 
     /// Builds an RGB24 video frame from an [`image::DynamicImage`].
@@ -1436,110 +1599,6 @@ fn cast_samples<S: ElementType, T: ElementType>(samples: Vec<S>) -> Vec<T> {
         .collect()
 }
 
-/// 由色彩矩阵返回色相系数三元组 (Kr, Kg, Kb)。
-/// 供 u16 大精度 RGB<->YUV 路径使用（`yuv` crate 的公开转换仅支持 8bit）。
-fn yuv_primaries(matrix: YuvStandardMatrix) -> (f32, f32, f32) {
-    match matrix {
-        YuvStandardMatrix::Bt601 => (0.299, 0.587, 0.114),
-        YuvStandardMatrix::Bt709 => (0.2126, 0.7152, 0.0722),
-        YuvStandardMatrix::Bt2020 => (0.2627, 0.6780, 0.0593),
-        YuvStandardMatrix::Smpte240 => (0.212, 0.701, 0.087),
-        YuvStandardMatrix::Bt470_6 => (0.299, 0.587, 0.114),
-        YuvStandardMatrix::Fcc => (0.310, 0.589, 0.101),
-        YuvStandardMatrix::Custom(kr, kb) => (kr, 1.0 - kr - kb, kb),
-    }
-}
-
-/// 16bit RGB24 -> 平面的 YUV420P（Full Range，2x2 间组抽样）。
-///
-/// `yuv` crate 的 `rgb_to_yuv420` 仅接受 u8，会对 u16 截断；此实现将色域矩阵在
-/// f32 中精确计算并按 16bit 保存，保留低 8 位精度（支持 10-bit/12-bit 内容）。
-///
-/// 返回 `(y, u, v)` 三个**原生尺寸**的平面（`w x h` 与两个 `w/2 x h/2`）。
-fn rgb_to_yuv420_16bit(
-    rgb16: &[u16],
-    width: usize,
-    height: usize,
-    matrix: YuvStandardMatrix,
-) -> Result<(Vec<u16>, Vec<u16>, Vec<u16>)> {
-    if rgb16.len() < width * height * 3 {
-        return Err(RsmediaError::msg(
-            "RGB data too short for 16-bit conversion",
-        ));
-    }
-    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(RsmediaError::msg(format!(
-            "YUV420P requires even dimensions, got {width}x{height}"
-        )));
-    }
-
-    let (kr, _kg, kb) = yuv_primaries(matrix);
-    let kg = 1.0 - kr - kb;
-    let denom_y = 2.0 * (1.0 - kb);
-    let denom_v = 2.0 * (1.0 - kr);
-    let scale = 65535_f32;
-    let center = scale / 2.0;
-
-    let (uv_w, uv_h) = (width / 2, height / 2);
-    let mut y_plane = vec![0u16; width * height];
-    let mut u_plane = vec![0u16; uv_w * uv_h];
-    let mut v_plane = vec![0u16; uv_w * uv_h];
-
-    for h in 0..height {
-        for w in 0..width {
-            let i = (h * width + w) * 3;
-            let r = rgb16[i] as f32 / scale;
-            let g = rgb16[i + 1] as f32 / scale;
-            let b = rgb16[i + 2] as f32 / scale;
-            let yv = kr.mul_add(r, kg.mul_add(g, kb * b));
-            y_plane[h * width + w] = (yv * scale).round() as u16;
-            if h % 2 == 0 && w % 2 == 0 {
-                let uv_idx = (h / 2) * uv_w + (w / 2);
-                u_plane[uv_idx] = (((b - yv) / denom_y) * scale + center).round() as u16;
-                v_plane[uv_idx] = (((r - yv) / denom_v) * scale + center).round() as u16;
-            }
-        }
-    }
-    Ok((y_plane, u_plane, v_plane))
-}
-
-/// 原生尺寸的 16bit YUV420P 平面 -> 打包 RGB24 样本（`width * height * 3` 个）。
-fn yuv420_to_rgb_16bit(
-    y_plane: &[u16],
-    u_plane: &[u16],
-    v_plane: &[u16],
-    width: usize,
-    height: usize,
-    matrix: YuvStandardMatrix,
-) -> Result<Vec<u16>> {
-    let (uv_w, uv_h) = (width / 2, height / 2);
-    if y_plane.len() < width * height || u_plane.len() < uv_w * uv_h || v_plane.len() < uv_w * uv_h
-    {
-        return Err(RsmediaError::msg("YUV420P plane buffer too small"));
-    }
-
-    let (kr, _kg, kb) = yuv_primaries(matrix);
-    let scale = 65535_f32;
-    let center = scale / 2.0;
-    let mut out = Vec::with_capacity(width * height * 3);
-
-    for h in 0..height {
-        for w in 0..width {
-            let y = y_plane[h * width + w] as f32 / scale;
-            let uv_idx = (h / 2) * uv_w + (w / 2);
-            let cb = (u_plane[uv_idx] as f32 - center) / scale;
-            let cr = (v_plane[uv_idx] as f32 - center) / scale;
-            let r = y + 2.0 * (1.0 - kr) * cr;
-            let b = y + 2.0 * (1.0 - kb) * cb;
-            let g = y - kr * r - kb * b;
-            out.push((r.clamp(0.0, 1.0) * scale).round() as u16);
-            out.push((g.clamp(0.0, 1.0) * scale).round() as u16);
-            out.push((b.clamp(0.0, 1.0) * scale).round() as u16);
-        }
-    }
-    Ok(out)
-}
-
 /// 验证采样元素类型 `T` 的大小与格式要求的每样本字节数一致。
 ///
 /// 两者不符时按 `T` 读写会越界（例如把 `u16` 样本写进 8bit 平面），因此这是
@@ -1590,7 +1649,9 @@ fn side_data_from_avframe(frame: &AVFrame) -> Vec<FrameSideData> {
 /// carries no pre-existing side data and needs no removal pass.
 fn write_side_data(frame: &mut AVFrame, entries: &[FrameSideData]) {
     for entry in entries {
-        if entry.data.is_empty() {
+        // 只跳过"既无载荷又无字典"的条目：`side_data_from_avframe` 会产出带字典的
+        // 空载荷条目（FFmpeg 允许），丢掉它们会让 side data 无法往返。
+        if entry.data.is_empty() && entry.metadata.is_empty() {
             continue;
         }
         // SAFETY: `frame` is a live AVFrame we own and the frame has no side data yet,
@@ -1609,7 +1670,9 @@ fn write_side_data(frame: &mut AVFrame, entries: &[FrameSideData]) {
         // SAFETY: `av_frame_new_side_data` allocated exactly `entry.data.len()` bytes,
         // and `(*raw).metadata` is a live dictionary slot owned by that entry.
         unsafe {
-            std::ptr::copy_nonoverlapping(entry.data.as_ptr(), (*raw).data, entry.data.len());
+            if !entry.data.is_empty() {
+                std::ptr::copy_nonoverlapping(entry.data.as_ptr(), (*raw).data, entry.data.len());
+            }
             entry.metadata.write_into_raw_dict(&mut (*raw).metadata);
         }
     }
@@ -1789,9 +1852,9 @@ mod tests {
         assert_eq!(packed.num_planes(), 1);
         assert_eq!(packed.as_packed().map(|a| a.dim()), Some((4, 6, 3)));
         assert!(packed.as_planes().is_none());
-        // 交错帧的唯一平面把分量轴并入列
-        assert_eq!(packed.plane(0).map(|p| p.dim()), Some((4, 18)));
-        assert!(packed.plane(1).is_none());
+        // 交错帧的唯一平面把分量轴并入列；越界平面是"没有该平面"的错误
+        assert_eq!(packed.plane(0).map(|p| p.dim()).ok(), Some((4, 18)));
+        assert!(packed.plane(1).is_err());
         assert_eq!(packed.len(), 72);
 
         let planar = FrameData::from(vec![
@@ -1800,7 +1863,8 @@ mod tests {
         ]);
         assert_eq!(planar.num_planes(), 2);
         assert!(planar.as_packed().is_none());
-        assert_eq!(planar.plane(1).map(|p| p.dim()), Some((2, 3)));
+        assert_eq!(planar.plane(1).map(|p| p.dim()).ok(), Some((2, 3)));
+        assert!(planar.plane(2).is_err());
         assert_eq!(planar.len(), 30);
         assert_eq!(planar.shapes(), vec![(4, 6), (2, 3)]);
 
@@ -1936,6 +2000,84 @@ mod tests {
             );
             assert!((actual_time - expected_time).as_secs_f32().abs() < 0.01);
         }
+
+        Ok(())
+    }
+
+    /// `convert_to` covers the whole swscale format matrix, not just the
+    /// `yuv`-crate's `RGB24` <-> `YUV420P` pair: every target keeps the geometry
+    /// and reports the requested format, colour survives a round trip, and the
+    /// two things it must *refuse* — an audio frame and a target with a
+    /// different component width — are refused.
+    #[test]
+    fn test_convert_to_arbitrary_pixel_formats() -> Result<()> {
+        let (width, height) = (16, 16);
+        let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24)?;
+        let (r, g, b) = fill_rgb_data(&mut frame, width, height);
+
+        // 8bit 家族的多种目标格式：几何不变、格式正确、布局自洽。
+        for dst in [
+            PixelFormat::RGB24,
+            PixelFormat::BGR24,
+            PixelFormat::RGBA,
+            PixelFormat::YUV420P,
+            PixelFormat::YUV422P,
+            PixelFormat::YUV444P,
+            PixelFormat::NV12,
+            PixelFormat::GRAY8,
+        ] {
+            let converted = frame.convert_to(dst)?;
+            assert_eq!(
+                converted.format,
+                FrameFormat::Pixel(dst),
+                "target {dst:?} not reported back"
+            );
+            assert_eq!((converted.width, converted.height), (width, height));
+            assert!(
+                converted.data.matches(&converted.data_layout()?),
+                "target {dst:?} produced a layout its own format disagrees with"
+            );
+        }
+
+        // 经 YUV444P 回到 RGB24：色度未二次采样，误差应很小。
+        let round_trip = frame
+            .convert_to(PixelFormat::YUV444P)?
+            .convert_to(PixelFormat::RGB24)?;
+        let back = round_trip.data.as_packed().expect("RGB24 is interleaved");
+        let max_error = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (y, x)))
+            .flat_map(|(y, x)| {
+                let idx = y * width + x;
+                [
+                    back[[y, x, 0]].abs_diff(r[idx]),
+                    back[[y, x, 1]].abs_diff(g[idx]),
+                    back[[y, x, 2]].abs_diff(b[idx]),
+                ]
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_error <= 2,
+            "RGB24 -> YUV444P -> RGB24 drifted by {max_error} levels"
+        );
+
+        // 音频帧没有像素格式可换。
+        let audio = MediaFrame::<f32>::new_audio_frame(SampleFormat::FLTP, 2, 128, 48_000)?;
+        assert!(audio.convert_to(PixelFormat::RGB24).is_err());
+
+        // 元素位宽不符：u8 帧不能产出 10bit 目标（否则会把半个平面读成垃圾）。
+        let err = match frame.convert_to(PixelFormat::YUV420P10LE) {
+            Ok(_) => panic!("a 10-bit target needs a 16-bit frame"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("expected 2, got 1"),
+            "unexpected error for a width mismatch: {err}"
+        );
+
+        // 已是指定格式时原样返回（无需转换）。
+        let same = frame.convert_to(PixelFormat::RGB24)?;
+        assert_eq!(same.data.as_packed().unwrap().dim(), (height, width, 3));
 
         Ok(())
     }

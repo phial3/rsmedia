@@ -85,7 +85,7 @@ fn assert_pixel_close(b: &MediaFrame<u8>, a: &MediaFrame<u8>, max_diff: i16) {
 /// 每个元素填一个确定性非零值，`element_bytes` 为 1（8bit）或 2（9..16bit）。
 fn fill_frame(frame: &mut AVFrame, layout: &DataLayout, element_bytes: usize) {
     for plane in 0..layout.num_planes() {
-        let (rows, samples_per_row) = layout.plane_extent(plane).expect("plane in range");
+        let (rows, samples_per_row) = layout.plane_row_extent(plane).expect("plane in range");
         let stride = frame.linesize[plane] as usize;
         let base = frame.data[plane];
         for row in 0..rows {
@@ -109,7 +109,7 @@ fn read_avframe_plane(
     layout: &DataLayout,
     element_bytes: usize,
 ) -> Vec<u8> {
-    let (rows, samples_per_row) = layout.plane_extent(plane).expect("plane in range");
+    let (rows, samples_per_row) = layout.plane_row_extent(plane).expect("plane in range");
     let stride = frame.linesize[plane] as usize;
     let base = frame.data[plane];
     let mut out = Vec::with_capacity(rows * samples_per_row * element_bytes);
@@ -196,20 +196,20 @@ fn test_rgb_yuv_roundtrip() -> Result<()> {
     fill_rgb_data(&mut rgb, TEST_WIDTH, TEST_HEIGHT);
 
     // 单次往返：RGB -> YUV -> RGB
-    let yuv = rgb.convert_rgb_to_yuv()?;
+    let yuv = rgb.convert_rgb24_to_yuv420p()?;
     assert_eq!(yuv.format, FrameFormat::Pixel(PixelFormat::YUV420P));
     assert!(yuv.data.as_planes().is_some(), "YUV420P 应为平面布局");
-    let back = yuv.convert_yuv_to_rgb()?;
+    let back = yuv.convert_yuv420p_to_rgb24()?;
     assert_eq!(back.format, FrameFormat::Pixel(PixelFormat::RGB24));
     assert!(back.data.as_packed().is_some(), "RGB24 应为交错布局");
     assert_pixel_close(&back, &rgb, 3);
 
     // 多次链式转换（容差放宽）
     let chained = rgb
-        .convert_rgb_to_yuv()?
-        .convert_yuv_to_rgb()?
-        .convert_rgb_to_yuv()?
-        .convert_yuv_to_rgb()?;
+        .convert_rgb24_to_yuv420p()?
+        .convert_yuv420p_to_rgb24()?
+        .convert_rgb24_to_yuv420p()?
+        .convert_yuv420p_to_rgb24()?;
     assert_pixel_close(&chained, &rgb, 5);
 
     Ok(())
@@ -222,10 +222,10 @@ fn test_rgb_yuv_conversion_with_matrix() -> Result<()> {
     let _ = fill_rgb_data(&mut rgb_frame, TEST_WIDTH, TEST_HEIGHT);
 
     // 显式指定不同色彩矩阵，均应输出 YUV420P
-    let yuv709 = rgb_frame.convert_rgb_to_yuv_with_matrix(YuvStandardMatrix::Bt709)?;
+    let yuv709 = rgb_frame.convert_rgb24_to_yuv420p_with_matrix(YuvStandardMatrix::Bt709)?;
     assert_eq!(yuv709.format, FrameFormat::Pixel(PixelFormat::YUV420P));
 
-    let yuv2020 = rgb_frame.convert_rgb_to_yuv_with_matrix(YuvStandardMatrix::Bt2020)?;
+    let yuv2020 = rgb_frame.convert_rgb24_to_yuv420p_with_matrix(YuvStandardMatrix::Bt2020)?;
     assert_eq!(yuv2020.format, FrameFormat::Pixel(PixelFormat::YUV420P));
 
     // 不同色彩矩阵导致不同的 YUV 转换结果
@@ -747,7 +747,7 @@ fn test_yuv420p_odd_dimensions() -> Result<()> {
 
     // 但 RGB24 -> YUV420P 转换仍要求偶数尺寸
     let odd_rgb = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24)?;
-    assert!(odd_rgb.convert_rgb_to_yuv().is_err());
+    assert!(odd_rgb.convert_rgb24_to_yuv420p().is_err());
 
     Ok(())
 }

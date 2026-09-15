@@ -60,9 +60,9 @@ fn encode_container(path: &Path, enc_threads: usize) -> Result<()> {
     let s_idx = writer.add_stream(s_enc.codecpar(), s_enc.time_base());
     writer.write_header()?;
     let (v_tb, a_tb, s_tb) = (
-        writer.stream_time_base(v_idx),
-        writer.stream_time_base(a_idx),
-        writer.stream_time_base(s_idx),
+        writer.stream_time_base(v_idx)?,
+        writer.stream_time_base(a_idx)?,
+        writer.stream_time_base(s_idx)?,
     );
 
     // Video frames (60): pts left unset, the encoder numbers them automatically.
