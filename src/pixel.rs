@@ -1,5 +1,6 @@
 use crate::error::{Result, RsmediaError};
 use crate::fmt::DataLayout;
+use crate::strutils;
 
 use rsmpeg::avutil::AVPixFmtDescriptorRef;
 use rsmpeg::ffi;
@@ -371,9 +372,7 @@ impl PixelFormat {
             if name.is_null() {
                 "unknown".to_string()
             } else {
-                std::ffi::CStr::from_ptr(name)
-                    .to_string_lossy()
-                    .into_owned()
+                strutils::c_char_to_str(name)
             }
         }
     }
