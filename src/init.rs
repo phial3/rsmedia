@@ -45,7 +45,8 @@ impl Default for AVLogFlag {
 /// `init_with` with whatever the environment resolves to. Idempotent.
 ///
 /// ```no_run
-/// rsmedia::init()?; // RUST_LOG=debug cargo run … 即可看到 FFmpeg 内部日志
+/// rsmedia::init().unwrap();
+/// // RUST_LOG=debug cargo run … 即可看到 FFmpeg 内部日志
 /// ```
 pub fn init() -> Result<()> {
     let mut level = level_from_env().unwrap_or_default();
@@ -189,7 +190,9 @@ ffi_enum!(
     AVLogFlag, u32 {
         SKIP_REPEATED => ffi::AV_LOG_SKIP_REPEATED;
         PRINT_LEVEL => ffi::AV_LOG_PRINT_LEVEL;
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         PRINT_TIME => ffi::AV_LOG_PRINT_TIME;
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         PRINT_DATETIME => ffi::AV_LOG_PRINT_DATETIME;
     }
 );
