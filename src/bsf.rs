@@ -40,7 +40,7 @@
 //! # }
 //! ```
 
-use crate::error::{Result, RsmediaError};
+use crate::error::{Context, Result, RsmediaError};
 use rsmpeg::avcodec::{
     AVBSFContext, AVBSFContextUninit, AVBitStreamFilter, AVCodecParameters, AVPacket,
 };
@@ -82,8 +82,7 @@ impl Bsf {
         codecpar: &AVCodecParameters,
         time_base: ffi::AVRational,
     ) -> Result<Self> {
-        let name_c = CString::new(name)
-            .map_err(|e| RsmediaError::invalid_config(format!("bsf name {name:?}: {e}")))?;
+        let name_c = CString::new(name).context(format!("bsf name {name:?}"))?;
         let filter = AVBitStreamFilter::find_by_name(&name_c).ok_or_else(|| {
             RsmediaError::invalid_config(format!(
                 "bitstream filter '{name}' not found in this FFmpeg build"

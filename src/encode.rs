@@ -536,7 +536,9 @@ impl EncoderBuilder {
                     Ok(Some(list)) if !list.is_empty() => PixelFormat::from(list[0]),
                     _ => PixelFormat::YUV420P,
                 };
-                log::debug!("negotiated pixel format {negotiated:?} for encoder '{codec_name}'");
+                tracing::debug!(
+                    "negotiated pixel format {negotiated:?} for encoder '{codec_name}'"
+                );
                 Ok(negotiated)
             }
         }
@@ -571,7 +573,9 @@ impl EncoderBuilder {
                     }
                     _ => SampleFormat::FLTP,
                 };
-                log::debug!("negotiated sample format {negotiated:?} for encoder '{codec_name}'");
+                tracing::debug!(
+                    "negotiated sample format {negotiated:?} for encoder '{codec_name}'"
+                );
                 Ok(negotiated)
             }
         }
@@ -620,7 +624,7 @@ impl EncoderBuilder {
                 Some(Quality::Crf(_)) => {
                     let capable = CRF_CAPABLE_CODECS.contains(&codec_name.as_str());
                     if !capable {
-                        log::warn!(
+                        tracing::warn!(
                             "codec '{codec_name}' has no CRF support, falling back to bit rate control"
                         );
                     }
@@ -728,7 +732,7 @@ impl EncoderBuilder {
                 let changed =
                     out_fr.num != self.frame_rate.num || out_fr.den != self.frame_rate.den;
                 if out_fr.num > 0 && out_fr.den > 0 && changed {
-                    log::info!(
+                    tracing::info!(
                         "Filter changes frame rate: {}/{} -> {}/{}",
                         self.frame_rate.num,
                         self.frame_rate.den,
@@ -744,7 +748,7 @@ impl EncoderBuilder {
                 && fh > 0
                 && (fw != encode_ctx.width || fh != encode_ctx.height)
             {
-                log::info!(
+                tracing::info!(
                     "Filter changes size: {}x{} -> {}x{}",
                     encode_ctx.width,
                     encode_ctx.height,
@@ -764,7 +768,7 @@ impl EncoderBuilder {
             })
             .map(|cfg| {
                 // codec support or not for hardware acceleration
-                log::info!(
+                tracing::info!(
                     "Video Encoder with HW acceleration codec: {:?}, config: {:#?}",
                     self.codec_name,
                     cfg
@@ -814,8 +818,8 @@ impl EncoderBuilder {
                      subtitle stream in a transcode pipeline",
                 ));
             };
-            let header_c = std::ffi::CString::new(header.as_str())
-                .map_err(|e| RsmediaError::msg(format!("Invalid subtitle header: {e}")))?;
+            let header_c =
+                std::ffi::CString::new(header.as_str()).context("Invalid subtitle header")?;
             encode_ctx
                 .set_subtitle_header(header_c.as_c_str())
                 .context("Failed to set subtitle header")?;
@@ -1056,8 +1060,8 @@ impl Encoder {
         // decoded text plus a spurious zero-style record.
         let mut subtitle = AVSubtitle::new();
         let dialogue = format!("0,0,Default,,0,0,0,,{}", segment.text);
-        let dialogue_c = std::ffi::CString::new(dialogue)
-            .map_err(|e| RsmediaError::msg(format!("Subtitle text contains NUL byte: {e}")))?;
+        let dialogue_c =
+            std::ffi::CString::new(dialogue).context("Subtitle text contains NUL byte")?;
         subtitle
             .push_ass_rect(dialogue_c.as_c_str())
             .context("Failed to build subtitle rect")?;
@@ -1132,7 +1136,7 @@ impl Encoder {
                     Some(filtered) => self.send_frame_post_filter(filtered)?,
                     None => {
                         // filter 暂未输出（内部缓冲中），等待后续帧驱动
-                        log::debug!("Filter graph drained, waiting for more input.");
+                        tracing::debug!("Filter graph drained, waiting for more input.");
                     }
                 }
             } else {
@@ -1268,7 +1272,7 @@ impl Encoder {
         } else {
             self.check_frame(Some(&hw_frame))?;
 
-            log::debug!(
+            tracing::debug!(
                 "Send frame to encoder: {:?}, time_base: {:?}, media_type: {:?}",
                 hw_frame,
                 self.time_base(),
@@ -1592,11 +1596,11 @@ impl Encoder {
                 // （已送出 EOS）。这里**不能**改状态——read 阶段同样会走到这里，
                 // 置成 `Drained` 会让 `is_drained()` 在流中段就永久为真
                 // （见 `Encoder::state` 的说明）。
-                log::debug!("Encoder drained, try send new frame again.");
+                tracing::debug!("Encoder drained, try send new frame again.");
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::EncoderFlushedError) => {
-                log::debug!("Encoder flushed, EOF reached.");
+                tracing::debug!("Encoder flushed, EOF reached.");
                 self.state = CodecContextState::Flushed;
                 Ok(None)
             }
@@ -1634,7 +1638,7 @@ impl Encoder {
         // `EncoderFlushedError`。`Muxer::finish` 每个流都会调用本方法，而它自己
         // 承诺可重复调用，所以第二次必须是 no-op 而不是错误。
         if self.state != CodecContextState::Normal {
-            log::debug!("Encoder already flushed ({:?}), nothing to do.", self.state);
+            tracing::debug!("Encoder already flushed ({:?}), nothing to do.", self.state);
             return Ok(W::Accum::default());
         }
 
@@ -1694,22 +1698,22 @@ impl Encoder {
                 }
                 Ok(None) => {
                     if self.is_drained() {
-                        log::debug!("Encoder drained, try send new frame again.");
+                        tracing::debug!("Encoder drained, try send new frame again.");
                         drained_iterations += 1;
                         if drained_iterations > crate::MAX_DRAIN_ITERATIONS {
-                            log::error!(
+                            tracing::error!(
                                 "Encoder keeps returning EAGAIN after EOF, aborting flush."
                             );
                             break;
                         }
                         continue;
                     } else {
-                        log::debug!("Encoder flushed, EOF reached.");
+                        tracing::debug!("Encoder flushed, EOF reached.");
                         break;
                     }
                 }
                 Err(e) => {
-                    log::debug!("Encode packet error: {e}");
+                    tracing::debug!("Encode packet error: {e}");
                     break;
                 }
             }
@@ -1728,7 +1732,7 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         //! let _ = self.flush();
         if !self.is_flushed() {
-            log::error!("Encoder dropped without flushing, data may be lost.");
+            tracing::error!("Encoder dropped without flushing, data may be lost.");
         }
     }
 }

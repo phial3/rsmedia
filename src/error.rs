@@ -15,6 +15,8 @@
 //! }
 //! ```
 
+use std::error::Error as StdError;
+
 use rsmpeg::error::RsmpegError;
 
 /// Unified error type for all rsmedia APIs.
@@ -42,6 +44,14 @@ pub enum RsmediaError {
     /// Any other error with a human readable message.
     #[error("{0}")]
     Other(String),
+    /// An opaque error bubbled up from a third-party dependency (ndarray,
+    /// yuv, …) with its original source preserved.
+    ///
+    /// Attach human-readable context on top with [`Context::context`]; the
+    /// root cause stays downcastable (`error.root().source()`) for anyhow /
+    /// eyre users.
+    #[error("{0}")]
+    External(#[source] Box<dyn StdError + Send + Sync + 'static>),
     /// An error with additional context attached (produced by [`Context`]).
     #[error("{context}: {source}")]
     Context {
@@ -149,6 +159,18 @@ impl From<std::str::Utf8Error> for RsmediaError {
     }
 }
 
+impl From<ndarray::ShapeError> for RsmediaError {
+    fn from(e: ndarray::ShapeError) -> Self {
+        RsmediaError::External(Box::new(e))
+    }
+}
+
+impl From<yuv::YuvError> for RsmediaError {
+    fn from(e: yuv::YuvError) -> Self {
+        RsmediaError::External(Box::new(e))
+    }
+}
+
 impl From<image::ImageError> for RsmediaError {
     fn from(e: image::ImageError) -> Self {
         RsmediaError::Other(format!("image processing error: {e}"))
@@ -203,7 +225,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error as _;
 
     #[test]
     fn test_display_variants() {
@@ -286,5 +307,64 @@ mod tests {
                 "context must not hide the root cause: {wrapped:?}"
             );
         }
+    }
+
+    /// `RsmediaError` 必须保持 `Send + Sync + 'static`，否则无法用 `?`
+    /// 转进 `anyhow::Error` / `eyre::Report`，也无法跨线程传递。
+    #[test]
+    fn test_error_is_send_sync_static() {
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<RsmediaError>();
+    }
+
+    /// anyhow 互操作：`?` 自动转换 + 源链完整可下钻到原始错误。
+    #[test]
+    fn test_anyhow_interop_preserves_chain() {
+        fn fallible() -> anyhow::Result<()> {
+            // 元素数与形状不符 → 稳定触发 ShapeError。
+            let shape_error: std::result::Result<(), ndarray::ShapeError> =
+                ndarray::Array2::<u8>::from_shape_vec((2, 2), vec![0; 3]).map(|_| ());
+            shape_error.context("building a frame")?;
+            Ok(())
+        }
+
+        let report = fallible().unwrap_err();
+        // 逐层下钻：anyhow → Context → External → ndarray::ShapeError。
+        let rsmedia_err = report
+            .downcast_ref::<RsmediaError>()
+            .expect("auto-converted");
+        let external = match rsmedia_err.root() {
+            RsmediaError::External(source) => source,
+            other => panic!("unexpected root: {other:?}"),
+        };
+        external
+            .downcast_ref::<ndarray::ShapeError>()
+            .expect("ndarray source preserved");
+        assert!(report.to_string().contains("building a frame"));
+    }
+
+    /// 反向边界：`anyhow::Error` 装箱进 [`RsmediaError::External`]。
+    ///
+    /// 库不依赖 anyhow，所以没有 `From<anyhow::Error>`；调用方用
+    /// `RsmediaError::External(err.into())`（anyhow 官方支持转
+    /// `Box<dyn Error + Send + Sync>`），源链在 Display/source() 中保留。
+    #[test]
+    fn test_anyhow_error_wraps_into_external() {
+        let anyhow_err = anyhow::Error::msg("upstream failure").context("while demuxing input"); // anyhow 自己的链
+        let boxed: Box<dyn StdError + Send + Sync + 'static> = anyhow_err.into();
+        let err = RsmediaError::External(boxed);
+        // 注意：anyhow 的 Display 只显示最外层 context；内层消息经 source() 可达。
+        assert!(err.to_string().contains("while demuxing input"));
+
+        let wrapped = err.with_context("rsmedia boundary");
+        assert!(wrapped.to_string().contains("rsmedia boundary"));
+        // root() 落在 External；其 source() 即 anyhow 的 StdError 包装，
+        // 再往下是原始的 "upstream failure" —— 链完整活着。
+        assert!(matches!(wrapped.root(), RsmediaError::External(_)));
+        let anyhow_wrapper = wrapped.root().source().expect("external has a source");
+        let inner = anyhow_wrapper
+            .source()
+            .expect("anyhow keeps its own causes via source()");
+        assert_eq!(inner.to_string(), "upstream failure");
     }
 }
