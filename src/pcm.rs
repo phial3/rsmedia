@@ -160,18 +160,18 @@ impl<W: Writer> PcmSink<W> {
 
     /// 写入交错 `f32` PCM 块（如 cpal `SampleFormat::F32` 回调数据）。
     ///
-    /// 返回最后一次 mux 的输出（见 [`Muxer::mux`]）。
-    pub fn write_f32(&mut self, interleaved: &[f32]) -> Result<Option<W::Out>> {
+    /// 返回本次写入所有块经 mux 产生的输出累积（见 [`Muxer::mux`]）。
+    pub fn write_f32(&mut self, interleaved: &[f32]) -> Result<W::Accum> {
         self.write_chunks(interleaved, ffi::AV_SAMPLE_FMT_FLT)
     }
 
     /// 写入交错 `i16` PCM 块（如 cpal `SampleFormat::I16` 回调数据）。
-    pub fn write_i16(&mut self, interleaved: &[i16]) -> Result<Option<W::Out>> {
+    pub fn write_i16(&mut self, interleaved: &[i16]) -> Result<W::Accum> {
         self.write_chunks(interleaved, ffi::AV_SAMPLE_FMT_S16)
     }
 
     /// 写入交错 `u8` PCM 块（无符号 8bit，与 `AV_SAMPLE_FMT_U8` 一致）。
-    pub fn write_u8(&mut self, interleaved: &[u8]) -> Result<Option<W::Out>> {
+    pub fn write_u8(&mut self, interleaved: &[u8]) -> Result<W::Accum> {
         self.write_chunks(interleaved, ffi::AV_SAMPLE_FMT_U8)
     }
 
@@ -179,7 +179,7 @@ impl<W: Writer> PcmSink<W> {
     ///
     /// 未调用时 `Drop` 会自动执行相同收尾（经 [`Muxer::finish`]），
     /// 但无法感知错误，且 Drop 路径不会冲刷重采样器尾样 —— 显式调用推荐。
-    pub fn finish(mut self) -> Result<Option<W::Out>> {
+    pub fn finish(mut self) -> Result<W::Accum> {
         self.drain_resampler()?;
         self.muxer.finish()
     }
@@ -198,7 +198,7 @@ impl<W: Writer> PcmSink<W> {
         &mut self,
         interleaved: &[T],
         sample_format: ffi::AVSampleFormat,
-    ) -> Result<Option<W::Out>> {
+    ) -> Result<W::Accum> {
         let channels = self.spec.channels as usize;
         if !interleaved.len().is_multiple_of(channels) {
             return Err(RsmediaError::invalid_config(format!(
@@ -209,16 +209,15 @@ impl<W: Writer> PcmSink<W> {
         }
         let samples_per_channel = interleaved.len() / channels;
         if samples_per_channel == 0 {
-            return Ok(None);
+            return Ok(W::Accum::default());
         }
 
         // 逐块累积：`Out` 对缓冲型 Writer 是**增量**字节，既不能被后续块的输出
         // 覆盖，也不能因为末块因内部缓冲没有输出而丢掉前面已产生的字节。
-        let mut collected: Option<W::Out> = None;
+        let mut collected = W::Accum::default();
         for chunk in interleaved.chunks(MAX_CHUNK_SAMPLES * channels) {
-            if let Some(out) = self.write_chunk(chunk, sample_format)? {
-                W::fold_out(&mut collected, out);
-            }
+            let out = self.write_chunk(chunk, sample_format)?;
+            W::merge_accum(&mut collected, out);
         }
         Ok(collected)
     }
@@ -227,7 +226,7 @@ impl<W: Writer> PcmSink<W> {
         &mut self,
         interleaved: &[T],
         sample_format: ffi::AVSampleFormat,
-    ) -> Result<Option<W::Out>> {
+    ) -> Result<W::Accum> {
         let nb_samples = (interleaved.len() / self.spec.channels as usize) as i32;
 
         // 输入帧：packed（交错）样本，全部位于 data[0]
@@ -256,7 +255,7 @@ impl<W: Writer> PcmSink<W> {
         let out_nb = dst.nb_samples;
         if out_nb <= 0 {
             // 重采样器内部缓冲（滤波延迟），随后续输入/flush 输出
-            return Ok(None);
+            return Ok(W::Accum::default());
         }
         dst.set_pts(self.output_samples as i64);
         self.output_samples += out_nb as u64;

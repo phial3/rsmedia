@@ -148,7 +148,7 @@ fn main() -> Result<()> {
     // ---- 收尾：冲刷重采样器尾样 + 编码器剩余样本 + 写 trailer ----
     // （忘记调用时 Drop 亦可兜底，但显式 finish 能感知错误）
     let recorded_samples = sink.input_samples();
-    let _ = sink.finish()?;
+    sink.finish()?;
 
     let recorded_secs = recorded_samples as f64 / rate as f64;
     let size = std::fs::metadata(&output)?.len();
@@ -257,7 +257,7 @@ mod tests {
             write_chunk(&mut sink, Chunk::F32(chunk))?;
             written += n;
         }
-        let _ = sink.finish()?;
+        sink.finish()?;
 
         let file = std::fs::File::open(&output)?;
         let len = file.metadata()?.len();

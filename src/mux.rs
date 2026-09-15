@@ -542,9 +542,9 @@ impl<W: Writer> Muxer<W> {
     /// 结果一起返回。缓冲型 [`Writer`] 的 `Out` 是**增量**字节，**不能在这里
     /// 丢掉**：`write_header` 已经把它们从 writer 的内部累积里取走，丢弃就意味着
     /// header 那些字节永远不会到达调用方（`BufferWriter` 用户会拿到缺头的容器）。
-    fn ensure_header_written(&mut self) -> Result<Option<W::Out>> {
+    fn ensure_header_written(&mut self) -> Result<W::Accum> {
         if self.have_written_header {
-            return Ok(None);
+            return Ok(W::Accum::default());
         }
         self.apply_metadata();
         self.apply_chapters();
@@ -553,7 +553,9 @@ impl<W: Writer> Muxer<W> {
         // 会往无头容器里塞包、`finish` 还会补一个 trailer，错误被彻底掩盖。
         self.have_written_header = true;
         self.refresh_stream_info()?;
-        Ok(Some(header))
+        let mut collected = W::Accum::default();
+        W::merge_out(&mut collected, header);
+        Ok(collected)
     }
 
     /// 将已调整好流索引与时间戳的 packet 写入输出容器，返回容器的写入结果。
@@ -578,7 +580,7 @@ impl<W: Writer> Muxer<W> {
     ///
     /// * `frame` - [`AVFrame`] to encode and mux.
     /// * `stream_idx` - Index of the target output stream.
-    pub fn mux(&mut self, frame: AVFrame, stream_idx: usize) -> Result<Option<W::Out>> {
+    pub fn mux(&mut self, frame: AVFrame, stream_idx: usize) -> Result<W::Accum> {
         let mut collected = self.ensure_header_written()?;
 
         let mux_stream = self.get_stream_mut(stream_idx)?;
@@ -610,7 +612,7 @@ impl<W: Writer> Muxer<W> {
             packet.rescale_ts(enc_time_base, out_time_base);
 
             let out = self.write_packet(&mut packet)?;
-            W::fold_out(&mut collected, out);
+            W::merge_out(&mut collected, out);
         }
         Ok(collected)
     }
@@ -634,7 +636,7 @@ impl<W: Writer> Muxer<W> {
         &mut self,
         segment: &SubtitleSegment,
         stream_idx: usize,
-    ) -> Result<Option<W::Out>> {
+    ) -> Result<W::Accum> {
         // header 的输出要并入返回值（见 `ensure_header_written`），且必须在
         // 借出 `mux_stream` 之前调用。
         let mut collected = self.ensure_header_written()?;
@@ -662,7 +664,7 @@ impl<W: Writer> Muxer<W> {
             packet.set_stream_index(stream_idx as i32);
             packet.rescale_ts(enc_time_base, out_time_base);
             let out = self.write_packet(&mut packet)?;
-            W::fold_out(&mut collected, out);
+            W::merge_out(&mut collected, out);
         }
         Ok(collected)
     }
@@ -678,11 +680,7 @@ impl<W: Writer> Muxer<W> {
     /// * `packet`   - 来自 [`Demuxer::demux_packet`] 的原始包；其 `stream_index`
     ///   会在写入前被改写为输出流 index。
     /// * `stream_idx` - [`Self::add_copy_stream`] 返回的输出流 index。
-    pub fn mux_packet(
-        &mut self,
-        packet: &mut AVPacket,
-        stream_idx: usize,
-    ) -> Result<Option<W::Out>> {
+    pub fn mux_packet(&mut self, packet: &mut AVPacket, stream_idx: usize) -> Result<W::Accum> {
         let mut collected = self.ensure_header_written()?;
 
         let (src_time_base, out_time_base) = {
@@ -705,21 +703,21 @@ impl<W: Writer> Muxer<W> {
         packet.rescale_ts(src_time_base, out_time_base);
 
         let out = self.write_packet(packet)?;
-        W::fold_out(&mut collected, out);
+        W::merge_out(&mut collected, out);
         Ok(collected)
     }
 
     /// Signal to the muxer that writing has finished. This will cause a trailer to be written if
     /// the container format has one.
-    pub fn finish(&mut self) -> Result<Option<W::Out>> {
+    pub fn finish(&mut self) -> Result<W::Accum> {
         // 从未 mux 过任何数据（header 也尚未写入）：没有实际内容需要 flush，
-        // 直接空操作返回 `None`，不产生“无头”的残缺输出。
+        // 直接空操作返回空累积器，不产生“无头”的残缺输出。
         if !self.have_written_header {
-            return Ok(None);
+            return Ok(W::Accum::default());
         }
 
         // flush 与 trailer 的输出同样要累积（缓冲型 Writer 的 `Out` 是增量字节）。
-        let mut collected: Option<W::Out> = None;
+        let mut collected = W::Accum::default();
         for mux_stream in self.streams.iter_mut() {
             // flush the encoder to ensure all packets are sent to the muxer.
             // 透传流没有编码器延迟缓冲，无需 flush。
@@ -734,21 +732,15 @@ impl<W: Writer> Muxer<W> {
                 out_stream_index,
                 out_stream_time_base,
             )?;
-            if let Some(out) = flushed {
-                W::fold_out(&mut collected, out);
-            }
+            W::merge_accum(&mut collected, flushed);
         }
 
         // 已写 header 且未写 trailer 时才写 trailer；header + trailer 均已写说明
-        // 是重复调用 finish()，此时幂等返回 None，避免重复写 trailer。
+        // 是重复调用 finish()，此时幂等返回已累积的内容，避免重复写 trailer。
         if !self.have_written_trailer {
             self.have_written_trailer = true;
             let trailer = self.writer.write_trailer()?;
-            if let Some(acc) = &mut collected {
-                W::merge_out(acc, trailer);
-                return Ok(collected);
-            }
-            return Ok(Some(trailer));
+            W::merge_out(&mut collected, trailer);
         }
         Ok(collected)
     }
@@ -1767,9 +1759,9 @@ mod tests {
     }
 
     /// 验证两种情况：
-    /// 1. 从未 mux 任何数据（header 未写）时，`finish()` 应为空操作返回 `Ok(None)`，
+    /// 1. 从未 mux 任何数据（header 未写）时，`finish()` 应为空操作返回空累积器，
     ///    不会产生仅含 encode-EOS 包但无 header/trailer 的残缺输出。
-    /// 2. 重复调用 `finish()` 是幂等的：第二次返回 `Ok(None)`，不会重复写 trailer。
+    /// 2. 重复调用 `finish()` 是幂等的，不会重复写 trailer。
     #[test]
     fn test_finish_without_mux_and_idempotent() -> Result<()> {
         let output_path =
@@ -1779,17 +1771,12 @@ mod tests {
         let mut muxer = Muxer::new(output_path)?;
         muxer.add_encoder(encoder)?;
 
-        // 未 mux 任何帧，直接 finish：应为空操作，返回 None
-        let first = muxer.finish()?;
-        assert!(
-            first.is_none(),
-            "finish() on an empty muxer should be a no-op"
-        );
+        // 未 mux 任何帧，直接 finish：应为空操作，不写 header
+        muxer.finish()?;
         assert!(!muxer.have_written_header, "header should not be written");
 
-        // 第二次 finish 应幂等，返回 None，不重复写 trailer
-        let second = muxer.finish()?;
-        assert!(second.is_none(), "idempotent finish() should return None");
+        // 第二次 finish 应幂等，不重复写 trailer
+        muxer.finish()?;
 
         Ok(())
     }
@@ -2120,7 +2107,7 @@ mod tests {
         }
 
         /// 计入本次写出的字节数，并把同样的大小作为本次的 `Out`。
-        fn count(&mut self, bytes: Vec<u8>) -> usize {
+        fn count(&mut self, bytes: bytes::Bytes) -> usize {
             self.total += bytes.len();
             bytes.len()
         }
@@ -2128,6 +2115,15 @@ mod tests {
 
     impl Writer for CountingWriter {
         type Out = usize;
+        type Accum = usize;
+
+        fn merge_out(acc: &mut usize, out: usize) {
+            *acc += out;
+        }
+
+        fn merge_accum(acc: &mut usize, other: usize) {
+            *acc += other;
+        }
 
         fn write_header(&mut self) -> Result<usize> {
             let bytes = self.inner.write_header()?;
@@ -2156,11 +2152,6 @@ mod tests {
         fn output_mut(&mut self) -> &mut AVFormatContextOutput {
             self.inner.output_mut()
         }
-
-        /// 累加而不是覆盖：本 writer 的 `Out` 就是"本次写了多少字节"。
-        fn merge_out(acc: &mut usize, out: usize) {
-            *acc += out;
-        }
     }
 
     /// header 与一帧编出的多个 packet（B 帧重排序、编码器内部缓冲）的输出都必须
@@ -2178,9 +2169,9 @@ mod tests {
         for frame_index in 0..30i64 {
             let mut frame = generate_video_frame(64, 64, frame_index);
             frame.set_pts(frame_index);
-            returned += muxer.mux(frame, index)?.unwrap_or(0);
+            returned += muxer.mux(frame, index)?;
         }
-        returned += muxer.finish()?.unwrap_or(0);
+        returned += muxer.finish()?;
 
         let written = muxer.writer.total;
         assert!(written > 0, "the muxer wrote nothing at all");
@@ -2359,8 +2350,7 @@ mod tests {
         Ok(())
     }
 
-    /// `finish()` 是幂等的：第一次写 trailer 并回传其输出，之后每次都是
-    /// `Ok(None)`。
+    /// `finish()` 是幂等的：第一次写 trailer，之后每次都是 no-op。
     ///
     /// 它内部对每个流调用 `Encoder::flush`，而 `Encoder::flush` 现在按状态幂等
     /// 短路 —— 否则第二次 finish 会撞上 FFmpeg 的 "encoder is already flushed"，
@@ -2376,16 +2366,18 @@ mod tests {
             muxer.mux(frame, index)?;
         }
 
-        // 第一次：写 trailer，回传字节
+        // 第一次：写 trailer
+        muxer.finish()?;
         assert!(
-            muxer.finish()?.is_some(),
-            "the first finish() must write (and return) the trailer"
+            muxer.have_written_trailer,
+            "the first finish() must write the trailer"
         );
         // 之后每次：幂等 no-op，绝不报错
         for round in 2..=3 {
+            muxer.finish()?;
             assert!(
-                muxer.finish()?.is_none(),
-                "finish() #{round} must be a no-op"
+                muxer.have_written_trailer,
+                "finish() #{round} must stay idempotent"
             );
         }
 

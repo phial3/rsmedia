@@ -1,4 +1,5 @@
 use crate::error::{Context, Result, RsmediaError};
+use crate::init::{AVLogFlag, AVLogLevel};
 use crate::location::Location;
 use crate::options::Options;
 use crate::stream::MediaType;
@@ -12,6 +13,7 @@ use rsmpeg::avformat::{
 use rsmpeg::avutil::{AVDictionary, AVMem};
 use rsmpeg::ffi;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -873,12 +875,24 @@ unsafe impl Send for IoReader {}
 ///
 /// 该 trait 是公开的扩展点：可以为任意目标（socket、channel、加密流等）
 /// 实现自定义 Writer。
+///
+/// 输出模型分两层：
+/// - [`Out`](Self::Out)：单次 `write_*` 调用产生的输出（如一个 [`Bytes`] 块）；
+/// - [`Accum`](Self::Accum)：跨多次调用累积输出的容器（如 `Vec<Bytes>`）。
+///
+/// 二者解耦，单次输出可以是不变类型（`Bytes`，交接/共享零拷贝），而累积走
+/// chunk 列表的指针移动（`push`/`extend`），没有任何字节级 memcpy。
 pub trait Writer {
     /// 单次 `write_*` 调用产生的输出类型：
     /// [`StreamWriter`] 为 `()`（数据直接写出），
-    /// [`BufferWriter`] 为 `Vec<u8>`（本次调用新增的字节），
-    /// [`PacketizedBufWriter`] 为 `Vec<Vec<u8>>`（按包切分的字节块）。
+    /// [`BufferWriter`] 为 [`Bytes`]（本次调用新增的字节块），
+    /// [`PacketizedBufWriter`] 为 `Vec<Bytes>`（按包切分的字节块）。
     type Out;
+
+    /// 跨多次 `write_*` 累积 [`Out`](Self::Out) 的容器；空累积器即
+    /// `Default::default()`，因此"从零开始累积"无需 `Option` 包装。
+    /// [`StreamWriter`] 为 `()`，两个缓冲型 writer 均为 `Vec<Bytes>`。
+    type Accum: Default;
 
     /// Write the container header.
     fn write_header(&mut self) -> Result<Self::Out>;
@@ -935,31 +949,23 @@ pub trait Writer {
             })
     }
 
-    /// Folds one more write's output into an accumulator.
+    /// Folds one more write's output into the accumulator.
     ///
     /// For the buffering writers `Out` is the *incremental* new output of a single
     /// write, so a step that produces several packets must accumulate instead of
     /// overwrite — [keeping only the last chunk would silently hand back a
-    /// truncated stream][mux]. The default suits writers whose `Out` carries
-    /// nothing to accumulate, such as [`StreamWriter`]'s `()`.
+    /// truncated stream][mux]. Start from an empty accumulator with
+    /// `<Self as Writer>::Accum::default()`.
     ///
     /// [mux]: crate::mux::Muxer::mux
-    fn merge_out(acc: &mut Self::Out, out: Self::Out) {
-        *acc = out;
-    }
+    fn merge_out(acc: &mut Self::Accum, out: Self::Out);
 
-    /// Folds one more write's output into an accumulator that may still be empty.
+    /// Merges one accumulator into another: folding a sub-pipeline's accumulated
+    /// output ([`Encoder::flush`](crate::Encoder::flush), PCM writer chunks, …)
+    /// into the caller's accumulator.
     ///
-    /// [`merge_out`](Self::merge_out) folds into an existing value; this is the
-    /// same fold for the first write, so a loop writing several packets reads as
-    /// a single call instead of the four-line `match` it would otherwise need.
-    /// (That `match` used to be written out at every one of these loops.)
-    fn fold_out(acc: &mut Option<Self::Out>, out: Self::Out) {
-        match acc {
-            Some(acc) => Self::merge_out(acc, out),
-            None => *acc = Some(out),
-        }
-    }
+    /// Must accumulate, not overwrite — same rationale as [`Self::merge_out`].
+    fn merge_accum(acc: &mut Self::Accum, other: Self::Accum);
 }
 
 /// 将 builder 阶段未消费的 options 在 `write_header` 时传给 muxer。
@@ -1106,6 +1112,10 @@ impl StreamWriter {
 
 impl Writer for StreamWriter {
     type Out = ();
+    type Accum = ();
+
+    fn merge_out(_acc: &mut (), _out: ()) {}
+    fn merge_accum(_acc: &mut (), _other: ()) {}
 
     fn write_header(&mut self) -> Result<()> {
         let mut dict = self.options.take();
@@ -1147,9 +1157,12 @@ unsafe impl Send for StreamWriter {}
 
 /// 内存写状态：`data` 为累计输出，`pos` 为 avio 当前写位置（支持 seek 回退
 /// 重写），`delivered` 为已通过增量接口返回给调用方的字节数。
+///
+/// 存储用 [`BytesMut`] 而非 `Vec<u8>`：`into_bytes` 可零拷贝 freeze/转换，
+/// 追加路径走 [`BufMut::put_slice`] 免去 `resize` 的 memset + memcpy 双写。
 #[derive(Default)]
 struct MemWriterState {
-    data: Vec<u8>,
+    data: BytesMut,
     pos: usize,
     delivered: usize,
 }
@@ -1163,13 +1176,19 @@ fn mem_write(state: &Mutex<MemWriterState>, buf: &[u8]) -> i32 {
         Ok(guard) => guard,
         Err(_) => return AVERROR_EIO,
     };
-    let pos = st.pos;
-    let end = pos + buf.len();
-    if end > st.data.len() {
-        st.data.resize(end, 0);
+    if st.pos == st.data.len() {
+        // 追加快路径：顺序写出（绝大多数调用）直接 put，一次写入。
+        st.data.put_slice(buf);
+    } else {
+        // seek 回退路径：重写中部区域，需保证缓冲覆盖到位。
+        let pos = st.pos;
+        let end = pos + buf.len();
+        if end > st.data.len() {
+            st.data.resize(end, 0);
+        }
+        st.data[pos..end].copy_from_slice(buf);
     }
-    st.data[pos..end].copy_from_slice(buf);
-    st.pos = end;
+    st.pos += buf.len();
     buf.len() as i32
 }
 
@@ -1275,9 +1294,12 @@ impl BufferWriter {
     }
 
     /// 取出本次写入操作新增的字节增量。
-    fn take_written(&mut self) -> Vec<u8> {
+    ///
+    /// 返回 [`Bytes`]：从 FFmpeg 复用的 avio 缓冲中拷出（这层拷贝不可避免），
+    /// 但之后的交接、切片、跨线程共享都是引用计数，不再有第二次拷贝。
+    fn take_written(&mut self) -> Bytes {
         let mut st = self.state.lock().expect("mem writer state poisoned");
-        let delta = st.data[st.delivered..].to_vec();
+        let delta = Bytes::copy_from_slice(&st.data[st.delivered..]);
         st.delivered = st.data.len();
         delta
     }
@@ -1296,7 +1318,7 @@ impl BufferWriter {
         // 先释放 format context（连带 IO 回调释放其持有的 state 引用）
         drop(output);
         match Arc::try_unwrap(state) {
-            Ok(st) => st.into_inner().expect("mem writer state poisoned").data,
+            Ok(st) => Vec::from(st.into_inner().expect("mem writer state poisoned").data),
             // 不可达：output 已 drop，回调持有的 Arc 引用随之释放。
             // 用 panic（fail-fast）而非静默返回空 Vec，避免数据无声丢失。
             Err(_) => panic!("BufferWriter: state still referenced after context drop"),
@@ -1305,33 +1327,39 @@ impl BufferWriter {
 }
 
 impl Writer for BufferWriter {
-    type Out = Vec<u8>;
+    type Out = Bytes;
+    type Accum = Vec<Bytes>;
 
-    fn write_header(&mut self) -> Result<Vec<u8>> {
+    /// chunk 列表 `push`：只移动 `Bytes` 句柄，零字节拷贝。
+    fn merge_out(acc: &mut Vec<Bytes>, out: Bytes) {
+        acc.push(out);
+    }
+
+    /// chunk 列表 `extend`：只移动 `Bytes` 句柄，零字节拷贝。
+    fn merge_accum(acc: &mut Vec<Bytes>, other: Vec<Bytes>) {
+        acc.extend(other);
+    }
+
+    fn write_header(&mut self) -> Result<Bytes> {
         let mut dict = self.options.take();
         write_header_with_options(&mut self.output, &mut dict)?;
         flush_avio(&mut self.output);
         Ok(self.take_written())
     }
 
-    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Vec<u8>> {
+    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Bytes> {
         self.output.write_frame(packet)?;
         flush_avio(&mut self.output);
         Ok(self.take_written())
     }
 
-    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Vec<u8>> {
+    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Bytes> {
         self.output.interleaved_write_frame(packet)?;
         flush_avio(&mut self.output);
         Ok(self.take_written())
     }
 
-    /// 追加而不是覆盖：一帧可能产出多个 packet，只保留最后一块会丢字节。
-    fn merge_out(acc: &mut Vec<u8>, out: Vec<u8>) {
-        acc.extend(out);
-    }
-
-    fn write_trailer(&mut self) -> Result<Vec<u8>> {
+    fn write_trailer(&mut self) -> Result<Bytes> {
         self.output.write_trailer()?;
         flush_avio(&mut self.output);
         Ok(self.take_written())
@@ -1384,14 +1412,16 @@ impl<'a> PacketizedBufWriterBuilder<'a> {
 
     /// Build [`PacketizedBufWriter`].
     pub fn build(self) -> Result<PacketizedBufWriter> {
-        let buffers = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let buffers = Arc::new(Mutex::new(Vec::<Bytes>::new()));
 
         // 回调在 FFI 调用栈中执行，严禁 panic：锁中毒返回 AVERROR(EIO)。
+        // 包数据必须从 FFmpeg 复用的 avio 缓冲中拷出；用 [`Bytes`] 承载，
+        // 下游切片/共享/跨线程分发均为廉价引用计数而非深拷贝。
         let write_buffers = buffers.clone();
         let write_packet: WritePacketCallback =
             Box::new(move |_opaque, buf: &[u8]| match write_buffers.lock() {
                 Ok(mut guard) => {
-                    guard.push(buf.to_vec());
+                    guard.push(Bytes::copy_from_slice(buf));
                     buf.len() as i32
                 }
                 Err(_) => AVERROR_EIO,
@@ -1431,7 +1461,7 @@ impl<'a> PacketizedBufWriterBuilder<'a> {
 /// ```
 pub struct PacketizedBufWriter {
     pub(crate) output: AVFormatContextOutput,
-    buffers: Arc<Mutex<Vec<Vec<u8>>>>,
+    buffers: Arc<Mutex<Vec<Bytes>>>,
     options: Option<AVDictionary>,
 }
 
@@ -1451,39 +1481,45 @@ impl PacketizedBufWriter {
     }
 
     #[inline]
-    fn take_buffers(&mut self) -> Vec<Vec<u8>> {
+    fn take_buffers(&mut self) -> Vec<Bytes> {
         std::mem::take(&mut *self.buffers.lock().expect("packet buffers poisoned"))
     }
 }
 
 impl Writer for PacketizedBufWriter {
-    type Out = Vec<Vec<u8>>;
+    type Out = Vec<Bytes>;
+    type Accum = Vec<Bytes>;
 
-    fn write_header(&mut self) -> Result<Vec<Vec<u8>>> {
+    /// chunk 列表 `extend`：只移动 `Bytes` 句柄，零字节拷贝。
+    fn merge_out(acc: &mut Vec<Bytes>, out: Vec<Bytes>) {
+        acc.extend(out);
+    }
+
+    /// chunk 列表 `extend`：只移动 `Bytes` 句柄，零字节拷贝。
+    fn merge_accum(acc: &mut Vec<Bytes>, other: Vec<Bytes>) {
+        acc.extend(other);
+    }
+
+    fn write_header(&mut self) -> Result<Vec<Bytes>> {
         let mut dict = self.options.take();
         write_header_with_options(&mut self.output, &mut dict)?;
         flush_avio(&mut self.output);
         Ok(self.take_buffers())
     }
 
-    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Vec<Vec<u8>>> {
+    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Vec<Bytes>> {
         self.output.write_frame(packet)?;
         flush_avio(&mut self.output);
         Ok(self.take_buffers())
     }
 
-    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Vec<Vec<u8>>> {
+    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Vec<Bytes>> {
         self.output.interleaved_write_frame(packet)?;
         flush_avio(&mut self.output);
         Ok(self.take_buffers())
     }
 
-    /// 追加而不是覆盖：一帧可能产出多个 packet，只保留最后一批会丢字节块。
-    fn merge_out(acc: &mut Vec<Vec<u8>>, out: Vec<Vec<u8>>) {
-        acc.extend(out);
-    }
-
-    fn write_trailer(&mut self) -> Result<Vec<Vec<u8>>> {
+    fn write_trailer(&mut self) -> Result<Vec<Bytes>> {
         self.output.write_trailer()?;
         flush_avio(&mut self.output);
         Ok(self.take_buffers())
@@ -1619,6 +1655,10 @@ impl<W: std::io::Write + Send + 'static> CustomIoWriter<W> {
 
 impl<W: std::io::Write + Send + 'static> Writer for CustomIoWriter<W> {
     type Out = ();
+    type Accum = ();
+
+    fn merge_out(_acc: &mut (), _out: ()) {}
+    fn merge_accum(_acc: &mut (), _other: ()) {}
 
     fn write_header(&mut self) -> Result<()> {
         let mut dict = self.options.take();
@@ -1663,11 +1703,11 @@ unsafe impl<W: std::io::Write + Send + 'static> Send for CustomIoWriter<W> {}
 
 /// Initialize the logging handler. This will redirect all ffmpeg logging to the Rust `tracing`
 /// crate and any subscribers to it.
-pub fn init_logging() {
+pub fn init_logging(level: AVLogLevel, flag: AVLogFlag) {
     unsafe {
         ffi::av_log_set_callback(Some(log_callback));
-        ffi::av_log_set_level(ffi::AV_LOG_TRACE as _);
-        // ffi::av_log_set_flags()
+        ffi::av_log_set_level(level as _);
+        ffi::av_log_set_flags(flag as _);
     }
 }
 
@@ -1960,9 +2000,8 @@ mod tests {
             let mut frame = generate_rgb_frame(64, 48, i);
             frame.set_pts(i);
             frame.set_time_base(tb);
-            if let Some(chunk) = muxer.mux(frame, video_index)? {
-                total += chunk.len();
-            }
+            let chunks = muxer.mux(frame, video_index)?;
+            total += chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
         }
         muxer.finish()?;
         let bytes = muxer.into_writer().into_bytes();

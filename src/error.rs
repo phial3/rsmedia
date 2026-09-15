@@ -15,32 +15,38 @@
 //! }
 //! ```
 
-use std::error::Error as StdError;
-use std::fmt;
-
 use rsmpeg::error::RsmpegError;
 
 /// Unified error type for all rsmedia APIs.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RsmediaError {
     /// Underlying FFmpeg (rsmpeg) error.
-    Ffmpeg(RsmpegError),
+    #[error("FFmpeg error: {0}")]
+    FFmpeg(#[from] RsmpegError),
     /// I/O error, typically from custom AVIO callbacks or file access.
-    Io(std::io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// The requested codec/encoder/decoder does not exist in this FFmpeg build.
+    #[error("codec not found in this FFmpeg build: '{0}'")]
     CodecNotFound(String),
     /// The requested container format does not exist in this FFmpeg build.
+    #[error("format not found in this FFmpeg build: '{0}'")]
     FormatNotFound(String),
     /// The operation is not supported on this platform, build or codec.
+    #[error("unsupported operation: {0}")]
     Unsupported(String),
     /// Invalid or contradictory configuration.
+    #[error("invalid configuration: {0}")]
     InvalidConfig(String),
     /// Any other error with a human readable message.
+    #[error("{0}")]
     Other(String),
     /// An error with additional context attached (produced by [`Context`]).
+    #[error("{context}: {source}")]
     Context {
         context: String,
+        #[source]
         source: Box<RsmediaError>,
     },
 }
@@ -129,48 +135,6 @@ impl RsmediaError {
     }
 }
 
-impl fmt::Display for RsmediaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RsmediaError::Ffmpeg(e) => write!(f, "FFmpeg error: {e}"),
-            RsmediaError::Io(e) => write!(f, "I/O error: {e}"),
-            RsmediaError::CodecNotFound(name) => {
-                write!(f, "codec not found in this FFmpeg build: '{name}'")
-            }
-            RsmediaError::FormatNotFound(name) => {
-                write!(f, "format not found in this FFmpeg build: '{name}'")
-            }
-            RsmediaError::Unsupported(reason) => write!(f, "unsupported operation: {reason}"),
-            RsmediaError::InvalidConfig(reason) => write!(f, "invalid configuration: {reason}"),
-            RsmediaError::Other(message) => write!(f, "{message}"),
-            RsmediaError::Context { context, source } => write!(f, "{context}: {source}"),
-        }
-    }
-}
-
-impl StdError for RsmediaError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            RsmediaError::Ffmpeg(e) => Some(e),
-            RsmediaError::Io(e) => Some(e),
-            RsmediaError::Context { source, .. } => Some(source.as_ref()),
-            _ => None,
-        }
-    }
-}
-
-impl From<RsmpegError> for RsmediaError {
-    fn from(e: RsmpegError) -> Self {
-        RsmediaError::Ffmpeg(e)
-    }
-}
-
-impl From<std::io::Error> for RsmediaError {
-    fn from(e: std::io::Error) -> Self {
-        RsmediaError::Io(e)
-    }
-}
-
 impl From<std::ffi::NulError> for RsmediaError {
     fn from(e: std::ffi::NulError) -> Self {
         RsmediaError::InvalidConfig(format!(
@@ -239,6 +203,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
 
     #[test]
     fn test_display_variants() {

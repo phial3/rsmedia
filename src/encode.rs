@@ -1618,9 +1618,10 @@ impl Encoder {
     ///
     /// # Returns
     ///
-    /// `Ok(Some(out))` with every flushed packet's output folded together, so a
-    /// byte-sink writer sees its tail bytes too; `Ok(None)` when nothing was
-    /// written (a subtitle stream, or a writer whose `Out` is `()`).
+    /// An accumulator (`W::Accum`) holding every flushed packet's output merged
+    /// via [`Writer::merge_out`], so a buffering writer sees its tail bytes too;
+    /// an empty accumulator when nothing was written (a subtitle stream, or a
+    /// writer whose output carries no data).
     /// May return an error if writing fails or encoder returns an error.
     pub fn flush<W: Writer>(
         &mut self,
@@ -1628,13 +1629,13 @@ impl Encoder {
         interleaved: bool,
         index: usize,
         out_stream_time_base: ffi::AVRational,
-    ) -> Result<Option<W::Out>> {
+    ) -> Result<W::Accum> {
         // 已经 flush 过就幂等返回：EOS 只能送一次，重复送会拿到 FFmpeg 的
         // `EncoderFlushedError`。`Muxer::finish` 每个流都会调用本方法，而它自己
         // 承诺可重复调用，所以第二次必须是 no-op 而不是错误。
         if self.state != CodecContextState::Normal {
             log::debug!("Encoder already flushed ({:?}), nothing to do.", self.state);
-            return Ok(None);
+            return Ok(W::Accum::default());
         }
 
         // 字幕编码器走同步 API（avcodec_encode_subtitle），无内部缓冲，
@@ -1643,7 +1644,7 @@ impl Encoder {
         // "未 flush" 告警只应针对真的丢了缓冲的编码器。
         if self.media_type == MediaType::SUBTITLE {
             self.state = CodecContextState::Flushed;
-            return Ok(None);
+            return Ok(W::Accum::default());
         }
 
         if let Some(filter) = self.filter_graph.as_mut() {
@@ -1668,7 +1669,7 @@ impl Encoder {
         // EOF 已发送，理论上编码器最终会返回 EOF；但为防御个别编码器在 EOS 后
         // 持续返回 EAGAIN（Drained）而不返回 EOF，增加迭代上限，避免死循环。
         let mut drained_iterations = 0usize;
-        let mut flushed_output: Option<W::Out> = None;
+        let mut flushed_output = W::Accum::default();
         loop {
             match self.receive_packet() {
                 Ok(Some(mut packet)) => {
@@ -1689,7 +1690,7 @@ impl Encoder {
                     } else {
                         writer.write_frame(&mut packet)?
                     };
-                    W::fold_out(&mut flushed_output, out);
+                    W::merge_out(&mut flushed_output, out);
                 }
                 Ok(None) => {
                     if self.is_drained() {

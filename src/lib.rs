@@ -43,7 +43,7 @@ pub use filter::Filter;
 pub use fmt::{DataLayout, FrameFormat, SampleFormat};
 pub use frame::{ElementType, FrameData, FrameSideData, MediaFrame};
 pub use hwaccel::{HWDeviceConfig, HWDeviceType};
-pub use init::init;
+pub use init::{AVLogFlag, AVLogLevel, init, init_with, init_with_level};
 pub use io::{AVSeekFlag, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
