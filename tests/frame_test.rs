@@ -8,8 +8,6 @@
 //!
 //! Requires the `ndarray` feature (`frame` itself is behind it).
 
-#![cfg(feature = "ndarray")]
-
 use rsmedia::colors::Color;
 use rsmedia::error::{Context, Result};
 use rsmedia::{

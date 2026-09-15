@@ -27,15 +27,14 @@ pub fn remove_test_output(path: &std::path::Path) {
 }
 
 // ---------------------------------------------------------------------------
-// Synthetic frame generators (ndarray-gated, used by integration tests that
+// Synthetic frame generators (used by integration tests that
 // drive the high-level MediaFrame API, e.g. tests/codec_matrix.rs).
 // ---------------------------------------------------------------------------
 
 /// Generates a video test frame (RGB24): horizontal red / vertical green
 /// gradients plus a phase-shifted blue channel, so round-trips exercise every
-/// plane. Requires the `ndarray` feature.
+/// plane.
 #[allow(dead_code)]
-#[cfg(feature = "ndarray")]
 pub fn gradient_video_frame(width: usize, height: usize, phase: f32) -> rsmedia::MediaFrame<u8> {
     let mut frame =
         rsmedia::MediaFrame::<u8>::new_video_frame(width, height, rsmedia::PixelFormat::RGB24)
@@ -57,9 +56,7 @@ pub fn gradient_video_frame(width: usize, height: usize, phase: f32) -> rsmedia:
 /// Generates one stereo sine-wave audio frame (FLTP, f32 samples).
 /// The encoder's native sample format is negotiated and converted
 /// automatically, so this single layout feeds every audio codec.
-/// Requires the `ndarray` feature.
 #[allow(dead_code)]
-#[cfg(feature = "ndarray")]
 pub fn sine_audio_frame(
     freq: f32,
     channels: u32,

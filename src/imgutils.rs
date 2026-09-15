@@ -636,7 +636,7 @@ pub fn apply_cropping(frame: &mut AVFrame, flags: i32) -> Result<()> {
 ///
 /// packed 8bit 格式（RGB24/RGBA/GRAY8）直接从帧数据构建，其他格式
 /// （YUV 系列、BGR 族等）经 swscale 统一转为 RGB24 再构建。
-/// 不依赖 `ndarray` feature。硬件帧需先下载到内存（见
+/// 不依赖 `MediaFrame`。硬件帧需先下载到内存（见
 /// `HWContext::hw_download`）。
 pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
     let (width, height) = (frame.width as u32, frame.height as u32);
@@ -1118,7 +1118,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "ndarray")]
     #[test]
     fn test_fill_frame_from_buffer() -> Result<()> {
         let mut frame = create_test_frame(320, 240, ffi::AV_PIX_FMT_RGB24)?;

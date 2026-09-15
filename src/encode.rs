@@ -2,7 +2,6 @@ use crate::codec::{CodecConfig, CodecContextState};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::fmt::FrameFormat;
-#[cfg(feature = "ndarray")]
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
@@ -991,7 +990,6 @@ impl Encoder {
     /// # Arguments
     ///
     /// * `frame` - Frame to encode in `HWC` format and standard layout.
-    #[cfg(feature = "ndarray")]
     pub fn encode<T>(&mut self, frame: MediaFrame<T>) -> Result<Vec<AVPacket>>
     where
         T: ElementType,
@@ -1749,7 +1747,7 @@ mod tests {
     // 核心方法单元测试
     //
     // 只覆盖编码器自身的决策逻辑 —— 格式协商、时间基/码率推导、pts 自动编号、
-    // 帧校验、builder 选项落点 —— 不落盘、不做编解码往返，因此不需要 ndarray，
+    // 帧校验、builder 选项落点 —— 不落盘、不做编解码往返，因此不需要 `MediaFrame`，
     // 也不依赖任何测试媒体文件。
     //
     // 需要真实文件的端到端功能测试（容器矩阵 / 编解码往返 / 滤镜 / 转码 /

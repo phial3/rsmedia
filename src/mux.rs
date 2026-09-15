@@ -183,6 +183,15 @@ impl<W: Writer> Muxer<W> {
     }
 
     pub fn add_encoder(&mut self, encoder: Encoder) -> Result<usize> {
+        // header 一旦写出（首个包 mux 时懒触发），AVFormatContext 的流数组就固定了；
+        // 此时再加流会让 av_interleaved_write_frame 访问越界的流索引 → SIGSEGV
+        // （边界测试实测）。必须报错而不是放行。
+        if self.have_written_header {
+            return Err(RsmediaError::invalid_config(
+                "Cannot add a stream after the container header has been written; \
+                 register all streams before the first mux()/mux_packet()",
+            ));
+        }
         let stream_idx = self
             .writer
             .add_stream(encoder.codecpar(), encoder.time_base());
@@ -201,6 +210,13 @@ impl<W: Writer> Muxer<W> {
     /// 典型用法：`Demuxer::new_passthrough` 迭代的 packet（保留原流 index）
     /// 与 `Muxer::add_copy_stream` 输入的源流一一对应。
     pub fn add_copy_stream(&mut self, src_info: &StreamInfo) -> Result<usize> {
+        // 与 `add_encoder` 同一守卫：header 写出后流数组已固定，再加流是未定义行为。
+        if self.have_written_header {
+            return Err(RsmediaError::invalid_config(
+                "Cannot add a stream after the container header has been written; \
+                 register all streams before the first mux()/mux_packet()",
+            ));
+        }
         let src_time_base = src_info.time_base;
         let stream_idx = self
             .writer
@@ -2223,6 +2239,36 @@ mod tests {
             "single-stream mode decodes, it is not a passthrough demuxer"
         );
 
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// header 写出之后再 `add_encoder` 必须报错（invalid_config），而不是 SIGSEGV。
+    ///
+    /// AVFormatContext 的流数组在 `write_header`（首个包 mux 时懒触发）之后固定，
+    /// 中途扩张会让 `av_interleaved_write_frame` 访问越界流索引 —— 边界测试实测段错误。
+    #[test]
+    fn test_add_encoder_after_packets_is_rejected() -> Result<()> {
+        let path = crate::test_support::test_output_path("mux", "test_late_add.mp4");
+        let mut muxer = Muxer::new(&path)?;
+        let index = muxer.add_encoder(Encoder::new_video(64, 64)?)?;
+        for frame_index in 0..3i64 {
+            let mut frame = generate_video_frame(64, 64, frame_index);
+            frame.set_pts(frame_index);
+            muxer.mux(frame, index)?;
+        }
+
+        let late = match muxer.add_encoder(Encoder::new_video(64, 64)?) {
+            Ok(_) => panic!("add_encoder after packets must fail, not segfault"),
+            Err(e) => e,
+        };
+        assert!(late.is_invalid_config(), "{late}");
+
+        // 已注册的流仍可继续写、finish 仍正常。
+        let mut frame = generate_video_frame(64, 64, 9);
+        frame.set_pts(9);
+        muxer.mux(frame, index)?;
+        muxer.finish()?;
         crate::test_support::remove_test_output(&path);
         Ok(())
     }

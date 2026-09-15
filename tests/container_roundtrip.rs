@@ -17,8 +17,6 @@
 //!
 //! Requires the `ndarray` feature (frames come from the high-level API).
 
-#![cfg(feature = "ndarray")]
-
 mod common;
 
 use std::path::Path;

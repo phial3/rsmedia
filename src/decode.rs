@@ -1,7 +1,6 @@
 use crate::codec::{AVCodecFlag, CodecContextState};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
-#[cfg(feature = "ndarray")]
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::{Reader, Seekable};
@@ -663,7 +662,6 @@ impl Decoder {
     ///     // Do something with frame...
     /// }
     /// ```
-    #[cfg(feature = "ndarray")]
     pub fn decode<T>(&mut self, reader: &mut impl Reader) -> Result<Option<MediaFrame<T>>>
     where
         T: ElementType,
@@ -688,7 +686,6 @@ impl Decoder {
     /// # Return value
     ///
     /// The decoded frame, or [`None`] at end of stream.
-    #[cfg(feature = "ndarray")]
     pub fn decode_frame(&mut self, reader: &mut impl Reader) -> Result<Option<MediaFrame<u8>>> {
         self.decode::<u8>(reader)
     }
@@ -810,7 +807,6 @@ impl Decoder {
     ///
     /// A tuple of the [`AVFrame`] and timestamp (relative to the stream) and the frame itself if the
     /// decoder has a frame available, [`None`] if not.
-    #[cfg(feature = "ndarray")]
     pub fn decode_packet<T>(&mut self, packet: &AVPacket) -> Result<Option<MediaFrame<T>>>
     where
         T: ElementType,
@@ -857,7 +853,6 @@ impl Decoder {
     ///
     /// A tuple of the [`AVFrame`] and timestamp (relative to the stream) and the frame itself if the
     /// decoder has a frame available, [`None`] if not.
-    #[cfg(feature = "ndarray")]
     pub fn drain<T>(&mut self) -> Result<Option<MediaFrame<T>>>
     where
         T: ElementType,
@@ -1271,7 +1266,7 @@ unsafe impl Send for Decoder {}
 /// 内部流程：构建视频解码器（RGB24 输出 + [`Resize::Fit`] 保持纵横比缩放）
 /// → seek 到目标时间 → 解码一帧原始 `AVFrame` → 转为
 /// [`image::DynamicImage`](crate::imgutils::to_dynamic_image)。
-/// 不依赖 `ndarray` feature，适合生成封面图 / 视频预览等场景。
+/// 不依赖 `MediaFrame`，适合生成封面图 / 视频预览等场景。
 ///
 /// # Arguments
 ///
