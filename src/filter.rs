@@ -655,11 +655,7 @@ pub mod video {
     /// 高斯模糊。
     /// `sigma`: 高斯标准差（越大越模糊，默认 0.5）。
     pub fn gblur(sigma: f32) -> Filter {
-        Filter::new(
-            "gblur",
-            MediaType::VIDEO,
-            format!("gblur=sigma={sigma}"),
-        )
+        Filter::new("gblur", MediaType::VIDEO, format!("gblur=sigma={sigma}"))
     }
 
     /// 平均值模糊（boxblur，参数化版本）。
@@ -1049,7 +1045,11 @@ pub mod audio {
     /// 高频增益（treble）。
     /// `freq` - 中心频率，`gain` - 增益（dB）。
     pub fn treble(freq: u32, gain: f32) -> Filter {
-        Filter::new("treble", MediaType::AUDIO, format!("treble=f={freq}:g={gain}"))
+        Filter::new(
+            "treble",
+            MediaType::AUDIO,
+            format!("treble=f={freq}:g={gain}"),
+        )
     }
 
     /// 低频搁架滤波器（lowshelf）。
