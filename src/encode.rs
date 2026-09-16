@@ -1115,7 +1115,7 @@ impl Encoder {
             let graph_input_format = self.filter_input_format.unwrap_or_else(|| {
                 // 无声明时图输入=编码器协商格式
                 match self.media_type {
-                    MediaType::VIDEO => FrameFormat::Pixel(self.pix_fmt()),
+                    MediaType::VIDEO => FrameFormat::Pixel(self.input_sw_pix_fmt()),
                     _ => FrameFormat::Sample(self.sample_fmt()),
                 }
             });
@@ -1519,6 +1519,20 @@ impl Encoder {
     #[inline]
     pub fn pix_fmt(&self) -> PixelFormat {
         self.context.pix_fmt.into()
+    }
+
+    /// 编码器期望的**软件输入**像素格式。
+    ///
+    /// 软件编码器即编码器协商格式（[`Self::pix_fmt`]）；硬件编码器时
+    /// `codec_ctx.pix_fmt` 被 [`crate::hwaccel::HWContext::setup_encoder_frames`]
+    /// 覆写为硬件私有格式（如 `AV_PIX_FMT_VIDEOTOOLBOX`），而输入帧仍需以
+    /// **软件格式**（如 NV12）做 swscale/上传，故此处返回 `hw_ctx` 的软件格式。
+    #[inline]
+    fn input_sw_pix_fmt(&self) -> PixelFormat {
+        match self.hw_context.as_ref() {
+            Some(hw_ctx) => hw_ctx.get_format(false).into(),
+            None => self.pix_fmt(),
+        }
     }
 
     /// Each submitted frame except the last must contain exactly frame_size samples per channel.

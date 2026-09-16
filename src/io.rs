@@ -5,12 +5,14 @@ use crate::options::Options;
 use crate::stream::MediaType;
 use crate::{strutils, time};
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
 use rsmpeg::avformat::{
     AVFormatContextInput, AVFormatContextOutput, AVIOContextContainer, AVIOContextCustom,
     AVInputFormat, ReadPacketCallback, SeekCallback, WritePacketCallback,
 };
 use rsmpeg::avutil::{AVDictionary, AVMem};
+use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -27,8 +29,32 @@ const AVIO_BUFFER_SIZE: usize = 4096;
 ffi_enum!(
     /// Flags for [`Seekable::seek_to_frame`] (FFmpeg `AVSEEK_FLAG_*`).
     ///
-    /// Combinable: `AVSeekFlag::BACKWARD | AVSeekFlag::ANY` yields the raw `i32` mask that
-    /// `seek_to_frame` accepts, since its parameter is `impl Into<i32>`.
+    /// # Combining flags
+    ///
+    /// `|` combines flag bits, and the result is the **raw `i32` mask** — a fieldless
+    /// enum cannot hold an unnamed combination such as `BACKWARD | ANY` — which
+    /// [`Seekable::seek_to_frame`] accepts directly, because its parameter is
+    /// `impl Into<i32>`. A single flag converts on its own:
+    ///
+    /// ```
+    /// # use rsmedia::AVSeekFlag;
+    /// let mask: i32 = AVSeekFlag::BACKWARD | AVSeekFlag::ANY; // 0b101
+    /// let one: i32 = AVSeekFlag::ANY.into();
+    /// ```
+    ///
+    /// Mixing a flag with a raw mask needs an explicit `as i32`: the `AVSEEK_FLAG_*`
+    /// constants in rsmpeg are **`u32`**, whereas the operators are generated for the
+    /// enum's own `repr` (here `i32`, because `av_seek_frame` takes `int`) and for
+    /// `AVSeekFlag` only — a mixed-signedness overload is deliberately not provided:
+    ///
+    /// ```
+    /// # use rsmedia::AVSeekFlag;
+    /// let mixed: i32 = AVSeekFlag::FRAME | AVSeekFlag::BYTE;
+    /// // `AVSeekFlag::FRAME | ffi::AVSEEK_FLAG_BYTE` does not compile: u32 vs i32.
+    /// ```
+    ///
+    /// A combination is a bare `i32` from then on: no API turns it back into named
+    /// flags, so test individual bits against `AVSeekFlag::X.as_raw()`.
     AVSeekFlag, i32 {
         BACKWARD => ffi::AVSEEK_FLAG_BACKWARD;
         BYTE => ffi::AVSEEK_FLAG_BYTE;
@@ -171,29 +197,40 @@ pub trait Seekable: Reader {
         Ok(())
     }
 
-    /// Seek to a specific frame in the video stream.
+    /// Seek to a position in a stream: by **timestamp** by default, or by byte offset /
+    /// "frame index" when the matching flag is set.
     ///
-    /// Wraps FFmpeg's `av_seek_frame`, which by default (without `AVSeekFlag::BYTE`
-    /// or `AVSeekFlag::FRAME`) treats `frame_ts` as a **timestamp in stream
-    /// time-base units**.
+    /// Wraps FFmpeg's `av_seek_frame`. `frame_ts` is interpreted according to `flags`,
+    /// and — this is the part worth reading — **the flags do not all do what their names
+    /// promise**. Measured behaviour on FFmpeg 9:
     ///
-    /// # Frame-based seeking (`AVSeekFlag::FRAME`)
+    /// - **No flag, or `AVSeekFlag::ANY` / `AVSeekFlag::BACKWARD`** — timestamp seek, in
+    ///   the stream's time-base units. Works on containers that build an index (MP4/MOV,
+    ///   MPEG-TS, MKV, …); fails on raw Annex-B, which has neither index nor timestamps
+    ///   (next bullet).
+    /// - **`AVSeekFlag::FRAME` is not implemented by FFmpeg.** `avformat.h` documents it
+    ///   as "seeking based on frame number", but no code path in libavformat reads it: a
+    ///   few niche demuxers *reject* it (`mv`, `cine`, `concat`, subtitles, …) and
+    ///   everything else ignores it, so the call falls through to the ordinary timestamp
+    ///   path. On MP4, `seek_to_frame(0, 7, AVSeekFlag::FRAME)` therefore does **not**
+    ///   land on frame 7 and does **not** fail either: it seeks to timestamp 7 and lands
+    ///   on the first keyframe at `ts >= 7` (measured: frame 1 of an all-intra file).
+    ///   Do not use it expecting frame indexes.
+    /// - **`AVSeekFlag::BYTE`** repositions by byte offset — a plain `avio_seek`.
+    ///   Demuxers that index by timestamp and set `AVFMT_NO_BYTE_SEEK` reject it with an
+    ///   error (**MP4/MOV** is one; measured), while raw Annex-B accepts it (pure
+    ///   byte-offset repositioning; measured).
+    /// - **Raw Annex-B (`.h264` / `.hevc`)**: the raw demuxers carry no
+    ///   `read_seek`/`read_seek2` and no `read_timestamp`, and decode every packet with
+    ///   `pts = AV_NOPTS_VALUE`, so nothing ever fills the index and **every** seek by
+    ///   timestamp or by "frame" fails — only `BYTE` works. [`Seekable::seek_to_start`]
+    ///   fails there too.
     ///
-    /// Passing `AVSeekFlag::FRAME` asks for **frame-precise** seeking: `frame_ts`
-    /// is interpreted as a frame **index** (not a timestamp). Support is entirely
-    /// **source-dependent** and most containers cannot honour it:
-    ///
-    /// - **Not supported** by common containers like **MP4/MOV/MKV/AVI** (their
-    ///   demuxers index by timestamp, not by frame), nor by network/live sources.
-    ///   For these, `seek_to_frame(.., N, AVSeekFlag::FRAME)` returns `Err` with a
-    ///   negative FFmpeg code — even though [`Seekable::seek_to_timestamp`] works fine.
-    /// - **Supported** by a handful of raw / low-level demuxers such as **`.h264` /
-    ///   `.hevc` / raw PCM**, which are the intended consumers of frame-index seeking.
-    ///
-    /// So treat this call as **fallible** (propagate the `Result`, don't `.unwrap()`)
-    /// and prefer [`Seekable::seek_to_timestamp`] for container formats. Note also that
-    /// seeking is best-effort: it lands on the nearest **keyframe** unless
-    /// `AVSeekFlag::ANY` is combined.
+    /// Support is otherwise source-dependent (network/live inputs may refuse or block),
+    /// so treat the returned `Result` as authoritative — propagate it instead of
+    /// `.unwrap()`-ing it, and prefer [`Seekable::seek_to_timestamp`] for containers.
+    /// Seeking lands on the nearest **keyframe** unless `AVSeekFlag::ANY` is combined,
+    /// which allows landing on a non-keyframe.
     ///
     /// A `stream_index` outside the input's streams is rejected here, before FFmpeg
     /// sees it: `av_seek_frame` dereferences the `AVStream` it is given without
@@ -203,20 +240,19 @@ pub trait Seekable: Reader {
     /// # Arguments
     ///
     /// * `stream_index` - The index of the stream to seek to.
-    /// * `frame_ts` - The timestamp of the target frame, or a frame **index** when
-    ///   `AVSeekFlag::FRAME` is set. In the timestamp case this is typically derived
-    ///   from the frame's presentation timestamp (PTS) in the stream's time base.
-    /// * `flags` - [`AVSeekFlag`] bit flags, combinable with `|`, e.g.
-    ///   `AVSeekFlag::BACKWARD | AVSeekFlag::ANY` (or mixed with a raw mask:
-    ///   `AVSeekFlag::ANY` `| 2`); [`AVSeekFlag::FRAME`] seeks by frame index,
-    ///   [`AVSeekFlag::BYTE`] seeks by byte position, and [`AVSeekFlag::ANY`]
-    ///   allows landing on a non-keyframe.
+    /// * `frame_ts` - The target timestamp (stream time-base units), or a byte offset
+    ///   with `AVSeekFlag::BYTE`. "Frame index" only if a demuxer ever honours
+    ///   `AVSeekFlag::FRAME`, which none does today — see above.
+    /// * `flags` - [`AVSeekFlag`] bits: a single flag, or a raw `i32` mask built with
+    ///   `|` (e.g. `AVSeekFlag::BACKWARD | AVSeekFlag::ANY`) — see [`AVSeekFlag`] for
+    ///   how to mix in rsmpeg's `u32` `AVSEEK_FLAG_*` constants.
     fn seek_to_frame(
         &mut self,
         stream_index: usize,
         frame_ts: i64,
-        flags: AVSeekFlag,
+        flags: impl Into<i32>,
     ) -> Result<()> {
+        let flags: i32 = flags.into();
         // 越界的流索引必须先拦下：`av_seek_frame` 会直接按索引取 `AVStream` 并
         // 读它的时间基，越界即未定义行为（实测 segfault），而不是返回错误码。
         let nb_streams = self.input().nb_streams as usize;
@@ -230,12 +266,11 @@ pub trait Seekable: Reader {
                 self.input_mut().as_mut_ptr(),
                 stream_index as i32,
                 frame_ts,
-                flags.into(),
+                flags,
             );
             if res < 0 {
                 return Err(RsmediaError::msg(format!(
-                    "Seek to frame failed: stream={stream_index}, ts={frame_ts}, flags={:?}, err={res}",
-                    flags
+                    "Seek to frame failed: stream={stream_index}, ts={frame_ts}, flags={flags:#x}, err={res}"
                 )));
             }
             Ok(())
@@ -351,13 +386,19 @@ fn build_output_custom(
 
 /// FFmpeg 阻塞操作（网络读、seek 等）的中断控制。
 ///
-/// FFmpeg 在每次可能阻塞的操作前调用 `AVFormatContext.interrupt_callback`；
-/// 回调返回非 0 时操作立即中止并返回错误。将同一个句柄传给
-/// `ReaderBuilder::with_interrupt` 后，可从任意线程 [`abort`](Interrupt::abort)
-/// 或设置 [`timeout`](Interrupt::set_timeout) 来取消卡住的读取。
+/// FFmpeg 在每次可能阻塞的操作前调用 `AVIOInterruptCB`，回调返回非 0 时操作
+/// 立即中止并返回错误。将同一个句柄传给 `ReaderBuilder::with_interrupt` 后，
+/// 可从任意线程 [`abort`](Interrupt::abort) 或设置 [`timeout`](Interrupt::set_timeout)
+/// 来取消卡住的读取。
 ///
-/// 注意：中断回调在 `avformat_open_input` 之后安装，因此打开/探测阶段的
-/// 阻塞不受保护；运行时读包、seek 的阻塞可以取消（网络流的主要场景）。
+/// 覆盖范围：
+/// - 文件/URL 输入（[`StreamReaderBuilder`]）：回调在 `avformat_open_input`
+///   **之前**安装，因此打开/探测阶段与协议层阻塞读（含 http/tcp 的重试与轮询
+///   等待）均可被取消（原理见 `open_input_with_interrupt`）；
+/// - seek：FFmpeg 的 `avio_seek`/`url_seek` 路径本身不做中断检查，能否被打断
+///   取决于解复用器内部是否还要读数据（本地文件 seek 无阻塞，不需要中断）；
+/// - 自定义 IO 输入（`BufferReader`/`IoReader` 等）不经过协议层，只有 format
+///   context 层生效（探测循环），用户回调自身的阻塞读不受保护。
 #[derive(Clone)]
 pub struct Interrupt {
     data: Arc<InterruptData>,
@@ -425,19 +466,90 @@ unsafe extern "C" fn interrupt_callback(opaque: *mut std::ffi::c_void) -> std::f
     i32::from(aborted || timed_out)
 }
 
-/// 将中断回调安装到已打开的输入上下文。
+/// 由 [`Interrupt`] 构造 FFmpeg 中断回调结构。
 ///
-/// 回调的 `opaque` 指向 `interrupt` 内部 `Arc<InterruptData>` 的堆内容；
-/// 调用方必须让该 `Interrupt` 存活至 context drop（Reader 将其作为字段
-/// 持有，且 context 字段先于 interrupt 字段 drop）。
+/// `opaque` 指向 `interrupt` 内部 `Arc<InterruptData>` 的堆内容；调用方必须
+/// 让该 `Interrupt` 存活至回调被移除（Reader 将其作为字段持有，且 context
+/// 字段先于 interrupt 字段 drop）。
+fn interrupt_cb(interrupt: &Interrupt) -> ffi::AVIOInterruptCB {
+    ffi::AVIOInterruptCB {
+        callback: Some(interrupt_callback),
+        opaque: Arc::as_ptr(&interrupt.data) as *mut std::ffi::c_void,
+    }
+}
+
+/// 用原始 FFI 打开输入，并在 `avformat_open_input` **之前**安装中断回调。
+///
+/// 之所以不能用 rsmpeg 的 builder（它在内部 alloc + open，插不进回调）：FFmpeg
+/// 不实时读取 `AVFormatContext.interrupt_callback`，而是把回调**按值拷贝**给
+/// 用到的每一层：
+/// - `io_open_default` → `ffio_open_whitelist(..., s->interrupt_callback, ...)`
+///   → `ffurl_alloc` 存入 `URLContext.interrupt_callback`（`avio.c`），协议层每次
+///   读只看这份副本（`retry_transfer_wrapper` 里的
+///   `ff_check_interrupt(&h->interrupt_callback)`）；内层连接继续按值接力
+///   （`tcp.c`: `ffurl_alloc(..., &s->interrupt_callback)`，`http.c` 等同理）；
+/// - 网络等待/重试轮询用它（`network.c`: `ff_poll_interrupt`）；
+/// - 探测循环用它（`demux.c`: `ff_check_interrupt(&ic->interrupt_callback)`）。
+///
+/// 因此回调必须在 open 前就位：open 之后补写只能覆盖探测循环，而那时协议层
+/// 副本已经形成，阻塞读（网络流的主要场景）拦不住。
+///
+/// 也正因为回调要先于 open，这里只能写裸指针：`Deref`/`UnsafeDerefMut` 要求
+/// 手上已有 [`AVFormatContextInput`]，而 open 前提前包装是不安全的——open 失败
+/// 时 FFmpeg 自行释放 context 并把局部指针置空，包装体的 `Drop` 会二次释放。
+/// 上下文成功建立之后的字段写（[`install_interrupt`]）则走 rsmpeg 的访问器。
+fn open_input_with_interrupt(
+    filename: &std::ffi::CStr,
+    format: Option<&AVInputFormat>,
+    options: &mut Option<AVDictionary>,
+    interrupt: &Interrupt,
+) -> Result<AVFormatContextInput> {
+    let mut ctx = unsafe { ffi::avformat_alloc_context() };
+    if ctx.is_null() {
+        return Err(RsmediaError::msg("avformat_alloc_context failed"));
+    }
+    let fmt = format.map(|f| f.as_ptr()).unwrap_or(std::ptr::null());
+    let mut opts = options
+        .as_mut()
+        .map(|d| d.as_mut_ptr())
+        .unwrap_or(std::ptr::null_mut());
+    let ret = unsafe {
+        (*ctx).interrupt_callback = interrupt_cb(interrupt);
+        ffi::avformat_open_input(&mut ctx, filename.as_ptr(), fmt, &mut opts)
+    };
+    if ret < 0 {
+        // 文档保证 open 失败时用户提供的 context 已被释放、`ctx` 置空。
+        return Err(RsmpegError::OpenInputError(ret).into());
+    }
+    // 与 rsmpeg builder 一致：把 FFmpeg 回写的剩余选项接回 Rust 所有权
+    // （旧值已被 FFmpeg 就地消费/释放，必须整体换出后 forget，不能 drop）。
+    let mut leftover = unsafe { std::ptr::NonNull::new(opts).map(|p| AVDictionary::from_raw(p)) };
+    std::mem::swap(options, &mut leftover);
+    std::mem::forget(leftover);
+
+    // SAFETY: ctx 非空（open 成功），所有权交给 RAII 包装（Drop: avformat_close_input，
+    // 它会关闭并释放 pb），因此 io_context 留空即可。
+    let mut ctx_input =
+        unsafe { AVFormatContextInput::from_raw(std::ptr::NonNull::new_unchecked(ctx)) };
+    let ret =
+        unsafe { ffi::avformat_find_stream_info(ctx_input.as_mut_ptr(), std::ptr::null_mut()) };
+    if ret < 0 {
+        return Err(RsmpegError::FindStreamInfoError(ret).into());
+    }
+    Ok(ctx_input)
+}
+
+/// 把中断回调装到 format context（探测循环 `avformat_find_stream_info` 会读它）。
+///
+/// 只服务于自定义 IO 输入（`BufferReader`/`IoReader` 等）：这类输入不经过
+/// 协议层，没有 `URLContext` 副本，因此只有探测循环受保护；文件/URL 输入走
+/// [`open_input_with_interrupt`]，回调在 open 前就位、协议层一并生效。
 fn install_interrupt(ctx: &mut AVFormatContextInput, interrupt: &Interrupt) {
-    // SAFETY: context 独占；opaque 指向的 Arc 目标由 Reader 的
-    // `interrupt` 字段保活，context drop 后不会再有回调。
+    // SAFETY: context 独占；opaque 指向的 Arc 目标由调用方保活。此处只写
+    // `interrupt_callback` 字段，不触碰 FFmpeg 自身的指针/所有权成员，故走
+    // rsmpeg 为"改 ffi 结构体成员"提供的 `UnsafeDerefMut` 访问器。
     unsafe {
-        (*ctx.as_mut_ptr()).interrupt_callback = ffi::AVIOInterruptCB {
-            callback: Some(interrupt_callback),
-            opaque: Arc::as_ptr(&interrupt.data) as *mut std::ffi::c_void,
-        };
+        ctx.deref_mut().interrupt_callback = interrupt_cb(interrupt);
     }
 }
 
@@ -530,15 +642,19 @@ impl<'a> StreamReaderBuilder<'a> {
             .format
             .and_then(|str| AVInputFormat::find(&strutils::str_to_cstring(str)));
         let mut dict = self.options.and_then(|opts| opts.into_dict());
-        let mut ctx_input = AVFormatContextInput::builder()
-            .url(&filename)
-            .maybe_format(fmt_opt.as_deref())
-            .options(&mut dict)
-            .open()
-            .context("Create input format context failed.")?;
-        if let Some(interrupt) = &self.interrupt {
-            install_interrupt(&mut ctx_input, interrupt);
-        }
+        let mut ctx_input = match &self.interrupt {
+            // 带中断句柄时必须让回调先于 `avformat_open_input` 存在，见
+            // [`open_input_with_interrupt`]；无中断时走 rsmpeg 的常规 builder。
+            Some(interrupt) => {
+                open_input_with_interrupt(&filename, fmt_opt.as_deref(), &mut dict, interrupt)?
+            }
+            None => AVFormatContextInput::builder()
+                .url(&filename)
+                .maybe_format(fmt_opt.as_deref())
+                .options(&mut dict)
+                .open()
+                .context("Create input format context failed.")?,
+        };
         ctx_input
             .dump(0, &filename)
             .context("Dump input format context failed.")?;
@@ -2207,8 +2323,133 @@ mod tests {
         Ok(())
     }
 
+    /// `seek_to_timestamp` 的**落点精度**：全 I 帧文件（gop=1，每帧都是关键帧，
+    /// BACKWARD seek 无回退余地）上，seek 到任意帧边界必须精确落在该帧。
+    ///
+    /// 上面的 `test_seek_to_timestamp_advances_the_read_position` 只断言
+    /// "位置移动了"，抓不住落点漂移类回归（曾因此漏检）。
+    #[test]
+    fn test_seek_to_timestamp_lands_exactly_on_all_intra() -> Result<()> {
+        const FPS: f64 = 25.0;
+        const FRAMES: i64 = 60;
+        let path = crate::test_support::test_output_path("io", "test_seek_exact.mp4");
+        {
+            let mut muxer = crate::Muxer::new(&path)?;
+            let encoder = EncoderBuilder::new_video(64, 64)
+                .with_fps(FPS as f32)
+                .with_gop_size(1)
+                .build()?;
+            let index = muxer.add_encoder(encoder)?;
+            for frame_index in 0..FRAMES {
+                let mut frame = AVFrame::new();
+                frame.set_width(64);
+                frame.set_height(64);
+                frame.set_format(PixelFormat::YUV420P.into());
+                frame
+                    .alloc_buffer()
+                    .context("Failed to allocate frame buffer")?;
+                frame.set_pts(frame_index);
+                muxer.mux(frame, index)?;
+            }
+            muxer.finish()?;
+        }
+
+        // 步长采样覆盖首/中/尾帧边界；目标时间 = 第 n 帧起点。
+        for n in (0..FRAMES).step_by(7).chain(std::iter::once(FRAMES - 1)) {
+            let target_ms = (n as f64 / FPS * 1000.0).round() as i64;
+            let mut reader = StreamReader::new(&path)?;
+            reader.seek_to_timestamp(target_ms)?;
+            let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+            let frame = decoder
+                .decode::<u8>(&mut reader)?
+                .ok_or_else(|| RsmediaError::msg("no frame decoded after the seek"))?;
+            let tb = reader.input().streams()[decoder.stream_index()].time_base;
+            let landed_secs = frame.pts as f64 * tb.num as f64 / tb.den as f64;
+            let expected_secs = n as f64 / FPS;
+            assert!(
+                (landed_secs - expected_secs).abs() <= 0.5 / FPS + 1e-6,
+                "seek to {target_ms}ms landed at {landed_secs:.4}s, \
+                 expected frame {n} at {expected_secs:.4}s"
+            );
+        }
+
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// `seek_to_frame` 的参数是 `impl Into<i32>`：既要吃单个 `AVSeekFlag`，也要吃
+    /// `|` 组合出来的**裸掩码**（字段枚举装不下 `BACKWARD | ANY` 这种无名组合）。
+    ///
+    /// 目标正好是帧边界，所以 `BACKWARD | ANY` 与两者单独使用都落在同一帧。
+    #[test]
+    fn test_seek_to_frame_accepts_flag_masks() -> Result<()> {
+        const FPS: f64 = 25.0;
+        const FRAMES: i64 = 60;
+        const TARGET: i64 = 30;
+        let path = crate::test_support::test_output_path("io", "test_seek_flags.mp4");
+        {
+            let mut muxer = crate::Muxer::new(&path)?;
+            let encoder = EncoderBuilder::new_video(64, 64)
+                .with_fps(FPS as f32)
+                .with_gop_size(1)
+                .build()?;
+            let index = muxer.add_encoder(encoder)?;
+            for frame_index in 0..FRAMES {
+                let mut frame = AVFrame::new();
+                frame.set_width(64);
+                frame.set_height(64);
+                frame.set_format(PixelFormat::YUV420P.into());
+                frame
+                    .alloc_buffer()
+                    .context("Failed to allocate frame buffer")?;
+                frame.set_pts(frame_index);
+                muxer.mux(frame, index)?;
+            }
+            muxer.finish()?;
+        }
+
+        // 单位：`seek_to_frame` 的 ts 是**流时间基**（`seek_to_timestamp` 才是
+        // AV_TIME_BASE 微秒），所以先读流的 tb 再换算，别拿 TIME_BASE 直接算。
+        let tb = StreamReader::new(&path)?.input().streams()[0].time_base;
+        let target_ts =
+            (TARGET as f64 / FPS * f64::from(tb.den) / f64::from(tb.num)).round() as i64;
+        assert!(target_ts > 0, "target_ts 计算异常：{target_ts}");
+        // 组合掩码、单个旗标、裸 i32 掩码三条路径，都必须落在第 TARGET 帧。
+        let cases: [(&str, i32); 3] = [
+            (
+                "AVSeekFlag::BACKWARD | AVSeekFlag::ANY",
+                AVSeekFlag::BACKWARD | AVSeekFlag::ANY,
+            ),
+            ("AVSeekFlag::ANY", AVSeekFlag::ANY.into()),
+            (
+                "裸 i32 掩码（AVSeekFlag::ANY.as_raw()）",
+                AVSeekFlag::ANY.as_raw(),
+            ),
+        ];
+        for (what, flags) in cases {
+            let mut reader = StreamReader::new(&path)?;
+            reader
+                .seek_to_frame(0, target_ts, flags)
+                .with_context(|| format!("seek with {what}"))?;
+            let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+            let frame = decoder
+                .decode::<u8>(&mut reader)?
+                .ok_or_else(|| RsmediaError::msg("no frame decoded after the seek"))?;
+            let tb = reader.input().streams()[decoder.stream_index()].time_base;
+            let landed = frame.pts as f64 * tb.num as f64 / tb.den as f64;
+            let expected = TARGET as f64 / FPS;
+            assert!(
+                (landed - expected).abs() <= 0.5 / FPS + 1e-6,
+                "{what}: 落在 {landed:.4}s, 期望第 {TARGET} 帧 {expected:.4}s"
+            );
+        }
+
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
     /// `seek_to_frame` 是**可失败**的：不存在的流索引必须报错，而不是静默不动。
-    /// （MP4 等容器不支持按帧索引 seek，见该方法的文档。）
+    /// （`av_seek_frame` 会越界解引用 `AVStream`，所以这层校验不是可选的。）
     #[test]
     fn test_seek_to_frame_rejects_an_unknown_stream() -> Result<()> {
         let mut reader = StreamReader::new(std::path::Path::new("assets/mp4.mp4"))?;
@@ -2219,9 +2460,15 @@ mod tests {
         Ok(())
     }
 
-    /// 中断句柄：新建时未触发，`abort` 立即触发，零超时也立即触发。
+    /// 中断句柄：新建时未触发，`abort` 立即触发，零超时也立即触发；
+    /// 且**已触发的句柄必须真的拦得下打开与读包**。
     ///
-    /// 已触发的句柄会让读操作失败——这是取消一个卡住的网络读取的唯一途径。
+    /// 曾经的实现只在 `avformat_open_input` 之后把回调写到 format context 上，
+    /// 而 FFmpeg 在打开时会把回调**按值拷贝**进协议层（`ffurl_alloc`），
+    /// `av_read_frame` 自己也不查回调，于是协议层的阻塞读永远看不到它——本测试
+    /// 当时只能断言"装配成功，无法验证中止效果"。现在带 `with_interrupt` 的 URL
+    /// 输入走 `open_input_with_interrupt`（回调先于 open 安装），已触发的句柄会在
+    /// 打开阶段的探测读上直接拿到 AVERROR_EXIT。
     #[test]
     fn test_interrupt_abort_and_timeout() -> Result<()> {
         let fresh = Interrupt::new();
@@ -2231,15 +2478,42 @@ mod tests {
         expired.set_timeout(std::time::Duration::ZERO);
         assert!(expired.triggered(), "a zero timeout fires immediately");
 
+        // 未触发的句柄对读取完全透明。
+        let mut reader = StreamReaderBuilder::new("assets/mp4.mp4")
+            .with_interrupt(fresh)
+            .build()?;
+        assert!(
+            reader.read_packet()?.is_some(),
+            "a fresh interrupt must not disturb reading"
+        );
+
+        // 已触发的句柄：打开阶段的探测读就会被协议层拦下。
         let aborted = Interrupt::new();
         aborted.abort();
         assert!(aborted.triggered(), "abort must trigger");
 
-        // 句柄可以挂到 reader 上（`abort` 是取消**阻塞**读取的途径；本地文件不会
-        // 阻塞，所以这里只验证装配成功，无法验证中止效果）。
-        StreamReaderBuilder::new("assets/mp4.mp4")
+        match StreamReaderBuilder::new("assets/mp4.mp4")
             .with_interrupt(aborted)
-            .build()?;
+            .build()
+        {
+            Err(RsmediaError::FFmpeg(RsmpegError::OpenInputError(_))) => {}
+            Err(other) => {
+                panic!("an aborted interrupt must fail opening with OpenInputError, got {other:?}")
+            }
+            Ok(mut reader) => {
+                // 兜底：若某天该输入在打开阶段不经过协议层读，那么读包必须立刻被拦。
+                let mut read = 0usize;
+                loop {
+                    match reader.read_packet() {
+                        Ok(Some(_)) => read += 1,
+                        Ok(None) => panic!(
+                            "an aborted interrupt took no effect: {read} packets read through"
+                        ),
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

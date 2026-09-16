@@ -1,12 +1,6 @@
 #[macro_use]
 mod macros;
 
-/// 排空循环的迭代上限，供解码器、编码器与滤镜图三处的 EOF 排空共用。
-///
-/// 这些循环都在等 FFmpeg 报"结束"，而个别编解码器/滤镜图在收到 EOS 后可能一直
-/// 回 EAGAIN 而不报 EOF；没有上限就是挂死（`Drop` 里更不能卡住），故统一收尾。
-pub(crate) const MAX_DRAIN_ITERATIONS: usize = 1_000;
-
 pub mod bsf;
 pub mod codec;
 pub mod colors;
@@ -58,10 +52,13 @@ pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
 pub use time::Time;
 
+pub(crate) const MAX_DRAIN_ITERATIONS: usize = 1_000;
+
 #[cfg(feature = "image")]
 pub use imgutils::thumbnail;
 
-pub use rsmpeg::avutil;
+/// re-exported under the name `ffmpeg`
+pub use rsmpeg as ffmpeg;
 
 /// Unit-test helpers
 #[cfg(test)]

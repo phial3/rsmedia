@@ -96,18 +96,29 @@ impl Options {
     /// Keys/values containing interior NUL bytes are skipped with a warning
     /// (they cannot be represented in a C string).
     pub fn to_dict(&self) -> Option<AVDictionary> {
-        self.clone().into_dict()
+        Self::build(self.0.iter())
     }
 
     /// Consuming variant of [`Options::to_dict`].
     pub fn into_dict(self) -> Option<AVDictionary> {
+        Self::build(self.0)
+    }
+
+    /// Shared materialization core: fold an owning or borrowed entry iterator
+    /// into an [`AVDictionary`] without an intermediate copy of the whole map.
+    fn build<K, V>(entries: impl IntoIterator<Item = (K, V)>) -> Option<AVDictionary>
+    where
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
         let mut dict: Option<AVDictionary> = None;
-        for (k, v) in self.0 {
+        for (k, v) in entries {
+            let (k, v) = (k.as_ref(), v.as_ref());
             if k.contains('\0') || v.contains('\0') {
                 tracing::warn!("Skip option with interior NUL: {k:?}={v:?}");
                 continue;
             }
-            let (key, value) = (strutils::str_to_cstring(&k), strutils::str_to_cstring(&v));
+            let (key, value) = (strutils::str_to_cstring(k), strutils::str_to_cstring(v));
             dict = match dict {
                 Some(dict) => Some(dict.set(&key, &value, 0)),
                 None => Some(AVDictionary::new(&key, &value, 0)),

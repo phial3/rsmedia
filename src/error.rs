@@ -174,7 +174,7 @@ impl From<yuv::YuvError> for RsmediaError {
 #[cfg(feature = "image")]
 impl From<image::ImageError> for RsmediaError {
     fn from(e: image::ImageError) -> Self {
-        RsmediaError::Other(format!("image processing error: {e}"))
+        RsmediaError::External(Box::new(e))
     }
 }
 

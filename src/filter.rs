@@ -652,6 +652,84 @@ pub mod video {
         Filter::new("deblock", MediaType::VIDEO, "deblock".to_string())
     }
 
+    /// 高斯模糊。
+    /// `sigma`: 高斯标准差（越大越模糊，默认 0.5）。
+    pub fn gblur(sigma: f32) -> Filter {
+        Filter::new("gblur", MediaType::VIDEO, format!("gblur=sigma={sigma}"))
+    }
+
+    /// 平均值模糊（boxblur，参数化版本）。
+    /// * `luma_radius` - 亮度模糊半径（像素，可为 `"2"` 或 `"min(cw/2\,ch/2)"` 等表达式）。
+    /// * `luma_power` - 亮度模糊强度（1 表示完全平均，2 表示两遍）。
+    ///
+    /// 注意：`blur(radius)` 是 convenience 版，只设 `luma_radius`；
+    /// 这里保留 boxblur 完整参数供精细控制。
+    pub fn boxblur(luma_radius: &str, luma_power: u32) -> Filter {
+        Filter::new(
+            "boxblur",
+            MediaType::VIDEO,
+            format!("boxblur=luma_radius={luma_radius}:luma_power={luma_power}"),
+        )
+    }
+
+    /// 叠加（overlay），将一个视频流（overlay）叠加到主视频流上。
+    ///
+    /// 这是**多输入**滤镜，rsmedia 的编码侧滤镜图假定单一视频输入，
+    /// 因此这里以 `RGB` 构造一个可独立使用的 `overlay`，实际部署需要
+    /// 自定义多输入图时请直接用 `Filter::new("overlay", ...)` 组合多条链。
+    /// * `x` / `y` - 叠加层在基底上的偏移（支持表达式，如 `"main_w-overlay_w-10"`）。
+    /// * `opacity` - 叠加层不透明度（0~1）。
+    pub fn overlay(x: &str, y: &str, opacity: Option<f32>) -> Filter {
+        let alpha = match opacity {
+            Some(a) => format!(":alpha={a}"),
+            None => String::new(),
+        };
+        Filter::new(
+            "overlay",
+            MediaType::VIDEO,
+            format!("overlay=x={x}:y={y}{alpha}"),
+        )
+    }
+
+    /// 色度键抠像（chromakey），将指定颜色转为透明。
+    /// * `color` - 要抠掉的颜色，如 `"green@0.5"`。
+    /// * `similarity` - 颜色相似度阈值（0~0.01，越大越宽松）。
+    /// * `blend` - 混合比例（0~1）。
+    pub fn chromakey(color: &str, similarity: f32, blend: f32) -> Filter {
+        Filter::new(
+            "chromakey",
+            MediaType::VIDEO,
+            format!("chromakey=color={color}:similarity={similarity}:blend={blend}"),
+        )
+    }
+
+    /// RGB 色键（colorkey），将指定 RGB 颜色转为透明。
+    /// `color` - 如 `"black"` 或 `"0x000000"`。
+    pub fn colorkey(color: &str, similarity: f32, blend: f32) -> Filter {
+        Filter::new(
+            "colorkey",
+            MediaType::VIDEO,
+            format!("colorkey=color={color}:similarity={similarity}:blend={blend}"),
+        )
+    }
+
+    /// 曲线调节（curves），通过控制点微调 R/G/B 通道色调。
+    /// `preset`/`points` 二选一；`points` 形如 `"0/0 0.5/0.5 1/1"`。
+    pub fn curves(preset: Option<&str>, points: Option<&str>) -> Filter {
+        let spec = match (preset, points) {
+            (Some(p), _) => format!("curves=preset={p}"),
+            (None, Some(pt)) => format!("curves=all={pt}"),
+            _ => "curves".to_string(),
+        };
+        Filter::new("curves", MediaType::VIDEO, spec)
+    }
+
+    /// 逐行/隔行转换（bwdif）去隔行，现代去隔行替代方案。
+    /// `mode`: `send_frame`(默认) / `send_field` / `send_frame_nospatial`。
+    pub fn bwdif(mode: &str) -> Filter {
+        Filter::new("bwdif", MediaType::VIDEO, format!("bwdif=mode={mode}"))
+    }
+
     /// GIF 单遍调色板滤镜链（palettegen/paletteuse），输出 pal8 帧供 `gif`
     /// 编码器直接编码。
     ///
@@ -912,6 +990,85 @@ pub mod audio {
             "afftdn",
             MediaType::AUDIO,
             format!("afftdn=nr={strength}:nt=w"),
+        )
+    }
+
+    /// 音频淡入淡出（afade）。
+    /// * `fade_type` - `in` 或 `out`。
+    /// * `start` - 起点（秒）。
+    /// * `duration` - 淡变时长（秒）。
+    pub fn afade(fade_type: &str, start: f32, duration: f32) -> Filter {
+        Filter::new(
+            "afade",
+            MediaType::AUDIO,
+            format!("afade=t={fade_type}:st={start}:d={duration}"),
+        )
+    }
+
+    /// 回声（aecho）。
+    /// * `in_gain` / `out_gain` - 输入/输出增益。
+    /// * `delays` - 延迟序列（ms，如 `"60|30"`）。
+    /// * `decays` - 衰减系数（如 `"0.4|0.3"`）。
+    pub fn aecho(in_gain: f32, out_gain: f32, delays: &str, decays: &str) -> Filter {
+        Filter::new(
+            "aecho",
+            MediaType::AUDIO,
+            format!("aecho=in_gain={in_gain}:out_gain={out_gain}:delays={delays}:decays={decays}"),
+        )
+    }
+
+    /// 混音（amix），将多路输入混成一路。
+    ///
+    /// 这是**多输入**滤镜，与 overlay 同理；rsmedia 编码侧滤镜图假定单一
+    /// 音频输入。这里提供单路退化的参数化形式，多路混音请用
+    /// `Filter::new("amix", MediaType::AUDIO, ...)` 自定义。
+    /// `inputs`: 输入路数；`duration`: `longest`/`shortest`/`first`。
+    pub fn amix(inputs: u32, duration: &str) -> Filter {
+        Filter::new(
+            "amix",
+            MediaType::AUDIO,
+            format!("amix=inputs={inputs}:duration={duration}"),
+        )
+    }
+
+    /// 反转音频（areverse）。
+    pub fn areverse() -> Filter {
+        Filter::new("areverse", MediaType::AUDIO, "areverse".to_string())
+    }
+
+    /// 低频增益（bass）。
+    /// `freq` - 中心频率，`gain` - 增益（dB）。
+    pub fn bass(freq: u32, gain: f32) -> Filter {
+        Filter::new("bass", MediaType::AUDIO, format!("bass=f={freq}:g={gain}"))
+    }
+
+    /// 高频增益（treble）。
+    /// `freq` - 中心频率，`gain` - 增益（dB）。
+    pub fn treble(freq: u32, gain: f32) -> Filter {
+        Filter::new(
+            "treble",
+            MediaType::AUDIO,
+            format!("treble=f={freq}:g={gain}"),
+        )
+    }
+
+    /// 低频搁架滤波器（lowshelf）。
+    /// `freq` - 转折频率，`gain` - 增益（dB）。
+    pub fn lowshelf(freq: u32, gain: f32) -> Filter {
+        Filter::new(
+            "lowshelf",
+            MediaType::AUDIO,
+            format!("lowshelf=f={freq}:g={gain}"),
+        )
+    }
+
+    /// 高频搁架滤波器（highshelf）。
+    /// `freq` - 转折频率，`gain` - 增益（dB）。
+    pub fn highshelf(freq: u32, gain: f32) -> Filter {
+        Filter::new(
+            "highshelf",
+            MediaType::AUDIO,
+            format!("highshelf=f={freq}:g={gain}"),
         )
     }
 }

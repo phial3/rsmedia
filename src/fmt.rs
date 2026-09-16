@@ -47,6 +47,11 @@ ffi_enum_wrap_from!(
     /// a fast failure.
     ///
     /// `AV_SAMPLE_FMT_NONE` itself is a listed value, so it still converts to `NONE`.
+    ///
+    /// Since `ffi::AVSampleFormat` **is** `c_int`, the generated conversions *are* the `i32` ones:
+    /// `i32::from(SampleFormat::FLTP)` and `SampleFormat::from(raw_i32)` both exist (the latter
+    /// panics on an unlisted value, so prefer [`from_ffi_checked`](SampleFormat::from_ffi_checked)
+    /// for values coming from FFmpeg).
     SampleFormat => ffi::AVSampleFormat,
     repr = i32,
     fallback = panic {
