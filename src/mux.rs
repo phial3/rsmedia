@@ -383,8 +383,23 @@ impl<W: Writer> Muxer<W> {
 
     /// Adds a cover-art (attached picture) stream: `cover_frame` is encoded
     /// with `encoder` (typically `mjpeg` or `png`) into a dedicated video
-    /// stream marked with `AV_DISPOSITION_ATTACHED_PIC`, which MP4 writes as
-    /// the `covr` atom and MKV as an attachment.
+    /// stream marked with `AV_DISPOSITION_ATTACHED_PIC` and muxed as a single
+    /// frame.
+    ///
+    /// What that mark actually buys differs per muxer, and only MP4/MOV ends up
+    /// with a real attached picture:
+    ///
+    /// - **MP4/MOV**: the frame is stored in the `covr` atom instead of as a track
+    ///   sample (`mov_write_covr`), which requires the stream's disposition to be
+    ///   **exactly** `AV_DISPOSITION_ATTACHED_PIC` — `is_cover_image()` compares for
+    ///   equality, so OR-ing another disposition bit in silently drops the cover.
+    ///   The stream itself stays in the file and reads back with `ATTACHED_PIC` set.
+    /// - **MKV**: matroskaenc only treats a stream as an attachment when its
+    ///   `codecpar->codec_type` is `AVMEDIA_TYPE_ATTACHMENT`, which a video stream
+    ///   never is — so the cover is written as an ordinary single-frame **video
+    ///   track**, and reading the file back shows `disposition = 0` with no
+    ///   attachment tag. ffmpeg's CLI does the same for `-disposition:v attached_pic`.
+    /// - Other muxers ignore the disposition.
     ///
     /// The stream is marked and the frame muxed immediately, so this must be
     /// called after all primary streams are added (the header is written on

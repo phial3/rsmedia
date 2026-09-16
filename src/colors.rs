@@ -350,7 +350,15 @@ color!(PLUM, (221, 160, 221));
 
 /// Convert RGB to HSV color space.
 ///
-/// 返回 `[h, s, v]`，其中 `h` 为 0-360 度，`s`/`v` 为 0-100
+/// Returns `[h, s, v]` where `h` is an angle in **degrees** (0-360) and `s` / `v` are
+/// **percentages** (0-100) — *not* the 0-1 fractions some HSV APIs use. It is the exact
+/// counterpart of [`hsv_to_rgb`], so the two round-trip:
+///
+/// ```
+/// # use rsmedia::colors::{hsv_to_rgb, rgb_to_hsv};
+/// assert_eq!(rgb_to_hsv(255, 0, 0), [0.0, 100.0, 100.0]);
+/// assert_eq!(hsv_to_rgb(0.0, 100.0, 100.0), [255, 0, 0]);
+/// ```
 pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> [f32; 3] {
     let hsv = colorutils_rs::Rgb::<u8>::new(r, g, b).to_hsv();
     [hsv.h, hsv.s * 100.0, hsv.v * 100.0]
@@ -358,7 +366,9 @@ pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> [f32; 3] {
 
 /// Convert HSV to RGB color space.
 ///
-/// 输入 `h` 为 0-360 度，`s`/`v` 为 0-100
+/// The inverse of [`rgb_to_hsv`], with the same convention: `h` is in **degrees**
+/// (0-360) and `s` / `v` are **percentages** (0-100). The channels are converted to
+/// integers before the conversion, so fractional parts are truncated.
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
     let rgb = colorutils_rs::Hsv::new(h as u16, s as u16, v as u16).to_rgb8();
     [rgb.r, rgb.g, rgb.b]
