@@ -83,27 +83,20 @@ fn calculate_fit_dims(dims: (u32, u32), fit_dims: (u32, u32)) -> Option<(u32, u3
 /// The fitted dimensions if they exist and are positive and more than zero.
 fn calculate_fit_dims_even(dims: (u32, u32), fit_dims: (u32, u32)) -> Option<(u32, u32)> {
     let (w, h) = dims;
-    let (mut w_max, mut h_max) = fit_dims;
-    while w_max > 0 && h_max > 0 {
-        let wf = w_max as f32 / w as f32;
-        let hf = h_max as f32 / h as f32;
-        let f = wf.min(hf).min(1.0);
-        let out_w = (w as f32 * f).round() as u32;
-        let out_h = (h as f32 * f).round() as u32;
-        if (out_w > 0) && (out_h > 0) {
-            // (out_w % 2 == 0) && (out_h % 2 == 0)
-            if out_w.is_multiple_of(2) && out_h.is_multiple_of(2) {
-                return Some((out_w, out_h));
-            } else if wf < hf {
-                w_max -= 1;
-            } else {
-                h_max -= 1;
-            }
-        } else {
-            break;
-        }
+    if w == 0 || h == 0 {
+        return None;
     }
-    None
+
+    // 只缩放一次（与 `calculate_fit_dims` 相同，且绝不放大），然后把宽、高**各自**
+    // 向下取偶。逐格压低 `w_max`/`h_max` 去凑偶数的旧做法会一路缩过头：
+    // 100x99 配 100x100 会一直缩到 50x50，而不是 100x98。
+    let (out_w, out_h) = calculate_fit_dims(dims, fit_dims)?;
+    let (out_w, out_h) = (out_w & !1, out_h & !1);
+    if out_w == 0 || out_h == 0 {
+        None
+    } else {
+        Some((out_w, out_h))
+    }
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use crate::pixel::PixelFormat;
 use crate::{Options, imgutils, strutils};
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use once_cell::sync::Lazy;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVPixFmtDescriptorRef};
@@ -53,51 +54,42 @@ impl HWDeviceConfig {
         }
     }
 
+    /// 按设备类型的**默认格式映射**构造配置。
+    ///
+    /// [`Self::default_hw_pixel_format`]/[`Self::default_sw_pixel_format`]（定义在
+    /// [`HWDeviceType`] 上）是格式映射的唯一真相源：构造器与平台自动选择
+    /// （[`Self::auto_platform`]）都走这里，避免同一设备类型出现两套说法。
+    fn default_for(device_type: HWDeviceType, device_id: Option<String>) -> Self {
+        Self::new(
+            device_type,
+            device_type.default_hw_pixel_format(),
+            device_type.default_sw_pixel_format(),
+            device_id,
+            None,
+        )
+    }
+
     /// build CUDA HWDeviceConfig
     ///
     /// `device_id` 为 GPU 编号字符串（如 `"0"`、`"1"`），与其他设备构造器
     /// 的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。
     pub fn cuda(device_id: Option<String>) -> Self {
-        Self::new(
-            HWDeviceType::CUDA,
-            PixelFormat::CUDA,
-            PixelFormat::NV12,
-            device_id,
-            None,
-        )
+        Self::default_for(HWDeviceType::CUDA, device_id)
     }
 
     /// build VAAPI HWDeviceConfig
     pub fn vaapi(device_id: Option<String>) -> Self {
-        Self::new(
-            HWDeviceType::VAAPI,
-            PixelFormat::VAAPI,
-            PixelFormat::NV12,
-            device_id,
-            None,
-        )
+        Self::default_for(HWDeviceType::VAAPI, device_id)
     }
 
     /// build VULKAN HWDeviceConfig
     pub fn vulkan(device_id: Option<String>) -> Self {
-        Self::new(
-            HWDeviceType::VULKAN,
-            PixelFormat::VULKAN,
-            PixelFormat::NV12,
-            device_id,
-            None,
-        )
+        Self::default_for(HWDeviceType::VULKAN, device_id)
     }
 
     /// build QSV (Intel Quick Sync Video) HWDeviceConfig
     pub fn qsv(device_id: Option<String>) -> Self {
-        Self::new(
-            HWDeviceType::QSV,
-            PixelFormat::QSV,
-            PixelFormat::NV12,
-            device_id,
-            None,
-        )
+        Self::default_for(HWDeviceType::QSV, device_id)
     }
 
     /// build AMD AMF HWDeviceConfig（Windows 平台，基于 D3D11 设备）。
@@ -107,13 +99,7 @@ impl HWDeviceConfig {
     /// 先上传到 D3D11 surface，再由 AMF 编码。
     #[cfg(target_os = "windows")]
     pub fn amf(device_id: Option<String>) -> Self {
-        Self::new(
-            HWDeviceType::D3D11VA,
-            PixelFormat::D3D11,
-            PixelFormat::NV12,
-            device_id,
-            None,
-        )
+        Self::default_for(HWDeviceType::D3D11VA, device_id)
     }
 
     /// 按当前平台自动选择最佳可用的硬件加速配置。
@@ -148,23 +134,49 @@ static HW_CTX_CACHE: Lazy<DashMap<HWDeviceConfig, Arc<HWContext>>> = Lazy::new(D
 /// 硬件设备上下文持有 GPU 资源，长驻进程中持续切换配置（device_id / 选项 /
 /// 设备类型组合不同）会不断产生新条目；不设上限会导致 GPU 资源泄漏。
 /// 典型应用只使用 1~2 种配置，8 已留足余量。仍在使用的条目不会被驱逐，
-/// 全部在使用中时可超额容纳（等待 `clear_hw_ctx_cache` 后续清理）。
+/// 全部在使用中时可超额容纳（等待 [`release_unused_hw_contexts`] 后续清理）。
 const HW_CTX_CACHE_MAX_ENTRIES: usize = 8;
+
+/// 无锁地收集缓存中**当前未被使用**（引用计数为 1，仅缓存自身持有）的条目键。
+fn unused_hw_ctx_configs() -> Vec<HWDeviceConfig> {
+    HW_CTX_CACHE
+        .iter()
+        .filter(|entry| Arc::strong_count(entry.value()) <= 1)
+        .map(|entry| entry.key().clone())
+        .collect()
+}
+
+/// 逐个移除 `candidates` 并返回被移除的上下文。
+///
+/// 移除用 `remove_if`：判定与移除在同一分片锁内原子完成，迭代期间又有使用者
+/// 拿到引用（`strong_count` 变大）的条目会被跳过而不是被强行移除。
+///
+/// 被移除的 `Arc` 一律**交还给调用方**（`remove_if` 把值返回，而不是在锁内析构），
+/// 由调用方在锁外 drop：`Arc<HWContext>` 的析构会 unref 底层 `AVBufferRef`，
+/// 可能触发 FFmpeg 日志回调与驱动调用，在 DashMap 的写锁内做会阻塞其它线程。
+fn remove_cached_hw_ctxs(candidates: Vec<HWDeviceConfig>) -> Vec<Arc<HWContext>> {
+    let mut removed = Vec::new();
+    for config in candidates {
+        if let Some((_, ctx)) =
+            HW_CTX_CACHE.remove_if(&config, |_, ctx| Arc::strong_count(ctx) <= 1)
+        {
+            removed.push(ctx);
+        }
+    }
+    removed
+}
 
 /// 容量超限时驱逐未使用条目（保留使用中的与新创建的 `keep` 条目）。
 fn prune_hw_ctx_cache(keep: &HWDeviceConfig) {
     if HW_CTX_CACHE.len() <= HW_CTX_CACHE_MAX_ENTRIES {
         return;
     }
-    let mut removed = 0;
-    HW_CTX_CACHE.retain(|config, ctx| {
-        if Arc::strong_count(ctx) > 1 || config == keep {
-            true
-        } else {
-            removed += 1;
-            false
-        }
-    });
+    let candidates = unused_hw_ctx_configs()
+        .into_iter()
+        .filter(|config| config != keep)
+        .collect::<Vec<_>>();
+    // 锁外析构（见 `remove_cached_hw_ctxs`）
+    let removed = remove_cached_hw_ctxs(candidates).len();
     if HW_CTX_CACHE.len() > HW_CTX_CACHE_MAX_ENTRIES {
         tracing::warn!(
             "HW context cache still holds {} entries (> {HW_CTX_CACHE_MAX_ENTRIES}) \
@@ -176,31 +188,19 @@ fn prune_hw_ctx_cache(keep: &HWDeviceConfig) {
     }
 }
 
-/// 清理硬件上下文缓存。
+/// 释放所有**当前未被使用**的硬件设备上下文，返回被释放的条目数。
 ///
-/// 移除所有**当前未被使用**（引用计数为 1，仅缓存自身持有）的硬件设备上下文，
-/// 释放对应的 GPU 资源。仍在被解码器/编码器使用的上下文会保留，待其释放后
-/// 可再次调用清理。
+/// 缓存会保留最近使用的设备（上限见 `HW_CTX_CACHE_MAX_ENTRIES`），好让同一配置的
+/// 解码器/编码器反复复用同一个 GPU 设备；代价是条目与其设备上下文会常驻到进程结束。
+/// 长驻进程在结束一批转码、切换设备配置或需要立刻回收 GPU 资源时，可以调用本函数：
+/// 仅被缓存自身持有（引用计数为 1）的上下文会被移除并释放，仍被解码器/编码器使用的
+/// 条目会保留下来，待其释放后再调用一次即可回收。
 ///
-/// 日常驱逐由 `prune_hw_ctx_cache`（容量超限时）负责；本函数是给测试用的确定性
-/// 清空入口，故仅在测试构建中存在。
-///
-/// 返回被移除的条目数。
-#[cfg(test)]
-pub(crate) fn clear_hw_ctx_cache() -> usize {
-    let mut removed = 0;
-    // retain 逐条检查：只保留仍被外部持有的条目（strong_count > 1）；其余条目
-    // 已无人使用，可以释放。
-    HW_CTX_CACHE.retain(|_config, ctx| {
-        if Arc::strong_count(ctx) > 1 {
-            true
-        } else {
-            removed += 1;
-            false
-        }
-    });
+/// 日常驱逐由 `prune_hw_ctx_cache`（容量超限时）负责，本函数是显式的确定性释放入口。
+pub fn release_unused_hw_contexts() -> usize {
+    let removed = remove_cached_hw_ctxs(unused_hw_ctx_configs()).len();
     if removed > 0 {
-        tracing::debug!("Cleared {removed} unused hardware device context(s).");
+        tracing::debug!("Released {removed} unused hardware device context(s).");
     }
     removed
 }
@@ -223,15 +223,24 @@ pub(crate) struct HWContext {
 impl HWContext {
     /// create a new HWContext with the given HWDeviceConfig
     pub(crate) fn new(config: HWDeviceConfig) -> Result<Arc<HWContext>> {
-        // Try to get existing context from cache (lock-free read)
+        // 快路径：命中缓存直接复用，无需（也不应）再次打开设备。
         if let Some(ctx) = HW_CTX_CACHE.get(&config) {
             tracing::debug!("Reusing existing hardware device context. config:{config:?}");
             return Ok(ctx.clone());
         }
 
-        // create a new hardware device context
+        // 创建设备上下文**不持缓存锁**：打开 GPU 设备可能耗时并触发 FFmpeg 日志，
+        // 不应阻塞同一分片上的其它线程。
         let hw_device_ctx = {
-            let device = strutils::str_to_cstring_opt(config.device_id.as_ref());
+            // device_id 来自调用者（CUDA 是 GPU 编号、VAAPI/DRM 是设备路径），
+            // 含内部 NUL 的输入只能是调用者的错误：报错而不是 panic。
+            let device = match config.device_id.as_deref() {
+                Some(device_id) => Some(
+                    strutils::os_str_to_cstring_checked(device_id)
+                        .context("Invalid hardware device id")?,
+                ),
+                None => None,
+            };
             let opts = config.options.as_ref().and_then(|opts| opts.to_dict());
             AVHWDeviceContext::create(
                 config.device_type.into(),
@@ -248,13 +257,36 @@ impl HWContext {
             config: config.clone(),
             device_ctx: hw_device_ctx,
         });
-        // Insert into cache (lock-free write)
-        HW_CTX_CACHE.insert(config, ctx.clone());
-        // 超过容量上限时自动驱逐未使用的旧条目（本条目刚插入、且被局部
-        // `ctx` 持有，不会被驱逐）
-        prune_hw_ctx_cache(&ctx.config);
 
-        Ok(ctx)
+        // 抢占式插入：`entry()` 在同一分片锁内原子地"存在则取用、不存在则插入"。
+        // 若像以前那样先 `get()` 后 `insert()`，两个线程可能同时 miss、各自打开一次
+        // 设备，后插入的会覆盖先插入的条目，被覆盖的设备再无人引用 —— 重复创建且泄漏。
+        // 这里并发时只有第一个线程的上下文进入缓存，其余线程复用同一个 `Arc`。
+        let mut duplicate = None;
+        let cached = {
+            // 整个 match 放在块中：`entry` 守卫（分片写锁）随块一起析构。
+            match HW_CTX_CACHE.entry(config.clone()) {
+                Entry::Occupied(entry) => {
+                    tracing::debug!("Reusing existing hardware device context. config:{config:?}");
+                    let existing = entry.get().clone();
+                    duplicate = Some(ctx);
+                    existing
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(ctx.clone());
+                    ctx
+                }
+            }
+        };
+        // 锁已释放：此刻才析构落败的重复上下文（`Arc<HWContext>` 析构会 unref 硬件
+        // 设备，可能触发 FFmpeg 日志回调/驱动调用），不在写锁内做。
+        drop(duplicate);
+
+        // 超过容量上限时自动驱逐未使用的旧条目（本条目刚插入、且被局部 `cached`
+        // 持有，不会被驱逐）
+        prune_hw_ctx_cache(&cached.config);
+
+        Ok(cached)
     }
 
     /// Initialize the hardware frames context for a **decoder**.
@@ -474,7 +506,10 @@ impl HWContext {
         unsafe {
             let dst_ptr = dst.as_mut_ptr();
             (*dst_ptr).flags = src.flags;
-            (*dst_ptr).opaque = src.opaque;
+            // 刻意**不**拷贝 `opaque`：它是 FFmpeg 留给应用层的私有指针，本 crate
+            // 从不用它（见 `hwaccel_get_format`），而逐帧共享同一个 opaque 会让两个
+            // 帧都指向调用者的同一份数据——新帧既不拥有它、也无法在其生命周期结束
+            // 时做任何处理，调用者释放后即悬空。新帧的 `opaque` 保持 NULL。
             (*dst_ptr).quality = src.quality;
             (*dst_ptr).duration = src.duration;
             (*dst_ptr).sample_aspect_ratio = src.sample_aspect_ratio;
@@ -656,7 +691,15 @@ impl HWDeviceType {
         unsafe {
             let mut hwdevice_type = ffi::av_hwdevice_iterate_types(ffi::AV_HWDEVICE_TYPE_NONE);
             while hwdevice_type != ffi::AV_HWDEVICE_TYPE_NONE {
-                hw_device_types.push(HWDeviceType::from(hwdevice_type));
+                // FFmpeg 可能报出本 crate 未建模的设备类型（新版本新增的类型，或
+                // 平台特有的取值）。这里跳过它，而不是走会 panic 的 `From`：探测
+                // 列表来自 FFmpeg，属于外部数据，不能中止进程。
+                match HWDeviceType::from_ffi_checked(hwdevice_type) {
+                    Some(device_type) => hw_device_types.push(device_type),
+                    None => tracing::debug!(
+                        "Skipping hardware device type not modelled by rsmedia: {hwdevice_type}"
+                    ),
+                }
                 hwdevice_type = ffi::av_hwdevice_iterate_types(hwdevice_type);
             }
             hw_device_types
@@ -710,7 +753,9 @@ impl HWDeviceType {
                         & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32)
                         != 0;
                     if hw_config_supports_codec
-                        && HWDeviceType::from((*hw_config).device_type) == *self
+                        // `device_type` 来自 FFmpeg 的 codec 配置表，未收录的类型
+                        // 直接视为不匹配（而不是走会 panic 的 `From`）。
+                        && HWDeviceType::from_ffi_checked((*hw_config).device_type) == Some(*self)
                     {
                         break Some((*hw_config).pix_fmt);
                     }
@@ -782,28 +827,28 @@ mod tests {
         }
     }
 
-    /// 空缓存清理应返回 0 且不 panic（CI / 无 GPU 环境）。
-    /// 有 GPU 时：创建 context → 释放引用 → 清理应移除该条目。
+    /// 空缓存释放应返回 0 且不 panic（CI / 无 GPU 环境）。
+    /// 有 GPU 时：创建 context → 释放引用 → 释放应移除该条目。
     #[test]
-    fn test_clear_hw_ctx_cache() {
+    fn test_release_unused_hw_contexts() {
         let _guard = HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // 基线：先清理其它测试可能遗留的条目，再验证空缓存清理返回 0
-        let _leftovers = clear_hw_ctx_cache();
-        let removed = clear_hw_ctx_cache();
-        assert_eq!(removed, 0, "empty cache should remove nothing");
+        // 基线：先释放其它测试可能遗留的条目，再验证空缓存释放返回 0
+        let _leftovers = release_unused_hw_contexts();
+        let removed = release_unused_hw_contexts();
+        assert_eq!(removed, 0, "empty cache should release nothing");
 
-        // 若本机有可用 GPU 设备：创建后释放，缓存条目应可被清理
+        // 若本机有可用 GPU 设备：创建后释放，缓存条目应可被释放
         let Some(ctx) = try_auto_hw_context() else {
             return;
         };
-        // 持有期间清理不应移除
-        assert_eq!(clear_hw_ctx_cache(), 0);
+        // 持有期间释放不应移除
+        assert_eq!(release_unused_hw_contexts(), 0);
         drop(ctx);
-        // 引用释放后（仅缓存持有），清理应移除该条目
-        assert_eq!(clear_hw_ctx_cache(), 1);
-        // 再次清理：缓存已空
-        assert_eq!(clear_hw_ctx_cache(), 0);
+        // 引用释放后（仅缓存持有），释放应移除该条目
+        assert_eq!(release_unused_hw_contexts(), 1);
+        // 再次释放：缓存已空
+        assert_eq!(release_unused_hw_contexts(), 0);
     }
 
     /// `HWContext` 跨线程共享同一 Arc 不应触发数据竞争（回归测试：

@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
         .expect("failed to create encoder");
 
     // 为输出容器添加一条视频流，并写出容器头。
-    let stream_idx = writer.add_stream(encoder.codecpar(), encoder.time_base());
+    let stream_idx = writer.add_stream(encoder.codecpar(), encoder.time_base())?;
     writer.write_header()?;
 
     // 容器（MP4 的 movenc）可能在 `write_header` 时重设流时间基，因此写包前

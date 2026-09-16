@@ -376,7 +376,8 @@ impl PixelFormat {
         })
     }
 
-    /// 获取像素格式名称（FFmpeg 返回静态字符串，借用即可，避免每次分配 String）
+    /// 获取像素格式名称。FFmpeg 对已知格式返回静态字符串，这里复制成拥有的
+    /// `String` 返回（未知格式为 `"unknown"`）。
     pub fn get_pix_fmt_name(&self) -> String {
         unsafe {
             let name = ffi::av_get_pix_fmt_name((*self).into());
@@ -416,9 +417,11 @@ impl PixelFormat {
     /// for free:
     ///
     /// * a format **without** `AV_PIX_FMT_FLAG_PLANAR` is interleaved — one
-    ///   `(height, width, n)` array whose per-pixel element run `n` follows from
-    ///   the component steps and chroma subsampling (`rgb24` → 3, `rgba` → 4,
-    ///   `yuyv422` → 2, `gray8` → 1);
+    ///   `(height, ceil(width, 2^log2_chroma_w) * 2^log2_chroma_w, n)` array whose
+    ///   per-pixel element run `n` follows from the component steps and chroma
+    ///   subsampling (`rgb24` → 3, `rgba` → 4, `yuyv422` → 2, `gray8` → 1), the
+    ///   width being rounded up to whole chroma units as FFmpeg's
+    ///   `av_image_fill_linesizes` does;
     /// * a **planar** format is one array per plane, each chroma plane carrying
     ///   its own subsampled size, taken from `log2_chroma_w` / `log2_chroma_h`.
     ///
@@ -454,20 +457,31 @@ impl PixelFormat {
         let ceil_shift = |value: usize, shift: u32| (value + (1usize << shift) - 1) >> shift;
 
         if desc.flags & ffi::AV_PIX_FMT_FLAG_PLANAR as u64 == 0 {
-            // Interleaved: one plane, `bytes_per_pixel` elements per pixel. The
-            // largest component step spans one pixel per `2^log2_chroma_w` columns
-            // for a horizontally subsampled format (`yuyv422`: 4 >> 1 = 2 bytes).
+            // Interleaved: one plane of `2^log2_chroma_w`-pixel row units, each unit
+            // holding the largest component step in bytes (`yuyv422`: 4 bytes = 2
+            // elements per 2-pixel unit, `rgb24`: 3 elements per 1-pixel unit).
             let max_step = (0..components)
                 .map(|c| desc.comp[c].step.max(0) as usize)
                 .max()?;
-            let bytes_per_pixel = max_step >> desc.log2_chroma_w;
-            if bytes_per_pixel == 0 || !bytes_per_pixel.is_multiple_of(element_bytes) {
+            let unit_pixels = 1usize << desc.log2_chroma_w;
+            // Elements per pixel. A horizontally subsampled packed format can store a
+            // fractional number of elements per pixel (`uyyvyy411`: 6 elements per 4
+            // pixels), which no whole-pixel array can express.
+            if !max_step.is_multiple_of(element_bytes * unit_pixels) {
                 return None;
             }
+            let elements_per_pixel = max_step / (element_bytes * unit_pixels);
+            if elements_per_pixel == 0 {
+                return None;
+            }
+            // FFmpeg rounds the row up to whole units (`av_image_fill_linesizes`),
+            // so an odd width covers the pixels of one more unit: 65 pixels of
+            // `yuyv422` occupy 33 units = 66 columns. Using `width` verbatim would
+            // drop that last unit, leaving each row's tail out of the round trip.
             Some(DataLayout::Interleaved {
                 rows: height,
-                cols: width,
-                components: bytes_per_pixel / element_bytes,
+                cols: ceil_shift(width, desc.log2_chroma_w as u32) * unit_pixels,
+                components: elements_per_pixel,
             })
         } else {
             let plane_count = self.count_planes().ok()? as usize;
@@ -557,11 +571,14 @@ pub fn find_codec_best_pix_fmt(
     src_pix_fmt: PixelFormat,
     has_alpha: bool,
 ) -> Result<PixelFormat> {
-    let pix_fmts = pix_fmt_list.as_ptr() as *const _;
+    // 候选列表以 `AV_PIX_FMT_NONE` 为终止符（底层按 `!= AV_PIX_FMT_NONE` 遍历），
+    // 直接传 `&[PixelFormat]` 的裸指针会让它读越界；这里补上哨兵。
+    let mut pix_fmts: Vec<i32> = pix_fmt_list.iter().map(|&fmt| fmt.into()).collect();
+    pix_fmts.push(ffi::AV_PIX_FMT_NONE);
     let alpha = if has_alpha { 1 } else { 0 };
     let ret = unsafe {
         ffi::avcodec_find_best_pix_fmt_of_list(
-            pix_fmts,
+            pix_fmts.as_ptr(),
             src_pix_fmt.into(),
             alpha,
             std::ptr::null_mut(),
@@ -572,7 +589,14 @@ pub fn find_codec_best_pix_fmt(
             "Failed to find codec best pix fmt, ret: {ret}"
         )));
     }
-    Ok(PixelFormat::from(ret))
+    // 返回值来自外部：用 checked 转换，未收录的格式返回 Err 而不是 panic。
+    PixelFormat::from_ffi_checked(ret)
+        .filter(|fmt| *fmt != PixelFormat::NONE)
+        .ok_or_else(|| {
+            RsmediaError::msg(format!(
+                "No pixel format of the candidate list is usable (got {ret})"
+            ))
+        })
 }
 
 /// 计算像素格式转换的损失值（封装 av_get_pix_fmt_loss）
@@ -605,6 +629,43 @@ pub fn get_pix_fmt_loss(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 交错格式一行的字节数必须等于 `av_image_fill_linesizes`：水平子采样的 packed
+    /// 格式按整个色度单元存储，奇数宽度向上取整到下一个单元（用 `width` 会丢行尾）。
+    #[test]
+    fn test_interleaved_layout_matches_ffmpeg_linesize() -> Result<()> {
+        use crate::imgutils::fill_linesizes;
+
+        for fmt in [
+            PixelFormat::GRAY8,
+            PixelFormat::RGB24,
+            PixelFormat::RGBA,
+            PixelFormat::YUYV422,
+            PixelFormat::UYVY422,
+            PixelFormat::YVYU422,
+            PixelFormat::Y210LE,
+            PixelFormat::Y216LE,
+        ] {
+            let element_bytes = fmt.bytes_per_component().expect("whole-byte components");
+            for width in 1..=9 {
+                let layout = fmt
+                    .data_layout(width, 7)
+                    .expect("packed format has a layout");
+                let (rows, row_elements) = layout.plane_row_extent(0).expect("one plane");
+                assert_eq!(rows, 7, "{fmt:?} at width {width}");
+                assert_eq!(
+                    row_elements * element_bytes,
+                    fill_linesizes(fmt, width as i32)?[0] as usize,
+                    "{fmt:?} at width {width}: layout row bytes vs FFmpeg linesize"
+                );
+            }
+        }
+
+        // 每像素不足一个元素、无法用整像素数组表达的格式不被臆造出来
+        assert_eq!(PixelFormat::UYYVYY411.data_layout(8, 7), None);
+
+        Ok(())
+    }
 
     #[test]
     fn test_pixel_format() -> Result<()> {

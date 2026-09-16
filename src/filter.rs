@@ -71,7 +71,10 @@ impl Filter {
 /// libfreetype，许多发行版构建不含）。用于**前置**跳过不可用滤镜，避免依赖
 /// FFmpeg 运行时错误字符串来判断。
 pub fn is_available(name: &str) -> bool {
-    let name_c = strutils::str_to_cstring(name);
+    // 名字来自调用者，可能含 NUL 字节；转换失败即视为"不存在"，不 panic。
+    let Ok(name_c) = strutils::str_to_cstring_checked(name) else {
+        return false;
+    };
     // SAFETY: `name_c` 是合法的 NUL 结尾 C 字符串；查询函数只读且线程安全。
     unsafe { !ffi::avfilter_get_by_name(name_c.as_ptr()).is_null() }
 }
@@ -147,6 +150,60 @@ fn escape_filter_str(input: &str) -> String {
     }
 }
 
+/// filtergraph 的「图级」转义：对**已经过** [`escape_filter_str`] 选项级转义的
+/// 字符串再转义一层。
+///
+/// FFmpeg 对滤镜描述做两级解析：先在整条描述上按 `,` `;` `[` `]` 拆分滤镜与
+/// 链路（图级），再在每个滤镜的参数串上按 `:` `=` 拆分选项（选项级）。所以一个
+/// 不带引号直接写进描述的值必须转义两层：只转一层时，值里的 `,` / `;` / `[]`
+/// 会被图级解析吃掉（如 `movie=/tmp/a,b.mp4` 会被拆成两个滤镜）。
+fn escape_filter_graph_str(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    // 与 `escape_filter_str` 同样的降级策略：av_escape 失败时剥离 NUL 原样放行。
+    let fallback = || input.replace('\0', "");
+
+    unsafe {
+        let c_input = match CString::new(input) {
+            Ok(s) => s,
+            Err(_) => return fallback(),
+        };
+
+        // 图级特殊字符：`\` `'` `[` `]` `,` `;`
+        let special_chars = CString::new("\\'[],;").unwrap();
+        let mut escaped_ptr = std::ptr::null_mut();
+
+        let result = ffi::av_escape(
+            &mut escaped_ptr,
+            c_input.as_ptr(),
+            special_chars.as_ptr(),
+            ffi::AV_ESCAPE_MODE_BACKSLASH,
+            // 不设 AV_ESCAPE_FLAG_WHITESPACE：空格已在选项级转义过，
+            // 再转一次会多出一层反斜杠（值会被解析成前导 `\`）。
+            0,
+        );
+
+        if result < 0 || escaped_ptr.is_null() {
+            tracing::warn!("av_escape failed while escaping filtergraph characters");
+            return fallback();
+        }
+
+        let escaped_string = std::ffi::CStr::from_ptr(escaped_ptr)
+            .to_string_lossy()
+            .into_owned();
+        ffi::av_free(escaped_ptr as *mut _);
+
+        escaped_string
+    }
+}
+
+/// 把调用者提供的值安全地写进滤镜描述（值外层不加引号时使用）：依次做
+/// **选项级**（[`escape_filter_str`]）与**图级**（[`escape_filter_graph_str`]）转义。
+fn escape_filter_option(input: &str) -> String {
+    escape_filter_graph_str(&escape_filter_str(input))
+}
+
 /// 转义文本，但保留 FFmpeg 的 `%{...}` 展开块（如 `%{localtime}`、`%{pts:hms}`）。
 ///
 /// 用于 `drawtext` 等需要显示动态时间/帧号的场景，避免 `{` `}` 被转义后无法展开。
@@ -202,7 +259,7 @@ pub mod video {
     pub fn scale(width: u32, height: u32, flags: Option<&str>) -> Filter {
         // 默认与 FFmpeg `scale` 滤镜一致，也与本 crate 的 `Scaler::default()`
         // 一致（BICUBIC）；早先这里是 `fast_bilinear`，与上方文档矛盾。
-        let flags_str = flags.unwrap_or("bicubic");
+        let flags_str = escape_filter_option(flags.unwrap_or("bicubic"));
 
         Filter::new(
             "scale",
@@ -235,8 +292,16 @@ pub mod video {
 
     /// 在视频上绘制文字的 Builder，对应 FFmpeg `drawtext` 滤镜。
     ///
-    /// `fontfile` 可选，缺省时使用项目内 `fonts/Arial.ttf`（避免依赖 system fontconfig，
-    /// 例如 Windows 等没有 fontconfig 配置的平台会崩溃）；也支持给文字加描边盒子（`boxed`）。
+    /// `fontfile` 可选；不指定时用**相对路径** `fonts/Arial.ttf`（避免依赖 system
+    /// fontconfig，例如 Windows 等没有 fontconfig 配置的平台会崩溃）。相对路径
+    /// 按**进程当前工作目录**解析：只有工作目录恰好在仓库根目录时才找得到，
+    /// 因此生产代码请总是用 [`DrawText::fontfile`] 传绝对路径（如用
+    /// `env!("CARGO_MANIFEST_DIR")` 拼出字体路径）。路径不存在时滤镜图初始化会失败
+    /// （`drawtext` 报找不到字体文件），不会 panic。
+    /// 也支持给文字加描边盒子（`boxed`）。
+    ///
+    /// Requires `drawtext`, i.e. an FFmpeg built with libfreetype; check with
+    /// [`crate::filter::is_available`] beforehand.
     ///
     /// # Examples
     ///
@@ -324,10 +389,15 @@ pub mod video {
             };
             let mut spec = format!(
                 "drawtext=text='{}':x={}:y={}:fontsize={}:fontcolor={}",
-                text_spec, self.x, self.y, self.fontsize, self.fontcolor
+                text_spec,
+                self.x,
+                self.y,
+                self.fontsize,
+                escape_filter_option(&self.fontcolor)
             );
             // 缺省使用项目自带字体，避免依赖 system fontconfig（Windows 等平台没有
             // fontconfig 配置会在查字体时崩溃）；用户显式指定字体时优先用用户的。
+            // 注意 `fonts/Arial.ttf` 是相对路径，按进程当前工作目录解析（见结构体文档）。
             let fontfile = self
                 .fontfile
                 .unwrap_or_else(|| "fonts/Arial.ttf".to_string());
@@ -335,7 +405,8 @@ pub mod video {
             if self.box_enabled {
                 spec.push_str(&format!(
                     ":box=1:boxcolor={}:boxborderw={}",
-                    self.box_color, self.box_border_w
+                    escape_filter_option(&self.box_color),
+                    self.box_border_w
                 ));
             }
             Filter::new("drawtext", MediaType::VIDEO, spec)
@@ -348,6 +419,7 @@ pub mod video {
             // FFmpeg 't=fill' is also possible
             tracing::warn!("Box thickness is negative ({thickness}), using absolute value.",);
         }
+        let color = escape_filter_option(color);
         Filter::new(
             "drawbox",
             MediaType::VIDEO,
@@ -451,7 +523,15 @@ pub mod video {
     }
 
     /// zoompan - 平移和缩放效果
+    ///
+    /// `zoom`/`x`/`y` 均为 FFmpeg 表达式（如 `"1.5"`、`"iw/2-(iw/zoom/2)"`），
+    /// 内部会做选项级 + 图级转义。
     pub fn zoompan(zoom: &str, x: &str, y: &str, duration: Option<i32>) -> Filter {
+        let (zoom, x, y) = (
+            escape_filter_option(zoom),
+            escape_filter_option(x),
+            escape_filter_option(y),
+        );
         let mut params = format!("zoompan=z={zoom}:x={x}:y={y}");
         if let Some(d) = duration {
             params.push_str(&format!(":d={d}"));
@@ -474,10 +554,14 @@ pub mod video {
         Filter::new("transpose", MediaType::VIDEO, format!("transpose={mode}"))
     }
 
-    /// rotate - 任意角度旋转滤镜（使用浮点弧度，支持动画）
-    /// 注意：性能较低，可能有插值模糊；用于精准旋转或动态旋转场景
+    /// rotate - 任意角度旋转滤镜（支持动画表达式）
+    ///
+    /// `angle` 为**角度**（度），内部转成 FFmpeg `rotate` 需要的弧度表达式
+    /// (`{angle}*PI/180`)；`rotate` 的选项本身是表达式，因此也可以直接
+    /// 用 `Filter::new("rotate", ...)` 写 `PI/4` 之类的弧度表达式。
+    /// 注意：性能较低，可能有插值模糊；用于精准旋转或动态旋转场景。
     pub fn rotate(angle: i32) -> Filter {
-        // Ffmpeg 中的角度使用弧度而非度数，因此需要转换
+        // FFmpeg 的 rotate 角度以弧度为单位，这里把调用者给的度数换算过去。
         Filter::new("rotate", MediaType::VIDEO, format!("rotate={angle}*PI/180"))
     }
 
@@ -548,6 +632,7 @@ pub mod video {
     /// 去交错（Deinterlace），将隔行扫描转为逐行扫描。
     /// `mode`: `send_frame`(默认), `send_field`, `send_frame_nospatial`, `send_field_nospatial`.
     pub fn yadif(mode: &str) -> Filter {
+        let mode = escape_filter_option(mode);
         Filter::new("yadif", MediaType::VIDEO, format!("yadif=mode={mode}"))
     }
 
@@ -557,6 +642,7 @@ pub mod video {
     /// * `x` / `y` - 原视频在输出画布上的偏移。
     /// * `color` - 填充颜色，如 `"black"`。
     pub fn pad(w: u32, h: u32, x: i32, y: i32, color: &str) -> Filter {
+        let color = escape_filter_option(color);
         Filter::new(
             "pad",
             MediaType::VIDEO,
@@ -565,9 +651,10 @@ pub mod video {
     }
 
     /// 烧录字幕（Subtitles）。
-    /// `path`: 字幕文件路径（`srt`/`ass` 等）。
+    /// `path`: 字幕文件路径（`srt`/`ass` 等）；路径中的转义字符（如 `,`/`;`/`[]`）
+    /// 会被自动转义，调用者传原始路径即可。
     pub fn subtitles(path: &str) -> Filter {
-        let escaped = escape_filter_str(path);
+        let escaped = escape_filter_option(path);
         Filter::new(
             "subtitles",
             MediaType::VIDEO,
@@ -659,12 +746,14 @@ pub mod video {
     }
 
     /// 平均值模糊（boxblur，参数化版本）。
-    /// * `luma_radius` - 亮度模糊半径（像素，可为 `"2"` 或 `"min(cw/2\,ch/2)"` 等表达式）。
+    /// * `luma_radius` - 亮度模糊半径（像素），可以是表达式，如 `"2"` 或
+    ///   `"min(cw/2,ch/2)"`（传**未转义**的表达式，内部会做两层转义）。
     /// * `luma_power` - 亮度模糊强度（1 表示完全平均，2 表示两遍）。
     ///
     /// 注意：`blur(radius)` 是 convenience 版，只设 `luma_radius`；
     /// 这里保留 boxblur 完整参数供精细控制。
     pub fn boxblur(luma_radius: &str, luma_power: u32) -> Filter {
+        let luma_radius = escape_filter_option(luma_radius);
         Filter::new(
             "boxblur",
             MediaType::VIDEO,
@@ -696,6 +785,7 @@ pub mod video {
     /// * `similarity` - 颜色相似度阈值（0~0.01，越大越宽松）。
     /// * `blend` - 混合比例（0~1）。
     pub fn chromakey(color: &str, similarity: f32, blend: f32) -> Filter {
+        let color = escape_filter_option(color);
         Filter::new(
             "chromakey",
             MediaType::VIDEO,
@@ -706,6 +796,7 @@ pub mod video {
     /// RGB 色键（colorkey），将指定 RGB 颜色转为透明。
     /// `color` - 如 `"black"` 或 `"0x000000"`。
     pub fn colorkey(color: &str, similarity: f32, blend: f32) -> Filter {
+        let color = escape_filter_option(color);
         Filter::new(
             "colorkey",
             MediaType::VIDEO,
@@ -714,11 +805,11 @@ pub mod video {
     }
 
     /// 曲线调节（curves），通过控制点微调 R/G/B 通道色调。
-    /// `preset`/`points` 二选一；`points` 形如 `"0/0 0.5/0.5 1/1"`。
+    /// `preset`/`points` 二选一；`points` 形如 `"0/0 0.5/0.5 1/1"`（无需自行转义）。
     pub fn curves(preset: Option<&str>, points: Option<&str>) -> Filter {
         let spec = match (preset, points) {
-            (Some(p), _) => format!("curves=preset={p}"),
-            (None, Some(pt)) => format!("curves=all={pt}"),
+            (Some(p), _) => format!("curves=preset={}", escape_filter_option(p)),
+            (None, Some(pt)) => format!("curves=all={}", escape_filter_option(pt)),
             _ => "curves".to_string(),
         };
         Filter::new("curves", MediaType::VIDEO, spec)
@@ -727,6 +818,7 @@ pub mod video {
     /// 逐行/隔行转换（bwdif）去隔行，现代去隔行替代方案。
     /// `mode`: `send_frame`(默认) / `send_field` / `send_frame_nospatial`。
     pub fn bwdif(mode: &str) -> Filter {
+        let mode = escape_filter_option(mode);
         Filter::new("bwdif", MediaType::VIDEO, format!("bwdif=mode={mode}"))
     }
 
@@ -759,7 +851,9 @@ pub mod video {
     ///     .unwrap();
     /// ```
     pub fn gif_palette(fps: f32, dither: Option<&str>) -> Filter {
-        let dither_part = dither.map(|d| format!(":dither={d}")).unwrap_or_default();
+        let dither_part = dither
+            .map(|d| format!(":dither={}", escape_filter_option(d)))
+            .unwrap_or_default();
         Filter::new(
             "paletteuse",
             MediaType::VIDEO,
@@ -775,7 +869,7 @@ pub mod audio {
     /// 创建音频重采样过滤器
     pub fn resample(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
         // 统一走解析函数以便复用 channel_desc 处理，避免 describe().unwrap() panic
-        let channel_desc = audio_channel_desc(nb_channels);
+        let channel_desc = audio_channel_desc(nb_channels as i32);
 
         // async=1 可能更适合实时场景，避免缓冲问题。
         let spec_str = format!(
@@ -793,7 +887,7 @@ pub mod audio {
     /// `format`: <https://ffmpeg.org/ffmpeg-filters.html#format>
     /// `aformat`: <https://ffmpeg.org/ffmpeg-filters.html#aformat-1>
     pub fn format(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
-        let channel_desc = audio_channel_desc(nb_channels);
+        let channel_desc = audio_channel_desc(nb_channels as i32);
 
         Filter::new(
             "aformat",
@@ -808,8 +902,9 @@ pub mod audio {
     }
 
     /// 把通道数解析为 FFmpeg 通道布局描述；失败时回退到数字通道数，避免 panic。
-    fn audio_channel_desc(nb_channels: u32) -> String {
-        AVChannelLayout::from_nb_channels(nb_channels as i32)
+    /// 滤镜图源/汇（`FilterGraph::setup_audio_filters`）也复用同一逻辑。
+    pub(super) fn audio_channel_desc(nb_channels: i32) -> String {
+        AVChannelLayout::from_nb_channels(nb_channels)
             .describe()
             .map(|d| d.to_string_lossy().to_string())
             .unwrap_or_else(|_| format!("{nb_channels}"))
@@ -903,8 +998,10 @@ pub mod audio {
 
     /// 延时（ms）
     ///
-    /// 注意：不能使用 `delays=100|100` 逐通道写法，因为 `|` 在滤镜图中是滤镜链
-    /// 分隔符，会导致图解析失败；统一用 `all=1` 应用到所有通道。
+    /// 这里固定用 `all=1` 把同一个延时应用到所有通道；逐通道写法
+    /// (`delays=100|100`) 必须按实际通道数逐个列出，通道数不匹配时会被
+    /// 静默忽略，因此不在此暴露。（滤镜链的分隔符是 `,`，`|` 只是部分滤镜
+    /// 选项值内部的分隔符。）
     pub fn adelay(delay_ms: i32) -> Filter {
         Filter::new(
             "adelay",
@@ -937,7 +1034,7 @@ pub mod audio {
         noise_type: Option<&str>,
         time_smoothing: Option<f32>,
     ) -> Filter {
-        let nt = noise_type.unwrap_or("w");
+        let nt = escape_filter_option(noise_type.unwrap_or("w"));
         let tr = time_smoothing.unwrap_or(0.0);
         Filter::new(
             "afftdn",
@@ -998,6 +1095,7 @@ pub mod audio {
     /// * `start` - 起点（秒）。
     /// * `duration` - 淡变时长（秒）。
     pub fn afade(fade_type: &str, start: f32, duration: f32) -> Filter {
+        let fade_type = escape_filter_option(fade_type);
         Filter::new(
             "afade",
             MediaType::AUDIO,
@@ -1010,6 +1108,7 @@ pub mod audio {
     /// * `delays` - 延迟序列（ms，如 `"60|30"`）。
     /// * `decays` - 衰减系数（如 `"0.4|0.3"`）。
     pub fn aecho(in_gain: f32, out_gain: f32, delays: &str, decays: &str) -> Filter {
+        let (delays, decays) = (escape_filter_option(delays), escape_filter_option(decays));
         Filter::new(
             "aecho",
             MediaType::AUDIO,
@@ -1024,6 +1123,7 @@ pub mod audio {
     /// `Filter::new("amix", MediaType::AUDIO, ...)` 自定义。
     /// `inputs`: 输入路数；`duration`: `longest`/`shortest`/`first`。
     pub fn amix(inputs: u32, duration: &str) -> Filter {
+        let duration = escape_filter_option(duration);
         Filter::new(
             "amix",
             MediaType::AUDIO,
@@ -1088,7 +1188,7 @@ fn audio_or_video_filter_name(
 /// `expr`: FFmpeg expression (e.g., "0.5*PTS", "PTS-STARTPTS").
 pub fn setpts(media_type: MediaType, expr: &str) -> Filter {
     let name = audio_or_video_filter_name("asetpts", "setpts", media_type);
-    let escaped_expr = escape_filter_str(expr);
+    let escaped_expr = escape_filter_option(expr);
     Filter::new(name, media_type, format!("{name}={escaped_expr}"))
 }
 
@@ -1123,7 +1223,8 @@ pub struct VideoParams {
     pub format: PixelFormat,
     /// 滤镜图**输入**（buffer 源）像素格式：默认与 `format` 相同；当滤镜链
     /// 声明了不同的输入格式（如 GIF 调色板链要求 RGB 输入、输出 pal8）时，
-    /// 由编码器侧设置为声明的输入格式，src→sink 的格式转换由滤镜图内完成。
+    /// 编码/解码两条流水线都把它设为声明的格式，并在进图前把帧转成同一格式；
+    /// src→sink 的格式转换由滤镜图内完成。
     pub src_format: PixelFormat,
     pub time_base: ffi::AVRational,
     pub frame_rate: ffi::AVRational,
@@ -1158,6 +1259,9 @@ pub struct FilterGraph {
     graph: AVFilterGraph,
     state: FilterGraphState,
     initialized: AtomicBool,
+    /// 是否已经推过 EOF（`av_buffersrc_add_frame(src, NULL)`）。EOF 只能推一次，
+    /// 重复推送会拿到 `AVERROR_EOF`；`flush` 会先检查它。
+    eof_sent: bool,
 }
 
 impl FilterGraph {
@@ -1166,6 +1270,7 @@ impl FilterGraph {
             graph: AVFilterGraph::new(),
             state: FilterGraphState::Normal,
             initialized: AtomicBool::new(false),
+            eof_sent: false,
         }
     }
 
@@ -1186,11 +1291,26 @@ impl FilterGraph {
         self.graph = AVFilterGraph::new();
         self.state = FilterGraphState::Normal;
         self.initialized.store(false, DEFAULT_ORDERING);
+        self.eof_sent = false;
         self.init(params, filters)
     }
 
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(DEFAULT_ORDERING)
+    }
+
+    /// 建一张已初始化的滤镜图（`new` + [`init`](Self::init) 的合并入口）。
+    ///
+    /// 解码与编码两条流水线都用它建图，转义、媒体类型校验、滤镜可用性校验
+    /// （缺失滤镜 → [`FilterNotFound`](crate::RsmediaError::FilterNotFound)）
+    /// 因此只有 [`init`](Self::init) 一处实现——调用方不需要在门外再抄一遍这些
+    /// 检查，两份检查只会随 FFmpeg 版本漂移。
+    pub(crate) fn build(params: &FilterParams, filters: &[Filter]) -> Result<FilterGraph> {
+        let mut graph = Self::new();
+        graph
+            .init(params, filters)
+            .context("Failed to initialize filter graph")?;
+        Ok(graph)
     }
 
     pub fn is_drained(&self) -> bool {
@@ -1209,9 +1329,16 @@ impl FilterGraph {
 
         // check
         for filter in filters {
+            // 名字必须是本 FFmpeg 构建里真实存在的滤镜：`drawtext` 需要
+            // libfreetype、`subtitles` 需要 libass，缺失时在此前置报错，
+            // 而不是等到 parse 阶段返回一句难以定位的字符串错误。
+            if !is_available(filter.name()) {
+                return Err(RsmediaError::filter_not_found(filter.name()));
+            }
             if filter.media_type() != params.media_type() {
                 return Err(RsmediaError::msg(format!(
-                    "Filter media type mismatch: expected {:?}, got {:?}",
+                    "Filter '{}' media type mismatch: expected {:?}, got {:?}",
+                    filter.name(),
                     params.media_type(),
                     filter.media_type()
                 )));
@@ -1303,7 +1430,13 @@ impl FilterGraph {
         // Parse with endpoints
         let (_in, _out) = self
             .graph
-            .parse_ptr(&spec_cstr, Some(inputs), Some(outputs))?;
+            .parse_ptr(&spec_cstr, Some(inputs), Some(outputs))
+            .with_context(|| {
+                format!(
+                    "Failed to parse video filter graph: {}",
+                    spec_cstr.to_string_lossy()
+                )
+            })?;
 
         Ok(())
     }
@@ -1312,7 +1445,9 @@ impl FilterGraph {
     /// `abuffer`: <https://ffmpeg.org/ffmpeg-filters.html#abuffer>
     /// `abuffersink`: <https://ffmpeg.org/ffmpeg-filters.html#abuffersink>
     fn setup_audio_filters(&mut self, params: &AudioParams, spec: String) -> Result<()> {
-        let channel_desc = AVChannelLayout::from_nb_channels(params.nb_channels).describe()?;
+        // 与 `audio::audio_channel_desc` 共用同一套「通道数 → 布局描述」逻辑
+        // （失败时回退到数字通道数，不会 panic）。
+        let channel_desc = audio::audio_channel_desc(params.nb_channels);
 
         let args = {
             let args = format!(
@@ -1321,7 +1456,7 @@ impl FilterGraph {
                 params.time_base.den,
                 params.sample_rate,
                 params.src_format.get_sample_fmt_name(),
-                channel_desc.to_string_lossy(),
+                channel_desc,
             );
             CString::new(args)?
         };
@@ -1346,21 +1481,25 @@ impl FilterGraph {
         // - buffersink ：新数组选项 pixel_formats （旧 pix_fmts 已废弃）
         // - abuffersink ：新数组选项 `sample_formats`/`samplerates`/`channel_layouts` （旧 `sample_fmts`/`sample_rates`/`ch_layouts`(binary/string) 已废弃）
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-        sink_ctx.opt_set_array(
-            c"sample_formats",
-            0,
-            Some(&[params.format as i32]),
-            ffi::AV_OPT_TYPE_SAMPLE_FMT,
-        )?;
+        sink_ctx
+            .opt_set_array(
+                c"sample_formats",
+                0,
+                Some(&[params.format as i32]),
+                ffi::AV_OPT_TYPE_SAMPLE_FMT,
+            )
+            .context("Failed to set audio sink sample format")?;
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         sink_ctx.opt_set_bin(c"sample_fmts", &(params.format as i32))?;
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-        sink_ctx.opt_set_array(
-            c"samplerates",
-            0,
-            Some(&[params.sample_rate]),
-            ffi::AV_OPT_TYPE_INT,
-        )?;
+        sink_ctx
+            .opt_set_array(
+                c"samplerates",
+                0,
+                Some(&[params.sample_rate]),
+                ffi::AV_OPT_TYPE_INT,
+            )
+            .context("Failed to set audio sink sample rate")?;
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         sink_ctx.opt_set_bin(c"sample_rates", &params.sample_rate)?;
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
@@ -1376,7 +1515,10 @@ impl FilterGraph {
                 .context("Failed to set audio sink channel layout")?;
         }
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-        sink_ctx.opt_set(c"ch_layouts", &channel_desc)?;
+        sink_ctx.opt_set(
+            c"ch_layouts",
+            &AVChannelLayout::from_nb_channels(params.nb_channels).describe()?,
+        )?;
         sink_ctx
             .init_str(None)
             .context("Failed to init audio buffer sink")?;
@@ -1390,25 +1532,51 @@ impl FilterGraph {
         // Parse with endpoints
         let (_in, _out) = self
             .graph
-            .parse_ptr(&spec_cstr, Some(inputs), Some(outputs))?;
+            .parse_ptr(&spec_cstr, Some(inputs), Some(outputs))
+            .with_context(|| {
+                format!(
+                    "Failed to parse audio filter graph: {}",
+                    spec_cstr.to_string_lossy()
+                )
+            })?;
 
         Ok(())
     }
 
-    /// 处理单帧
+    /// 处理单帧：推入一帧（`Some`）或 EOF（`None`），再取一帧。
+    ///
+    /// EOF 与取帧的语义分别由 `push_frame` / `receive_frame` 承担，
+    /// 这个方法只是两者的组合。
     pub fn process_frame(&mut self, frame: Option<AVFrame>) -> Result<Option<AVFrame>> {
+        self.push_frame(frame)?;
+        self.receive_frame()
+    }
+
+    /// 把一帧（`Some`）或 EOF（`None`）推入滤镜图。
+    ///
+    /// EOF 只会推一次：重复 `av_buffersrc_add_frame(src, NULL)` 会返回
+    /// `AVERROR_EOF`，所以第二次起直接返回 `Ok(())`。
+    fn push_frame(&mut self, frame: Option<AVFrame>) -> Result<()> {
         if !self.is_initialized() {
             return Err(RsmediaError::msg("Filter graph not initialized"));
         }
+        if frame.is_none() {
+            if self.eof_sent {
+                return Ok(());
+            }
+            self.eof_sent = true;
+        }
 
-        {
-            // Get source context and send the frame
-            let mut src_ctx = self.get_src_context()?;
-            src_ctx
-                .buffersrc_add_frame(frame, None)
-                .context("Error submitting the frame to the filter graph.")?;
-        } // src_ctx is dropped here, releasing the mutable borrow
+        // src_ctx is dropped at the end of the block, releasing the mutable borrow
+        let mut src_ctx = self.get_src_context()?;
+        src_ctx
+            .buffersrc_add_frame(frame, None)
+            .context("Error submitting the frame to the filter graph.")
+    }
 
+    /// 从滤镜图取一帧：`Ok(Some)` 是产出帧，`Ok(None)` 表示暂时无帧
+    /// （图被 drain，状态置为 `Drained`）或已到流末尾（状态置为 `Flushed`）。
+    fn receive_frame(&mut self) -> Result<Option<AVFrame>> {
         let filter_result = {
             // safely get a new mutable borrow for sink_ctx
             let mut sink_ctx = self.get_sink_context()?;
@@ -1432,7 +1600,7 @@ impl FilterGraph {
         }
     }
 
-    /// 刷新过滤器链
+    /// 刷新过滤器链：推入一次 EOF，然后把图里缓存的帧全部取出来。
     pub fn flush(&mut self) -> Result<Vec<AVFrame>> {
         if !self.is_initialized() {
             return Err(RsmediaError::msg("Filter graph not initialized"));
@@ -1442,11 +1610,14 @@ impl FilterGraph {
             return Ok(Vec::new());
         }
 
+        // 只有推过 EOF，图才会吐出缓冲帧。
+        self.push_frame(None)?;
+
         let mut frames = Vec::new();
         let mut drained_iterations = 0usize;
 
         loop {
-            match self.process_frame(None) {
+            match self.receive_frame() {
                 Ok(Some(frame)) => {
                     drained_iterations = 0;
                     frames.push(frame);
@@ -1457,13 +1628,19 @@ impl FilterGraph {
                     }
                     // EAGAIN：图里仍有缓冲帧要出，继续拉取；但个别滤镜可能一直回
                     // EAGAIN 而不进入 Flushed，故设上限收尾（与解码/编码排空一致）。
+                    // 触顶时不能静默返回半截结果：残留帧会被丢掉，必须让调用者知道。
                     if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
                         tracing::error!(
                             "Filter graph keeps returning EAGAIN while flushing; \
                              giving up after {} iterations",
                             crate::MAX_DRAIN_ITERATIONS
                         );
-                        break;
+                        return Err(RsmediaError::msg(format!(
+                            "Filter graph stalled while flushing: still no output after {} \
+                             iterations; {} already-dequeued frames are discarded",
+                            crate::MAX_DRAIN_ITERATIONS,
+                            frames.len()
+                        )));
                     }
                     drained_iterations += 1;
                     tracing::trace!("Filter graph draining during flush...");
@@ -1557,11 +1734,13 @@ mod tests {
             "Brackets should be escaped and spaces too"
         );
 
-        // Test case 4: String with multiple special characters
+        // Test case 4: 选项级转义只保证"值里的 `:` 不会截断选项"，不负责图级
+        // 分隔符——`file:///...` 作为**不带引号**的选项值还必须再经过图级转义
+        // （见 test_escape_filter_option_two_levels）。
         assert_eq!(
             escape_filter_str("file:///path/to/video.mp4"),
             "file\\:///path/to/video.mp4",
-            "Colon should be escaped"
+            "Single-level (option) escaping escapes the colon"
         );
 
         // Test case 5: String with all special characters
@@ -1623,6 +1802,36 @@ mod tests {
             long_result.ends_with("\\=\\[\\]\\:"),
             "Long strings should have special characters at the end properly escaped"
         );
+    }
+
+    #[test]
+    fn test_escape_filter_option_two_levels() {
+        // 普通值不受影响：scale/pad/yadif/adelay 等生成的 spec 依赖"简单值原样保留"。
+        for plain in ["lanczos", "send_frame", "black@0.5", "16/9"] {
+            assert_eq!(escape_filter_option(plain), plain, "plain value changed");
+        }
+
+        // `:` 是**选项级**分隔符：第一层转义后带一个反斜杠；第二层必须把该反斜杠
+        // 自身再转义（`\\`），否则图级解析会把它吃掉，值里的 `:` 又变成分隔符。
+        let path = escape_filter_option("file:///path/to/video.mp4");
+        assert!(
+            path.starts_with(r"file\\"),
+            "option-level backslash must be escaped for the graph level: {path}"
+        );
+        assert!(
+            path.contains(r"\:"),
+            "colon must stay escaped after graph-level escaping: {path}"
+        );
+
+        // `,` `;` `[` `]` 是**图级**分隔符（`movie=`/`subtitles=` 这类路径值必须防住，
+        // 否则值会被拆成多个滤镜/链路）。两层转义后每个字符前都应留有反斜杠。
+        let tricky = escape_filter_option("/tmp/a,b;c[d].mp4");
+        for ch in [',', ';', '[', ']'] {
+            assert!(
+                tricky.contains(&format!("\\{ch}")),
+                "{ch} must be escaped for the graph level: {tricky}"
+            );
+        }
     }
 
     #[test]

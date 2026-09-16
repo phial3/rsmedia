@@ -2,13 +2,24 @@ use crate::error::{Result, RsmediaError};
 use crate::stream::MediaType;
 use crate::strutils;
 
-#[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
-use rsmpeg::avcodec::AVCodecContext;
-use rsmpeg::avcodec::{AVCodec, AVCodecRef};
+use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecRef};
 use rsmpeg::ffi;
 
 use std::ffi::CStr;
 use std::fmt;
+
+/// 设置 `AVCodecContext::thread_count`。
+///
+/// rsmpeg 的 `settable!` 字段表不含 `thread_count`，只能直接写字段；把这个
+/// unsafe 收敛在这里，`Encoder`/`Decoder` 都不再自己碰裸指针。
+pub(crate) fn set_thread_count(context: &mut AVCodecContext, thread_count: usize) {
+    // SAFETY: `context` 由 `AVCodecContext::new` 分配、在借用期内一直有效；
+    // `thread_count` 是普通 `int` 字段，无别名与不变量要求。夹到 `i32` 范围内，
+    // 避免 `usize -> i32` 截断成负数（FFmpeg 里 0 = 自动，负数无意义）。
+    unsafe {
+        (*context.as_mut_ptr()).thread_count = i32::try_from(thread_count).unwrap_or(i32::MAX);
+    }
+}
 
 /// 编解码器（编码器/解码器共用）的推进状态。
 ///
@@ -253,17 +264,6 @@ impl CodecConfig {
         match self.supported_sample_formats() {
             Ok(None) | Err(_) => true,
             Ok(Some(formats)) => formats.contains(&sample_fmt),
-        }
-    }
-
-    /// 注意：对音频编码器查询帧率会得到 EINVAL（音频无帧率概念），
-    /// 此时按"支持"处理。
-    pub(crate) fn is_support_frame_rates(&self, frame_rate: ffi::AVRational) -> bool {
-        match self.supported_frame_rates() {
-            Ok(None) | Err(_) => true,
-            Ok(Some(rates)) => rates
-                .iter()
-                .any(|r| r.num == frame_rate.num && r.den == frame_rate.den),
         }
     }
 

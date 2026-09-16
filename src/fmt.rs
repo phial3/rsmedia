@@ -147,8 +147,10 @@ pub enum DataLayout {
     Interleaved {
         /// Rows of the array — the picture height for video, `1` for audio.
         rows: usize,
-        /// Columns of the array — the picture width for video, the sample count
-        /// for audio.
+        /// Columns of the array — the sample count for audio; for video, the
+        /// picture width rounded up to whole row units, as FFmpeg's linesize
+        /// does (a horizontally subsampled packed format such as `YUYV422`
+        /// rounds an odd width up to a whole 2-pixel unit).
         cols: usize,
         /// Storage elements per row-unit: the per-pixel element run for packed
         /// video, the channel count for packed audio.

@@ -23,6 +23,28 @@ pub fn path_to_cstring<P: AsRef<Path> + ?Sized>(path: &P) -> CString {
     }
 }
 
+/// Fallible [`path_to_cstring`].
+///
+/// Use this for paths that come from the caller (file names, URLs, filter
+/// arguments): an interior NUL byte becomes [`RsmediaError::InvalidConfig`]
+/// instead of a panic.
+///
+/// [`RsmediaError::InvalidConfig`]: crate::RsmediaError::InvalidConfig
+pub fn path_to_cstring_checked<P: AsRef<Path> + ?Sized>(path: &P) -> crate::error::Result<CString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(CString::new(path.as_ref().as_os_str().as_bytes())?)
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(CString::new(
+            path.as_ref().as_os_str().to_string_lossy().as_bytes(),
+        )?)
+    }
+}
+
 /// Option<&Path> -> `Option<CString>`
 pub fn path_to_cstring_opt<P: AsRef<Path> + ?Sized>(path: Option<&P>) -> Option<CString> {
     path.map(path_to_cstring)
@@ -61,13 +83,26 @@ pub fn str_to_cstring<S: AsRef<str> + ?Sized>(s: &S) -> CString {
     CString::new(s.as_ref()).unwrap()
 }
 
+/// Fallible [`str_to_cstring`].
+///
+/// Use this for strings that come from the caller (codec names, options,
+/// filter arguments): an interior NUL byte becomes
+/// [`RsmediaError::InvalidConfig`] instead of a panic.
+///
+/// [`RsmediaError::InvalidConfig`]: crate::RsmediaError::InvalidConfig
+pub fn str_to_cstring_checked<S: AsRef<str> + ?Sized>(s: &S) -> crate::error::Result<CString> {
+    Ok(CString::new(s.as_ref())?)
+}
+
 /// Option<&str> -> `Option<CString>`
 pub fn str_to_cstring_opt<S: AsRef<str> + ?Sized>(s: Option<&S>) -> Option<CString> {
     s.map(str_to_cstring)
 }
 
 /// &Cstr -> String
-pub fn cstr_to_string<C: AsRef<CStr> + ?Sized>(cstr: &C) -> Result<String, std::str::Utf8Error> {
+pub fn cstr_to_string<C: AsRef<CStr> + ?Sized>(
+    cstr: &C,
+) -> std::result::Result<String, std::str::Utf8Error> {
     cstr.as_ref().to_str().map(String::from)
 }
 
@@ -115,6 +150,25 @@ pub fn os_str_to_cstring(path_or_url: impl AsRef<OsStr>) -> CString {
     #[cfg(not(unix))]
     {
         CString::new(path_or_url.as_ref().to_string_lossy().as_bytes()).unwrap()
+    }
+}
+
+/// Fallible [`os_str_to_cstring`].
+///
+/// Use this for OS strings that come from the caller (paths, device names,
+/// URLs): an interior NUL byte becomes [`RsmediaError::InvalidConfig`] instead
+/// of a panic.
+///
+/// [`RsmediaError::InvalidConfig`]: crate::RsmediaError::InvalidConfig
+pub fn os_str_to_cstring_checked(os: impl AsRef<OsStr>) -> crate::error::Result<CString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(CString::new(os.as_ref().as_bytes())?)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(CString::new(os.as_ref().to_string_lossy().as_bytes())?)
     }
 }
 

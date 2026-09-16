@@ -248,8 +248,13 @@ impl<W: Writer> PcmSink<W> {
         }
         self.input_samples += nb_samples as u64;
 
-        // 转换到编码器规格并按实际输出样本数累计 pts
-        let mut dst = self.alloc_encoder_frame(self.encoder_sample_rate)?;
+        // 转换到编码器规格并按实际输出样本数累计 pts。
+        // 容量按本块的输出样本数上界分配（重采样会改变样本数），而不是按 1 秒的
+        // 大上界：`swr_convert` 只写到容量为止，容量过剩只是白占内存。
+        let capacity = self
+            .ensure_resampler(sample_format)?
+            .get_out_samples(nb_samples);
+        let mut dst = self.alloc_encoder_frame(capacity)?;
         self.ensure_resampler(sample_format)?
             .convert_frame(&src, &mut dst)?;
         let out_nb = dst.nb_samples;

@@ -54,7 +54,8 @@ pub fn get_linesize(pix_fmt: PixelFormat, width: u32, plane: usize) -> Result<us
 /// # Arguments
 ///
 /// * `format` - The pixel format of the image.
-/// * `linesizes` - An iterator of the linesizes for each plane of the image.
+/// * `linesizes` - An iterator of the linesizes for each plane of the image. Its length must match
+///   the plane count of `format` exactly.
 /// * `height` - The height of the image in pixels.
 ///
 /// Returns an array to be filled with the size of each image plane
@@ -65,11 +66,30 @@ pub fn fill_plane_sizes<I: IntoIterator<Item = u32>>(
 ) -> Result<Vec<usize>> {
     const MAX_FFMPEG_PLANES: usize = 4;
 
+    // 平面数由像素格式决定，而不是由传入的行步长个数决定：底层只读
+    // `linesizes[0..planes]`，个数不符时多传的部分会被静默忽略、少传则读到未初始化值。
+    let planes = format.count_planes()? as usize;
+    if planes > MAX_FFMPEG_PLANES {
+        return Err(format_err!(
+            "{format:?} has {planes} planes, the API supports at most {MAX_FFMPEG_PLANES}"
+        ));
+    }
+
     let mut linesizes_buf = [0; MAX_FFMPEG_PLANES];
-    let mut planes = 0;
-    for (i, linesize) in linesizes.into_iter().take(MAX_FFMPEG_PLANES).enumerate() {
+    let mut count = 0;
+    for (i, linesize) in linesizes.into_iter().enumerate() {
+        if i >= planes {
+            return Err(format_err!(
+                "Too many linesizes for {format:?}: it has {planes} planes"
+            ));
+        }
         linesizes_buf[i] = linesize as _;
-        planes += 1;
+        count += 1;
+    }
+    if count != planes {
+        return Err(format_err!(
+            "Wrong number of linesizes for {format:?}: expected {planes}, got {count}"
+        ));
     }
     let mut plane_sizes_buf = [0; MAX_FFMPEG_PLANES];
 
@@ -100,11 +120,12 @@ pub fn fill_plane_sizes<I: IntoIterator<Item = u32>>(
 
 /// frame data => `Vec<u8>`
 pub fn copy_frame_to_buffer(frame: &AVFrame) -> Result<Vec<u8>> {
-    let frame_width: i32 = frame.width;
-    let frame_height: i32 = frame.height;
-    if frame_width * frame_height <= 0 {
-        return Err(format_err!("Invalid frame dimensions"));
-    }
+    check_image_size(
+        frame.width as u32,
+        frame.height as u32,
+        PixelFormat::NONE,
+        0,
+    )?;
 
     let buf_size = frame.image_get_buffer_size(1)?;
     let mut buffer = vec![0u8; buf_size];
@@ -220,9 +241,12 @@ fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
 
 /// 获取指定帧的指定平面的实际数据，不包含额外的填充字节
 pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
-    if frame.width * frame.height <= 0 {
-        return Err(format_err!("Invalid frame dimensions"));
-    }
+    check_image_size(
+        frame.width as u32,
+        frame.height as u32,
+        PixelFormat::NONE,
+        0,
+    )?;
 
     // count planes of format
     let planes = frame_pixel_format(frame)?.count_planes()?;
@@ -251,14 +275,15 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     // 获取像素格式的描述信息
     let geom = plane_geom(frame, plane_idx)?;
 
-    // 获取行步长
-    let linesize = frame.linesize[plane_idx] as usize;
+    // 行步长可以为负：垂直翻转的帧里 `data[plane]` 指向图像的第一行，后续行向低地址
+    // 延伸。这里统一按有符号偏移定位，把负值当 `usize` 用会绕成巨大值并越界。
+    let linesize = frame.linesize[plane_idx] as isize;
 
     // 创建一个新的缓冲区，只包含实际的像素数据（不包括填充）
     let bytes_per_row = geom.width * geom.bytes_per_pixel;
     let total_size = geom.height * bytes_per_row;
     // 退化尺寸的平面没有数据可读；`plane_geom` 之后这不该发生，故报错而不是
-    // 让下面"最后一行"的偏移计算下溢（release 下会绕成巨大偏移）。
+    // 让下面的偏移计算落到平面数据之外。
     if total_size == 0 {
         return Err(format_err!(
             "Plane {} has no data at {}x{}",
@@ -270,29 +295,41 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     let mut result = Vec::with_capacity(total_size);
 
     unsafe {
+        let buf_size = (*buf_ptr).size;
+        let buf_data = (*buf_ptr).data;
+
         // 计算平面数据在缓冲区中的偏移量
-        let data_offset = frame.data[plane_idx].offset_from((*buf_ptr).data) as usize;
-        if data_offset >= (*buf_ptr).size {
+        let data_offset = frame.data[plane_idx].offset_from(buf_data) as usize;
+        if data_offset >= buf_size {
             return Err(format_err!("Invalid data offset for plane {}", plane_idx));
         }
-
-        // 计算平面数据地址加上偏移量
-        let src_ptr = (*buf_ptr).data.add(data_offset);
-
-        // 确保不会超出缓冲区的大小
-        if data_offset + (geom.height - 1) * linesize + bytes_per_row > (*buf_ptr).size {
-            return Err(format_err!("Buffer too small for plane {}", plane_idx));
-        }
+        let data_offset = isize::try_from(data_offset)
+            .map_err(|_| format_err!("Data offset of plane {} is out of range", plane_idx))?;
 
         // Set the actual length
         result.set_len(total_size);
 
-        // 使用批量复制操作逐行复制数据，跳过填充字节
+        // 使用批量复制操作逐行复制数据，跳过填充字节。每一行单独做边界检查，
+        // 因此负行步长（行向低地址延伸）同样安全。
         let dst_ptr: *mut u8 = result.as_mut_ptr();
         for y in 0..geom.height {
-            let row_src_ptr = src_ptr.add(y * linesize);
-            let row_dst_ptr = dst_ptr.add(y * bytes_per_row);
-            std::ptr::copy_nonoverlapping(row_src_ptr, row_dst_ptr, bytes_per_row);
+            let row_start = (y as isize)
+                .checked_mul(linesize)
+                .and_then(|offset| data_offset.checked_add(offset))
+                .and_then(|start| usize::try_from(start).ok())
+                .filter(|&start| {
+                    start
+                        .checked_add(bytes_per_row)
+                        .is_some_and(|end| end <= buf_size)
+                })
+                .ok_or_else(|| {
+                    format_err!("Plane {} row {} is outside the buffer", plane_idx, y)
+                })?;
+            std::ptr::copy_nonoverlapping(
+                buf_data.add(row_start),
+                dst_ptr.add(y * bytes_per_row),
+                bytes_per_row,
+            );
         }
     }
 
@@ -321,9 +358,12 @@ pub fn fill_plane_from_buffer(
     src_linesize: usize,
 ) -> Result<()> {
     // 基本参数检查
-    if frame.width * frame.height <= 0 {
-        return Err(RsmediaError::msg("Invalid frame dimensions"));
-    }
+    check_image_size(
+        frame.width as u32,
+        frame.height as u32,
+        PixelFormat::NONE,
+        0,
+    )?;
     if !frame.is_writable()? {
         return Err(RsmediaError::msg("Frame is not writable"));
     }
@@ -425,10 +465,12 @@ pub unsafe fn fill_plane_with<F>(
     F: Fn(usize, usize) -> u8,
 {
     unsafe {
-        let linesize = frame.linesize[plane] as usize;
+        // 行步长可以为负（垂直翻转的帧，行向低地址延伸），故按有符号偏移定位；
+        // `(x, y)` 的合法范围由调用者按 SAFETY 段保证。
+        let linesize = frame.linesize[plane] as isize;
         let base = frame.data[plane].cast::<u8>();
         for y in 0..plane_h {
-            let row = base.add(y * linesize);
+            let row = base.offset((y as isize) * linesize);
             for x in 0..plane_w {
                 *row.add(x) = filler(x, y);
             }
@@ -981,11 +1023,17 @@ mod tests {
         // 错误3：非法宽度（0或负数）
         assert!(get_linesize(yuv_fmt, 0, 0).is_err(), "Width 0 should fail");
 
-        // 错误4：传入过多平面（超过4个）
+        // 错误4：行步长个数与格式的平面数不符
+        // 多传：YUV420P 只有 3 个平面，第 4 个会被底层静默忽略
         let oversized_input = vec![640, 320, 320, 128, 64];
         assert!(
-            fill_plane_sizes(yuv_fmt, oversized_input, 480).is_ok(),
-            "Should truncate to first 4 planes"
+            fill_plane_sizes(yuv_fmt, oversized_input, 480).is_err(),
+            "Should reject more linesizes than the format has planes"
+        );
+        // 少传：不得补 0 后按未初始化/错误值计算
+        assert!(
+            fill_plane_sizes(yuv_fmt, vec![640, 320], 480).is_err(),
+            "Should reject fewer linesizes than the format has planes"
         );
 
         Ok(())
@@ -1139,6 +1187,43 @@ mod tests {
         assert_eq!(&y_buffer[..y_size], &y_data[..], "Y value doesn't match");
         assert_eq!(&u_buffer[..uv_size], &u_data[..], "U value doesn't match");
         assert_eq!(&v_buffer[..uv_size], &v_data[..], "V value doesn't match");
+    }
+
+    #[test]
+    fn test_get_plane_buffer_vertical_flip() -> Result<()> {
+        // 垂直翻转的帧：行步长为负，`data[0]` 指向图像的第一行、后续行向低地址延伸。
+        // 负行步长不得被当成巨大 usize（那会算出行外的偏移并越界读）。
+        let (width, height) = (32usize, 8usize);
+        let mut frame = create_test_frame(width as i32, height as i32, ffi::AV_PIX_FMT_GRAY8)?;
+
+        unsafe {
+            let base = frame.data[0].cast::<u8>();
+            let linesize = frame.linesize[0] as usize;
+            // 每行写入行号，行内为定值
+            for y in 0..height {
+                for x in 0..width {
+                    *base.add(y * linesize + x) = y as u8;
+                }
+            }
+            // 反转行序：data 指向原本的最后一行（图像第 0 行），后续行向低地址延伸
+            (*frame.as_mut_ptr()).data[0] = base.add((height - 1) * linesize);
+            (*frame.as_mut_ptr()).linesize[0] = -(linesize as i32);
+        }
+
+        let buf = get_plane_buffer(&frame, 0)?;
+        assert_eq!(buf.len(), width * height);
+        for y in 0..height {
+            // 图像第 y 行是内存中的倒数第 y+1 行
+            let expected = (height - 1 - y) as u8;
+            assert!(
+                buf[y * width..(y + 1) * width]
+                    .iter()
+                    .all(|&v| v == expected),
+                "row {y} of a vertically flipped frame"
+            );
+        }
+
+        Ok(())
     }
 
     #[test]

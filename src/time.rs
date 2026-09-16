@@ -10,7 +10,13 @@ use std::time::Duration;
 /// depending on the function that returns it.
 ///
 /// [`Time`] may represent a non-existing time, in which case [`Time::has_value`] will return
-/// `false`, and conversions to seconds will return `0.0`.
+/// `false`, and conversions to seconds will return `0.0`. FFmpeg's `AV_NOPTS_VALUE`
+/// sentinel means exactly that, so it is folded into "no value" at the FFI
+/// boundary (see [`Time::new`]) and by every accessor below.
+///
+/// Equality and ordering are expressed in **seconds**, not in `(time, time_base)`
+/// pairs: two stamps that denote the same instant are equal even if their time
+/// bases differ (see [`PartialEq`]).
 ///
 /// A [`Time`] object may be aligned with another [`Time`] object, which produces an [`Aligned`]
 /// object, on which arithmetic operations can be performed.
@@ -23,12 +29,20 @@ pub struct Time {
 impl Time {
     /// Create a new time by its time value and time base in which the time is expressed.
     ///
+    /// `AV_NOPTS_VALUE` (FFmpeg's "no timestamp" sentinel, which streams and
+    /// frames routinely carry) is normalised to `None` here — this is the FFI
+    /// boundary, so callers can trust [`Time::has_value`] afterwards instead of
+    /// re-checking the sentinel themselves.
+    ///
     /// # Arguments
     ///
     /// * `time` - Relative time in `time_base` units.
     /// * `time_base` - Time base of source.
     pub fn new(time: Option<i64>, time_base: AVRational) -> Time {
-        Self { time, time_base }
+        Self {
+            time: time.filter(|time| *time != ffi::AV_NOPTS_VALUE),
+            time_base,
+        }
     }
 
     /// Creates a new timestamp that reprsents `nth` of a second.
@@ -98,8 +112,33 @@ impl Time {
     /// the `AV_NOPTS_VALUE` sentinel FFmpeg writes when a stream simply has no
     /// timestamp. This is the predicate to branch on before converting to seconds
     /// — converting a NOPTS would yield ≈ -9.2e13 seconds.
+    /// [`Self::into_value`], the seconds conversions and the comparisons all
+    /// agree with it.
     pub fn has_value(&self) -> bool {
-        self.time.is_some_and(|time| time != ffi::AV_NOPTS_VALUE)
+        self.value().is_some()
+    }
+
+    /// The raw value, with the `AV_NOPTS_VALUE` sentinel filtered out.
+    ///
+    /// [`Time::new`] already normalises the sentinel, but `time` is a public
+    /// field, so a hand-built `Time { time: Some(AV_NOPTS_VALUE), .. }` is still
+    /// possible; every accessor funnels through here so that there is only one
+    /// notion of "has a value".
+    fn value(&self) -> Option<i64> {
+        self.time.filter(|time| *time != ffi::AV_NOPTS_VALUE)
+    }
+
+    /// The instant in seconds, or `None` when there is nothing to convert: no
+    /// value at all, or a degenerate time base (`0/0`).
+    ///
+    /// The comparison and formatting impls key off this, so "equal", "ordered"
+    /// and "printed" always refer to the same number.
+    fn seconds_or_none(&self) -> Option<f64> {
+        let time = self.value()?;
+        if self.time_base.num == 0 || self.time_base.den == 0 {
+            return None;
+        }
+        Some(time as f64 * (self.time_base.num as f64 / self.time_base.den as f64))
     }
 
     /// Align the timestamp with another timestamp, which will convert the `rhs` timestamp to the
@@ -114,46 +153,41 @@ impl Time {
     /// Two timestamps that are aligned.
     pub fn aligned_with(&self, rhs: Time) -> Aligned {
         Aligned {
-            lhs: self.time,
+            lhs: self.value(),
             rhs: rhs
-                .time
+                .value()
                 .map(|rhs_time| rhs_time.rescale(rhs.time_base, self.time_base)),
             time_base: self.time_base,
         }
     }
 
     /// Get number of seconds as floating point value.
+    ///
+    /// Single-precision on purpose (the historical API); it is computed from
+    /// [`Self::as_secs_f64`] solely so the two can never disagree. Use the `f64`
+    /// variant when precision matters.
     pub fn as_secs(&self) -> f32 {
-        // time_base 无效（num/den 为 0）时回退为 0.0，避免产生 NaN，
-        // 否则下游 Duration::from_secs_f64(NaN) 等会直接 panic
-        if self.time_base.num == 0 || self.time_base.den == 0 {
-            return 0.0;
-        }
-        if let Some(time) = self.time {
-            (time as f32) * (self.time_base.num as f32 / self.time_base.den as f32)
-        } else {
-            0.0
-        }
+        self.as_secs_f64() as f32
     }
 
     /// Get number of seconds as floating point value.
+    ///
+    /// Returns `0.0` when there is no usable value ([`Self::has_value`] is
+    /// `false`) or the time base is degenerate (`0/0`), which also keeps the
+    /// result finite — a NOPTS would otherwise turn into ≈ -9.2e13 seconds.
     pub fn as_secs_f64(&self) -> f64 {
-        if self.time_base.num == 0 || self.time_base.den == 0 {
-            return 0.0;
-        }
-        if let Some(time) = self.time {
-            (time as f64) * (self.time_base.num as f64 / self.time_base.den as f64)
-        } else {
-            0.0
-        }
+        self.seconds_or_none().unwrap_or(0.0)
     }
 
     /// Convert to underlying time to `i64` (the number of time units).
     ///
+    /// Returns `None` when there is no usable value — including the
+    /// `AV_NOPTS_VALUE` sentinel — so it agrees with [`Self::has_value`].
+    ///
     /// Assumes that the caller knows the time base and applies it correctly when doing arithmetic
     /// operations on the time value.
     pub fn into_value(self) -> Option<i64> {
-        self.time
+        self.value()
     }
 
     /// Align the timestamp along another `time_base`.
@@ -164,7 +198,7 @@ impl Time {
     pub fn aligned_with_rational(&self, time_base: AVRational) -> Time {
         Time {
             time: self
-                .time
+                .value()
                 .map(|time| time.rescale(self.time_base, time_base)),
             time_base,
         }
@@ -222,34 +256,34 @@ pub fn av_rational_eq(a: &AVRational, b: &AVRational) -> bool {
 }
 
 impl PartialEq for Time {
+    /// Compares the instants, **in seconds**, not the `(time, time_base)` pairs:
+    /// `Time::from_units(1, 4)` and `Time::new(Some(2), new_rational(1, 2))` both
+    /// mean 0.5 s and are therefore equal.
+    ///
+    /// Requiring the raw fields to match used to make "the same instant" compare
+    /// unequal whenever the time bases differed. Two "no value" times are equal
+    /// (`None == None`); a "no value" time never equals a valued one. The result
+    /// matches [`PartialOrd`]: `a == b` ⟺ `a.partial_cmp(&b) == Some(Equal)`.
     fn eq(&self, other: &Self) -> bool {
-        self.time == other.time
-            && self.time_base.num == other.time_base.num
-            && self.time_base.den == other.time_base.den
+        self.seconds_or_none() == other.seconds_or_none()
     }
 }
 
 impl Eq for Time {}
 
 impl PartialOrd for Time {
-    /// 与 [`PartialEq`] 的契约保持一致：只有**可比且相等**时才返回 `Equal`。
-    ///
-    /// 两个时间基不同的值不可比较（返回 `None`），这在两个都有值时已经成立；
-    /// 两个都无值时同样如此，否则会出现 `a != b` 却 `partial_cmp(a, b) == Equal`
-    /// 的矛盾（`PartialEq` 把时间基也算作相等的一部分）。
+    /// Orders by seconds, "no value" first; [`PartialEq`] uses the same key, so
+    /// the `PartialOrd` contract holds. Always `Some`, since the key is always
+    /// comparable.
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // 时间基不同即不可比较，与有无值无关。
-        if !av_rational_eq(&self.time_base, &other.time_base) {
-            return None;
-        }
-
-        match (self.time, other.time) {
-            // "无值" 排在 "有值" 之前，两者不会判等。
-            (None, None) => Some(std::cmp::Ordering::Equal),
-            (None, Some(_)) => Some(std::cmp::Ordering::Less),
-            (Some(_), None) => Some(std::cmp::Ordering::Greater),
-            (Some(t1), Some(t2)) => t1.partial_cmp(&t2),
-        }
+        Some(match (self.seconds_or_none(), other.seconds_or_none()) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            // `den != 0` and a finite `time` cannot produce NaN; the fallback
+            // just keeps the ordering total if that ever changes.
+            (Some(lhs), Some(rhs)) => lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal),
+        })
     }
 }
 
@@ -271,15 +305,16 @@ impl From<Time> for Duration {
 impl std::fmt::Display for Time {
     /// Format [`Time`] as follows:
     ///
-    /// * If the inner value is not `None`: `time/time_base`.
-    /// * If the inner value is `None`: `none`.
+    /// * If the inner value is usable: the number of seconds, e.g. `0.5 secs`.
+    /// * Otherwise: `none`.
+    ///
+    /// Printing the seconds (from [`Time::as_secs_f64`]) rather than the raw
+    /// `time * time_base.num` numerator keeps `Display` panic-free: that product
+    /// overflows `i64` for large timestamps and would panic in debug builds.
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        if let Some(time) = self.time {
-            let num = self.time_base.num as i64 * time;
-            let den = self.time_base.den;
-            write!(f, "{num}/{den} secs")
-        } else {
-            write!(f, "none")
+        match self.seconds_or_none() {
+            Some(secs) => write!(f, "{secs} secs"),
+            None => write!(f, "none"),
         }
     }
 }
@@ -395,7 +430,7 @@ mod tests {
         assert_eq!(time.into_value(), Some(0));
     }
 
-    /// `Time::zero()` 与同样表示 0 秒的值完全相等（含时间基）。
+    /// `Time::zero()` 与同样表示 0 秒的值相等（无论时间基是否相同）。
     #[test]
     fn test_zero_equals_other_zero_values() {
         assert_eq!(Time::zero(), Time::new(Some(0), TIME_BASE));
@@ -403,7 +438,8 @@ mod tests {
         assert_eq!(Time::zero(), Time::from_secs_f64(0.0));
     }
 
-    /// "无值" 与 `AV_NOPTS_VALUE` 都表示"没有可用时间戳"，`has_value` 一律为 false。
+    /// "无值" 与 `AV_NOPTS_VALUE` 都表示"没有可用时间戳"：`new` 在 FFI 边界把
+    /// 哨兵归一为 `None`，所有取值口（`has_value` / `into_value` / 秒换算）一致。
     #[test]
     fn test_has_value_rejects_missing_and_nopts() {
         let missing = Time::new(None, TIME_BASE);
@@ -411,22 +447,25 @@ mod tests {
 
         assert!(!missing.has_value());
         assert!(!nopts.has_value());
-        assert!(!missing.has_value());
-        assert!(!nopts.has_value());
+        assert_eq!(nopts.into_value(), None);
+        assert_eq!(nopts.as_secs_f64(), 0.0);
+        assert_eq!(nopts.as_secs(), 0.0);
+        assert_eq!(nopts.to_string(), "none");
+        assert_eq!(nopts, missing);
 
         assert!(Time::new(Some(0), TIME_BASE).has_value());
     }
 
-    /// `partial_cmp` 与 `PartialEq` 保持一致：时间基不同即不可比较，且不会报 `Equal`。
+    /// `partial_cmp` 与 `PartialEq` 同键（秒）：同一时刻即使时间基不同也相等且有序。
     #[test]
     fn test_partial_cmp_is_consistent_with_eq() {
         let a = Time::new(None, new_rational(1, 2));
         let b = Time::new(None, new_rational(1, 4));
-        assert_ne!(a, b);
+        assert_eq!(a, b, "两个无值的时间戳相等");
         assert_eq!(
             a.partial_cmp(&b),
-            None,
-            "different time bases must be unordered"
+            Some(std::cmp::Ordering::Equal),
+            "无值之间可比且相等"
         );
 
         let same = Time::new(None, new_rational(1, 2));
@@ -436,6 +475,32 @@ mod tests {
         let later = Time::new(Some(3), new_rational(1, 2));
         assert_eq!(a.partial_cmp(&later), Some(std::cmp::Ordering::Less));
         assert_eq!(later.partial_cmp(&a), Some(std::cmp::Ordering::Greater));
+
+        // 同一时刻、时间基不同 —— 秒是唯一比较键
+        let same_instant = new_rational(1, 4);
+        let later_other_base = Time::new(Some(6), same_instant);
+        assert_eq!(later, later_other_base);
+        assert_eq!(
+            later.partial_cmp(&later_other_base),
+            Some(std::cmp::Ordering::Equal)
+        );
+
+        let earlier = Time::new(Some(1), new_rational(1, 4));
+        assert_eq!(
+            earlier.partial_cmp(&later_other_base),
+            Some(std::cmp::Ordering::Less)
+        );
+        assert!(earlier < later_other_base);
+    }
+
+    /// `Display` 打印秒数且不会因 `time * time_base.num` 溢出 `i64` 而 panic。
+    #[test]
+    fn test_display_prints_seconds_without_overflow() {
+        assert_eq!(Time::new(Some(2), new_rational(1, 2)).to_string(), "1 secs");
+        assert_eq!(Time::new(None, TIME_BASE).to_string(), "none");
+        // 旧实现会计算 `time_base.num as i64 * time`，在 debug 下 panic
+        let huge = Time::new(Some(i64::MAX / 2), new_rational(1_000_000, 1_000_000));
+        assert!(huge.to_string().ends_with(" secs"));
     }
 
     #[test]
@@ -526,10 +591,24 @@ mod tests {
         )
     }
 
+    /// `AV_NOPTS_VALUE` 是"无时间戳"，在 FFI 边界归一为 `None`：所有取值口都
+    /// 按"无值"处理（早先 `into_value` 会把哨兵原样吐出来，与 `has_value` 矛盾）。
     #[test]
-    fn test_av_no_pts_value() {
+    fn test_av_no_pts_value_is_normalized() {
         let nopts = Time::new(Some(ffi::AV_NOPTS_VALUE), new_rational(0, 0));
-        assert_eq!(nopts.into_value(), Some(ffi::AV_NOPTS_VALUE));
+        assert_eq!(nopts.time, None);
+        assert!(!nopts.has_value());
+        assert_eq!(nopts.into_value(), None);
+        assert_eq!(nopts.as_secs_f64(), 0.0);
         assert_eq!(Duration::from(nopts).as_secs_f32(), 0.0);
+
+        // 公开字段仍可手工塞入哨兵，取值口同样归一（不 panic、不吐出约 -9.2e13 秒）
+        let hand_built = Time {
+            time: Some(ffi::AV_NOPTS_VALUE),
+            time_base: TIME_BASE,
+        };
+        assert!(!hand_built.has_value());
+        assert_eq!(hand_built.into_value(), None);
+        assert_eq!(hand_built.as_secs_f64(), 0.0);
     }
 }

@@ -1,6 +1,6 @@
 use crate::error::{Context, Result, RsmediaError};
 use crate::{PixelFormat, imgutils};
-use rsmpeg::avutil::AVBufferPool;
+use rsmpeg::avutil::{AVBufferPool, AVBufferRef};
 
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
@@ -333,6 +333,87 @@ fn setup_scaler(
     Ok(sws_ctx)
 }
 
+/// `fmt` 的样本是否按 full range 编码（RGB/BGR/GRAY 家族：样本按定义铺满
+/// `0..2^n-1`），判据与 `frame::converted_color` 一致。
+fn is_full_range_format(fmt: PixelFormat) -> bool {
+    fmt.descriptor()
+        .is_ok_and(|desc| desc.flags as u32 & ffi::AV_PIX_FMT_FLAG_RGB != 0)
+}
+
+/// 按**目标像素格式**修正缩放输出帧的色彩标记。
+///
+/// 缩放前的 `imgutils::copy_frame_metadata` 会把源帧的色域元数据整套搬给目标帧，
+/// 而换了像素格式后这套标记不再成立：full range 的 RGB/灰度样本若沿用源帧的
+/// limited range 标签，下游再编码一次就会发灰（`frame.rs` 的 `converted_color`
+/// 记录了同一约定）。因此这里按目标格式修正范围与色度位置：
+/// - RGB/BGR/GRAY 目标：恒标 full range（`AVCOL_RANGE_JPEG`），色度位置无意义；
+/// - YUV/NV 目标：范围随源帧（`UNSPECIFIED` 按 FFmpeg 约定等同 limited），保持
+///   `copy_frame_metadata` 搬来的取值。
+///
+/// `colorspace`/`color_primaries`/`color_trc` 描述色度学本身，缩放不改变它们，
+/// 故一律沿用源帧取值。
+///
+/// FFmpeg 8+ 的动态 API 直接把这些标记当作**转换目标**属性读取，修正后的标记正好
+/// 是它需要的输入；FFmpeg 6/7 的 legacy 上下文另由 `set_scaler_colorspace_details`
+/// 逐帧告知范围。
+fn fix_output_color_metadata(dst_frame: &mut AVFrame, dst_pix_fmt: PixelFormat) {
+    if !is_full_range_format(dst_pix_fmt) {
+        return;
+    }
+    // Safety: dst_frame 由本模块新建/持有（引用计数为 1）；rsmpeg 的 wrap 不实现
+    // DerefMut，字段写入经裸指针完成。
+    unsafe {
+        let raw = dst_frame.as_mut_ptr();
+        (*raw).color_range = ffi::AVCOL_RANGE_JPEG;
+        (*raw).chroma_location = ffi::AVCHROMA_LOC_UNSPECIFIED;
+    }
+}
+
+/// FFmpeg 6/7 的 legacy 上下文（`sws_getContext`）在创建时拿不到帧的色域信息，
+/// 输入/输出范围与 YUV↔RGB 系数必须逐帧经 `sws_setColorspaceDetails` 告知，否则
+/// 转换按默认假设进行（例如 limited YUV → RGB 会输出 limited RGB 而非 full range）。
+///
+/// 本转换只换像素格式、不换色度学，故输入/输出用同一套系数（由源帧 `colorspace`
+/// 选出，未指定/未收录时退回 `SWS_CS_DEFAULT`）；亮度/对比度/饱和度不做校正
+/// （`0`/`1<<16`/`1<<16`）。
+///
+/// 返回值 < 0 表示该像素格式组合不支持设置色彩细节（官方文档：`LIBSWSCALE_VERSION_MAJOR
+/// < 7` 时以 -1 表示不支持），与缩放本身无关，只记日志、不失败。
+#[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+fn set_scaler_colorspace_details(sws: &mut SwsContext, src_frame: &AVFrame, dst_frame: &AVFrame) {
+    let colorspace = match src_frame.colorspace {
+        ffi::AVCOL_SPC_BT709 => ffi::SWS_CS_ITU709,
+        ffi::AVCOL_SPC_FCC => ffi::SWS_CS_FCC,
+        ffi::AVCOL_SPC_SMPTE170M | ffi::AVCOL_SPC_BT470BG => ffi::SWS_CS_ITU601,
+        ffi::AVCOL_SPC_SMPTE240M => ffi::SWS_CS_SMPTE240M,
+        ffi::AVCOL_SPC_BT2020_NCL | ffi::AVCOL_SPC_BT2020_CL => ffi::SWS_CS_BT2020,
+        _ => ffi::SWS_CS_DEFAULT,
+    };
+    // Safety: `sws` 是有效上下文，两个帧均为有效 AVFrame；`sws_getCoefficients` 返回
+    // FFmpeg 的静态系数表指针，在进程生命周期内有效。
+    let ret = unsafe {
+        let table = ffi::sws_getCoefficients(colorspace as i32);
+        ffi::sws_setColorspaceDetails(
+            sws.as_mut_ptr(),
+            table,
+            i32::from(src_frame.color_range == ffi::AVCOL_RANGE_JPEG),
+            table,
+            i32::from(dst_frame.color_range == ffi::AVCOL_RANGE_JPEG),
+            0,
+            1 << 16,
+            1 << 16,
+        )
+    };
+    if ret < 0 {
+        tracing::debug!(
+            "sws_setColorspaceDetails is not supported for this conversion (ret: {ret}); \
+             keeping the scaler defaults. src range: {:?}, dst range: {:?}",
+            src_frame.color_range,
+            dst_frame.color_range
+        );
+    }
+}
+
 /// Scales one frame into a new frame, with the default kernel and quality mask.
 ///
 /// Free-function form for a single conversion; a stream should keep a [`Scaler`]
@@ -455,8 +536,8 @@ impl Scaler {
     /// [`BufferPool`](rsmpeg::avutil::AVBufferPool) instead of being freshly allocated per call; when
     /// a previously returned frame is dropped, its buffer goes back to the pool and the
     /// next same-geometry call reuses it. A steady stream of same-geometry output thus
-    /// stops allocating after a couple of frames, and the buffers are zero-filled exactly
-    /// like `alloc_buffer`'s, so padding bytes stay deterministic for the encoder.
+    /// stops allocating after a couple of frames, and the buffers' padding bytes are
+    /// zeroed exactly like `alloc_buffer`'s, so they stay deterministic for the encoder.
     ///
     /// The pool is created lazily together with the scaling context and sized for the
     /// bound destination geometry; a geometry/format change rebuilds it. This is a
@@ -565,7 +646,9 @@ impl Scaler {
                 pool,
             });
         }
-        let bound = self.bound.as_mut().expect("bound above");
+        let bound = self.bound.as_mut().ok_or_else(|| {
+            RsmediaError::msg("scaler context was not bound before scaling (internal invariant)")
+        })?;
 
         let mut dst_frame = match bound.pool.as_mut() {
             Some(pool) => alloc_pooled_frame(pool, dst_width, dst_height, dst_pix_fmt)?,
@@ -581,6 +664,11 @@ impl Scaler {
             }
         };
         imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
+        // 目标帧的像素格式与源帧不同，色域标记要按目标格式修正（见函数注释）。
+        fix_output_color_metadata(&mut dst_frame, dst_pix_fmt);
+
+        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+        set_scaler_colorspace_details(&mut bound.sws, src_frame, &dst_frame);
 
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         {
@@ -693,9 +781,10 @@ fn pooled_frame_buffer_size(fmt: PixelFormat, width: i32, height: i32) -> Result
 /// 缓冲自动归还池（池已析构则直接释放）。
 ///
 /// FFmpeg 的池在**复用**时不会重新清零缓冲（与 `av_frame_get_buffer` 的
-/// "每次清零分配"不同），这里在组装帧前显式清零整个缓冲：memset 的代价
-/// 远小于一次 malloc，换来与 `alloc_buffer` 完全一致的跨平台语义——帧的
-/// padding 字节内容确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。
+/// "每次清零分配"不同），这里在组装帧前把 swscale 不会写入的 padding 字节
+/// 清零（见 [`zero_frame_padding`]）：代价是一次只覆盖 padding 的写，换来与
+/// `alloc_buffer` 完全一致的跨平台语义——帧的 padding 字节内容确定为零，
+/// 编码器内部的 SIMD 读取路径不受脏数据影响。
 fn alloc_pooled_frame(
     pool: &mut AVBufferPool,
     width: i32,
@@ -710,11 +799,6 @@ fn alloc_pooled_frame(
     let buffer = pool
         .get()
         .context("Failed to get a buffer from the frame pool")?;
-    // Safety: buffer.data 有效且长度为 buffer.size
-    // 整段清零写是合法的独占访问（引用计数为 1，无其他持有者）。
-    unsafe {
-        std::ptr::write_bytes((*buffer.as_ptr()).data, 0, (*buffer.as_ptr()).size);
-    }
 
     // 池缓冲的起始地址对齐由 FFmpeg 的 pool allocator 决定，跨平台不保证
     // 32 字节（Windows 上 `av_malloc` 通常仅 16 对齐）。而编码器的 SIMD
@@ -749,6 +833,18 @@ fn alloc_pooled_frame(
         )));
     }
 
+    // 池缓冲在**复用**时不会重新清零（FFmpeg 只在首次分配时置零，见
+    // `AVBufferPool` 的文档），这里把 swscale 不会写入的字节（对齐偏移、行内
+    // stride 余量、平面间隙、尾部留白）恢复为零，保持与 `alloc_buffer`
+    // （`av_frame_get_buffer` 每次清零分配）一致的语义——帧的 padding 字节内容
+    // 确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。可见像素由 swscale
+    // 整体覆写，无需预先清零。
+    // Safety: buffer 为独占引用（引用计数 1），data/linesize 是上面
+    // `av_image_fill_arrays` 在 buffer 内部排布的结果。
+    unsafe {
+        zero_frame_padding(&buffer, fmt, width, height, &data, &linesize)?;
+    }
+
     // Safety: frame 由本函数刚构造，无其他引用；rsmpeg 的 wrap 不实现
     // DerefMut，字段写入经 UnsafeDerefMut::deref_mut 完成。
     let raw = unsafe { frame.deref_mut() };
@@ -760,6 +856,119 @@ fn alloc_pooled_frame(
     // av_frame_unref 归还/释放。
     raw.buf[0] = buffer.into_raw().as_ptr();
     Ok(frame)
+}
+
+/// 清零帧缓冲中 `av_image_fill_arrays` 的**可见像素之外**的字节：缓冲起点到
+/// `data[0]` 的对齐偏移、每行 stride 的余量、平面之间/之后的间隙，以及缓冲尾部留白。
+///
+/// 排布用 FFmpeg 自己的 `av_image_fill_linesizes`（每平面可见行字节）+
+/// `av_image_fill_plane_sizes`（每平面可见总字节 → 行数）还原，不自行推算子采样规则，
+/// 因此与 `av_image_fill_arrays` 的结果严格一致。
+///
+/// # Safety
+///
+/// `data`/`linesize` 必须是 `av_image_fill_arrays(fmt, width, height, POOL_ALIGN)` 在
+/// `buffer` 内部排布的结果，且 `buffer` 是独占引用（无其他持有者）。
+unsafe fn zero_frame_padding(
+    buffer: &AVBufferRef,
+    fmt: PixelFormat,
+    width: i32,
+    height: i32,
+    data: &[*mut u8; 8],
+    linesize: &[i32; 8],
+) -> Result<()> {
+    // Safety: buffer 持有有效引用，data/size 描述其内存范围。
+    let (buf_start, buf_size) = unsafe {
+        let raw = buffer.as_ptr();
+        ((*raw).data, (*raw).size)
+    };
+
+    let mut visible = [0i32; 8];
+    // Safety: 本地数组 + 调用方已校验的格式/尺寸。
+    let ret = unsafe { ffi::av_image_fill_linesizes(visible.as_mut_ptr(), fmt.into(), width) };
+    if ret < 0 {
+        return Err(RsmediaError::msg(format!(
+            "av_image_fill_linesizes failed for {fmt:?} width {width}, ret: {ret}"
+        )));
+    }
+    let visible_isize: [isize; 8] = visible.map(|bytes| bytes as isize);
+    let mut plane_bytes = [0usize; 8];
+    // Safety: 同上；av_image_fill_plane_sizes 写前 4 项，数组按 AV_NUM_DATA_POINTERS 给足。
+    let ret = unsafe {
+        ffi::av_image_fill_plane_sizes(
+            plane_bytes.as_mut_ptr(),
+            fmt.into(),
+            height,
+            visible_isize.as_ptr(),
+        )
+    };
+    if ret < 0 {
+        return Err(RsmediaError::msg(format!(
+            "av_image_fill_plane_sizes failed for {fmt:?} height {height}, ret: {ret}"
+        )));
+    }
+    // Safety: 纯查询，参数为已校验的像素格式。
+    let planes = unsafe { ffi::av_pix_fmt_count_planes(fmt.into()) };
+    if planes <= 0 {
+        return Err(RsmediaError::msg(format!(
+            "cannot count the planes of {fmt:?}, av_pix_fmt_count_planes returned {planes}"
+        )));
+    }
+
+    // Safety: 下面所有写入都限制在 [buf_start, buf_start + buf_size) 内——各平面的可见区
+    // （rows × stride）由 `av_image_fill_arrays` 用同一套 FFmpeg 计算铺排在缓冲内，
+    // 平面可见区之后到下一平面（或缓冲末尾）之间的部分正是要清零的 padding。
+    unsafe {
+        let buf_end = buf_start.add(buf_size);
+        let planes = planes as usize;
+        // 对齐偏移：缓冲起点到第一个平面基准之间的字节不会被写入。
+        write_zeros(
+            buf_start,
+            (data[0] as usize).saturating_sub(buf_start as usize),
+        );
+        for plane in 0..planes {
+            let (visible_bytes, stride) = (visible[plane], linesize[plane]);
+            if visible_bytes <= 0 || stride <= 0 {
+                continue;
+            }
+            let (visible_bytes, stride) = (visible_bytes as usize, stride as usize);
+            let rows = plane_bytes[plane] / visible_bytes;
+            let start = data[plane];
+            if stride > visible_bytes {
+                // 每行可见数据之后的 stride 余量。
+                for row in 0..rows {
+                    write_zeros(
+                        start.add(row * stride + visible_bytes),
+                        stride - visible_bytes,
+                    );
+                }
+            }
+            // 平面可见内容之后直到下一平面（或缓冲末尾）：平面间隙 + 尾部留白。
+            let visible_end = start.add(rows * stride);
+            let region_end = if plane + 1 < planes {
+                data[plane + 1]
+            } else {
+                buf_end
+            };
+            write_zeros(
+                visible_end,
+                (region_end as usize).saturating_sub(visible_end as usize),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 将 `ptr` 起的 `len` 字节清零；`len == 0` 时不做任何事。
+///
+/// # Safety
+///
+/// `ptr` 必须指向至少 `len` 字节的可写内存。
+unsafe fn write_zeros(ptr: *mut u8, len: usize) {
+    if len > 0 {
+        // Safety: 由调用方保证。
+        unsafe { std::ptr::write_bytes(ptr, 0, len) };
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use crate::codec::{AVCodecFlag, CodecContextState};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
+use crate::fmt::FrameFormat;
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Reader;
@@ -23,8 +24,11 @@ use std::sync::Arc;
 /// Builds a [`Decoder`].
 #[derive(Debug)]
 pub struct DecoderBuilder {
-    flags: AVCodecFlag,
-    thread_count: usize,
+    /// `None` = 未显式设置，构建时取 [`AVCodecFlag::LOW_DELAY`]。
+    flags: Option<AVCodecFlag>,
+    /// `None` = 未显式设置，构建时取 [`num_cpus::get`]；`Some(n)` 表示调用方指定过
+    /// —— 该"显式"信息被 [`Self::owned_option_keys`] 用来判定配置冲突。
+    thread_count: Option<usize>,
     media_type: MediaType,
     codec_name: Option<String>,
     codec_opts: Option<Options>,
@@ -56,8 +60,8 @@ impl DecoderBuilder {
             codec_name: None,
             codec_opts: None,
             hw_device_config: None,
-            thread_count: num_cpus::get(),
-            flags: AVCodecFlag::LOW_DELAY,
+            thread_count: None,
+            flags: None,
             scale_algorithm: ScaleAlgorithm::default(),
             scale_quality: ScaleQuality::default_quality().to_vec(),
             scale_pool: false,
@@ -69,7 +73,7 @@ impl DecoderBuilder {
 
     /// Set decoding flags.
     pub fn with_flags(mut self, flags: AVCodecFlag) -> Self {
-        self.flags = flags;
+        self.flags = Some(flags);
         self
     }
 
@@ -81,14 +85,21 @@ impl DecoderBuilder {
     }
 
     /// codec options to use for decoding.
+    ///
+    /// 只用于 builder 未建模的**编解码器私有参数**。builder 有 typed setter 的项
+    /// （`with_thread_count`、`with_flags`）若同时出现在这里，构建时报
+    /// [`RsmediaError::InvalidConfig`]：同一项有两个配置源时无法判断以谁为准。
     pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
         self.codec_opts = options.into();
         self
     }
 
     /// set the thread count.
+    ///
+    /// 与 `with_options("threads")` 互斥：两者同时指定会在构建时报错（同一项
+    /// 只能有一个配置源）。
     pub fn with_thread_count(mut self, thread_count: usize) -> Self {
-        self.thread_count = thread_count;
+        self.thread_count = Some(thread_count);
         self
     }
 
@@ -234,25 +245,38 @@ impl DecoderBuilder {
         }
 
         decoder.apply_codecpar(&input.codecpar())?;
-        decoder.set_flags(self.flags as i32);
+        decoder.set_flags(self.flags.unwrap_or(AVCodecFlag::LOW_DELAY) as i32);
         decoder.set_time_base(input.time_base);
         decoder.set_pkt_timebase(input.time_base);
         if let Some(framerate) = input.guess_framerate() {
             decoder.set_framerate(framerate);
         }
 
-        unsafe {
-            (*decoder.as_mut_ptr()).thread_count = self.thread_count as i32;
-        }
+        crate::codec::set_thread_count(decoder, self.thread_count.unwrap_or_else(num_cpus::get));
 
         Ok(())
     }
 
+    /// 解码器 AVOption 里由 builder typed setter 独占的键，`(option key, setter)`。
+    ///
+    /// 只列出**调用方显式设置过**的项（默认值不算配置过），规则见
+    /// [`options::ensure_single_source`](crate::options)。
+    fn owned_option_keys(&self) -> Vec<(&'static str, &'static str)> {
+        let mut owned = Vec::new();
+        if self.thread_count.is_some() {
+            owned.push(("threads", "with_thread_count"));
+        }
+        if self.flags.is_some() {
+            owned.push(("flags", "with_flags"));
+        }
+        owned
+    }
+
     /// 构建一个**裸** [`Decoder`]（不持有 reader）。
     ///
-    /// 适合需要精细控制 reader 生命周期的高级场景：构建时会在内部创建并持有
-    /// 一个 reader，解码时需每帧传入该 reader（`decoder.decode(&mut reader)`），
-    /// 且 seek 需要显式操作 reader。
+    /// 适合需要精细控制 reader 生命周期的高级场景：这里只为**探测流信息**临时
+    /// 打开一次 reader，构建结束即释放；解码时需每帧传入你自己的 reader
+    /// （`decoder.decode(&mut reader)`），seek 也由你显式操作该 reader。
     pub fn build(self, source: impl Into<Location>) -> Result<Decoder> {
         let reader = StreamReader::new(source)?;
         self.build_from_reader(&reader)
@@ -264,6 +288,8 @@ impl DecoderBuilder {
     /// reader，且不支持 seek。
     pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
+        // 单一配置源：typed setter 与 `with_options` 不得同时配置同一项。
+        crate::options::ensure_single_source(self.codec_opts.as_ref(), &self.owned_option_keys())?;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
         let input_stream = reader
             .input()
@@ -277,7 +303,7 @@ impl DecoderBuilder {
         // 的返回值）。这两个名字来自不同来源，不要写在同名绑定里——那样两个分支
         // 看起来一模一样，实际解析到不同的变量。
         let codec_name = self.codec_name.as_deref().unwrap_or(&codec_name);
-        let codec = AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name))
+        let codec = AVCodec::find_decoder_by_name(&strutils::str_to_cstring_checked(codec_name)?)
             .context(format!("Failed to find decoder by name: '{codec_name}'"))?;
 
         let duration = Time::new(Some(input_stream.duration), input_stream.time_base);
@@ -300,22 +326,35 @@ impl DecoderBuilder {
                 // hardware acceleration enabled for video
                 media_type == MediaType::VIDEO
             })
-            .map(|cfg| {
+            .map(|mut cfg| {
                 // codec support or not for hardware acceleration
                 let hw_pixel = cfg
                     .device_type
                     .find_hw_pixel_format_with_codec(&codec)
                     .ok_or_else(|| {
-                        let codec_name = strutils::cstr_to_string(codec.name()).unwrap();
+                        // 名字来自 FFmpeg，可能是非 UTF-8；它只用于文案，
+                        // 拿不到合法字符串并不改变"不支持"这一结论。
+                        let codec_name = strutils::cstr_to_string(codec.name())
+                            .unwrap_or_else(|_| "unknown".to_owned());
                         RsmediaError::msg(format!(
                             "Decoder with HW acceleration is not supported for codec: {codec_name}"
                         ))
                     })?;
 
+                // 以 `avcodec_get_hw_config` 的声明为准回写配置：hw frames 按这个字段
+                // 分配，配置里的值若与编解码器声明不符，会得到错误的输出格式。
+                // 未知格式（绑定/FFmpeg 版本不匹配）报错而不是 panic。
+                cfg.hw_pixel_format = PixelFormat::from_ffi_checked(hw_pixel).ok_or_else(|| {
+                    RsmediaError::msg(format!(
+                        "Codec {} reports an unknown hardware pixel format: {hw_pixel}",
+                        strutils::cstr_to_string_lossy(codec.name())
+                    ))
+                })?;
+
                 tracing::info!(
                     "Video decoder with HW acceleration codec: {:?}, hw_pixel: {:?}, config: {:#?}",
                     codec.name(),
-                    PixelFormat::from(hw_pixel),
+                    cfg.hw_pixel_format,
                     cfg
                 );
 
@@ -379,12 +418,25 @@ impl DecoderBuilder {
             (_, None) => None,
         };
 
+        // 滤镜链声明的图输入格式（见 [`Filter::with_input_format`]）：帧在进图
+        // 之前会被转成它，图内 buffer 源按同一格式声明，两者必须一致（声明与
+        // 实喂不符会被 av_buffersrc 拒绝）。未声明时图输入 = 解码输出格式，
+        // 零额外转换，与从前完全一致。
+        let filter_input_format = self
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.iter().find_map(|f| f.input_format()));
+
         let filter_graph = if let Some(filters) = self.filters {
             let filter_params = match media_type {
                 MediaType::VIDEO => FilterParams::Video(VideoParams {
                     width: init_width,
                     height: init_height,
-                    src_format: output_pix_fmt,
+                    src_format: filter_input_format
+                        .and_then(FrameFormat::into_pixel)
+                        .unwrap_or(output_pix_fmt),
+                    // sink 格式 = 解码输出格式：图内负责把链的输出转回来，
+                    // `MediaFrame` 因此拿到的仍是 `with_pix_fmt` 承诺的格式。
                     format: output_pix_fmt,
                     time_base: decode_ctx.time_base,
                     frame_rate: decode_ctx.framerate,
@@ -393,12 +445,13 @@ impl DecoderBuilder {
                 MediaType::AUDIO => FilterParams::Audio(AudioParams {
                     nb_channels: decode_ctx.ch_layout.nb_channels,
                     sample_rate: decode_ctx.sample_rate,
-                    // 滤镜图的输入格式须与送进去的帧一致：指定了输出采样格式时，
-                    // 帧在进图之前已转换（见 `receive_frame_from_decoder`），因此
-                    // 这里用目标格式而非编解码器原生格式。
+                    // sink 格式 = 解码输出采样格式（未指定则保留原生）。
                     format: output_sample_fmt.unwrap_or(SampleFormat::from(decode_ctx.sample_fmt)),
-                    src_format: output_sample_fmt
-                        .unwrap_or(SampleFormat::from(decode_ctx.sample_fmt)),
+                    src_format: filter_input_format
+                        .and_then(FrameFormat::into_sample)
+                        .unwrap_or(
+                            output_sample_fmt.unwrap_or(SampleFormat::from(decode_ctx.sample_fmt)),
+                        ),
                     time_base: decode_ctx.time_base,
                 }),
                 _ => {
@@ -408,16 +461,9 @@ impl DecoderBuilder {
                 }
             };
 
-            let mut graph = FilterGraph::new();
-            // 验证 Filter 链的媒体类型是否与当前流匹配
-            if !filters.iter().all(|f| f.media_type() == media_type) {
-                return Err(RsmediaError::msg(format!(
-                    "Filter media type mismatch for stream type {media_type:?}"
-                )));
-            }
-            graph
-                .init(&filter_params, filters.as_slice())
-                .context("Failed to initialize filter graph")?;
+            // 滤镜链的媒体类型与可用性校验都在 `init` 内（缺失滤镜 →
+            // `FilterNotFound`），这里不再重复一遍。
+            let graph = FilterGraph::build(&filter_params, filters.as_slice())?;
 
             // 参数随图一起留下：重启流水线时必须重建一张新图。
             Some(DecodeFilterChain {
@@ -444,6 +490,8 @@ impl DecoderBuilder {
             resize: self.resize,
             output_pix_fmt,
             output_sample_fmt,
+            filter_input_format,
+            audio_converter: resample::StreamingConverter::new(),
         })
     }
 }
@@ -488,6 +536,11 @@ pub struct Decoder {
     output_pix_fmt: PixelFormat,
     /// 解码输出目标采样格式（仅音频）；`None` = 保留编解码器原生格式
     output_sample_fmt: Option<SampleFormat>,
+    /// 滤镜链声明的**进图**格式（见 [`Filter::with_input_format`]）；`None` =
+    /// 图输入就是解码输出格式（零额外转换）。有值时进图前的帧会被转成它。
+    filter_input_format: Option<FrameFormat>,
+    /// 音频输出格式转换器；跨帧复用同一个 `SwrContext`，避免逐帧重建丢掉重采样延迟。
+    audio_converter: resample::StreamingConverter,
 }
 
 impl Decoder {
@@ -639,6 +692,22 @@ impl Decoder {
             }
     }
 
+    /// 阶段守卫：解码器只在 `Normal` 阶段接受输入。
+    ///
+    /// EOS 送出之后（`Drained`/`Flushed`）再送包，FFmpeg 只会回
+    /// "Decoder is already flushed"/EINVAL，调用方看不出该怎么办；这里统一
+    /// 快速失败，并提示唯一的出路是 [`reset`](Self::reset)。
+    fn ensure_normal(&self) -> Result<()> {
+        if self.state == CodecContextState::Normal {
+            Ok(())
+        } else {
+            Err(RsmediaError::invalid_config(format!(
+                "Decoder cannot decode after drained/flushed (state: {:?}). Call reset().",
+                self.state
+            )))
+        }
+    }
+
     /// Decode a single frame.
     ///
     /// `T` must match the width of the samples being decoded: the byte size of
@@ -720,6 +789,11 @@ impl Decoder {
         &mut self,
         packet: Option<&mut AVPacket>,
     ) -> Result<Option<AVSubtitle>> {
+        // 只有送包才需要阶段守卫；`None`（flush）在已排空的解码器上重复调用
+        // 也必须保持可用（`drain_subtitle` 依赖这一点）。
+        if packet.is_some() {
+            self.ensure_normal()?;
+        }
         self.context
             .decode_subtitle(packet)
             .context("Failed to decode subtitle packet")
@@ -754,48 +828,56 @@ impl Decoder {
                 self.media_type
             )));
         }
-        if self.is_flushed() {
-            return Err(RsmediaError::invalid_config(
-                "Decoder cannot decode after flushed. Call reset().",
-            ));
-        }
+        // 与音视频解码共用同一套驱动（`decode_stream`）：读包 → 解码 → EOF 排空的
+        // 骨架、阶段守卫、排空上限都只有一份，字幕不再手抄一遍状态机。
+        decode_stream(
+            self,
+            reader,
+            Decoder::decode_packet_subtitle,
+            Decoder::drain_subtitle,
+        )
+    }
 
-        let mut read_exhausted = false;
-        loop {
-            if !read_exhausted {
-                match reader.read_packet()? {
-                    Some((stream_index, mut packet)) => {
-                        if stream_index != self.stream_index {
-                            tracing::trace!("skip stream index: {stream_index}");
-                            continue;
-                        }
-                        if let Some(subtitle) = self.decode_subtitle_packet(Some(&mut packet))?
-                            && let Some(segment) = SubtitleSegment::from_avsubtitle(&subtitle)
-                        {
-                            return Ok(Some(segment));
-                        }
-                    }
-                    None => {
-                        tracing::debug!("No more packets, Reader exhausted.");
-                        read_exhausted = true;
+    /// 解码一个包并取出字幕段落（[`decode_stream`] 的 `on_packet`）。
+    fn decode_packet_subtitle(&mut self, packet: &AVPacket) -> Result<Option<SubtitleSegment>> {
+        // `avcodec_decode_subtitle2` 只读包数据，但 rsmpeg 的包装签名要求 `&mut`：
+        // 用一个共享同一缓冲的别名（`av_packet_ref`，不拷贝负载）满足它。
+        let mut alias = AVPacket::new();
+        // SAFETY: 两个 `AVPacket` 都由 rsmpeg 管理生命周期；`av_packet_ref` 失败时
+        // `alias` 保持空包状态，成功时与 `packet` 共享引用计数缓冲，全程无写入别名。
+        let ret = unsafe { ffi::av_packet_ref(alias.as_mut_ptr(), packet.as_ptr()) };
+        if ret < 0 {
+            return Err(RsmediaError::FFmpeg(rsmpeg::error::RsmpegError::from(ret)));
+        }
+        Ok(self
+            .decode_subtitle_packet(Some(&mut alias))?
+            .and_then(|subtitle| SubtitleSegment::from_avsubtitle(&subtitle)))
+    }
+
+    /// EOF 后继续取字幕（[`decode_stream`] 的 `on_drain`）。
+    ///
+    /// 字幕解码器没有帧队列，flush 的方式是「反复喂空包直到不再返回字幕」
+    /// （见 `avcodec_decode_subtitle2` 文档）；`AV_CODEC_CAP_DELAY` 的解码器可能
+    /// 仍缓存若干条。循环有上限，避免损坏的流让公开 API 转不出来。
+    fn drain_subtitle(&mut self) -> Result<Option<SubtitleSegment>> {
+        for _ in 0..crate::MAX_DRAIN_ITERATIONS {
+            match self.decode_subtitle_packet(None)? {
+                Some(subtitle) => {
+                    if let Some(segment) = SubtitleSegment::from_avsubtitle(&subtitle) {
+                        return Ok(Some(segment));
                     }
                 }
-            } else {
-                // EOF：空包 flush 字幕解码器（CAP_DELAY 解码器可能仍有缓冲字幕）
-                match self.decode_subtitle_packet(None)? {
-                    Some(subtitle) => {
-                        if let Some(segment) = SubtitleSegment::from_avsubtitle(&subtitle) {
-                            return Ok(Some(segment));
-                        }
-                    }
-                    None => {
-                        self.state = CodecContextState::Flushed;
-                        tracing::debug!("Subtitle decoder flushed. EOF reached.");
-                        return Ok(None);
-                    }
+                None => {
+                    self.state = CodecContextState::Flushed;
+                    tracing::debug!("Subtitle decoder flushed. EOF reached.");
+                    return Ok(None);
                 }
             }
         }
+        Err(RsmediaError::msg(format!(
+            "Subtitle decoder keeps returning subtitles after EOF ({} iterations); giving up",
+            crate::MAX_DRAIN_ITERATIONS
+        )))
     }
 
     /// Decode one [`AVPacket`].
@@ -811,11 +893,9 @@ impl Decoder {
     where
         T: ElementType,
     {
-        match self.decode_raw_packet(packet) {
-            Ok(Some(raw_frame)) => Ok(Some(MediaFrame::<T>::from_avframe(&raw_frame)?)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.decode_raw_packet(packet)?
+            .map(|raw_frame| MediaFrame::<T>::from_avframe(&raw_frame))
+            .transpose()
     }
 
     /// Decode one [`AVPacket`].
@@ -832,13 +912,9 @@ impl Decoder {
     ///
     /// The decoded raw frame as [`AVFrame`] if the decoder has a frame available, [`None`] if not.
     pub fn decode_raw_packet(&mut self, packet: &AVPacket) -> Result<Option<AVFrame>> {
-        // 与 `decode`/`decode_raw` 同一阶段守卫：解码器 flush 之后再送包，FFmpeg
-        // 只会回一句 "Decoder is already flushed"，调用方看不出该怎么办。
-        if self.is_finished() {
-            return Err(RsmediaError::invalid_config(
-                "Decoder cannot decode after flushed. Call reset().",
-            ));
-        }
+        // 与 `decode`/`decode_raw` 同一阶段守卫：`drain_raw` 之后解码器已收到 EOS，
+        // 再送包会被 FFmpeg 拒绝（EINVAL），必须在 `reset()` 之后才能复用。
+        self.ensure_normal()?;
         self.send_packet_to_decoder(Some(packet))?;
         self.receive_normalized_frame()
     }
@@ -857,11 +933,9 @@ impl Decoder {
     where
         T: ElementType,
     {
-        match self.drain_raw() {
-            Ok(Some(raw_frame)) => Ok(Some(MediaFrame::<T>::from_avframe(&raw_frame)?)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.drain_raw()?
+            .map(|raw_frame| MediaFrame::<T>::from_avframe(&raw_frame))
+            .transpose()
     }
 
     /// Drain one frame from the decoder.
@@ -939,13 +1013,14 @@ impl Decoder {
             .context("Failed to rebuild the filter graph")
     }
 
-    /// Send packet to decoder.
-    /// Ensure rescaling timestamps accordingly before sending to decoder.
+    /// 把一个包（`None` = EOS）送进解码器。
+    ///
+    /// 时间戳换算不在这里做：进入解码器的包带参流时间基，解码器按 `pkt_timebase`
+    /// 解释（见 `DecoderBuilder::setup_codec_context`）。
     fn send_packet_to_decoder(&mut self, packet: Option<&AVPacket>) -> Result<()> {
         self.context
             .send_packet(packet)
-            .context("Failed to send packet to decoder")?;
-        Ok(())
+            .context("Failed to send packet to decoder")
     }
 
     /// Pulls one frame out of the decoder and returns it in a uniform shape.
@@ -1009,9 +1084,15 @@ impl Decoder {
         // 注意：这里无论是否有 Filter，都会统一转成目标格式（因为
         // `MediaFrame` 视频目前主要支持 YUV420P/RGB24）。因此即使源是
         // yuv444p / nv12 / 10-bit，解码输出也会被转成目标格式，不会颜色错乱。
+        // 有滤镜图时目标格式是「滤镜声明的输入格式，否则 `with_pix_fmt` 的值」
+        // （见 `build_from_reader`）：图内 buffer 源按同一格式声明，sink 再转回
+        // 解码输出格式，因此对外的格式承诺不变。
         let raw_frame = match self.media_type {
             MediaType::VIDEO => {
-                let target_sw_pix_fmt = self.output_pix_fmt;
+                let target_sw_pix_fmt = self
+                    .filter_input_format
+                    .and_then(FrameFormat::into_pixel)
+                    .unwrap_or(self.output_pix_fmt);
                 // 计算目标尺寸：无 resize 时保持源尺寸，有 resize 时按策略计算
                 let (out_w, out_h) = match self.resize {
                     Some(resize) => resize
@@ -1031,21 +1112,27 @@ impl Decoder {
                     target_sw_pix_fmt,
                 )?
             }
-            MediaType::AUDIO => match self.output_sample_fmt {
-                // 统一音频输出格式（由 `with_sample_fmt` 配置）。与视频侧一样在
-                // 进滤镜图之前完成，图内因此按目标格式声明输入（见 build_from_reader）。
-                // 只在格式真的不同、且帧确实带样本时转换：默认（未指定目标）与
-                // 「目标 == 原生」两种情况都零开销，空帧也无从转换。
+            MediaType::AUDIO => match self
+                .filter_input_format
+                .and_then(FrameFormat::into_sample)
+                .or(self.output_sample_fmt)
+            {
+                // 统一音频输出格式（由 `with_sample_fmt` 配置，或滤镜声明的输入
+                // 格式）。与视频侧一样在进滤镜图之前完成，图内因此按目标格式声明
+                // 输入（见 build_from_reader）。只在格式真的不同、且帧确实带样本时
+                // 转换：默认（未指定目标）与「目标 == 原生」两种情况都零开销，空帧
+                // 也无从转换。
                 Some(target)
                     if target != SampleFormat::from(sw_frame.format) && sw_frame.nb_samples > 0 =>
                 {
-                    resample::convert_frame(
-                        &sw_frame,
-                        sw_frame.ch_layout,
-                        target.into(),
-                        sw_frame.sample_rate,
-                    )
-                    .context("Failed to convert decoded audio to the output sample format")?
+                    self.audio_converter
+                        .convert(
+                            &sw_frame,
+                            sw_frame.ch_layout,
+                            target.into(),
+                            sw_frame.sample_rate,
+                        )
+                        .context("Failed to convert decoded audio to the output sample format")?
                 }
                 _ => sw_frame,
             },
@@ -1117,6 +1204,10 @@ where
     OP: FnMut(&mut Decoder, &AVPacket) -> Result<Option<O>>,
     OD: FnMut(&mut Decoder) -> Result<Option<O>>,
 {
+    // 入口守卫只看**整条流水线**是否已结束：解码器先到 EOF 时，滤镜图里可能
+    // 还压着缓冲帧（如 `aresample`/`fps` 这类带延迟的滤镜），调用方必须能继续
+    // 调用把它们取出来。真正的"不能送包"由 `decode_raw_packet` 的
+    // `ensure_normal` 负责——两者管的是不同的事。
     if decoder.is_finished() {
         return Err(RsmediaError::invalid_config(
             "Decoder cannot decode after flushed. Call reset().",
@@ -1157,22 +1248,20 @@ where
                     // （多见于含 B 帧的码流）。
                     if decoder.is_drained() {
                         // 有上限的继续排空：解码器若一直回 EAGAIN 而从不报 EOF，
-                        // 这里必须收尾，否则公开的 decode() 会永远转下去。
+                        // 说明状态机已坏（或码流异常），必须报错而不是当作正常
+                        // 结束 —— 否则调用方会把截断的输出当成完整结果。
                         if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
-                            tracing::error!(
-                                "Decoder keeps returning EAGAIN after EOF, giving up after \
-                                 {} iterations",
+                            return Err(RsmediaError::msg(format!(
+                                "Decoder keeps returning EAGAIN after EOF, aborting after {} \
+                                 iterations",
                                 crate::MAX_DRAIN_ITERATIONS
-                            );
-                            break None;
+                            )));
                         }
                         drained_iterations += 1;
                         tracing::debug!("Decoder drained, keep draining.");
                         continue;
                     }
                     tracing::debug!("Decoder flushed. EOF reached.");
-                    // self.reset();
-                    // read_exhausted = false;
                     break None;
                 }
                 Err(e) => {
@@ -1194,25 +1283,28 @@ impl Drop for Decoder {
             return;
         }
 
-        // 1. Flush Filter Graph if exists.
-        if let Some(chain) = self.filter_graph.as_mut() {
-            match chain.graph.flush() {
-                Ok(frames) => {
-                    if !frames.is_empty() {
+        // 1. 先排空解码器里残留的帧。顺序不能颠倒：滤镜图在步骤 2 才冲刷，
+        //    若先冲滤镜，解码器排出的帧既进不了图、也不会再从图里流出来。
+        //    - `Normal`：先送 EOS 进入 draining；
+        //    - `Drained`：EOS 已送过，直接排空（重复送 NULL 只会拿到
+        //      AVERROR_EOF 并打出无意义的告警）；
+        //    - `Flushed`：已无帧可排，整个步骤跳过。
+        if self.state != CodecContextState::Flushed {
+            let eos_sent = if self.state == CodecContextState::Normal {
+                match self.send_packet_to_decoder(None) {
+                    Ok(()) => true,
+                    Err(e) => {
                         tracing::warn!(
-                            "{} frames dropped during Decoder drop filter flush.",
-                            frames.len()
+                            "Failed to send flush packet to decoder during Decoder drop: {e}"
                         );
+                        false
                     }
-                    tracing::debug!("Filter graph flushed during Decoder drop.");
                 }
-                Err(e) => tracing::error!("Failed to flush filter graph during Decoder drop: {e}"),
-            }
-        }
+            } else {
+                true
+            };
 
-        // We need to drain the items still in the decoders queue.
-        match self.send_packet_to_decoder(None) {
-            Ok(_) => {
+            if eos_sent {
                 // 兜底上限见 `MAX_DRAIN_ITERATIONS`。
                 let mut iterations = 0usize;
                 loop {
@@ -1246,8 +1338,21 @@ impl Drop for Decoder {
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!("Failed to send flush packet to decoder: {e}")
+        }
+
+        // 2. Flush Filter Graph if exists.
+        if let Some(chain) = self.filter_graph.as_mut() {
+            match chain.graph.flush() {
+                Ok(frames) => {
+                    if !frames.is_empty() {
+                        tracing::warn!(
+                            "{} frames dropped during Decoder drop filter flush.",
+                            frames.len()
+                        );
+                    }
+                    tracing::debug!("Filter graph flushed during Decoder drop.");
+                }
+                Err(e) => tracing::error!("Failed to flush filter graph during Decoder drop: {e}"),
             }
         }
     }

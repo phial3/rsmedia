@@ -74,13 +74,13 @@ Pick **exactly one** FFmpeg version feature;
 
 ```toml
 # FFmpeg 9 on unix (default features are fine)
-rsmedia = "0.7"
+rsmedia = "0.8"
 
 # FFmpeg 7 on unix
-rsmedia = { version = "0.7", default-features = false, features = ["ffmpeg7", "link_system_ffmpeg"] }
+rsmedia = { version = "0.8", default-features = false, features = ["ffmpeg7", "link_system_ffmpeg"] }
 
 # FFmpeg 6 on windows, linking with vcpkg
-rsmedia = { version = "0.7", default-features = false, features = ["ffmpeg6", "link_vcpkg_ffmpeg"] }
+rsmedia = { version = "0.8", default-features = false, features = ["ffmpeg6", "link_vcpkg_ffmpeg"] }
 ```
 
 ## 📦 Setup
