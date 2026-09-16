@@ -119,6 +119,12 @@
 /// - A variant's doc comment is forwarded to both the enum variant and the `match` arm. Doc on
 ///   a match arm is an `unused_doc_comments` warning, so the macro inserts
 ///   `#[allow(unused_doc_comments)]` on every arm.
+/// - When the FFI type is a plain integer alias — `ffi::AVPixelFormat` and `ffi::AVSampleFormat`
+///   are both `c_int` — the generated `From` impls **are** the integer conversions, so
+///   `i32::from(PixelFormat::RGB24)` and `PixelFormat::from(raw_i32)` work without any extra
+///   impl (and a separate `impl From<i32>` would be rejected as a duplicate impl of the same
+///   type). The reverse one runs through the `fallback`, so an unlisted integer panics: reach
+///   for `from_ffi_checked` when the value arrives from FFmpeg.
 /// - `fallback = panic` and `fallback = <expression>` are two **entry** rules that differ only
 ///   in the fallback they hand to the internal `@expand` rule, which holds the single copy of
 ///   the expansion. Each hands over a **closure** — `|value| panic!(...)`, `|_| <expr>` — that
@@ -505,8 +511,9 @@ mod tests {
     //! one of the `no` capabilities at that call site would fail to compile. Those `no` cells
     //! were confirmed once with a throwaway probe: `as_raw()`, `BitOr` and `BitAnd` on
     //! `PixelFormat`, `BitOr`/`BitAnd` on `ProbeWrapFlags`, the reverse `From<i32>` for
-    //! `AVSeekFlag` and `ProbeWrapFlags`, and `Into<i32>` for `ProbeWrapFlags` are all rejected by
-    //! the compiler.
+    //! `AVSeekFlag` and `ProbeWrapFlags`, `Into<i32>` for `ProbeWrapFlags`, and a second
+    //! `From<i32>` for `PixelFormat` (E0119 — the generated `From<ffi::AVPixelFormat>` already *is*
+    //! that impl, because the alias is `c_int`) are all rejected by the compiler.
 
     use rsmpeg::ffi;
 
@@ -580,6 +587,24 @@ mod tests {
 
         // FFI value -> variant: the direction no other macro offers.
         assert_eq!(PixelFormat::from(ffi::AV_PIX_FMT_RGB24), PixelFormat::RGB24);
+    }
+
+    /// The ID tables' `From` impls **are** the `i32` conversions: `ffi::AVPixelFormat` and
+    /// `ffi::AVSampleFormat` are `c_int` aliases, so `Into<i32>` / `From<i32>` come for free in
+    /// both directions. Spelled with `i32` on purpose — that is the contract downstream code
+    /// relies on when handing these values to other FFmpeg-facing crates.
+    #[test]
+    fn id_enums_convert_to_and_from_i32() {
+        use crate::fmt::SampleFormat;
+        use crate::pixel::PixelFormat;
+
+        let raw: i32 = PixelFormat::RGB24.into();
+        assert_eq!(raw, ffi::AV_PIX_FMT_RGB24);
+        assert_eq!(PixelFormat::from(raw), PixelFormat::RGB24);
+
+        let raw: i32 = SampleFormat::FLTP.into();
+        assert_eq!(raw, ffi::AV_SAMPLE_FMT_FLTP);
+        assert_eq!(SampleFormat::from(raw), SampleFormat::FLTP);
     }
 
     /// `fallback = panic` on `PixelFormat`: an unlisted value is a hard error.

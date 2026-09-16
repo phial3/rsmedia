@@ -22,6 +22,17 @@ ffi_enum!(
 });
 
 ffi_enum_wrap_from!(
+    /// Pixel format (FFmpeg `AV_PIX_FMT_*`): how a picture is laid out in memory.
+    ///
+    /// Generated from one `variant => constant` table with a two-way `From`. A value the table
+    /// does not list panics instead of degrading to `NONE` — silently assuming a different layout
+    /// corrupts the picture, while a fast failure points at the actual mismatch. The listed
+    /// `AV_PIX_FMT_NONE` itself still converts to `NONE` as usual.
+    ///
+    /// Since `ffi::AVPixelFormat` **is** `c_int`, the generated conversions *are* the `i32` ones:
+    /// `i32::from(PixelFormat::RGB24)` and `PixelFormat::from(raw_i32)` both exist (the latter
+    /// panics on an unlisted value, so prefer [`from_ffi_checked`](PixelFormat::from_ffi_checked)
+    /// for values coming from FFmpeg).
     #[allow(non_camel_case_types)]
     PixelFormat => ffi::AVPixelFormat,
     repr = i32,
