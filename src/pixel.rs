@@ -644,6 +644,7 @@ mod tests {
             PixelFormat::UYVY422,
             PixelFormat::YVYU422,
             PixelFormat::Y210LE,
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
             PixelFormat::Y216LE,
         ] {
             let element_bytes = fmt.bytes_per_component().expect("whole-byte components");
