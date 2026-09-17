@@ -86,6 +86,13 @@ pub struct Muxer<W: Writer> {
     pub writer: W,
     streams: Vec<MuxerStream>,
     interleaved: bool,
+    /// `true` 时把提交进来的时间戳整体平移到 0 起点，见
+    /// [`Muxer::set_normalize_timestamps`]。
+    normalize_timestamps: bool,
+    /// 归一化基准（微秒，`AV_TIME_BASE`），首个带有效时间戳的提交单元建立。
+    /// 存微秒而**不是**某个流的时间基单位：视频（1/fps）与音频（1/sample_rate）
+    /// 减的必须是同一物理时刻，否则会破坏音视频同步。
+    pts_base_us: Option<i64>,
     have_written_header: bool,
     have_written_trailer: bool,
     /// Container-level metadata (e.g. "title", "artist"), applied to the
@@ -160,6 +167,10 @@ impl<W: Writer> Muxer<W> {
             // 非交错直写会让 FLV 等容器报 "Packets poorly interleaved / not in
             // the proper order with respect to DTS"（AVERROR(EINVAL)）。
             interleaved: true,
+            // 默认不平移：库不悄悄改用户给的时间戳，需要的人显式开启
+            // （live 采集的 wallclock/epoch 时间戳等，见 set_normalize_timestamps）。
+            normalize_timestamps: false,
+            pts_base_us: None,
             have_written_header: false,
             have_written_trailer: false,
             metadata: Metadata::new(),
@@ -199,6 +210,50 @@ impl<W: Writer> Muxer<W> {
         }
         self.interleaved = interleaved;
         self
+    }
+
+    /// 开关时间戳归一化：以**首个带有效时间戳的提交单元**为基准，把全部流的时间戳
+    /// 平移到 0 起点，等价于 ffmpeg CLI 默认的 `ts_offset`（把输入起点移到 0）行为。
+    ///
+    /// 用于时间戳本身很大的输入——live 采集的 wallclock/epoch 时间戳（`avformat`
+    /// 的 `use_wallclock_as_timestamps=1`）、SDI 时间码、带绝对起点的 RTP 流等。
+    /// **FLV/RTMP 的时间戳字段只有 32 位毫秒**，直接透传 epoch 值会溢出回绕：产物
+    /// 起始 pts 落在几十万秒处，播放器的时长/缓冲计算随之失真。
+    ///
+    /// 只做整体平移，帧间间隔（真实到达节奏、卡顿造成的 PTS 跳变）完全保留；
+    /// 基准跨流共享同一物理时刻（内部按微秒存储、逐流换算回各自时间基），
+    /// 因此音视频同步不受影响。`AV_NOPTS_VALUE`（未设 pts，由编码器自动编号）
+    /// 原样透传，也不参与基准建立。
+    ///
+    /// 应在写入任何数据**之前**调用；header 写出后才开启时基准只能从下一个提交
+    /// 单元建立，先前写出的包保持原值，时间戳会出现回跳（此处会告警）。
+    pub fn set_normalize_timestamps(&mut self, normalize: bool) -> &mut Self {
+        if normalize && self.have_written_header {
+            tracing::warn!(
+                "set_normalize_timestamps(true) after header write: the base is taken from the \
+                 next submitted frame/packet; already-written packets keep their original values"
+            );
+        }
+        self.normalize_timestamps = normalize;
+        self.pts_base_us = None;
+        self
+    }
+
+    /// 把一个时间戳平移到归一化基准（`tb` 是该值当前所在的时间基）。
+    ///
+    /// 首个有效时间戳建立基准并把自身恰好平移到 0（避免换算取整后首帧落在 ±1 tick）；
+    /// 后续值减去同一基准。未开启归一化或时间戳为 `AV_NOPTS_VALUE` 时原样返回。
+    fn normalize_ts(&mut self, ts: i64, tb: ffi::AVRational) -> i64 {
+        if !self.normalize_timestamps || ts == ffi::AV_NOPTS_VALUE {
+            return ts;
+        }
+        match self.pts_base_us {
+            Some(base_us) => ts - rsmpeg::avutil::av_rescale_q(base_us, ffi::AV_TIME_BASE_Q, tb),
+            None => {
+                self.pts_base_us = Some(rsmpeg::avutil::av_rescale_q(ts, tb, ffi::AV_TIME_BASE_Q));
+                0
+            }
+        }
     }
 
     pub fn add_encoder(&mut self, encoder: Encoder) -> Result<usize> {
@@ -687,15 +742,34 @@ impl<W: Writer> Muxer<W> {
     ///
     /// * `frame` - [`AVFrame`] to encode and mux.
     /// * `stream_idx` - Index of the target output stream.
-    pub fn mux(&mut self, frame: AVFrame, stream_idx: usize) -> Result<W::Accum> {
+    pub fn mux(&mut self, mut frame: AVFrame, stream_idx: usize) -> Result<W::Accum> {
         // 先校验目标流是编码流，再提交 header（见 `ensure_header_written`）：拿
         // 透传流调 `mux()` 属于参数错误，不该把 header 不可逆地写出去。
-        if self.get_stream(stream_idx)?.encoder.is_none() {
-            return Err(RsmediaError::msg(format!(
-                "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
-            )));
-        }
+        let enc_time_base = self
+            .get_stream(stream_idx)?
+            .encoder
+            .as_ref()
+            .ok_or_else(|| {
+                RsmediaError::msg(format!(
+                    "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
+                ))
+            })?
+            .time_base();
         let mut collected = self.ensure_header_written()?;
+
+        // 归一化在**编码前**应用：编码器内部的自动编号与 flush 出的延迟包就都在同一
+        // 坐标系里，输出侧（含 `finish()` 的 flush 路径）无需再区分处理。
+        // 帧自带有效时间基时以它为准；否则 pts 已按编码器时间基计数（见
+        // `MediaFrame.time_base` 的约定）。
+        let frame_time_base = if frame.time_base.num > 0 && frame.time_base.den > 0 {
+            frame.time_base
+        } else {
+            enc_time_base
+        };
+        let normalized = self.normalize_ts(frame.pts, frame_time_base);
+        if normalized != frame.pts {
+            frame.set_pts(normalized);
+        }
 
         let mux_stream = self.get_stream_mut(stream_idx)?;
         let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
@@ -703,7 +777,6 @@ impl<W: Writer> Muxer<W> {
                 "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
             ))
         })?;
-        let enc_time_base = encoder.time_base();
         let packets = encoder.encode_raw(frame)?;
         // 编码器输出的 packet 常不带 duration（mpeg4 等），若缺失则按
         // 帧率/采样率补上，否则 MP4 等交错 muxer 无法推导**最后一帧**的
@@ -772,9 +845,18 @@ impl<W: Writer> Muxer<W> {
         let enc_time_base = encoder.time_base();
         let packets = encoder.encode_subtitle_segment(segment)?;
 
-        // 与 `mux` 相同的累积写法（字幕段通常是 0/1 个 packet，但没理由与
-        // `mux` 用两套语义）。
+        // 与 `mux` 相同的累积写法（字幕段通常是 0/1 个 packet，但没理由与 `mux` 用两套语义）。
         for mut packet in packets {
+            // 与 `mux` 一致：归一化在写包前应用（字幕包的 pts/dts 在编码器的
+            // 1/1000 时间基里），基准与音视频流共享，不破坏同步。
+            let pts = self.normalize_ts(packet.pts, enc_time_base);
+            let dts = self.normalize_ts(packet.dts, enc_time_base);
+            if pts != packet.pts {
+                packet.set_pts(pts);
+            }
+            if dts != packet.dts {
+                packet.set_dts(dts);
+            }
             let out = self.write_out_packet(&mut packet, stream_idx, enc_time_base)?;
             W::merge_out(&mut collected, out);
         }
@@ -801,6 +883,17 @@ impl<W: Writer> Muxer<W> {
             ))
         })?;
         let mut collected = self.begin_packet_write()?;
+
+        // 与 `mux` 一致：归一化在写包前应用（透传包的 pts/dts 在源流时间基里），
+        // 基准与编码流共享同一物理时刻。
+        let pts = self.normalize_ts(packet.pts, src_time_base);
+        let dts = self.normalize_ts(packet.dts, src_time_base);
+        if pts != packet.pts {
+            packet.set_pts(pts);
+        }
+        if dts != packet.dts {
+            packet.set_dts(dts);
+        }
 
         // src_stream_time_base => out_stream_time_base（重复调用会重复换算，
         // 因此只在我们自己保存的源时间基与输出时间基之间进行一次换算）
@@ -2472,6 +2565,79 @@ mod tests {
         );
 
         crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// `set_normalize_timestamps(true)`：epoch 级起点（模拟 `use_wallclock_as_timestamps=1`
+    /// 的墙钟 pts）在 FLV 里被平移到 0，帧间间隔与采集卡顿造成的跳变逐 tick 保留。
+    /// 默认（false）时相对间隔虽在、但起点被 FLV 的 32 位毫秒字段回绕成垃圾值。
+    #[test]
+    fn test_normalize_timestamps_shifts_epoch_pts_to_zero() -> Result<()> {
+        // 25fps + ultrafast（无 B 帧）：pts/dts 同坐标，容器不做负时间戳平移，
+        // 可以把回读的 pts 与注入值逐个精确比对。
+        const EPOCH_TICKS: i64 = 1_789_635_572 * 25;
+        // 第 5 帧前模拟一次 1s 的采集卡顿（正常间隔 40ms = 1 tick），其后恢复。
+        let delta_ticks = |i: i64| if i >= 5 { 25 + (i - 5) } else { i };
+
+        let run = |normalize: bool, name: &str| -> Result<Vec<i64>> {
+            let path = crate::test_support::test_output_path("mux", name);
+            {
+                let mut muxer = Muxer::new(&path)?;
+                muxer.set_normalize_timestamps(normalize);
+                let mut options = crate::Options::new();
+                options.insert("preset", "ultrafast");
+                let encoder = EncoderBuilder::new_video(64, 64)
+                    .with_fps(25.0)
+                    .with_options(options)
+                    .build()?;
+                let index = muxer.add_encoder(encoder)?;
+                for i in 0..10i64 {
+                    let mut frame = generate_video_frame(64, 64, i);
+                    frame.set_pts(EPOCH_TICKS + delta_ticks(i));
+                    muxer.mux(frame, index)?;
+                }
+                muxer.finish()?;
+            }
+
+            let reader = StreamReader::new(&path)?;
+            let tb = reader.input().streams()[0].time_base;
+            let mut demuxer = Demuxer::new_passthrough(reader)?;
+            let mut pts_us: Vec<i64> = demuxer
+                .packets()
+                .map(|item| {
+                    item.map(|(_, packet)| {
+                        rsmpeg::avutil::av_rescale_q(packet.pts, tb, ffi::AV_TIME_BASE_Q)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // 包顺序受 dts 交错影响，比较排序后的时间轴。
+            pts_us.sort_unstable();
+            crate::test_support::remove_test_output(&path);
+            Ok(pts_us)
+        };
+
+        let normalized = run(true, "test_normalize_ts_on.flv")?;
+        let raw = run(false, "test_normalize_ts_off.flv")?;
+        assert_eq!(normalized.len(), 10, "帧数不对：{normalized:?}");
+
+        // 归一化后：首个提交单元落在 0，后续间隔（含 1s 卡顿）逐 tick 保留。
+        let expected: Vec<i64> = (0..10i64).map(|i| delta_ticks(i) * 40_000).collect();
+        assert_eq!(
+            normalized, expected,
+            "normalize=true 的时间轴应为 0 起点且保留真实间隔"
+        );
+        // 未开启时：相对间隔仍在，但 FLV 的时间戳字段只有 32 位毫秒，epoch 起点被
+        // 回绕成垃圾值（文件 start 落在几十万秒处）——这正是必须归一化的原因。
+        let raw_deltas: Vec<i64> = raw.windows(2).map(|w| w[1] - w[0]).collect();
+        let expected_deltas: Vec<i64> = (1..10i64)
+            .map(|i| (delta_ticks(i) - delta_ticks(i - 1)) * 40_000)
+            .collect();
+        assert_eq!(raw_deltas, expected_deltas, "回绕不应破坏相对间隔");
+        assert_ne!(
+            raw.first().copied().unwrap_or(0),
+            EPOCH_TICKS * 40_000,
+            "normalize=false 时 FLV 承载不了 epoch 起点"
+        );
         Ok(())
     }
 
