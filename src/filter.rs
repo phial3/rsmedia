@@ -10,7 +10,7 @@ use crate::pixel::PixelFormat;
 use crate::state::ProcessState;
 use crate::strutils;
 
-use rsmpeg::avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut};
+use rsmpeg::avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut, AVFilterRef};
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
 
@@ -219,16 +219,12 @@ impl From<Filter> for FilterNode {
     }
 }
 
-/// Whether the named FFmpeg filter exists in this build（如 `drawtext` 依赖
-/// libfreetype，许多发行版构建不含）。用于**前置**跳过不可用滤镜，避免依赖
-/// FFmpeg 运行时错误字符串来判断。
-pub fn is_available(name: &str) -> bool {
-    // 名字来自调用者，可能含 NUL 字节；转换失败即视为"不存在"
-    let Ok(name_c) = strutils::str_to_cstring(name) else {
-        return false;
-    };
-    // SAFETY: `name_c` 是合法的 NUL 结尾 C 字符串；查询函数只读且线程安全。
-    unsafe { !ffi::avfilter_get_by_name(name_c.as_ptr()).is_null() }
+/// Whether the named FFmpeg filter exists in this build
+/// （如 `drawtext` 依赖 libfreetype、`subtitles` 依赖 libass）
+/// 用于**前置**跳过不可用滤镜，避免依赖 FFmpeg 运行时错误字符串来判断
+pub fn get_by_name(name: &str) -> Result<Option<AVFilterRef<'static>>> {
+    let filter_name = strutils::str_to_cstring(name)?;
+    Ok(AVFilter::get_by_name(&filter_name))
 }
 
 /// Escapes characters that are special within FFmpeg filtergraph descriptions.
@@ -451,9 +447,6 @@ pub mod video {
     /// `env!("CARGO_MANIFEST_DIR")` 拼出字体路径）。路径不存在时滤镜图初始化会失败
     /// （`drawtext` 报找不到字体文件），不会 panic。
     /// 也支持给文字加描边盒子（`boxed`）。
-    ///
-    /// Requires `drawtext`, i.e. an FFmpeg built with libfreetype; check with
-    /// [`crate::filter::is_available`] beforehand.
     ///
     /// # Examples
     ///
@@ -1878,10 +1871,9 @@ impl FilterGraph {
 
     /// 校验单个滤镜：是否存在于本次构建、媒体类型是否与图一致。
     fn check_filter(filter: &Filter, media_type: MediaType) -> Result<()> {
-        // 名字必须是本 FFmpeg 构建里真实存在的滤镜：`drawtext` 需要
-        // libfreetype、`subtitles` 需要 libass，缺失时在此前置报错，
+        // 名字必须是本 FFmpeg 构建里真实存在的滤镜：缺失时在此前置报错，
         // 而不是等到 parse 阶段返回一句难以定位的字符串错误。
-        if !is_available(filter.name()) {
+        if get_by_name(filter.name())?.is_none() {
             return Err(RsmediaError::filter_not_found(filter.name()));
         }
         if filter.media_type() != media_type {

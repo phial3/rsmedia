@@ -646,8 +646,7 @@ mod tests {
     /// 若返回会导致 Demuxer 构建失败）。
     #[test]
     fn test_find_decoder_name_vaapi_falls_back() {
-        let reader =
-            StreamReader::new(std::path::Path::new("assets/mp4.mp4")).expect("open test asset");
+        let reader = StreamReader::new("assets/mp4.mp4").expect("open test asset");
         let info = StreamInfo::from_reader(&reader, 0).expect("read stream 0");
         assert_eq!(info.media_type, MediaType::VIDEO);
 

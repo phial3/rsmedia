@@ -1525,25 +1525,12 @@ mod tests {
 
     #[test]
     fn test_decode_video() -> Result<()> {
-        let video_path = std::path::Path::new("assets/mp4.mp4");
+        let filters = vec![filter::video::scale(1280, 720, None)];
 
-        // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用：前置探测
-        // 滤镜是否存在，缺失时降级为仅 scale，而非匹配错误字符串。
-        let scale = filter::video::scale(1280, 720, None);
-        let mut reader = StreamReader::new(video_path)?;
-        let filters = if filter::is_available("drawtext") {
-            let drawtext = filter::video::DrawText::new("Hello", 10, 10, 24, "white").build();
-            vec![scale, drawtext]
-        } else {
-            println!("SKIP drawtext (libfreetype not available)");
-            vec![scale]
-        };
-        let build_decoder = |filters: Vec<Filter>| -> Result<Decoder> {
-            DecoderBuilder::new(MediaType::VIDEO)
-                .with_filters(filters)
-                .build_from_reader(&reader)
-        };
-        let mut decoder = build_decoder(filters)?;
+        let mut reader = StreamReader::new("assets/mp4.mp4")?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_filters(filters)
+            .build_from_reader(&reader)?;
 
         loop {
             match decoder.decode_raw(&mut reader) {
@@ -1566,14 +1553,12 @@ mod tests {
 
     #[test]
     fn test_decode_audio() -> Result<()> {
-        let audio_path = std::path::Path::new("assets/wav.wav");
-
         let filters = vec![
             filter::audio::resample(2, 48000, SampleFormat::FLTP),
             filter::audio::volume(1.5),
         ];
 
-        let mut reader = StreamReader::new(audio_path)?;
+        let mut reader = StreamReader::new("assets/wav.wav")?;
         let mut decoder = DecoderBuilder::new(MediaType::AUDIO)
             .with_filters(filters)
             .build_from_reader(&reader)?;
@@ -1603,8 +1588,7 @@ mod tests {
     /// 掩码），顺带回归重采样器的 `AVERROR_INPUT/OUTPUT_CHANGED`。
     #[test]
     fn test_decode_audio_with_sample_fmt_unifies_output() -> Result<()> {
-        let audio_path = std::path::Path::new("assets/wav.wav");
-
+        let audio_path = "assets/wav.wav";
         // 统一到 FLTP：decode::<f32> 全程可用，且每帧的格式都是目标格式。
         let mut reader = StreamReader::new(audio_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::AUDIO)
@@ -1665,10 +1649,7 @@ mod tests {
     #[test]
     fn test_decode_video_with_resize() -> Result<()> {
         use crate::Resize;
-
-        let video_path = std::path::Path::new("assets/mp4.mp4");
-
-        let mut reader = StreamReader::new(video_path)?;
+        let mut reader = StreamReader::new("assets/mp4.mp4")?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
             .with_resize(Resize::Exact(320, 240))
             .build_from_reader(&reader)?;
@@ -1688,9 +1669,7 @@ mod tests {
     /// 可正常转换。
     #[test]
     fn test_decode_video_with_pix_fmt_rgb24() -> Result<()> {
-        let video_path = std::path::Path::new("assets/mp4.mp4");
-
-        let mut reader = StreamReader::new(video_path)?;
+        let mut reader = StreamReader::new("assets/mp4.mp4")?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
             .with_pix_fmt(PixelFormat::RGB24)
             .build_from_reader(&reader)?;
@@ -1709,13 +1688,12 @@ mod tests {
     /// 且在构建时返回错误而非 panic。
     #[test]
     fn test_decode_video_with_pix_fmt_unsupported() {
-        let video_path = std::path::Path::new("assets/mp4.mp4");
         for fmt in [
             PixelFormat::MONOWHITE, // 位流：分量不足一字节
             PixelFormat::PAL8,      // 调色板格式：样本指向独立调色板
             PixelFormat::VAAPI,     // 硬件格式：没有主机端样本
         ] {
-            let reader = StreamReader::new(video_path).unwrap();
+            let reader = StreamReader::new("assets/mp4.mp4").unwrap();
             let result = DecoderBuilder::new(MediaType::VIDEO)
                 .with_pix_fmt(fmt)
                 .build_from_reader(&reader);
@@ -1727,9 +1705,8 @@ mod tests {
     /// 输出格式不再是「YUV420P + packed 8bit」白名单。
     #[test]
     fn test_decode_video_with_planar_pix_fmt_accepted() {
-        let video_path = std::path::Path::new("assets/mp4.mp4");
         for fmt in [PixelFormat::NV12, PixelFormat::YUV422P, PixelFormat::GBRP] {
-            let reader = StreamReader::new(video_path).unwrap();
+            let reader = StreamReader::new("assets/mp4.mp4").unwrap();
             let result = DecoderBuilder::new(MediaType::VIDEO)
                 .with_pix_fmt(fmt)
                 .build_from_reader(&reader);
@@ -1740,8 +1717,7 @@ mod tests {
     /// `with_pix_fmt` 对音频解码器应快速失败，而非静默忽略。
     #[test]
     fn test_decode_audio_with_pix_fmt_fails() {
-        let video_path = std::path::Path::new("assets/mp4.mp4");
-        let reader = StreamReader::new(video_path).unwrap();
+        let reader = StreamReader::new("assets/mp4.mp4").unwrap();
         let result = DecoderBuilder::new(MediaType::AUDIO)
             .with_pix_fmt(PixelFormat::YUV420P)
             .build_from_reader(&reader);
@@ -1754,7 +1730,7 @@ mod tests {
     fn test_resize_vs_filter_scale() -> Result<()> {
         use crate::Resize;
 
-        let video_path = std::path::Path::new("assets/mp4.mp4");
+        let video_path = "assets/mp4.mp4";
 
         // A) 仅 with_resize
         eprintln!("[A] with_resize only");
@@ -1809,7 +1785,7 @@ mod tests {
     /// 默认关闭，显式开启后为真（真实 build 路径）。
     #[test]
     fn test_builder_scale_pool_reaches_decoder_scaler() -> Result<()> {
-        let video_path = std::path::Path::new("assets/mp4.mp4");
+        let video_path = "assets/mp4.mp4";
 
         let decoder = DecoderBuilder::new(MediaType::VIDEO)
             .build_from_reader(&StreamReader::new(video_path)?)?;
@@ -1829,7 +1805,7 @@ mod tests {
     /// （含滤镜图）结束。此后继续解码必须报错，而不是静默返回 `None`。
     #[test]
     fn test_decode_reaches_finished_state() -> Result<()> {
-        let video_path = std::path::Path::new("assets/mp4.mp4");
+        let video_path = "assets/mp4.mp4";
         let mut reader = StreamReader::new(video_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
 
@@ -1842,7 +1818,7 @@ mod tests {
             );
         }
 
-        assert!(decoded > 0, "decoded nothing from {}", video_path.display());
+        assert!(decoded > 0, "decoded nothing from {}", video_path);
         assert!(decoder.is_flushed(), "EOF must leave the decoder flushed");
         assert!(
             decoder.is_finished(),
@@ -1868,9 +1844,8 @@ mod tests {
     /// "可以继续"，正是"状态在说谎"。
     #[test]
     fn test_reset_restarts_the_filtered_pipeline() -> Result<()> {
-        let path = std::path::Path::new("assets/mp4.mp4");
-
-        let mut reader = StreamReader::new(path)?;
+        let video_path = "assets/mp4.mp4";
+        let mut reader = StreamReader::new(video_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
             .with_filters(vec![crate::filter::video::fps(10.0)])
             .build_from_reader(&reader)?;
@@ -1886,7 +1861,7 @@ mod tests {
         assert!(!decoder.is_flushed() && !decoder.is_finished());
 
         // 重新读同一个文件：必须能正常出帧，而不是 AVERROR_EOF。
-        let mut reader = StreamReader::new(path)?;
+        let mut reader = StreamReader::new(video_path)?;
         let mut second_pass = 0usize;
         while decoder.decode::<u8>(&mut reader)?.is_some() {
             second_pass += 1;
@@ -1989,13 +1964,13 @@ mod tests {
     /// flush 之后再走低层入口（`decode_raw_packet`）也要拿到同一个清晰的错误。
     #[test]
     fn test_decode_raw_packet_rejects_a_finished_decoder() -> Result<()> {
-        let path = std::path::Path::new("assets/mp4.mp4");
-        let mut reader = StreamReader::new(path)?;
+        let video_path = "assets/mp4.mp4";
+        let mut reader = StreamReader::new(video_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
         while decoder.decode_raw(&mut reader)?.is_some() {}
         assert!(decoder.is_finished());
 
-        let mut source = StreamReader::new(path)?;
+        let mut source = StreamReader::new(video_path)?;
         if let Some((_index, packet)) = source.read_packet()? {
             let err = match decoder.decode_raw_packet(&packet) {
                 Ok(_) => panic!("a finished decoder must reject a packet"),

@@ -2233,7 +2233,7 @@ mod tests {
     /// 解码出至少一帧且尺寸与源图一致。
     #[test]
     fn test_read_single_image() -> Result<()> {
-        let demuxer = Demuxer::new(std::path::Path::new("assets/cat.jpg"))?;
+        let demuxer = Demuxer::new("assets/cat.jpg")?;
         let decoded: Vec<_> = demuxer.filter_map(|res| res.ok()).collect();
         assert!(
             !decoded.is_empty(),
@@ -2344,7 +2344,7 @@ mod tests {
     /// `is_byte_seekable` must be `true` and `seek_to_start` must succeed.
     #[test]
     fn test_stream_reader_local_is_byte_seekable() -> Result<()> {
-        let mut reader = StreamReader::new(std::path::Path::new("assets/mp4.mp4"))?;
+        let mut reader = StreamReader::new("assets/mp4.mp4")?;
         assert!(
             reader.is_byte_seekable(),
             "local file IO should report byte-seekable"
@@ -2629,7 +2629,7 @@ mod tests {
     /// （`av_seek_frame` 会越界解引用 `AVStream`，所以这层校验不是可选的。）
     #[test]
     fn test_seek_to_frame_rejects_an_unknown_stream() -> Result<()> {
-        let mut reader = StreamReader::new(std::path::Path::new("assets/mp4.mp4"))?;
+        let mut reader = StreamReader::new("assets/mp4.mp4")?;
         assert!(
             reader.seek_to_frame(99, 0, AVSeekFlag::BACKWARD).is_err(),
             "seeking a stream that does not exist must fail"

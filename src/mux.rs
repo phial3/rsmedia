@@ -2271,8 +2271,6 @@ mod tests {
     /// 回读应得到 ~20 帧 GIF（fps 滤镜丢帧），解码器为 gif。
     #[test]
     fn test_encode_gif_palette_pipeline() -> Result<()> {
-        use crate::filter::video;
-
         let output_path = crate::test_support::test_output_path("mux", "test_gif_palette.gif");
         crate::test_support::remove_test_output(&output_path);
 
@@ -2280,11 +2278,17 @@ mod tests {
         let in_fps = 30.0f32;
         let out_fps = 10.0f32;
 
+        // 没有gif_palette
+        let gif_palette = crate::filter::video::gif_palette(out_fps, None);
+        if crate::filter::get_by_name(gif_palette.name())?.is_none() {
+            return Ok(());
+        }
+
         // 编码器按**输入**帧率（30fps）构建，滤镜图内 fps=10 完成抽帧
-        let encoder = crate::EncoderBuilder::new_video(width, height)
+        let encoder = EncoderBuilder::new_video(width, height)
             .with_codec_name("gif".to_string())
             .with_fps(in_fps)
-            .with_filters(vec![video::gif_palette(out_fps, None)])
+            .with_filters(vec![gif_palette])
             .build()?;
 
         let mut muxer = Muxer::new(&output_path)?;

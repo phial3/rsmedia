@@ -39,7 +39,10 @@ use rsmpeg::ffi;
 /// `fft_denoise`/`loudnorm` 依赖特定编译配置）时优雅跳过：**前置**探测滤镜
 /// 是否存在（`avfilter_get_by_name`），而非匹配 FFmpeg 运行时错误字符串。
 fn skip_if_filter_unavailable(filter: &Filter, path: &Path) -> bool {
-    if rsmedia::filter::is_available(filter.name()) {
+    if rsmedia::filter::get_by_name(filter.name())
+        .unwrap()
+        .is_some()
+    {
         return false;
     }
     println!(

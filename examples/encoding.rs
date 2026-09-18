@@ -1,8 +1,6 @@
 use rsmedia::{EncoderBuilder, HWDeviceConfig, PixelFormat, StreamWriterBuilder, Writer};
 use rsmedia::{colors, filter, frame::MediaFrame};
 
-use rsmpeg::avfilter::AVFilter;
-
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -24,18 +22,15 @@ fn main() -> anyhow::Result<()> {
         filter::video::hqdn3d(3.0, 2.0), // 视频降噪
     ];
 
-    // `drawtext` 需要 FFmpeg 编译时启用 libfreetype，并非所有构建都支持。
-    // 运行前检测，若不支持则跳过时间水印，保证示例在各种 FFmpeg 上可运行。
-    if AVFilter::get_by_name(c"drawtext").is_some() {
-        filters.push(
-            filter::video::DrawText::new("", 50, 50, 18, "white@0.5")
-                .time_text("%{localtime}") // 当前时间水印
-                .build(),
-        );
+    // `drawtext` 需要 FFmpeg 编译时启用 libfreetype，并非所有构建都支持：
+    // 不可用就跳过时间水印，保证示例在各种 FFmpeg 上都能跑。
+    let drawtext = filter::video::DrawText::new("", 50, 50, 18, "white@0.5")
+        .time_text("%{localtime}") // 当前时间水印
+        .build();
+    if filter::get_by_name(drawtext.name())?.is_some() {
+        filters.push(drawtext);
     } else {
-        eprintln!(
-            "WARN: drawtext filter unavailable (FFmpeg built without libfreetype), skipping watermark"
-        );
+        eprintln!("skip drawtext watermark: filter unavailable in this FFmpeg build");
     }
 
     let output_path = "/tmp/rainbow.mp4";
