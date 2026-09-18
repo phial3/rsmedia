@@ -63,7 +63,7 @@ ffi_enum!(
     /// [`EXPLODE`](Self::EXPLODE) 语义相反，FFmpeg 按位判断，同时置位时行为由
     /// FFmpeg 内部顺序决定，调用方不应同时给出。
     #[allow(non_camel_case_types)]
-    ErrRecognition, i32 {
+    ErrRecognition, u32 {
         /// 校验 CRC 之类的校验和（默认开启，`AV_EF_CRCCHECK`）。
         CRCCHECK => ffi::AV_EF_CRCCHECK;
         /// 把码流层（比特流语法）的异常当错误（`AV_EF_BITSTREAM`）。
@@ -343,8 +343,8 @@ impl DecoderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_err_recognition(mut self, err_recognition: impl Into<i32>) -> Self {
-        self.err_recognition = Some(err_recognition.into());
+    pub fn with_err_recognition(mut self, err_recognition: impl Into<u32>) -> Self {
+        self.err_recognition = Some(err_recognition.into() as i32);
         self
     }
 
@@ -879,7 +879,7 @@ impl Decoder {
     ///
     /// ```ignore
     /// loop {
-    ///     let (ts, frame) = decoder.decode::<u8>()?;
+    ///     let (ts, frame) = decoder.decode::<u8>().unwrap();
     ///     // Do something with frame...
     /// }
     /// ```
@@ -1210,7 +1210,7 @@ impl Decoder {
                         }
                         Ok(None)
                     }
-                }
+                };
             }
             Err(e) => return Err(e),
         };
