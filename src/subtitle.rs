@@ -81,13 +81,21 @@ pub fn copy_subtitle_stream<R: Reader, W: Writer>(
 ///   2. 写 header；
 ///   3. 逐段编码并把包 pts 从编码器 time_base 换算到输出流 time_base 后写盘；
 ///   4. flush 编码器（字幕路径为 no-op）+ 写 trailer。
+///
+/// # 前置条件
+///
+/// `writer` 必须是**处女态**（尚未添加过流、也未写过 header）：本函数自己负责
+/// 建流并写 header，对已经用过的 writer 再走一遍会让 `AVFormatContext` 的流
+/// 数组变动而 FFmpeg 内部仍持有旧指针（实测 SIGSEGV）。这一条件由 `mux` 模块的
+/// `ensure_writer_pristine` 强制校验，违规时返回 `invalid_config` 而不是崩溃。
 pub fn encode_subtitle_segments(
     writer: &mut impl Writer,
     encoder: &mut crate::encode::Encoder,
     segments: &[SubtitleSegment],
 ) -> Result<()> {
+    crate::mux::ensure_writer_pristine(writer)?;
     let enc_tb = encoder.time_base();
-    let index = writer.add_stream(encoder.codecpar(), enc_tb);
+    let index = writer.add_stream(encoder.codecpar(), enc_tb)?;
     writer.write_header()?;
     let out_tb = writer.stream_time_base(index)?;
 
@@ -348,6 +356,30 @@ mod tests {
         Ok(())
     }
 
+    /// 用过的 writer（已建流/已写 header）必须被拒绝，而不是再走一遍
+    /// `add_stream` + `write_header`（那会让 FFmpeg 持有的流数组指针失效 →
+    /// SIGSEGV）。
+    #[test]
+    fn test_encode_subtitle_segments_rejects_used_writer() -> Result<()> {
+        let path = test_support::test_output_path("subtitle", "rsmedia_used_writer.srt");
+        test_support::remove_test_output(&path);
+
+        let segments = sample_segments();
+        let mut encoder = EncoderBuilder::new_subtitle()
+            .with_subtitle_header(ASS_HEADER)
+            .build()?;
+        let mut writer = crate::io::StreamWriter::new(&path)?;
+        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
+
+        // 同一 writer 再次调用：必须在触碰到 writer 之前就报错
+        let err = encode_subtitle_segments(&mut writer, &mut encoder, &segments)
+            .expect_err("a non-fresh writer must be rejected");
+        assert!(err.is_invalid_config(), "{err}");
+
+        test_support::remove_test_output(&path);
+        Ok(())
+    }
+
     /// Encode subtitles as mov_text into an MP4 file via the generic Encoder,
     /// then read back and **strictly verify** via decode roundtrip:
     /// 1. subtitle stream exists with codec id `AV_CODEC_ID_MOV_TEXT`;
@@ -501,7 +533,7 @@ mod tests {
             let src_stream = reader.input().streams().get(src_index).unwrap();
             (src_stream.codecpar().clone(), src_stream.time_base)
         };
-        let out_index = out_writer.add_stream(codecpar, src_tb);
+        let out_index = out_writer.add_stream(codecpar, src_tb)?;
 
         // Write header, copy packets, write trailer
         out_writer.write_header()?;

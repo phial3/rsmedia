@@ -174,7 +174,7 @@ fn codec_id(encoder: &str) -> ffi::AVCodecID {
 /// the builder rejects the configuration. The rate prefers the one the matrix
 /// asks for and falls back to the codec's list (Opus is fixed at 48 kHz).
 fn negotiate_audio(codec: &str, preferred_rate: u32) -> Result<(SampleFormat, u32)> {
-    let Some(encoder) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec)) else {
+    let Some(encoder) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec)?) else {
         return Err(RsmediaError::codec_not_found(format!(
             "encoder {codec} not available in this FFmpeg build"
         )));

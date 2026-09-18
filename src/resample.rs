@@ -61,10 +61,17 @@ fn default_layout_for(layout: ffi::AVChannelLayout) -> Option<ffi::AVChannelLayo
         .then(|| AVChannelLayout::from_nb_channels(layout.nb_channels).into_inner())
 }
 
+/// 采样格式的可读名称；未收录的取值退化为原始整数（来自外部的值不 panic）。
+fn sample_fmt_name(sample_fmt: ffi::AVSampleFormat) -> String {
+    SampleFormat::from_ffi_checked(sample_fmt)
+        .map_or_else(|| sample_fmt.to_string(), |fmt| fmt.get_sample_fmt_name())
+}
+
 /// Runs `convert` with `frame`'s unspecified channel layout filled in.
 ///
-/// The clone only happens in that one case; a frame whose layout is specified is
-/// passed through untouched, samples and all.
+/// The clone only happens in that one case, and it is `av_frame_clone`: the buffers are
+/// **shared by reference count** (sample data is not copied), so the cost is a refcount
+/// bump. A frame whose layout is specified is passed through untouched.
 fn with_normalized_layout<R>(
     frame: &AVFrame,
     convert: impl FnOnce(&AVFrame) -> Result<R>,
@@ -116,15 +123,44 @@ pub fn convert_frame(
     // 未指定的 order 会触发 `AVERROR_OUTPUT_CHANGED`。
     let out_ch_layout = default_layout_for(out_ch_layout).unwrap_or(out_ch_layout);
 
-    let mut resampler = Resampler::new(
+    let mut resampler = build_resampler(src_frame, out_ch_layout, out_sample_fmt, out_sample_rate)?;
+    convert_with(
+        &mut resampler,
+        src_frame,
+        out_ch_layout,
+        out_sample_fmt,
+        out_sample_rate,
+    )
+}
+
+/// 按 `src_frame` 的**当前**规格与目标规格创建一个重采样上下文。
+///
+/// 单独抽出来是因为流式路径会在规格变化时按同样规则重建上下文
+/// （见 [`StreamingConverter::convert`]）。
+fn build_resampler(
+    src_frame: &AVFrame,
+    out_ch_layout: ffi::AVChannelLayout,
+    out_sample_fmt: ffi::AVSampleFormat,
+    out_sample_rate: i32,
+) -> Result<Resampler> {
+    Resampler::new(
         src_frame.ch_layout,
         src_frame.format,
         src_frame.sample_rate,
         out_ch_layout,
         out_sample_fmt,
         out_sample_rate,
-    )?;
+    )
+}
 
+/// 用给定的重采样上下文把一帧转成新分配的输出帧（不改动上下文，可跨帧复用）。
+fn convert_with(
+    resampler: &mut Resampler,
+    src_frame: &AVFrame,
+    out_ch_layout: ffi::AVChannelLayout,
+    out_sample_fmt: ffi::AVSampleFormat,
+    out_sample_rate: i32,
+) -> Result<AVFrame> {
     let mut dst_frame = AVFrame::new();
     // copy props
     imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
@@ -155,14 +191,103 @@ pub fn convert_frame(
     tracing::debug!(
         "Swr convert_frame from src:[{}, {:?}, {}] to dst:[{}, {:?}, {}]",
         src_frame.ch_layout.nb_channels,
-        SampleFormat::from(src_frame.format),
+        sample_fmt_name(src_frame.format),
         src_frame.sample_rate,
         out_ch_layout.nb_channels,
-        SampleFormat::from(out_sample_fmt),
+        sample_fmt_name(out_sample_fmt),
         out_sample_rate
     );
 
     Ok(dst_frame)
+}
+
+/// 错误是否表示「帧规格与重采样上下文不一致」——FFmpeg 要求此时重建上下文。
+///
+/// `swr_convert_frame` 用 `AVERROR_INPUT_CHANGED` / `AVERROR_OUTPUT_CHANGED` 报告
+/// 该情况，两者也可能按位或在一起，故用位测试而不是相等比较。`Context` 包装过的
+/// 错误要走到 [`RsmediaError::root`] 才能看到原始形态。
+fn is_spec_change_error(err: &RsmediaError) -> bool {
+    let changed = ffi::AVERROR_INPUT_CHANGED | ffi::AVERROR_OUTPUT_CHANGED;
+    matches!(
+        err.root(),
+        RsmediaError::FFmpeg(rsmpeg::error::RsmpegError::AVError(code)) if code & changed != 0
+    )
+}
+
+/// 连续帧复用的格式转换器：逐帧新建 `SwrContext` 的流式替代。
+///
+/// 与 [`convert_frame`] 的差别只有上下文生命周期，但这不是优化而是正确性：输入/
+/// 输出采样率不同时，重采样器会把尾部若干样本留在**内部延迟缓冲**里、由下一次转换
+/// 带出，逐帧新建上下文等于每帧丢掉这个尾巴（成百上千帧后是秒级的样本缺口）。
+/// 这里惰性创建上下文并跨帧复用。
+///
+/// 规格真的变化时（FFmpeg 以 `AVERROR_INPUT_CHANGED` / `AVERROR_OUTPUT_CHANGED`
+/// 报告，见 [`is_spec_change_error`]）按新规格重建上下文并重试一次：旧延迟缓冲随之
+/// 丢弃，但那些样本属于已经结束的旧规格，本就无从转换。
+///
+/// 最后一次转换后仍留在上下文里的尾部延迟不由 `Drop` 排空：它不足一帧，音频编码
+/// 的末帧填充会把它吸收；需要字节级精确时调用方应在最后一帧后自行排空。
+pub(crate) struct StreamingConverter {
+    /// `None` = 尚未遇到需要转换的帧（零开销，直到第一次转换才创建）。
+    resampler: Option<Resampler>,
+}
+
+impl StreamingConverter {
+    pub(crate) fn new() -> Self {
+        Self { resampler: None }
+    }
+
+    /// 转换一帧；参数与 [`convert_frame`] 同义，输出帧的分配规则也相同。
+    pub(crate) fn convert(
+        &mut self,
+        src_frame: &AVFrame,
+        out_ch_layout: ffi::AVChannelLayout,
+        out_sample_fmt: ffi::AVSampleFormat,
+        out_sample_rate: i32,
+    ) -> Result<AVFrame> {
+        check_resampler_input(src_frame)?;
+
+        // 与 `convert_frame` 完全相同的归一化：UNSPEC 布局按声道数取默认布局，
+        // 否则 `swr` 会以 `AVERROR_INPUT/OUTPUT_CHANGED` 拒绝每一帧。
+        let normalized = with_normalized_layout(src_frame, |frame| Ok(frame.clone()))?;
+        let src_frame = &normalized;
+        let out_ch_layout = default_layout_for(out_ch_layout).unwrap_or(out_ch_layout);
+
+        let resampler = match self.resampler.as_mut() {
+            Some(resampler) => resampler,
+            None => self.resampler.insert(build_resampler(
+                src_frame,
+                out_ch_layout,
+                out_sample_fmt,
+                out_sample_rate,
+            )?),
+        };
+
+        let converted = convert_with(
+            resampler,
+            src_frame,
+            out_ch_layout,
+            out_sample_fmt,
+            out_sample_rate,
+        );
+        match converted {
+            Err(err) if is_spec_change_error(&err) => {
+                tracing::debug!(
+                    "Resampler spec changed ({err}); rebuilding the context for the new frame"
+                );
+                *resampler =
+                    build_resampler(src_frame, out_ch_layout, out_sample_fmt, out_sample_rate)?;
+                convert_with(
+                    resampler,
+                    src_frame,
+                    out_ch_layout,
+                    out_sample_fmt,
+                    out_sample_rate,
+                )
+            }
+            result => result,
+        }
+    }
 }
 
 /// Persistent streaming resampler.
@@ -175,6 +300,11 @@ pub fn convert_frame(
 /// the last few milliseconds of samples will be lost.
 pub struct Resampler {
     swr: SwrContext,
+    /// 上下文构建时的输出声道数（`out_ch_layout` 归一化后的 `nb_channels`）。
+    /// [`Self::convert`] 按它分配输出缓冲，形参与之不一致时必须报错而不是越界写。
+    out_channels: i32,
+    /// 上下文构建时的输出采样格式，同样用于 [`Self::convert`] 的形参校验。
+    out_sample_fmt: ffi::AVSampleFormat,
 }
 
 impl Resampler {
@@ -186,6 +316,9 @@ impl Resampler {
         out_sample_fmt: ffi::AVSampleFormat,
         out_sample_rate: i32,
     ) -> Result<Self> {
+        // 与 `convert`/`convert_frame` 用同一套归一化，保证这里记录的输出声道数就是
+        // 上下文真正使用的声道数。
+        let out_ch_layout = default_layout_for(out_ch_layout).unwrap_or(out_ch_layout);
         Ok(Self {
             swr: setup_resampler(
                 in_ch_layout,
@@ -195,6 +328,8 @@ impl Resampler {
                 out_sample_fmt,
                 out_sample_rate,
             )?,
+            out_channels: out_ch_layout.nb_channels,
+            out_sample_fmt,
         })
     }
 
@@ -240,6 +375,20 @@ impl Resampler {
         out_sample_fmt: ffi::AVSampleFormat,
     ) -> Result<(AVSamples, i32)> {
         let out_ch_layout = default_layout_for(out_ch_layout).unwrap_or(out_ch_layout);
+
+        // 输出样本缓冲必须按**上下文**的输出声道数/采样格式分配：`swr_convert`
+        // 始终按上下文（而非这里的形参）写数据。形参只用于分配缓冲，一旦不一致
+        // 就会按错误的大小分配 —— 声道数偏差会让 swr 越界写堆。这里快速失败。
+        if out_ch_layout.nb_channels != self.out_channels || out_sample_fmt != self.out_sample_fmt {
+            return Err(RsmediaError::invalid_config(format!(
+                "streaming resampler was built for {} channel(s) and {}, but convert() was \
+                 called with {} channel(s) and {}: the output buffer must match the context",
+                self.out_channels,
+                sample_fmt_name(self.out_sample_fmt),
+                out_ch_layout.nb_channels,
+                sample_fmt_name(out_sample_fmt),
+            )));
+        }
 
         with_normalized_layout(src_frame, |src_frame| {
             // 容量按输出样本数的上界分配，避免上采样（in < out）时尾部样本被丢弃。
@@ -694,6 +843,81 @@ mod tests {
             (produced as f64 - expected).abs() <= 2.0,
             "expected ~{expected:.0} samples across {chunks} chunks + flush, got {produced}"
         );
+        Ok(())
+    }
+
+    /// [`StreamingConverter`]（解码/编码路径用的逐帧接口）跨帧复用同一个上下文：
+    /// 采样率换算的余数留在上下文里、由后续帧带出，因此总样本数逼近理论值（只差
+    /// 上下文内尚未排出的那一份延迟）；而逐帧 `convert_frame` 每次新建上下文，
+    /// **每帧**都丢掉这份延迟，缺口随帧数线性放大。
+    ///
+    /// 这正是流式路径必须复用上下文的原因，也是本测试要钉住的差别。
+    #[test]
+    fn test_streaming_converter_reuses_context_across_frames() -> Result<()> {
+        let (in_rate, out_rate) = (44_100, 48_000);
+        let (channels, nb_samples, frames) = (2, 1024, 50);
+        let layout = || AVChannelLayout::from_nb_channels(channels).into_inner();
+
+        let src = create_test_frame(&AUDIO_FORMATS[2], in_rate, channels, nb_samples)?;
+
+        let mut converter = StreamingConverter::new();
+        let mut streamed = 0i64;
+        for _ in 0..frames {
+            let out = converter.convert(&src, layout(), ffi::AV_SAMPLE_FMT_FLTP, out_rate)?;
+            streamed += i64::from(out.nb_samples);
+        }
+
+        let mut rebuilt_each_call = 0i64;
+        for _ in 0..frames {
+            let out = convert_frame(&src, layout(), ffi::AV_SAMPLE_FMT_FLTP, out_rate)?;
+            rebuilt_each_call += i64::from(out.nb_samples);
+        }
+
+        let expected =
+            frames as i64 * i64::from(nb_samples) * i64::from(out_rate) / i64::from(in_rate);
+        assert!(
+            expected - streamed < i64::from(nb_samples),
+            "reusing the context may only lose one flush-less delay (< 1 frame), \
+             expected ~{expected}, got {streamed}"
+        );
+        assert!(
+            rebuilt_each_call < streamed,
+            "a context per frame must lose the delay every time: \
+             per-call {rebuilt_each_call} vs streamed {streamed}"
+        );
+        Ok(())
+    }
+
+    /// 帧规格中途变化（采样率/格式换了）时，`swr` 以
+    /// `AVERROR_INPUT_CHANGED` 拒绝复用旧上下文；[`StreamingConverter`] 必须
+    /// 按新规格重建并完成这一帧，而不是把错误抛给调用方。
+    #[test]
+    fn test_streaming_converter_rebuilds_on_spec_change() -> Result<()> {
+        let channels = 2;
+        let nb_samples = 1024;
+        let layout = || AVChannelLayout::from_nb_channels(channels).into_inner();
+
+        let mut converter = StreamingConverter::new();
+        let first = create_test_frame(&AUDIO_FORMATS[2], 44_100, channels, nb_samples)?;
+        let first_out = converter.convert(&first, layout(), ffi::AV_SAMPLE_FMT_FLTP, 48_000)?;
+        // 首帧的输出样本数由采样率比决定（约 1024 * 48/44.1），并扣掉留在上下文里的
+        // 那一份延迟；这里只要它非空且规格正确即可，具体数值随 FFmpeg 版本浮动。
+        assert!(first_out.nb_samples > 0);
+
+        // 换成 32kHz 的帧：与上下文（44.1kHz）不符，须重建。
+        let second = create_test_frame(&AUDIO_FORMATS[2], 32_000, channels, nb_samples)?;
+        let out = converter.convert(&second, layout(), ffi::AV_SAMPLE_FMT_FLTP, 48_000)?;
+        // 重建后的首帧按 32kHz → 48kHz 等比输出约 1024 * 1.5 = 1536 个样本，但重采样
+        // 滤波器自身的启动延迟会扣掉几十个样本（它们留在新上下文里、由后续帧带出），
+        // 所以这里只校验量级，不钉死具体数值。
+        let expected = nb_samples as f64 * 48_000.0 / 32_000.0;
+        assert!(
+            (f64::from(out.nb_samples) - expected).abs() < 64.0,
+            "expected ~{expected:.0} samples after the rebuild, got {}",
+            out.nb_samples
+        );
+        assert_eq!(out.format, ffi::AV_SAMPLE_FMT_FLTP);
+        assert_eq!(out.sample_rate, 48_000);
         Ok(())
     }
 }

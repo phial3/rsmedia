@@ -16,7 +16,7 @@ use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// `AVERROR(EIO)`：FFmpeg 以负 errno 报错，即 `AVERROR(e) = -e`。
@@ -347,7 +347,14 @@ fn open_input_custom(
     interrupt: Option<&Interrupt>,
     dump_name: &std::ffi::CStr,
 ) -> Result<AVFormatContextInput> {
-    let fmt_opt = format.and_then(|name| AVInputFormat::find(&strutils::str_to_cstring(name)));
+    // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
+    let fmt_opt = match format {
+        Some(name) => {
+            let name_c = strutils::str_to_cstring(name)?;
+            AVInputFormat::find(&name_c)
+        }
+        None => None,
+    };
     let mut dict = options.and_then(|opts| opts.into_dict());
     let mut ctx = AVFormatContextInput::builder()
         .maybe_format(fmt_opt.as_deref())
@@ -372,7 +379,7 @@ fn build_output_custom(
     io_context: AVIOContextCustom,
     format: &str,
 ) -> Result<AVFormatContextOutput> {
-    let format_cstr = strutils::str_to_cstring(format);
+    let format_cstr = strutils::str_to_cstring(format)?;
     AVFormatContextOutput::builder()
         .format_name(&format_cstr)
         .io_context(AVIOContextContainer::Custom(io_context))
@@ -624,7 +631,7 @@ impl<'a> StreamReaderBuilder<'a> {
 
     /// Build [`StreamReader`].
     pub fn build(self) -> Result<StreamReader> {
-        let filename = strutils::path_to_cstring(&self.source.as_path());
+        let filename = strutils::path_to_cstring(&self.source.as_path())?;
         let protocol = unsafe { ffi::avio_find_protocol_name(filename.as_ptr()) };
         if protocol.is_null() {
             return Err(RsmediaError::msg(format!(
@@ -638,9 +645,14 @@ impl<'a> StreamReaderBuilder<'a> {
             self.source
         );
 
-        let fmt_opt = self
-            .format
-            .and_then(|str| AVInputFormat::find(&strutils::str_to_cstring(str)));
+        // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
+        let fmt_opt = match self.format {
+            Some(name) => {
+                let name_c = strutils::str_to_cstring(name)?;
+                AVInputFormat::find(&name_c)
+            }
+            None => None,
+        };
         let mut dict = self.options.and_then(|opts| opts.into_dict());
         let mut ctx_input = match &self.interrupt {
             // 带中断句柄时必须让回调先于 `avformat_open_input` 存在，见
@@ -1011,7 +1023,21 @@ pub trait Writer {
     type Accum: Default;
 
     /// Write the container header.
+    ///
+    /// 容器头**恰好写一次**：再次调用返回 [`RsmediaError::InvalidConfig`]
+    /// （FFmpeg 要求 header 先于所有包、且只写一次；二次写会把 muxer 的内部
+    /// 状态重置到"刚开始写"，与已落盘的字节、已注册的流冲突）。
     fn write_header(&mut self) -> Result<Self::Out>;
+
+    /// 容器头是否已成功写出过（[`write_header`](Self::write_header) 的调用结果）。
+    ///
+    /// 这是"输出上下文的流数组是否已固定"的权威判据：header 写出后，
+    /// `AVFormatContext` 的流数量由 muxer 接管，此时再
+    /// [`add_stream`](Self::add_stream) 会破坏 FFmpeg 内部持有的指针/索引
+    /// （实测 SIGSEGV）。库内路径（[`Muxer`](crate::mux::Muxer)、字幕写入）
+    /// 都以此为准，自定义实现必须如实记录、不要靠猜——默认的
+    /// [`add_stream`](Self::add_stream) 实现就靠它拦截误用。
+    fn is_header_written(&self) -> bool;
 
     /// Write a packet into the container.
     ///
@@ -1037,11 +1063,30 @@ pub trait Writer {
     fn output_mut(&mut self) -> &mut AVFormatContextOutput;
 
     /// new stream
-    fn add_stream(&mut self, codecpar: AVCodecParameters, timebase: ffi::AVRational) -> usize {
+    ///
+    /// 只能在 [`write_header`](Self::write_header) **之前**调用：header 写出后
+    /// 流数组已固定，再建流会破坏 muxer 内部持有的指针/索引（SIGSEGV），因此
+    /// 此时返回 [`RsmediaError::InvalidConfig`] 而不是继续执行。
+    ///
+    /// 返回新流的 index（写包时作为 stream index 使用）。自定义实现若覆盖本方法，
+    /// 必须用 [`is_header_written`](Self::is_header_written) 做同样的拦截——这是
+    /// 安全前提，不是风格问题。
+    fn add_stream(
+        &mut self,
+        codecpar: AVCodecParameters,
+        timebase: ffi::AVRational,
+    ) -> Result<usize> {
+        if self.is_header_written() {
+            return Err(RsmediaError::invalid_config(format!(
+                "Cannot add a stream after the container header has been written \
+                 ({} output stream(s) already registered); register all streams first",
+                self.output().nb_streams
+            )));
+        }
         let mut av_stream = self.output_mut().new_stream();
         av_stream.set_codecpar(codecpar);
         av_stream.set_time_base(timebase);
-        av_stream.index as usize
+        Ok(av_stream.index as usize)
     }
 
     /// 获取输出流当前的时间基。
@@ -1107,6 +1152,21 @@ fn flush_avio(output: &mut AVFormatContextOutput) {
     }
 }
 
+/// [`Writer::write_header`] 的前置检查：容器头只能写一次。
+///
+/// 四个内置实现都在写之前调用它，从而把"二次写 header"挡在 FFmpeg 之前；
+/// 检查通过后各实现自己把状态位置为 `true`（只在成功后置位，失败时仍是处女态，
+/// 允许修好参数重试）。
+fn ensure_header_not_written<W: Writer>(writer: &W) -> Result<()> {
+    if writer.is_header_written() {
+        return Err(RsmediaError::invalid_config(
+            "write_header() was already called on this writer: a container header is written \
+             exactly once, before any packet",
+        ));
+    }
+    Ok(())
+}
+
 ////////////////////////////////////////
 // StreamWriter（Location/URL 输出）
 ////////////////////////////////////////
@@ -1169,8 +1229,12 @@ impl<'a> StreamWriterBuilder<'a> {
 
     /// Build [`StreamWriter`].
     pub fn build(self) -> Result<StreamWriter> {
-        let filename = strutils::path_to_cstring(&self.destination.as_path());
-        let format = self.format.map(strutils::str_to_cstring);
+        let filename = strutils::path_to_cstring(&self.destination.as_path())?;
+        // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
+        let format = match self.format {
+            Some(name) => Some(strutils::str_to_cstring(name)?),
+            None => None,
+        };
         let mut dict = self.options.and_then(|opts| opts.into_dict());
         let output_ctx = AVFormatContextOutput::builder()
             .filename(&filename)
@@ -1185,6 +1249,7 @@ impl<'a> StreamWriterBuilder<'a> {
             destination: self.destination,
             output: output_ctx,
             options: dict,
+            header_written: false,
         })
     }
 }
@@ -1212,6 +1277,8 @@ pub struct StreamWriter {
     pub output: AVFormatContextOutput,
     /// 构建阶段未被 avio 层消费的 options，write_header 时传给 muxer。
     pub(crate) options: Option<AVDictionary>,
+    /// `write_header` 是否成功过（见 [`Writer::is_header_written`]）。
+    header_written: bool,
 }
 
 impl StreamWriter {
@@ -1234,8 +1301,15 @@ impl Writer for StreamWriter {
     fn merge_accum(_acc: &mut (), _other: ()) {}
 
     fn write_header(&mut self) -> Result<()> {
+        ensure_header_not_written(self)?;
         let mut dict = self.options.take();
-        write_header_with_options(&mut self.output, &mut dict)
+        write_header_with_options(&mut self.output, &mut dict)?;
+        self.header_written = true;
+        Ok(())
+    }
+
+    fn is_header_written(&self) -> bool {
+        self.header_written
     }
 
     fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
@@ -1376,6 +1450,7 @@ impl<'a> BufferWriterBuilder<'a> {
             output,
             state,
             options: self.options.and_then(|opts| opts.into_dict()),
+            header_written: false,
         })
     }
 }
@@ -1396,6 +1471,8 @@ pub struct BufferWriter {
     pub(crate) output: AVFormatContextOutput,
     state: Arc<Mutex<MemWriterState>>,
     options: Option<AVDictionary>,
+    /// `write_header` 是否成功过（见 [`Writer::is_header_written`]）。
+    header_written: bool,
 }
 
 impl BufferWriter {
@@ -1430,6 +1507,7 @@ impl BufferWriter {
             output,
             state,
             options: _,
+            header_written: _,
         } = self;
         // 先释放 format context（连带 IO 回调释放其持有的 state 引用）
         drop(output);
@@ -1457,10 +1535,16 @@ impl Writer for BufferWriter {
     }
 
     fn write_header(&mut self) -> Result<Bytes> {
+        ensure_header_not_written(self)?;
         let mut dict = self.options.take();
         write_header_with_options(&mut self.output, &mut dict)?;
+        self.header_written = true;
         flush_avio(&mut self.output);
         Ok(self.take_written())
+    }
+
+    fn is_header_written(&self) -> bool {
+        self.header_written
     }
 
     fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Bytes> {
@@ -1562,6 +1646,7 @@ impl<'a> PacketizedBufWriterBuilder<'a> {
             output,
             buffers,
             options: self.options.and_then(|opts| opts.into_dict()),
+            header_written: false,
         })
     }
 }
@@ -1579,6 +1664,8 @@ pub struct PacketizedBufWriter {
     pub(crate) output: AVFormatContextOutput,
     buffers: Arc<Mutex<Vec<Bytes>>>,
     options: Option<AVDictionary>,
+    /// `write_header` 是否成功过（见 [`Writer::is_header_written`]）。
+    header_written: bool,
 }
 
 impl PacketizedBufWriter {
@@ -1617,10 +1704,16 @@ impl Writer for PacketizedBufWriter {
     }
 
     fn write_header(&mut self) -> Result<Vec<Bytes>> {
+        ensure_header_not_written(self)?;
         let mut dict = self.options.take();
         write_header_with_options(&mut self.output, &mut dict)?;
+        self.header_written = true;
         flush_avio(&mut self.output);
         Ok(self.take_buffers())
+    }
+
+    fn is_header_written(&self) -> bool {
+        self.header_written
     }
 
     fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Vec<Bytes>> {
@@ -1722,6 +1815,7 @@ impl<'a, W: std::io::Write + Send + 'static> CustomIoWriterBuilder<'a, W> {
             output,
             inner,
             options: self.options.and_then(|opts| opts.into_dict()),
+            header_written: false,
         })
     }
 }
@@ -1733,6 +1827,8 @@ pub struct CustomIoWriter<W: std::io::Write + Send + 'static> {
     pub(crate) output: AVFormatContextOutput,
     inner: Arc<Mutex<W>>,
     options: Option<AVDictionary>,
+    /// `write_header` 是否成功过（见 [`Writer::is_header_written`]）。
+    header_written: bool,
 }
 
 impl<W: std::io::Write + Send + 'static> CustomIoWriter<W> {
@@ -1753,6 +1849,7 @@ impl<W: std::io::Write + Send + 'static> CustomIoWriter<W> {
             output,
             inner,
             options: _,
+            header_written: _,
         } = self;
         // 先释放 format context（连带 IO 回调释放其持有的 inner 引用）
         drop(output);
@@ -1777,10 +1874,16 @@ impl<W: std::io::Write + Send + 'static> Writer for CustomIoWriter<W> {
     fn merge_accum(_acc: &mut (), _other: ()) {}
 
     fn write_header(&mut self) -> Result<()> {
+        ensure_header_not_written(self)?;
         let mut dict = self.options.take();
         write_header_with_options(&mut self.output, &mut dict)?;
+        self.header_written = true;
         flush_avio(&mut self.output);
         Ok(())
+    }
+
+    fn is_header_written(&self) -> bool {
+        self.header_written
     }
 
     fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
@@ -1819,7 +1922,12 @@ unsafe impl<W: std::io::Write + Send + 'static> Send for CustomIoWriter<W> {}
 
 /// Initialize the logging handler. This will redirect all ffmpeg logging to the Rust `tracing`
 /// crate and any subscribers to it.
+///
+/// `level` 也被记下来供回调自行过滤：FFmpeg 的 `av_log_set_level` 只作用于它
+/// 自带的默认回调，安装自定义回调后**所有**级别的消息都会送进回调，因此
+/// [`AVLogLevel::QUIET`] 必须由回调自己实现（见私有 `log_callback`）。
 pub fn init_logging(level: AVLogLevel, flag: AVLogFlag) {
+    LOG_LEVEL.store(level as i32, Ordering::Relaxed);
     unsafe {
         ffi::av_log_set_callback(Some(log_callback));
         ffi::av_log_set_level(level as _);
@@ -1827,8 +1935,16 @@ pub fn init_logging(level: AVLogLevel, flag: AVLogFlag) {
     }
 }
 
+/// [`init_logging`] 配置的最大输出级别（FFmpeg 数值语义：越大越啰嗦）。
+///
+/// 默认 `INFO`，与 FFmpeg 自带默认回调的过滤器行为一致。
+static LOG_LEVEL: AtomicI32 = AtomicI32::new(AVLogLevel::INFO as i32);
+
 /// Internal function with C-style callback behavior that receives all log messages from ffmpeg and
 /// handles them with the `tracing` crate, the Rust way.
+///
+/// 这里是 `catch_unwind` 边界：`tracing` 的订阅者可能 panic，而 panic 逸出
+/// `extern "C"` 边界会 abort 整个进程；宁可丢一条日志，也不能拖垮宿主程序。
 ///
 /// # Arguments
 ///
@@ -1843,6 +1959,26 @@ unsafe extern "C" fn log_callback(
     #[cfg(all(target_arch = "x86_64", target_family = "unix"))] vl: *mut ffi::__va_list_tag,
     #[cfg(not(all(target_arch = "x86_64", target_family = "unix")))] vl: ffi::va_list,
 ) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: 参数由 FFmpeg 传入，在回调期间保持有效；实现只读取它们。
+        unsafe { log_callback_impl(avcl, level_no, fmt, vl) };
+    }));
+}
+
+/// [`log_callback`] 的实现体，运行在 `catch_unwind` 边界内。
+unsafe fn log_callback_impl(
+    avcl: *mut std::ffi::c_void,
+    level_no: std::ffi::c_int,
+    fmt: *const std::ffi::c_char,
+    #[cfg(all(target_arch = "x86_64", target_family = "unix"))] vl: *mut ffi::__va_list_tag,
+    #[cfg(not(all(target_arch = "x86_64", target_family = "unix")))] vl: ffi::va_list,
+) {
+    // 先按 `init_logging` 的级别过滤（FFmpeg 装了自定义回调后不再自己过滤，
+    // 这一步是 `AVLogLevel::QUIET` 能真正静音的唯一保证）。
+    if level_no > LOG_LEVEL.load(Ordering::Relaxed) {
+        return;
+    }
+
     // Check whether or not the message would be printed at all.
     let event_would_log = match level_no as u32 {
         // These are all error states.
@@ -1897,6 +2033,13 @@ unsafe extern "C" fn log_callback(
                     _ => {}
                 };
             }
+        } else if ret > 0 {
+            // 格式化成功但不是合法 UTF-8：`tracing` 的 message 只能是 UTF-8 字符串，
+            // 这行字节无法承载。取有损转换会掩盖"日志内容被改写"，因此丢弃并留痕。
+            tracing::debug!(
+                target: "rsmedia",
+                "discarded a non-UTF-8 FFmpeg log line (level {level_no}, {ret} bytes)"
+            );
         }
     }
 }
@@ -1933,7 +2076,8 @@ pub fn output_protocols() -> Vec<String> {
 
 /// 返回将处理该 URL 的协议名（如 `"file"`、`"http"`），无匹配协议时为 `None`。
 pub fn find_protocol_name(url: &str) -> Option<String> {
-    let url_c = strutils::str_to_cstring(url);
+    // URL 来自调用者：含 NUL 字节的 URL 不可能匹配任何协议，返回 None 不 panic。
+    let url_c = strutils::str_to_cstring(url).ok()?;
     rsmpeg::avformat::AVIOProtocol::find_protocol_name(&url_c)
         .map(|p| p.to_string_lossy().into_owned())
 }
@@ -2098,6 +2242,39 @@ mod tests {
         let (_, frame) = &decoded[0];
         assert!(frame.width > 0 && frame.height > 0);
 
+        Ok(())
+    }
+
+    /// header 写出后的状态守卫：二次 `write_header` 与 `add_stream` 都必须报
+    /// [`RsmediaError::InvalidConfig`]（header 后流数组已固定，再建流是 SIGSEGV 级
+    /// 的未定义行为），而不是继续执行。
+    #[test]
+    fn test_writer_rejects_header_and_add_stream_after_header_written() -> Result<()> {
+        let mut writer = BufferWriter::new("mp4")?;
+        assert!(!writer.is_header_written());
+
+        let encoder = EncoderBuilder::new_video(64, 48).build()?;
+        let index = writer.add_stream(encoder.codecpar(), encoder.time_base())?;
+        assert_eq!(index, 0, "first stream must get index 0");
+
+        writer.write_header()?;
+        assert!(writer.is_header_written(), "header state must be recorded");
+
+        let err = writer
+            .write_header()
+            .expect_err("second write_header must be rejected");
+        assert!(
+            matches!(err, RsmediaError::InvalidConfig(_)),
+            "expected InvalidConfig, got {err:?}"
+        );
+
+        let err = writer
+            .add_stream(encoder.codecpar(), encoder.time_base())
+            .expect_err("add_stream after header must be rejected");
+        assert!(
+            matches!(err, RsmediaError::InvalidConfig(_)),
+            "expected InvalidConfig, got {err:?}"
+        );
         Ok(())
     }
 

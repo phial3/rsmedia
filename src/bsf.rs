@@ -54,6 +54,9 @@ use std::ffi::CString;
 /// "send 后必须把 receive 抽干"的复用语义（见 [`Self::filter_packet`]）。
 pub struct Bsf {
     inner: AVBSFContext,
+    /// `true` once EOF has been sent ([`Self::flush_packets`] ran): a second
+    /// `send_packet(None)` would make FFmpeg return EINVAL.
+    flushed: bool,
 }
 
 impl std::fmt::Debug for Bsf {
@@ -92,7 +95,10 @@ impl Bsf {
         ctx.set_par_in(codecpar);
         ctx.set_time_base_in(time_base);
         let inner = ctx.init()?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            flushed: false,
+        })
     }
 
     /// 本 filter 的名字（如 `h264_mp4toannexb`）。
@@ -103,7 +109,17 @@ impl Bsf {
     /// 送入一个输入包。EOF 后（[`Self::flush_packets`] 之后）再送入会报错。
     ///
     /// 低层步骤：外部入口是 [`Self::filter_packet`]（送入并抽干，一次完成）。
+    ///
+    /// 注意：包所有权在 `send` 时转移给 filter（FFmpeg 内部会 unref 这个包），
+    /// 调用方传入的 `packet` 在调用后即失效。
     fn send_packet(&mut self, packet: &mut AVPacket) -> Result<()> {
+        // 已发过 EOF 的通路不能再收包：FFmpeg 此时返回 EINVAL，直接给出可读的
+        // 状态错误，而不是把陌生的 AVERROR 透传给调用方。
+        if self.flushed {
+            return Err(RsmediaError::msg(
+                "bitstream filter is already flushed: no more packets can be filtered",
+            ));
+        }
         match self.inner.send_packet(Some(packet)) {
             Ok(()) => Ok(()),
             Err(RsmpegError::BitstreamFullError) => Err(RsmediaError::msg(
@@ -114,9 +130,16 @@ impl Bsf {
     }
 
     /// 发送 EOF 并抽出所有剩余输出包（每个输入流的通路结束时调用一次）。
+    ///
+    /// 幂等：第二次调用不再向 FFmpeg 发送 EOF（`AVBSFContext` 会返回 EINVAL），
+    /// 而是直接返回空列表——剩余输出在第一次调用时已经抽干。
     pub fn flush_packets(&mut self) -> Result<Vec<AVPacket>> {
+        if self.flushed {
+            return Ok(Vec::new());
+        }
         match self.inner.send_packet(None) {
             Ok(()) => {
+                self.flushed = true;
                 let mut holder = AVPacket::new();
                 self.drain(&mut holder)
             }
@@ -128,6 +151,11 @@ impl Bsf {
     ///
     /// 一个输入包可能产出零或多个输出包；时间戳由 filter 保持不变。
     /// 通路结束时改用 [`Self::flush_packets`]。
+    ///
+    /// **输入包在调用后失效**：`send` 会把 `packet` 交给 filter，FFmpeg 随即
+    /// 复用/清空它作为 receive 的输出 holder（本 crate 靠 `av_packet_ref` 为每个
+    /// 输出另建引用，见私有 `drain`）。因此 `packet` 只能使用一次——重发或
+    /// 在调用后继续读用它都是未定义数据。
     pub fn filter_packet(&mut self, packet: &mut AVPacket) -> Result<Vec<AVPacket>> {
         self.send_packet(packet)?;
         self.drain(packet)
@@ -225,6 +253,11 @@ mod tests {
             filtered += 1;
             muxer.mux_packet(&mut out, v_idx)?;
         }
+        // flush 幂等：二次调用不再向 FFmpeg 发 EOF（会报 EINVAL），返回空列表
+        assert!(
+            bsf.flush_packets()?.is_empty(),
+            "flush_packets must be idempotent"
+        );
         muxer.finish()?;
         assert_eq!(video_packets, filtered, "annexb 转换应 1:1 产出包");
 

@@ -467,7 +467,7 @@ const COMMON_AUDIO_CONTAINERS: &[(&str, &str, i64)] = &[
 fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64) -> Result<()> {
     // 编码器是否存在取决于 FFmpeg 编译配置（如 libmp3lame、libopus），
     // 缺失时跳过该容器而不是失败：用类型化 CodecNotFound 标记，调用方按变体跳过
-    let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)) else {
+    let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?) else {
         return Err(RsmediaError::codec_not_found(codec_name).into());
     };
     let codec_config = CodecConfig::from_codec(codec);

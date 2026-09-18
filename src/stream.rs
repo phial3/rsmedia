@@ -433,7 +433,8 @@ impl StreamInfo {
             .and_then(|hw| hw_decoder_name(hw, codec_id))
             .filter(|name| {
                 let exists =
-                    AVCodec::find_decoder_by_name(&strutils::str_to_cstring(name)).is_some();
+                    AVCodec::find_decoder_by_name(&strutils::str_to_cstring(name).unwrap())
+                        .is_some();
                 if !exists {
                     tracing::debug!(
                         "HW decoder '{name}' not registered in this FFmpeg build, \
@@ -456,7 +457,8 @@ impl StreamInfo {
             .and_then(|hw| hw_encoder_name(hw, codec_id))
             .filter(|name| {
                 let exists =
-                    AVCodec::find_encoder_by_name(&strutils::str_to_cstring(name)).is_some();
+                    AVCodec::find_encoder_by_name(&strutils::str_to_cstring(name).unwrap())
+                        .is_some();
                 if !exists {
                     tracing::debug!(
                         "HW encoder '{name}' not registered in this FFmpeg build, \
@@ -672,9 +674,9 @@ mod tests {
                 .find_decoder_name(Some(hw))
                 .ok_or_else(|| RsmediaError::msg(format!("lookup for {hw:?} failed")))?;
             let registered = if let Some(codec) =
-                AVCodec::find_decoder_by_name(&strutils::str_to_cstring(&name))
+                AVCodec::find_decoder_by_name(&strutils::str_to_cstring(&name)?)
             {
-                strutils::cstr_to_string(codec.name()).unwrap() == name
+                strutils::cstr_to_string(codec.name())? == name
             } else {
                 false
             };

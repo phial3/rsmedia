@@ -1,34 +1,43 @@
+use crate::error::Result;
+
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 
 /// &Path -> &Cstr
 ///
-/// # Panics
+/// Use this for paths that come from the caller (file names, URLs, filter
+/// arguments): an interior NUL byte becomes [`RsmediaError::InvalidConfig`]
+/// instead of a panic.
 ///
-/// Panics if the path contains an interior NUL byte — `CString::new` rejects it,
-/// and there is no sensible C string for such a path.
-pub fn path_to_cstring<P: AsRef<Path> + ?Sized>(path: &P) -> CString {
+/// [`RsmediaError::InvalidConfig`]: crate::RsmediaError::InvalidConfig
+pub fn path_to_cstring<P: AsRef<Path> + ?Sized>(path: &P) -> Result<CString> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        CString::new(path.as_ref().as_os_str().as_bytes()).unwrap()
+        Ok(CString::new(path.as_ref().as_os_str().as_bytes())?)
     }
 
     #[cfg(not(unix))]
     {
-        // Windows 下 OsStr 内部为 WTF-8，to_string_lossy() 可直接得到 UTF-8 字节。
-        // 与 os_str_to_cstring 保持一致，避免 UTF-16 (from_utf16_lossy) 的有损往返。
-        CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes()).unwrap()
+        Ok(CString::new(
+            path.as_ref().as_os_str().to_string_lossy().as_bytes(),
+        )?)
     }
 }
 
 /// Option<&Path> -> `Option<CString>`
-pub fn path_to_cstring_opt<P: AsRef<Path> + ?Sized>(path: Option<&P>) -> Option<CString> {
-    path.map(path_to_cstring)
+/// 如果转换失败（内部包含\0），返回None
+pub fn path_to_cstring_opt<P: AsRef<Path> + ?Sized>(path: Option<&P>) -> Result<Option<CString>> {
+    // path.and_then(|p| path_to_cstring(p).ok())
+    match path {
+        Some(p) => path_to_cstring(p).map(Some),
+        None => Ok(None),
+    }
 }
 
-/// &Cstr -> 路径
+/// &Cstr -> PathBuf
+///
 /// - Unix: 使用原始字节直接构造路径（允许任意字节）
 /// - Windows: 输入视为 UTF-8 字节序列（与 [`path_to_cstring`]、[`os_str_to_cstring`] 的编码一致）
 ///
@@ -52,22 +61,29 @@ pub fn cstr_to_path<C: AsRef<CStr> + ?Sized>(cstr: &C) -> PathBuf {
 
 /// &str -> CString
 ///
-/// # Panics
+/// Use this for strings that come from the caller (codec names, options,
+/// filter arguments): an interior NUL byte becomes
+/// [`RsmediaError::InvalidConfig`] instead of a panic.
 ///
-/// Panics if the string contains an interior NUL byte. Callers that take the
-/// string from a user (see `Options`, which filters NULs out first) must handle
-/// that case themselves.
-pub fn str_to_cstring<S: AsRef<str> + ?Sized>(s: &S) -> CString {
-    CString::new(s.as_ref()).unwrap()
+/// [`RsmediaError::InvalidConfig`]: crate::RsmediaError::InvalidConfig
+pub fn str_to_cstring<S: AsRef<str> + ?Sized>(s: &S) -> Result<CString> {
+    Ok(CString::new(s.as_ref())?)
 }
 
 /// Option<&str> -> `Option<CString>`
-pub fn str_to_cstring_opt<S: AsRef<str> + ?Sized>(s: Option<&S>) -> Option<CString> {
-    s.map(str_to_cstring)
+/// 如果转换失败（内部包含\0），返回None
+pub fn str_to_cstring_opt<S: AsRef<str> + ?Sized>(str: Option<&S>) -> Result<Option<CString>> {
+    // s.and_then(|x| str_to_cstring(x).ok())
+    match str {
+        Some(x) => str_to_cstring(x).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// &Cstr -> String
-pub fn cstr_to_string<C: AsRef<CStr> + ?Sized>(cstr: &C) -> Result<String, std::str::Utf8Error> {
+pub fn cstr_to_string<C: AsRef<CStr> + ?Sized>(
+    cstr: &C,
+) -> std::result::Result<String, std::str::Utf8Error> {
     cstr.as_ref().to_str().map(String::from)
 }
 
@@ -103,18 +119,20 @@ pub fn str_to_os_string(s: impl AsRef<str>) -> OsString {
 
 /// OsStr -> CString
 ///
-/// # Panics
+/// Use this for OS strings that come from the caller (paths, device names,
+/// URLs): an interior NUL byte becomes [`RsmediaError::InvalidConfig`] instead
+/// of a panic.
 ///
-/// Panics if the value contains an interior NUL byte.
-pub fn os_str_to_cstring(path_or_url: impl AsRef<OsStr>) -> CString {
+/// [`RsmediaError::InvalidConfig`]: crate::RsmediaError::InvalidConfig
+pub fn os_str_to_cstring(os: impl AsRef<OsStr>) -> Result<CString> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        CString::new(path_or_url.as_ref().as_bytes()).unwrap()
+        Ok(CString::new(os.as_ref().as_bytes())?)
     }
     #[cfg(not(unix))]
     {
-        CString::new(path_or_url.as_ref().to_string_lossy().as_bytes()).unwrap()
+        Ok(CString::new(os.as_ref().to_string_lossy().as_bytes())?)
     }
 }
 
@@ -188,12 +206,12 @@ mod tests {
         };
 
         // 从 &str 路径
-        let cstring = path_to_cstring(Path::new(path_str));
+        let cstring = path_to_cstring(Path::new(path_str)).unwrap();
         assert_eq!(cstring.to_str().unwrap(), path_str);
 
         // 从 PathBuf
         let path_buf = PathBuf::from(path_str);
-        let cstring = path_to_cstring(&path_buf);
+        let cstring = path_to_cstring(&path_buf).unwrap();
         assert_eq!(cstring.to_str().unwrap(), path_str);
 
         // UTF-8 中文路径 (使用平台特定分隔符)
@@ -227,7 +245,7 @@ mod tests {
             let os_str = path.as_os_str();
             let wide_chars: Vec<u16> = os_str.encode_wide().collect();
             let os_string = OsString::from_wide(&wide_chars);
-            let cstring = path_to_cstring(&os_string);
+            let cstring = path_to_cstring(&os_string).unwrap();
             let result_path = cstr_to_path(&cstring);
             assert_eq!(result_path.to_str().unwrap(), test_str);
         }
@@ -237,17 +255,17 @@ mod tests {
     fn test_str_conversion() {
         // 从 &str
         let s = "hello world";
-        let cstring = str_to_cstring(s);
+        let cstring = str_to_cstring(s).unwrap();
         assert_eq!(cstring.to_str().unwrap(), s);
 
         // 从 String
         let string = String::from("hello world");
-        let cstring = str_to_cstring(&string);
+        let cstring = str_to_cstring(&string).unwrap();
         assert_eq!(cstring.to_str().unwrap(), string);
 
         // 从 &OsStr
         let os_str = "/usr/local/bin";
-        let cstring = os_str_to_cstring(os_str);
+        let cstring = os_str_to_cstring(os_str).unwrap();
         assert_eq!(cstring.to_str().unwrap(), os_str);
 
         // to OsString
@@ -292,22 +310,15 @@ mod tests {
 
         // Optional Path
         let path: Option<&Path> = Some(Path::new(test_path));
-        let cstring = path_to_cstring_opt(path);
+        let cstring = path_to_cstring_opt(path).unwrap();
         assert!(cstring.is_some());
         assert_eq!(cstring.unwrap().to_str().unwrap(), test_path);
 
         // Optional str
         let s: Option<&str> = Some("hello");
-        let cstring = str_to_cstring_opt(s);
+        let cstring = str_to_cstring_opt(s).unwrap();
         assert!(cstring.is_some());
         assert_eq!(cstring.unwrap().to_str().unwrap(), "hello");
-
-        // None cases
-        let none_path: Option<&Path> = None;
-        assert!(path_to_cstring_opt(none_path).is_none());
-
-        let none_str: Option<&str> = None;
-        assert!(str_to_cstring_opt(none_str).is_none());
     }
 
     #[test]

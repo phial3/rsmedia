@@ -7,13 +7,15 @@ use crate::MediaType;
 use crate::error::{Context, Result, RsmediaError};
 use crate::fmt::{FrameFormat, SampleFormat};
 use crate::pixel::PixelFormat;
+use crate::state::ProcessState;
 use crate::strutils;
 
 use rsmpeg::avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut};
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
 
-use std::ffi::CString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone)]
@@ -67,11 +69,164 @@ impl Filter {
     }
 }
 
+/// 滤镜图中的一个**节点**：一个 [`Filter`] 加上它在图里的接线。
+///
+/// [`Filter`] 只描述「滤镜是什么」，接线（这一路输入来自哪个上游、输出叫什么名字）
+/// 属于图的结构，放在这里。两者分开的好处是：单输入滤镜可以线性链式拼接（`Vec<Filter>`），
+/// 而多输入滤镜（`overlay` / `amix` / `hstack` / `vstack` / `concat`）只能作为节点
+/// 显式接线，**无法**被误塞进线性链——那正是过去 `filter::video::overlay()` 公开却
+/// 建不出图的根源。
+///
+/// 输出侧同理：单输出滤镜用 [`with_label`](Self::with_label)，多输出 pad 的滤镜
+/// （`split` / `asplit`，见 [`video::split`] / [`audio::asplit`]）用
+/// [`with_outputs`](Self::with_outputs) 逐个 pad 标名，每个名字各接一条下游链路
+/// ——这是图中唯一合法的 fan-out 方式（同一个标签被消费两次仍会被拒）。
+///
+/// ```
+/// use rsmedia::{filter, MediaType};
+///
+/// // 线性节点：不写接线，自动接在链尾
+/// let node = filter::FilterNode::new(filter::video::scale(1280, 720, None));
+///
+/// // 多输入节点：显式指定两路来源（图输入标签或前序节点的输出标签）
+/// let node = filter::FilterNode::new(filter::video::overlay("10", "10", None))
+///     .with_inputs(["base", "logo"])
+///     .with_label("composed");
+///
+/// // 多输出节点：一路输入复制成两路（fan-out 必须先 split，再分别接下游）
+/// let node = filter::FilterNode::new(filter::video::split(2))
+///     .with_inputs(["in0"])
+///     .with_outputs(["copy_a", "copy_b"]);
+/// # let _ = (node, MediaType::VIDEO);
+/// ```
+#[derive(Debug, Clone)]
+pub struct FilterNode {
+    filter: Filter,
+    /// 各路输入分别接到哪个上游标签，顺序即滤镜的输入 pad 顺序。
+    /// 空 = 自动接线（接在链尾；链首接图的首个输入）。
+    inputs: Vec<String>,
+    /// 各输出 pad 的标签，顺序即滤镜的输出 pad 顺序；空 = 由构建器自动分配
+    /// （仅对**恰好一个**输出 pad 的滤镜成立，多输出滤镜必须显式标注）。
+    outputs: Vec<String>,
+}
+
+impl FilterNode {
+    /// 用单个滤镜建一个节点（不写接线，自动接在链尾）。
+    pub fn new(filter: impl Into<Filter>) -> Self {
+        Self {
+            filter: filter.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+
+    /// 绑定本节点的输入到指定的上游标签，顺序即滤镜的输入 pad 顺序。
+    ///
+    /// 上游可以是图输入（[`FilterGraphBuilder::add_input_with`] 声明的标签）或前序
+    /// 节点的输出（[`FilterNode::with_label`]）。多输入滤镜必须逐个指全；只给部分
+    /// 标签会在建图时报 [`RsmediaError::InvalidConfig`]，不会静默接错。
+    pub fn with_inputs<I, S>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inputs = inputs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// 给本节点的输出打标签，供下游节点或图输出引用。
+    ///
+    /// 标签是滤镜图内的接线标识，只能包含 ASCII 字母、数字与下划线；不设置时由
+    /// 构建器自动分配（因此不写标签的节点无法被 [`FilterGraphBuilder::add_output`]
+    /// 直接引用）。
+    ///
+    /// 这是单输出滤镜的简写；多输出 pad 的滤镜（`split` / `asplit`）请改用
+    /// [`with_outputs`](Self::with_outputs) 逐个 pad 标注，否则未被标注的 pad
+    /// 会以「有 pad 没有下游」的协商错误暴露出来。
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.outputs = vec![label.into()];
+        self
+    }
+
+    /// 逐个输出 pad 绑定标签，顺序即滤镜的输出 pad 顺序。
+    ///
+    /// 用于多输出 pad 的滤镜（`split` / `asplit`）把一路输入复制成多路：每个标签
+    /// 各接一条下游链路或声明为一个图输出。标签个数必须与滤镜的输出 pad 数一致
+    /// （多输出滤镜的动态 pad 数由这里的标签个数决定），否则 [`FilterGraphBuilder::build`]
+    /// 报 [`RsmediaError::InvalidConfig`]。
+    ///
+    /// ```no_run
+    /// # use rsmedia::filter::{self, FilterGraphBuilder, FilterNode, VideoEndpoint};
+    /// # use rsmedia::ffmpeg::ffi::AVRational;
+    /// # use rsmedia::PixelFormat;
+    /// # fn main() -> rsmedia::Result<()> {
+    /// # let endpoint = VideoEndpoint::new(320, 240, PixelFormat::YUV420P,
+    /// #     AVRational { num: 1, den: 25 }, AVRational { num: 25, den: 1 });
+    /// let mut builder = FilterGraphBuilder::new();
+    /// builder.add_input_with("src", endpoint);
+    /// // 一路输入复制成两路：一路原样输出、一路水平翻转后输出。
+    /// builder.add_node(
+    ///     FilterNode::new(filter::video::split(2))
+    ///         .with_inputs(["src"])
+    ///         .with_outputs(["copy_a", "copy_b"]),
+    /// );
+    /// builder.add_node(
+    ///     FilterNode::new(filter::video::hflip())
+    ///         .with_inputs(["copy_b"])
+    ///         .with_label("mirrored"),
+    /// );
+    /// builder.add_output("copy_a", endpoint);
+    /// builder.add_output("mirrored", endpoint);
+    /// let graph = builder.build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_outputs<I, S>(mut self, outputs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.outputs = outputs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// 本节点承载的滤镜。
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+
+    /// 本节点绑定的输入标签（自动接线时为空切片）。
+    pub fn inputs(&self) -> &[String] {
+        &self.inputs
+    }
+
+    /// 本节点的**第一个**输出标签（未设置时为 `None`）。
+    ///
+    /// 多输出节点请用 [`outputs`](Self::outputs) 取全部标签。
+    pub fn label(&self) -> Option<&str> {
+        self.outputs.first().map(String::as_str)
+    }
+
+    /// 本节点各输出 pad 的标签（自动接线时为空切片）。
+    pub fn outputs(&self) -> &[String] {
+        &self.outputs
+    }
+}
+
+impl From<Filter> for FilterNode {
+    fn from(filter: Filter) -> Self {
+        Self::new(filter)
+    }
+}
+
 /// Whether the named FFmpeg filter exists in this build（如 `drawtext` 依赖
 /// libfreetype，许多发行版构建不含）。用于**前置**跳过不可用滤镜，避免依赖
 /// FFmpeg 运行时错误字符串来判断。
 pub fn is_available(name: &str) -> bool {
-    let name_c = strutils::str_to_cstring(name);
+    // 名字来自调用者，可能含 NUL 字节；转换失败即视为"不存在"
+    let Ok(name_c) = strutils::str_to_cstring(name) else {
+        return false;
+    };
     // SAFETY: `name_c` 是合法的 NUL 结尾 C 字符串；查询函数只读且线程安全。
     unsafe { !ffi::avfilter_get_by_name(name_c.as_ptr()).is_null() }
 }
@@ -147,6 +302,60 @@ fn escape_filter_str(input: &str) -> String {
     }
 }
 
+/// filtergraph 的「图级」转义：对**已经过** [`escape_filter_str`] 选项级转义的
+/// 字符串再转义一层。
+///
+/// FFmpeg 对滤镜描述做两级解析：先在整条描述上按 `,` `;` `[` `]` 拆分滤镜与
+/// 链路（图级），再在每个滤镜的参数串上按 `:` `=` 拆分选项（选项级）。所以一个
+/// 不带引号直接写进描述的值必须转义两层：只转一层时，值里的 `,` / `;` / `[]`
+/// 会被图级解析吃掉（如 `movie=/tmp/a,b.mp4` 会被拆成两个滤镜）。
+fn escape_filter_graph_str(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    // 与 `escape_filter_str` 同样的降级策略：av_escape 失败时剥离 NUL 原样放行。
+    let fallback = || input.replace('\0', "");
+
+    unsafe {
+        let c_input = match CString::new(input) {
+            Ok(s) => s,
+            Err(_) => return fallback(),
+        };
+
+        // 图级特殊字符：`\` `'` `[` `]` `,` `;`
+        let special_chars = CString::new("\\'[],;").unwrap();
+        let mut escaped_ptr = std::ptr::null_mut();
+
+        let result = ffi::av_escape(
+            &mut escaped_ptr,
+            c_input.as_ptr(),
+            special_chars.as_ptr(),
+            ffi::AV_ESCAPE_MODE_BACKSLASH,
+            // 不设 AV_ESCAPE_FLAG_WHITESPACE：空格已在选项级转义过，
+            // 再转一次会多出一层反斜杠（值会被解析成前导 `\`）。
+            0,
+        );
+
+        if result < 0 || escaped_ptr.is_null() {
+            tracing::warn!("av_escape failed while escaping filtergraph characters");
+            return fallback();
+        }
+
+        let escaped_string = std::ffi::CStr::from_ptr(escaped_ptr)
+            .to_string_lossy()
+            .into_owned();
+        ffi::av_free(escaped_ptr as *mut _);
+
+        escaped_string
+    }
+}
+
+/// 把调用者提供的值安全地写进滤镜描述（值外层不加引号时使用）：依次做
+/// **选项级**（[`escape_filter_str`]）与**图级**（[`escape_filter_graph_str`]）转义。
+fn escape_filter_option(input: &str) -> String {
+    escape_filter_graph_str(&escape_filter_str(input))
+}
+
 /// 转义文本，但保留 FFmpeg 的 `%{...}` 展开块（如 `%{localtime}`、`%{pts:hms}`）。
 ///
 /// 用于 `drawtext` 等需要显示动态时间/帧号的场景，避免 `{` `}` 被转义后无法展开。
@@ -202,7 +411,7 @@ pub mod video {
     pub fn scale(width: u32, height: u32, flags: Option<&str>) -> Filter {
         // 默认与 FFmpeg `scale` 滤镜一致，也与本 crate 的 `Scaler::default()`
         // 一致（BICUBIC）；早先这里是 `fast_bilinear`，与上方文档矛盾。
-        let flags_str = flags.unwrap_or("bicubic");
+        let flags_str = escape_filter_option(flags.unwrap_or("bicubic"));
 
         Filter::new(
             "scale",
@@ -235,8 +444,16 @@ pub mod video {
 
     /// 在视频上绘制文字的 Builder，对应 FFmpeg `drawtext` 滤镜。
     ///
-    /// `fontfile` 可选，缺省时使用项目内 `fonts/Arial.ttf`（避免依赖 system fontconfig，
-    /// 例如 Windows 等没有 fontconfig 配置的平台会崩溃）；也支持给文字加描边盒子（`boxed`）。
+    /// `fontfile` 可选；不指定时用**相对路径** `fonts/Arial.ttf`（避免依赖 system
+    /// fontconfig，例如 Windows 等没有 fontconfig 配置的平台会崩溃）。相对路径
+    /// 按**进程当前工作目录**解析：只有工作目录恰好在仓库根目录时才找得到，
+    /// 因此生产代码请总是用 [`DrawText::fontfile`] 传绝对路径（如用
+    /// `env!("CARGO_MANIFEST_DIR")` 拼出字体路径）。路径不存在时滤镜图初始化会失败
+    /// （`drawtext` 报找不到字体文件），不会 panic。
+    /// 也支持给文字加描边盒子（`boxed`）。
+    ///
+    /// Requires `drawtext`, i.e. an FFmpeg built with libfreetype; check with
+    /// [`crate::filter::is_available`] beforehand.
     ///
     /// # Examples
     ///
@@ -324,10 +541,15 @@ pub mod video {
             };
             let mut spec = format!(
                 "drawtext=text='{}':x={}:y={}:fontsize={}:fontcolor={}",
-                text_spec, self.x, self.y, self.fontsize, self.fontcolor
+                text_spec,
+                self.x,
+                self.y,
+                self.fontsize,
+                escape_filter_option(&self.fontcolor)
             );
             // 缺省使用项目自带字体，避免依赖 system fontconfig（Windows 等平台没有
             // fontconfig 配置会在查字体时崩溃）；用户显式指定字体时优先用用户的。
+            // 注意 `fonts/Arial.ttf` 是相对路径，按进程当前工作目录解析（见结构体文档）。
             let fontfile = self
                 .fontfile
                 .unwrap_or_else(|| "fonts/Arial.ttf".to_string());
@@ -335,7 +557,8 @@ pub mod video {
             if self.box_enabled {
                 spec.push_str(&format!(
                     ":box=1:boxcolor={}:boxborderw={}",
-                    self.box_color, self.box_border_w
+                    escape_filter_option(&self.box_color),
+                    self.box_border_w
                 ));
             }
             Filter::new("drawtext", MediaType::VIDEO, spec)
@@ -348,6 +571,7 @@ pub mod video {
             // FFmpeg 't=fill' is also possible
             tracing::warn!("Box thickness is negative ({thickness}), using absolute value.",);
         }
+        let color = escape_filter_option(color);
         Filter::new(
             "drawbox",
             MediaType::VIDEO,
@@ -451,7 +675,15 @@ pub mod video {
     }
 
     /// zoompan - 平移和缩放效果
+    ///
+    /// `zoom`/`x`/`y` 均为 FFmpeg 表达式（如 `"1.5"`、`"iw/2-(iw/zoom/2)"`），
+    /// 内部会做选项级 + 图级转义。
     pub fn zoompan(zoom: &str, x: &str, y: &str, duration: Option<i32>) -> Filter {
+        let (zoom, x, y) = (
+            escape_filter_option(zoom),
+            escape_filter_option(x),
+            escape_filter_option(y),
+        );
         let mut params = format!("zoompan=z={zoom}:x={x}:y={y}");
         if let Some(d) = duration {
             params.push_str(&format!(":d={d}"));
@@ -474,10 +706,14 @@ pub mod video {
         Filter::new("transpose", MediaType::VIDEO, format!("transpose={mode}"))
     }
 
-    /// rotate - 任意角度旋转滤镜（使用浮点弧度，支持动画）
-    /// 注意：性能较低，可能有插值模糊；用于精准旋转或动态旋转场景
+    /// rotate - 任意角度旋转滤镜（支持动画表达式）
+    ///
+    /// `angle` 为**角度**（度），内部转成 FFmpeg `rotate` 需要的弧度表达式
+    /// (`{angle}*PI/180`)；`rotate` 的选项本身是表达式，因此也可以直接
+    /// 用 `Filter::new("rotate", ...)` 写 `PI/4` 之类的弧度表达式。
+    /// 注意：性能较低，可能有插值模糊；用于精准旋转或动态旋转场景。
     pub fn rotate(angle: i32) -> Filter {
-        // Ffmpeg 中的角度使用弧度而非度数，因此需要转换
+        // FFmpeg 的 rotate 角度以弧度为单位，这里把调用者给的度数换算过去。
         Filter::new("rotate", MediaType::VIDEO, format!("rotate={angle}*PI/180"))
     }
 
@@ -548,6 +784,7 @@ pub mod video {
     /// 去交错（Deinterlace），将隔行扫描转为逐行扫描。
     /// `mode`: `send_frame`(默认), `send_field`, `send_frame_nospatial`, `send_field_nospatial`.
     pub fn yadif(mode: &str) -> Filter {
+        let mode = escape_filter_option(mode);
         Filter::new("yadif", MediaType::VIDEO, format!("yadif=mode={mode}"))
     }
 
@@ -557,6 +794,7 @@ pub mod video {
     /// * `x` / `y` - 原视频在输出画布上的偏移。
     /// * `color` - 填充颜色，如 `"black"`。
     pub fn pad(w: u32, h: u32, x: i32, y: i32, color: &str) -> Filter {
+        let color = escape_filter_option(color);
         Filter::new(
             "pad",
             MediaType::VIDEO,
@@ -565,9 +803,10 @@ pub mod video {
     }
 
     /// 烧录字幕（Subtitles）。
-    /// `path`: 字幕文件路径（`srt`/`ass` 等）。
+    /// `path`: 字幕文件路径（`srt`/`ass` 等）；路径中的转义字符（如 `,`/`;`/`[]`）
+    /// 会被自动转义，调用者传原始路径即可。
     pub fn subtitles(path: &str) -> Filter {
-        let escaped = escape_filter_str(path);
+        let escaped = escape_filter_option(path);
         Filter::new(
             "subtitles",
             MediaType::VIDEO,
@@ -659,12 +898,14 @@ pub mod video {
     }
 
     /// 平均值模糊（boxblur，参数化版本）。
-    /// * `luma_radius` - 亮度模糊半径（像素，可为 `"2"` 或 `"min(cw/2\,ch/2)"` 等表达式）。
+    /// * `luma_radius` - 亮度模糊半径（像素），可以是表达式，如 `"2"` 或
+    ///   `"min(cw/2,ch/2)"`（传**未转义**的表达式，内部会做两层转义）。
     /// * `luma_power` - 亮度模糊强度（1 表示完全平均，2 表示两遍）。
     ///
     /// 注意：`blur(radius)` 是 convenience 版，只设 `luma_radius`；
     /// 这里保留 boxblur 完整参数供精细控制。
     pub fn boxblur(luma_radius: &str, luma_power: u32) -> Filter {
+        let luma_radius = escape_filter_option(luma_radius);
         Filter::new(
             "boxblur",
             MediaType::VIDEO,
@@ -674,9 +915,10 @@ pub mod video {
 
     /// 叠加（overlay），将一个视频流（overlay）叠加到主视频流上。
     ///
-    /// 这是**多输入**滤镜，rsmedia 的编码侧滤镜图假定单一视频输入，
-    /// 因此这里以 `RGB` 构造一个可独立使用的 `overlay`，实际部署需要
-    /// 自定义多输入图时请直接用 `Filter::new("overlay", ...)` 组合多条链。
+    /// 这是**多输入**滤镜：用 [`FilterGraphBuilder::overlay`] 直接建整图，或
+    /// `FilterNode::new(filter::video::overlay(...)).with_inputs([底层, 叠加层])`
+    /// 接进自定义的多输入图——线性滤镜链（`DecoderBuilder::with_filters` 等）
+    /// 装不下它，会以「输入 pad 数不匹配」报错。
     /// * `x` / `y` - 叠加层在基底上的偏移（支持表达式，如 `"main_w-overlay_w-10"`）。
     /// * `opacity` - 叠加层不透明度（0~1）。
     pub fn overlay(x: &str, y: &str, opacity: Option<f32>) -> Filter {
@@ -691,11 +933,58 @@ pub mod video {
         )
     }
 
+    /// 横向并排（hstack）：把多路视频并成一行。
+    ///
+    /// 多输入滤镜，接线方式见 [`Self::overlay`]；要求各路**高度一致**，
+    /// 输出宽度为各路宽度之和（[`FilterGraphBuilder::hstack`] 会自动收口到声明的
+    /// 输出尺寸）。
+    pub fn hstack(inputs: u32) -> Filter {
+        Filter::new(
+            "hstack",
+            MediaType::VIDEO,
+            format!("hstack=inputs={inputs}"),
+        )
+    }
+
+    /// 纵向堆叠（vstack）：把多路视频叠成一列。
+    ///
+    /// 多输入滤镜，要求各路**宽度一致**，输出高度为各路高度之和。
+    pub fn vstack(inputs: u32) -> Filter {
+        Filter::new(
+            "vstack",
+            MediaType::VIDEO,
+            format!("vstack=inputs={inputs}"),
+        )
+    }
+
+    /// 首尾拼接（concat，仅视频段）：把多路视频按顺序接成一路。
+    ///
+    /// 多输入滤镜，要求各路尺寸、像素格式、时间基一致。
+    /// `segments`: 段数（对应 `concat=n=N:v=1:a=0`）。
+    pub fn concat(segments: u32) -> Filter {
+        Filter::new(
+            "concat",
+            MediaType::VIDEO,
+            format!("concat=n={segments}:v=1:a=0"),
+        )
+    }
+
+    /// 把一路视频复制成 `outputs` 路相同内容（`split`），是视频 fan-out 的显式手段。
+    ///
+    /// **多输出**滤镜：用 [`FilterNode::with_outputs`] 给每个输出 pad 标名，每个名字
+    /// 各接一条下游链路——同一个标签被两处消费会被建图期拒绝，正是提示在这里插一个
+    /// `split`。复制的是同一份像素（后续各链路互不影响）。
+    /// `outputs` 必须 ≥ 2（FFmpeg 的 `split` 族下限）。
+    pub fn split(outputs: u32) -> Filter {
+        Filter::new("split", MediaType::VIDEO, format!("split={outputs}"))
+    }
+
     /// 色度键抠像（chromakey），将指定颜色转为透明。
     /// * `color` - 要抠掉的颜色，如 `"green@0.5"`。
     /// * `similarity` - 颜色相似度阈值（0~0.01，越大越宽松）。
     /// * `blend` - 混合比例（0~1）。
     pub fn chromakey(color: &str, similarity: f32, blend: f32) -> Filter {
+        let color = escape_filter_option(color);
         Filter::new(
             "chromakey",
             MediaType::VIDEO,
@@ -706,6 +995,7 @@ pub mod video {
     /// RGB 色键（colorkey），将指定 RGB 颜色转为透明。
     /// `color` - 如 `"black"` 或 `"0x000000"`。
     pub fn colorkey(color: &str, similarity: f32, blend: f32) -> Filter {
+        let color = escape_filter_option(color);
         Filter::new(
             "colorkey",
             MediaType::VIDEO,
@@ -714,11 +1004,11 @@ pub mod video {
     }
 
     /// 曲线调节（curves），通过控制点微调 R/G/B 通道色调。
-    /// `preset`/`points` 二选一；`points` 形如 `"0/0 0.5/0.5 1/1"`。
+    /// `preset`/`points` 二选一；`points` 形如 `"0/0 0.5/0.5 1/1"`（无需自行转义）。
     pub fn curves(preset: Option<&str>, points: Option<&str>) -> Filter {
         let spec = match (preset, points) {
-            (Some(p), _) => format!("curves=preset={p}"),
-            (None, Some(pt)) => format!("curves=all={pt}"),
+            (Some(p), _) => format!("curves=preset={}", escape_filter_option(p)),
+            (None, Some(pt)) => format!("curves=all={}", escape_filter_option(pt)),
             _ => "curves".to_string(),
         };
         Filter::new("curves", MediaType::VIDEO, spec)
@@ -727,6 +1017,7 @@ pub mod video {
     /// 逐行/隔行转换（bwdif）去隔行，现代去隔行替代方案。
     /// `mode`: `send_frame`(默认) / `send_field` / `send_frame_nospatial`。
     pub fn bwdif(mode: &str) -> Filter {
+        let mode = escape_filter_option(mode);
         Filter::new("bwdif", MediaType::VIDEO, format!("bwdif=mode={mode}"))
     }
 
@@ -759,7 +1050,9 @@ pub mod video {
     ///     .unwrap();
     /// ```
     pub fn gif_palette(fps: f32, dither: Option<&str>) -> Filter {
-        let dither_part = dither.map(|d| format!(":dither={d}")).unwrap_or_default();
+        let dither_part = dither
+            .map(|d| format!(":dither={}", escape_filter_option(d)))
+            .unwrap_or_default();
         Filter::new(
             "paletteuse",
             MediaType::VIDEO,
@@ -775,7 +1068,7 @@ pub mod audio {
     /// 创建音频重采样过滤器
     pub fn resample(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
         // 统一走解析函数以便复用 channel_desc 处理，避免 describe().unwrap() panic
-        let channel_desc = audio_channel_desc(nb_channels);
+        let channel_desc = audio_channel_desc(nb_channels as i32);
 
         // async=1 可能更适合实时场景，避免缓冲问题。
         let spec_str = format!(
@@ -793,7 +1086,7 @@ pub mod audio {
     /// `format`: <https://ffmpeg.org/ffmpeg-filters.html#format>
     /// `aformat`: <https://ffmpeg.org/ffmpeg-filters.html#aformat-1>
     pub fn format(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
-        let channel_desc = audio_channel_desc(nb_channels);
+        let channel_desc = audio_channel_desc(nb_channels as i32);
 
         Filter::new(
             "aformat",
@@ -808,8 +1101,9 @@ pub mod audio {
     }
 
     /// 把通道数解析为 FFmpeg 通道布局描述；失败时回退到数字通道数，避免 panic。
-    fn audio_channel_desc(nb_channels: u32) -> String {
-        AVChannelLayout::from_nb_channels(nb_channels as i32)
+    /// 滤镜图源/汇（`FilterGraph::setup_audio_filters`）也复用同一逻辑。
+    pub(super) fn audio_channel_desc(nb_channels: i32) -> String {
+        AVChannelLayout::from_nb_channels(nb_channels)
             .describe()
             .map(|d| d.to_string_lossy().to_string())
             .unwrap_or_else(|_| format!("{nb_channels}"))
@@ -903,8 +1197,10 @@ pub mod audio {
 
     /// 延时（ms）
     ///
-    /// 注意：不能使用 `delays=100|100` 逐通道写法，因为 `|` 在滤镜图中是滤镜链
-    /// 分隔符，会导致图解析失败；统一用 `all=1` 应用到所有通道。
+    /// 这里固定用 `all=1` 把同一个延时应用到所有通道；逐通道写法
+    /// (`delays=100|100`) 必须按实际通道数逐个列出，通道数不匹配时会被
+    /// 静默忽略，因此不在此暴露。（滤镜链的分隔符是 `,`，`|` 只是部分滤镜
+    /// 选项值内部的分隔符。）
     pub fn adelay(delay_ms: i32) -> Filter {
         Filter::new(
             "adelay",
@@ -937,7 +1233,7 @@ pub mod audio {
         noise_type: Option<&str>,
         time_smoothing: Option<f32>,
     ) -> Filter {
-        let nt = noise_type.unwrap_or("w");
+        let nt = escape_filter_option(noise_type.unwrap_or("w"));
         let tr = time_smoothing.unwrap_or(0.0);
         Filter::new(
             "afftdn",
@@ -998,6 +1294,7 @@ pub mod audio {
     /// * `start` - 起点（秒）。
     /// * `duration` - 淡变时长（秒）。
     pub fn afade(fade_type: &str, start: f32, duration: f32) -> Filter {
+        let fade_type = escape_filter_option(fade_type);
         Filter::new(
             "afade",
             MediaType::AUDIO,
@@ -1010,6 +1307,7 @@ pub mod audio {
     /// * `delays` - 延迟序列（ms，如 `"60|30"`）。
     /// * `decays` - 衰减系数（如 `"0.4|0.3"`）。
     pub fn aecho(in_gain: f32, out_gain: f32, delays: &str, decays: &str) -> Filter {
+        let (delays, decays) = (escape_filter_option(delays), escape_filter_option(decays));
         Filter::new(
             "aecho",
             MediaType::AUDIO,
@@ -1019,16 +1317,27 @@ pub mod audio {
 
     /// 混音（amix），将多路输入混成一路。
     ///
-    /// 这是**多输入**滤镜，与 overlay 同理；rsmedia 编码侧滤镜图假定单一
-    /// 音频输入。这里提供单路退化的参数化形式，多路混音请用
-    /// `Filter::new("amix", MediaType::AUDIO, ...)` 自定义。
+    /// 这是**多输入**滤镜：用 [`FilterGraphBuilder::amix`] 直接建整图，或
+    /// `FilterNode::new(filter::audio::amix(n, "longest")).with_inputs([...])`
+    /// 接进自定义的多输入图。各路采样率 / 采样格式 / 通道布局不同时，FFmpeg 会在
+    /// 链路协商阶段自动插入 `aresample`。
     /// `inputs`: 输入路数；`duration`: `longest`/`shortest`/`first`。
     pub fn amix(inputs: u32, duration: &str) -> Filter {
+        let duration = escape_filter_option(duration);
         Filter::new(
             "amix",
             MediaType::AUDIO,
             format!("amix=inputs={inputs}:duration={duration}"),
         )
+    }
+
+    /// 把一路音频复制成 `outputs` 路相同内容（`asplit`），是音频 fan-out 的显式手段。
+    ///
+    /// **多输出**滤镜：用 [`FilterNode::with_outputs`] 给每个输出 pad 标名，每个名字
+    /// 各接一条下游链路（同一个标签接两处会被建图期拒绝）。
+    /// `outputs` 必须 ≥ 2（FFmpeg 的 `split` 族下限）。
+    pub fn asplit(outputs: u32) -> Filter {
+        Filter::new("asplit", MediaType::AUDIO, format!("asplit={outputs}"))
     }
 
     /// 反转音频（areverse）。
@@ -1088,7 +1397,7 @@ fn audio_or_video_filter_name(
 /// `expr`: FFmpeg expression (e.g., "0.5*PTS", "PTS-STARTPTS").
 pub fn setpts(media_type: MediaType, expr: &str) -> Filter {
     let name = audio_or_video_filter_name("asetpts", "setpts", media_type);
-    let escaped_expr = escape_filter_str(expr);
+    let escaped_expr = escape_filter_option(expr);
     Filter::new(name, media_type, format!("{name}={escaped_expr}"))
 }
 
@@ -1112,6 +1421,35 @@ impl FilterParams {
             FilterParams::Audio(_) => MediaType::AUDIO,
         }
     }
+
+    /// 这一路的**输入**端点：按帧实际推入时的格式（`src_format`）声明。
+    pub(crate) fn input_endpoint(&self) -> Endpoint {
+        match self {
+            FilterParams::Video(p) => Endpoint::Video(p.clone().into()),
+            FilterParams::Audio(p) => Endpoint::Audio(p.clone().into()),
+        }
+    }
+
+    /// 这一路的**输出**端点：sink 按协商格式（`format`）约束，`src_format` →
+    /// `format` 的转换由图内滤镜完成（如 GIF 调色板链 RGB24 → pal8）。
+    pub(crate) fn output_endpoint(&self) -> Endpoint {
+        match self {
+            FilterParams::Video(p) => {
+                let endpoint: VideoEndpoint = p.clone().into();
+                Endpoint::Video(VideoEndpoint {
+                    format: p.format,
+                    ..endpoint
+                })
+            }
+            FilterParams::Audio(p) => {
+                let endpoint: AudioEndpoint = p.clone().into();
+                Endpoint::Audio(AudioEndpoint {
+                    format: p.format,
+                    ..endpoint
+                })
+            }
+        }
+    }
 }
 
 /// 视频过滤器参数
@@ -1123,7 +1461,8 @@ pub struct VideoParams {
     pub format: PixelFormat,
     /// 滤镜图**输入**（buffer 源）像素格式：默认与 `format` 相同；当滤镜链
     /// 声明了不同的输入格式（如 GIF 调色板链要求 RGB 输入、输出 pal8）时，
-    /// 由编码器侧设置为声明的输入格式，src→sink 的格式转换由滤镜图内完成。
+    /// 编码/解码两条流水线都把它设为声明的格式，并在进图前把帧转成同一格式；
+    /// src→sink 的格式转换由滤镜图内完成。
     pub src_format: PixelFormat,
     pub time_base: ffi::AVRational,
     pub frame_rate: ffi::AVRational,
@@ -1144,29 +1483,293 @@ pub struct AudioParams {
     pub time_base: ffi::AVRational,
 }
 
-const DEFAULT_ORDERING: Ordering = Ordering::SeqCst;
-
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-enum FilterGraphState {
-    Normal,
-    Drained,
-    Flushed,
+/// 滤镜图端点（`buffer`/`abuffer` 源，或 `buffersink`/`abuffersink` 汇）的格式声明。
+///
+/// 端点描述「这一路帧进来（或出去）时是什么格式、什么时间基」，构建器据此建
+/// `buffer` 源与 `buffersink` 汇。**各路端点不必格式一致**：FFmpeg 在链路协商
+/// 阶段会自动插入 `scale` / `aresample` 完成像素格式、尺寸与采样格式的转换，
+/// 所以叠加一个不同尺寸的 logo 只需如实声明它的尺寸。
+#[derive(Debug, Clone, Copy)]
+pub enum Endpoint {
+    /// 视频端点。
+    Video(VideoEndpoint),
+    /// 音频端点。
+    Audio(AudioEndpoint),
 }
 
-/// 过滤器图表 - 包含所有过滤器配置
+impl Endpoint {
+    /// 端点的媒体类型。
+    pub fn media_type(&self) -> MediaType {
+        match self {
+            Endpoint::Video(_) => MediaType::VIDEO,
+            Endpoint::Audio(_) => MediaType::AUDIO,
+        }
+    }
+}
+
+impl From<VideoEndpoint> for Endpoint {
+    fn from(value: VideoEndpoint) -> Self {
+        Endpoint::Video(value)
+    }
+}
+
+impl From<AudioEndpoint> for Endpoint {
+    fn from(value: AudioEndpoint) -> Self {
+        Endpoint::Audio(value)
+    }
+}
+
+/// 视频端点的格式声明。
+#[derive(Debug, Clone, Copy)]
+pub struct VideoEndpoint {
+    /// 像素宽。
+    pub width: i32,
+    /// 像素高。
+    pub height: i32,
+    /// 像素格式。
+    pub format: PixelFormat,
+    /// 时间基。同一张图内各路输入应当一致，否则画面会错位。
+    pub time_base: ffi::AVRational,
+    /// 帧率。
+    pub frame_rate: ffi::AVRational,
+    /// 像素宽高比。
+    pub pixel_aspect: ffi::AVRational,
+}
+
+impl VideoEndpoint {
+    /// 用尺寸、像素格式、时间基与帧率建一个视频端点（像素宽高比取 1:1）。
+    pub fn new(
+        width: i32,
+        height: i32,
+        format: PixelFormat,
+        time_base: ffi::AVRational,
+        frame_rate: ffi::AVRational,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            format,
+            time_base,
+            frame_rate,
+            pixel_aspect: ffi::AVRational { num: 1, den: 1 },
+        }
+    }
+
+    /// 覆盖像素宽高比。
+    pub fn with_pixel_aspect(mut self, pixel_aspect: ffi::AVRational) -> Self {
+        self.pixel_aspect = pixel_aspect;
+        self
+    }
+}
+
+/// 音频端点的格式声明。
+#[derive(Debug, Clone, Copy)]
+pub struct AudioEndpoint {
+    /// 通道数。
+    pub nb_channels: i32,
+    /// 采样率。
+    pub sample_rate: i32,
+    /// 采样格式。
+    pub format: SampleFormat,
+    /// 时间基。
+    pub time_base: ffi::AVRational,
+}
+
+impl AudioEndpoint {
+    /// 用通道数、采样率、采样格式与时间基建一个音频端点。
+    pub fn new(
+        nb_channels: i32,
+        sample_rate: i32,
+        format: SampleFormat,
+        time_base: ffi::AVRational,
+    ) -> Self {
+        Self {
+            nb_channels,
+            sample_rate,
+            format,
+            time_base,
+        }
+    }
+}
+
+impl From<VideoParams> for VideoEndpoint {
+    /// `VideoParams.src_format` 是这一路帧推入滤镜图时的实际格式，故取它。
+    fn from(params: VideoParams) -> Self {
+        Self {
+            width: params.width,
+            height: params.height,
+            format: params.src_format,
+            time_base: params.time_base,
+            frame_rate: params.frame_rate,
+            pixel_aspect: params.pixel_aspect,
+        }
+    }
+}
+
+impl From<AudioParams> for AudioEndpoint {
+    fn from(params: AudioParams) -> Self {
+        Self {
+            nb_channels: params.nb_channels,
+            sample_rate: params.sample_rate,
+            format: params.src_format,
+            time_base: params.time_base,
+        }
+    }
+}
+
+impl From<VideoParams> for Endpoint {
+    fn from(params: VideoParams) -> Self {
+        Endpoint::Video(params.into())
+    }
+}
+
+impl From<AudioParams> for Endpoint {
+    fn from(params: AudioParams) -> Self {
+        Endpoint::Audio(params.into())
+    }
+}
+
+/// 标签是否可安全地写进滤镜图描述：非空，且只含 ASCII 字母、数字与下划线。
+fn is_valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// 标签非法时的统一错误（构建器在建图前报出）。
+fn invalid_label(label: &str) -> RsmediaError {
+    RsmediaError::invalid_config(format!(
+        "invalid filter graph label '{label}': a label must be non-empty and consist of ASCII \
+         letters, digits and underscores only"
+    ))
+}
+
+/// 滤镜实例的静态输入 pad 数，以及它是否允许比静态列表更多的输入
+/// （`AVFILTER_FLAG_DYNAMIC_INPUTS`）。
+///
+/// `hstack` / `vstack` / `concat` / `amix` 的实际路数由滤镜自己的 `inputs=` / `n=`
+/// 选项决定，`AVFilter.inputs` 只列出静态 pad，所以这两类必须分开处理：静态滤镜按
+/// pad 数精确校验接线，动态滤镜的 pad 由标签数量生成、交由 FFmpeg 在 `config`
+/// 阶段核对选项。
+fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
+    let name_c = strutils::str_to_cstring(name)?;
+    let filter =
+        AVFilter::get_by_name(&name_c).ok_or_else(|| RsmediaError::filter_not_found(name))?;
+    // SAFETY: `filter` 指向 FFmpeg 的静态滤镜定义，`avfilter_filter_pad_count` 只读
+    // 其中以 NULL 结尾的 pad 数组（`is_output = 0` 取输入侧）。
+    let pads = unsafe { ffi::avfilter_filter_pad_count(filter.as_ptr(), 0) } as usize;
+    Ok((
+        pads,
+        filter.flags & ffi::AVFILTER_FLAG_DYNAMIC_INPUTS as i32 != 0,
+    ))
+}
+
+/// 滤镜实例的静态输出 pad 数，以及它的输出 pad 是否可以在协商时由选项/标签改写
+/// （`AVFILTER_FLAG_DYNAMIC_OUTPUTS`）。
+///
+/// `split` / `asplit` 的 `AVFilter.outputs` 为空数组（pad 数由 `outputs=` 选项决定），
+/// 因此它们的实际输出路数只能相信调用者给出的标签个数，其余滤镜按静态 pad 数精确校验
+/// ——多标一个标签会生成 `filter[a][b]` 这种 pad 数对不上的描述，FFmpeg 只会给出一句
+/// 难懂的解析错误，所以在这里提前拒掉。
+fn filter_output_pads(name: &str) -> Result<(usize, bool)> {
+    let name_c = strutils::str_to_cstring(name)?;
+    let filter =
+        AVFilter::get_by_name(&name_c).ok_or_else(|| RsmediaError::filter_not_found(name))?;
+    // SAFETY: 同 `filter_input_pads`，`is_output = 1` 取输出侧。
+    let pads = unsafe { ffi::avfilter_filter_pad_count(filter.as_ptr(), 1) } as usize;
+    Ok((
+        pads,
+        filter.flags & ffi::AVFILTER_FLAG_DYNAMIC_OUTPUTS as i32 != 0,
+    ))
+}
+
+/// 单输入线性链的图输入 / 图输出标签。
+///
+/// 线性链的 spec 不带标签（由 FFmpeg 按 `,` 自动接线），而 FFmpeg 对不带标签的
+/// 开放端点约定用 `in` / `out` 命名（参见 `avfilter_graph_parse` 里 "first input
+/// can be omitted if it is [in]" 的处理），所以这两个名字既是逻辑标签、也是端点名。
+const SINGLE_INPUT_LABEL: &str = "in";
+/// 见 [`SINGLE_INPUT_LABEL`]。
+const SINGLE_OUTPUT_LABEL: &str = "out";
+
+/// 把若干 [`AVFilterInOut`] 手工串成链表，返回链表头（空则返回 `None`）。
+///
+/// rsmpeg 只提供单节点构造，而 `avfilter_graph_parse_ptr` 要的是链表，节点顺序
+/// 无关紧要（配对按名字，见 [`FilterGraph::setup_endpoints`]），名字才是关键。
+/// 链表所有权交给 FFmpeg（`parse_ptr` 成功时会释放整条链），因此除头节点外的节点
+/// 必须 `mem::forget`，否则 rsmpeg 的 `Drop` 会二次释放。
+fn chain_inouts(mut nodes: Vec<AVFilterInOut>) -> Option<AVFilterInOut> {
+    if nodes.is_empty() {
+        return None;
+    }
+    let ptrs: Vec<*mut ffi::AVFilterInOut> = nodes.iter_mut().map(|n| n.as_mut_ptr()).collect();
+    // SAFETY: 所有指针都来自 `nodes`，且在 `nodes` 被消费前一直有效；
+    // `next` 是 `AVFilterInOut` 的普通字段。
+    unsafe {
+        for window in ptrs.windows(2) {
+            (*window[0]).next = window[1];
+        }
+    }
+    let head = nodes.swap_remove(0);
+    for node in nodes {
+        std::mem::forget(node);
+    }
+    Some(head)
+}
+
+const DEFAULT_ORDERING: Ordering = Ordering::SeqCst;
+
+/// 过滤器图表 —— 支持 **n 路输入 / m 路输出**。
+///
+/// 单输入线性链（`DecoderBuilder::with_filters` / `EncoderBuilder::with_filters`）
+/// 与多输入合成图（[`FilterGraphBuilder`]）走同一套实现：前者就是「1 进 1 出」的
+/// 退化情形。下标 0 是**主输入 / 主输出**，[`Self::process_frame`]、
+/// [`Self::is_flushed`] 这些便捷方法都以它为准。
 pub struct FilterGraph {
     graph: AVFilterGraph,
-    state: FilterGraphState,
+    /// 每路输出的状态；下标 0 为主输出。
+    states: Vec<ProcessState>,
     initialized: AtomicBool,
+    /// 每路输入的 EOF 是否已推过（`av_buffersrc_add_frame(src, NULL)`）。EOF 只能
+    /// 推一次，重复推送会拿到 `AVERROR_EOF`，所以第二遍起直接返回 `Ok(())`。
+    eof_sent: Vec<bool>,
+    /// 图输入标签，下标是逻辑输入序号。
+    input_labels: Vec<String>,
+    /// 图输出标签，下标是逻辑输出序号。
+    output_labels: Vec<String>,
+    /// `buffer` / `abuffer` 源实例名，按逻辑输入序号排列。
+    ///
+    /// 实例名同时用作建图时交给 FFmpeg 的端点名，因此**必须**等于该路输入在 spec
+    /// 里的标签：`avfilter_graph_parse_ptr` 按名字把调用方给的开放端点与图里的开放
+    /// 端点配对，名字对不上就配不上（见 [`Self::setup_endpoints`]）。
+    src_names: Vec<CString>,
+    /// `buffersink` / `abuffersink` 汇实例名，按逻辑输出序号排列；命名规则同
+    /// [`Self::src_names`]（名字 = 该路输出在 spec 里的标签）。
+    sink_names: Vec<CString>,
 }
 
 impl FilterGraph {
     pub(crate) fn new() -> Self {
         Self {
             graph: AVFilterGraph::new(),
-            state: FilterGraphState::Normal,
+            states: Vec::new(),
             initialized: AtomicBool::new(false),
+            eof_sent: Vec::new(),
+            input_labels: Vec::new(),
+            output_labels: Vec::new(),
+            src_names: Vec::new(),
+            sink_names: Vec::new(),
         }
+    }
+
+    /// 第 `output` 路输出的推进阶段；下标越界（图尚未初始化）按 `Normal` 处理：
+    /// 未建图 = 还没推进过任何阶段，因此 `is_drained_at`/`is_flushed_at` 都为假。
+    fn state_at(&self, output: usize) -> ProcessState {
+        self.states
+            .get(output)
+            .copied()
+            .unwrap_or(ProcessState::Normal)
     }
 
     /// Rebuilds the graph from scratch, discarding everything the old one held.
@@ -1184,8 +1787,13 @@ impl FilterGraph {
     /// has to keep them for exactly this reason.
     pub(crate) fn rebuild(&mut self, params: &FilterParams, filters: &[Filter]) -> Result<()> {
         self.graph = AVFilterGraph::new();
-        self.state = FilterGraphState::Normal;
+        self.states.clear();
         self.initialized.store(false, DEFAULT_ORDERING);
+        self.eof_sent.clear();
+        self.input_labels.clear();
+        self.output_labels.clear();
+        self.src_names.clear();
+        self.sink_names.clear();
         self.init(params, filters)
     }
 
@@ -1193,43 +1801,74 @@ impl FilterGraph {
         self.initialized.load(DEFAULT_ORDERING)
     }
 
+    /// 建一张已初始化的滤镜图（`new` + [`init`](Self::init) 的合并入口）。
+    ///
+    /// 解码与编码两条流水线都用它建图，转义、媒体类型校验、滤镜可用性校验
+    /// （缺失滤镜 → [`FilterNotFound`](crate::RsmediaError::FilterNotFound)）
+    /// 因此只有 [`init`](Self::init) 一处实现——调用方不需要在门外再抄一遍这些
+    /// 检查，两份检查只会随 FFmpeg 版本漂移。
+    pub(crate) fn build(params: &FilterParams, filters: &[Filter]) -> Result<FilterGraph> {
+        let mut graph = Self::new();
+        graph
+            .init(params, filters)
+            .context("Failed to initialize filter graph")?;
+        Ok(graph)
+    }
+
+    /// 主输出（下标 0）是否已 drain（`av_buffersink_get_frame` 返回 `EAGAIN`）。
     pub fn is_drained(&self) -> bool {
-        self.state == FilterGraphState::Drained
+        self.is_drained_at(0)
     }
 
+    /// 第 `output` 路输出是否已 drain。
+    pub fn is_drained_at(&self, output: usize) -> bool {
+        self.state_at(output).is_drained()
+    }
+
+    /// 主输出（下标 0）是否已到流末尾（`av_buffersink_get_frame` 返回 `EOF`）。
     pub fn is_flushed(&self) -> bool {
-        self.state == FilterGraphState::Flushed
+        self.is_flushed_at(0)
     }
 
-    /// 初始化过滤器图表
+    /// 第 `output` 路输出是否已到流末尾。
+    pub fn is_flushed_at(&self, output: usize) -> bool {
+        self.state_at(output).is_flushed()
+    }
+
+    /// 初始化过滤器图表（单输入线性链：1 路进、1 路出）。
+    ///
+    /// 滤镜之间靠 `,` 顺序串联，由 FFmpeg 自动接线，因此这一路只接受单输入 /
+    /// 单输出滤镜；需要 `overlay` / `amix` 这类多输入滤镜时改用
+    /// [`FilterGraphBuilder`]。
     pub fn init(&mut self, params: &FilterParams, filters: &[Filter]) -> Result<()> {
         if self.is_initialized() {
             return Err(RsmediaError::msg("Filter graph already initialized"));
         }
-
-        // check
         for filter in filters {
-            if filter.media_type() != params.media_type() {
-                return Err(RsmediaError::msg(format!(
-                    "Filter media type mismatch: expected {:?}, got {:?}",
-                    params.media_type(),
-                    filter.media_type()
-                )));
-            }
+            Self::check_filter(filter, params.media_type())?;
         }
 
-        // build filters spec
+        // 线性链描述：没有标签，靠 `,` 顺序串联。
         let filter_spec = filters
             .iter()
             .map(|f| f.spec())
             .collect::<Vec<_>>()
             .join(",");
 
-        // Set up the filter graph based on the media type
-        match params {
-            FilterParams::Video(p) => self.setup_video_filters(p, filter_spec)?,
-            FilterParams::Audio(p) => self.setup_audio_filters(p, filter_spec)?,
-        }
+        let (input, output) = (params.input_endpoint(), params.output_endpoint());
+
+        // 线性链的 spec 不带标签，FFmpeg 把这种开放端点约定为 `in` / `out`
+        // （见 `SINGLE_INPUT_LABEL` 的说明），端点名与实例名都用这两个名字。
+        self.input_labels = vec![SINGLE_INPUT_LABEL.to_string()];
+        self.output_labels = vec![SINGLE_OUTPUT_LABEL.to_string()];
+        self.eof_sent = vec![false];
+        self.states = vec![ProcessState::Normal];
+
+        self.setup_endpoints(
+            &[(SINGLE_INPUT_LABEL.to_string(), input)],
+            &[(SINGLE_OUTPUT_LABEL.to_string(), output)],
+            &filter_spec,
+        )?;
 
         self.graph.config()?;
         self.initialized.store(true, DEFAULT_ORDERING);
@@ -1237,42 +1876,69 @@ impl FilterGraph {
         Ok(())
     }
 
-    /// Setup video filters
+    /// 校验单个滤镜：是否存在于本次构建、媒体类型是否与图一致。
+    fn check_filter(filter: &Filter, media_type: MediaType) -> Result<()> {
+        // 名字必须是本 FFmpeg 构建里真实存在的滤镜：`drawtext` 需要
+        // libfreetype、`subtitles` 需要 libass，缺失时在此前置报错，
+        // 而不是等到 parse 阶段返回一句难以定位的字符串错误。
+        if !is_available(filter.name()) {
+            return Err(RsmediaError::filter_not_found(filter.name()));
+        }
+        if filter.media_type() != media_type {
+            return Err(RsmediaError::msg(format!(
+                "Filter '{}' media type mismatch: expected {:?}, got {:?}",
+                filter.name(),
+                media_type,
+                filter.media_type()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 建一路视频输入端点（`buffer` 源），按端点声明的尺寸、像素格式、时间基与帧率配置。
+    ///
     /// `buffer`: <https://ffmpeg.org/ffmpeg-filters.html#buffer>
-    /// `buffersink`: <https://ffmpeg.org/ffmpeg-filters.html#buffersink>
-    fn setup_video_filters(&mut self, params: &VideoParams, spec: String) -> Result<()> {
-        let args = {
-            // buffer 源按"滤镜图输入格式"配置（默认=编码器格式）；sink 仍按
-            // 编码器协商格式约束。二者不同时（如 GIF 调色板链 RGB→pal8），
-            // 格式转换由图内的滤镜（paletteuse/format 等）完成。
-            let args = format!(
-                "width={}:height={}:pix_fmt={}:time_base={}/{}:frame_rate={}/{}:pixel_aspect={}/{}",
-                params.width,
-                params.height,
-                params.src_format.get_pix_fmt_name(),
-                params.time_base.num,
-                params.time_base.den,
-                params.frame_rate.num,
-                params.frame_rate.den,
-                params.pixel_aspect.num,
-                params.pixel_aspect.den,
-            );
-            CString::new(args)?
-        };
+    fn create_video_source(
+        &self,
+        name: &CStr,
+        endpoint: &VideoEndpoint,
+    ) -> Result<AVFilterContextMut<'_>> {
+        // buffer 源按"这一路实际推入的帧格式"配置；sink 仍按目标格式约束。二者
+        // 不同时（如 GIF 调色板链 RGB→pal8），格式转换由图内的滤镜完成。
+        let args = CString::new(format!(
+            "width={}:height={}:pix_fmt={}:time_base={}/{}:frame_rate={}/{}:pixel_aspect={}/{}",
+            endpoint.width,
+            endpoint.height,
+            endpoint.format.get_pix_fmt_name(),
+            endpoint.time_base.num,
+            endpoint.time_base.den,
+            endpoint.frame_rate.num,
+            endpoint.frame_rate.den,
+            endpoint.pixel_aspect.num,
+            endpoint.pixel_aspect.den,
+        ))?;
 
         let buffersrc =
             AVFilter::get_by_name(c"buffer").context("Failed to get video filter 'buffer'.")?;
+        self.graph
+            .create_filter_context(&buffersrc, name, Some(&args))
+            .context("Failed to create video buffer source")
+    }
+
+    /// 建一路视频输出端点（`buffersink` 汇），把图内输出约束到 `format`。
+    ///
+    /// `buffersink`: <https://ffmpeg.org/ffmpeg-filters.html#buffersink>
+    fn create_video_sink(
+        &self,
+        name: &CStr,
+        format: PixelFormat,
+    ) -> Result<AVFilterContextMut<'_>> {
         let buffersink = AVFilter::get_by_name(c"buffersink")
             .context("Failed to get video filter 'buffersink'.")?;
 
-        let mut src_ctx = self
-            .graph
-            .create_filter_context(&buffersrc, c"in", Some(&args))
-            .context("Failed to create video buffer source")?;
-
         let mut sink_ctx = self
             .graph
-            .alloc_filter_context(&buffersink, c"out")
+            .alloc_filter_context(&buffersink, name)
             .context("Failed to allocate video buffer sink")?;
 
         // 先分配再设置选项、最后初始化。FFmpeg 8 将 `pix_fmts`(binary) 废弃为数组选项
@@ -1282,63 +1948,63 @@ impl FilterGraph {
             .opt_set_array(
                 c"pixel_formats",
                 0,
-                Some(&[ffi::AVPixelFormat::from(params.format)]),
+                Some(&[ffi::AVPixelFormat::from(format)]),
                 ffi::AV_OPT_TYPE_PIXEL_FMT,
             )
             .context("Failed to set video sink filter context pixel format")?;
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         sink_ctx
-            .opt_set_bin(c"pix_fmts", &(ffi::AVPixelFormat::from(params.format)))
+            .opt_set_bin(c"pix_fmts", &(ffi::AVPixelFormat::from(format)))
             .context("Failed to set video sink filter context pixel format")?;
         sink_ctx
             .init_str(None)
             .context("Failed to init video buffer sink")?;
-
-        // Create endpoints
-        let outputs = AVFilterInOut::new(c"in", &mut src_ctx, 0);
-        let inputs = AVFilterInOut::new(c"out", &mut sink_ctx, 0);
-
-        let spec_cstr = CString::new(spec)?;
-
-        // Parse with endpoints
-        let (_in, _out) = self
-            .graph
-            .parse_ptr(&spec_cstr, Some(inputs), Some(outputs))?;
-
-        Ok(())
+        Ok(sink_ctx)
     }
 
-    /// Setup audio filters
+    /// 建一路音频输入端点（`abuffer` 源），按端点声明的采样格式、采样率与通道数配置。
+    ///
     /// `abuffer`: <https://ffmpeg.org/ffmpeg-filters.html#abuffer>
-    /// `abuffersink`: <https://ffmpeg.org/ffmpeg-filters.html#abuffersink>
-    fn setup_audio_filters(&mut self, params: &AudioParams, spec: String) -> Result<()> {
-        let channel_desc = AVChannelLayout::from_nb_channels(params.nb_channels).describe()?;
+    fn create_audio_source(
+        &self,
+        name: &CStr,
+        endpoint: &AudioEndpoint,
+    ) -> Result<AVFilterContextMut<'_>> {
+        // 与 `audio::audio_channel_desc` 共用同一套「通道数 → 布局描述」逻辑
+        // （失败时回退到数字通道数，不会 panic）。
+        let channel_desc = audio::audio_channel_desc(endpoint.nb_channels);
 
-        let args = {
-            let args = format!(
-                "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout={}",
-                params.time_base.num,
-                params.time_base.den,
-                params.sample_rate,
-                params.src_format.get_sample_fmt_name(),
-                channel_desc.to_string_lossy(),
-            );
-            CString::new(args)?
-        };
+        let args = CString::new(format!(
+            "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout={}",
+            endpoint.time_base.num,
+            endpoint.time_base.den,
+            endpoint.sample_rate,
+            endpoint.format.get_sample_fmt_name(),
+            channel_desc,
+        ))?;
 
         let buffersrc = AVFilter::get_by_name(c"abuffer")
             .context("Failed to get audio filter buffer 'abuffer'.")?;
+        self.graph
+            .create_filter_context(&buffersrc, name, Some(&args))
+            .context("Failed to create audio buffer source")
+    }
+
+    /// 建一路音频输出端点（`abuffersink` 汇），把图内输出约束到指定的采样格式 /
+    /// 采样率 / 通道布局。
+    ///
+    /// `abuffersink`: <https://ffmpeg.org/ffmpeg-filters.html#abuffersink>
+    fn create_audio_sink(
+        &self,
+        name: &CStr,
+        endpoint: &AudioEndpoint,
+    ) -> Result<AVFilterContextMut<'_>> {
         let buffersink = AVFilter::get_by_name(c"abuffersink")
             .context("Failed to get audio filter buffer 'abuffersink'.")?;
 
-        let mut src_ctx = self
-            .graph
-            .create_filter_context(&buffersrc, c"in", Some(&args))
-            .context("Failed to create audio buffer source")?;
-
         let mut sink_ctx = self
             .graph
-            .alloc_filter_context(&buffersink, c"out")
+            .alloc_filter_context(&buffersink, name)
             .context("Failed to allocate audio buffer sink")?;
 
         // 先分配再设置选项、最后初始化，兼容 FFmpeg 8 中 sink 选项为非运行时选项的限制。
@@ -1346,26 +2012,30 @@ impl FilterGraph {
         // - buffersink ：新数组选项 pixel_formats （旧 pix_fmts 已废弃）
         // - abuffersink ：新数组选项 `sample_formats`/`samplerates`/`channel_layouts` （旧 `sample_fmts`/`sample_rates`/`ch_layouts`(binary/string) 已废弃）
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-        sink_ctx.opt_set_array(
-            c"sample_formats",
-            0,
-            Some(&[params.format as i32]),
-            ffi::AV_OPT_TYPE_SAMPLE_FMT,
-        )?;
+        sink_ctx
+            .opt_set_array(
+                c"sample_formats",
+                0,
+                Some(&[endpoint.format as i32]),
+                ffi::AV_OPT_TYPE_SAMPLE_FMT,
+            )
+            .context("Failed to set audio sink sample format")?;
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-        sink_ctx.opt_set_bin(c"sample_fmts", &(params.format as i32))?;
+        sink_ctx.opt_set_bin(c"sample_fmts", &(endpoint.format as i32))?;
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-        sink_ctx.opt_set_array(
-            c"samplerates",
-            0,
-            Some(&[params.sample_rate]),
-            ffi::AV_OPT_TYPE_INT,
-        )?;
+        sink_ctx
+            .opt_set_array(
+                c"samplerates",
+                0,
+                Some(&[endpoint.sample_rate]),
+                ffi::AV_OPT_TYPE_INT,
+            )
+            .context("Failed to set audio sink sample rate")?;
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-        sink_ctx.opt_set_bin(c"sample_rates", &params.sample_rate)?;
+        sink_ctx.opt_set_bin(c"sample_rates", &endpoint.sample_rate)?;
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         {
-            let layout = AVChannelLayout::from_nb_channels(params.nb_channels).into_inner();
+            let layout = AVChannelLayout::from_nb_channels(endpoint.nb_channels).into_inner();
             sink_ctx
                 .opt_set_array(
                     c"channel_layouts",
@@ -1376,94 +2046,212 @@ impl FilterGraph {
                 .context("Failed to set audio sink channel layout")?;
         }
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-        sink_ctx.opt_set(c"ch_layouts", &channel_desc)?;
+        sink_ctx.opt_set(
+            c"ch_layouts",
+            &AVChannelLayout::from_nb_channels(endpoint.nb_channels).describe()?,
+        )?;
         sink_ctx
             .init_str(None)
             .context("Failed to init audio buffer sink")?;
+        Ok(sink_ctx)
+    }
 
-        // Create endpoints
-        let outputs = AVFilterInOut::new(c"in", &mut src_ctx, 0);
-        let inputs = AVFilterInOut::new(c"out", &mut sink_ctx, 0);
+    /// 建图的开放端点：为每一路输入建 `buffer`/`abuffer` 源、为每一路输出建
+    /// `buffersink`/`abuffersink` 汇，再交给 `avfilter_graph_parse_ptr` 与 spec 的
+    /// 开放端点配对。
+    ///
+    /// `inputs` / `outputs` 是 `(端点名, 端点声明)`：**端点名必须等于该端点在 spec
+    /// 里的标签**（不带标签的线性链用 `in` / `out`，见 [`SINGLE_INPUT_LABEL`]）——
+    /// `avfilter_graph_parse_ptr` 是按名字把调用方给的开放端点与图里的开放端点配对的
+    /// （实测：名字对不上时不会报错，端点会静默地不接线，直到 `config()` 才以
+    /// "pad not connected" 失败）。顺序无关紧要，名字同时用作滤镜实例名，方便
+    /// `get_filter` 查找与错误定位。
+    fn setup_endpoints(
+        &mut self,
+        inputs: &[(String, Endpoint)],
+        outputs: &[(String, Endpoint)],
+        spec: &str,
+    ) -> Result<()> {
+        let mut src_names = Vec::with_capacity(inputs.len());
+        let mut sink_names = Vec::with_capacity(outputs.len());
+        let mut src_list = Vec::with_capacity(inputs.len());
+        let mut sink_list = Vec::with_capacity(outputs.len());
+
+        for (name, endpoint) in inputs {
+            let name = strutils::str_to_cstring(name)?;
+            let mut ctx = match endpoint {
+                Endpoint::Video(v) => self.create_video_source(&name, v)?,
+                Endpoint::Audio(a) => self.create_audio_source(&name, a)?,
+            };
+            src_list.push(AVFilterInOut::new(&name, &mut ctx, 0));
+            src_names.push(name);
+        }
+
+        for (name, endpoint) in outputs {
+            let name = strutils::str_to_cstring(name)?;
+            let mut ctx = match endpoint {
+                Endpoint::Video(v) => self.create_video_sink(&name, v.format)?,
+                Endpoint::Audio(a) => self.create_audio_sink(&name, a)?,
+            };
+            sink_list.push(AVFilterInOut::new(&name, &mut ctx, 0));
+            sink_names.push(name);
+        }
 
         let spec_cstr = CString::new(spec)?;
 
-        // Parse with endpoints
-        let (_in, _out) = self
+        // FFmpeg 的参数命名与直觉相反：`inputs` 参数收的是**图的输出端**（汇的链表），
+        // `outputs` 参数收的是**图的输入端**（源的链表）。
+        let (rest_inputs, rest_outputs) = self
             .graph
-            .parse_ptr(&spec_cstr, Some(inputs), Some(outputs))?;
+            .parse_ptr(&spec_cstr, chain_inouts(sink_list), chain_inouts(src_list))
+            .with_context(|| {
+                format!(
+                    "Failed to parse filter graph: {}",
+                    spec_cstr.to_string_lossy()
+                )
+            })?;
 
+        // 返回值实测是入参指针的原样回显（成功路径上 FFmpeg 既不改写、也不接管所有权，
+        // 节点仍归调用方），因此这里原样释放我们自己的链表即可——`parse_ptr` 已对入参
+        // `into_raw()`，释放由这对返回值唯一完成，不会重复释放。
+        //
+        // 注意：**不要**用这个返回值判断"有没有多余的开放端点"，它恒为传入值；
+        // 端点数量不匹配会由 FFmpeg 自身在 `config()` 时报错（pad 未连接）。
+        drop(rest_inputs);
+        drop(rest_outputs);
+
+        self.src_names = src_names;
+        self.sink_names = sink_names;
         Ok(())
     }
 
-    /// 处理单帧
+    /// 处理主输入（下标 0）的单帧：推入一帧（`Some`）或 EOF（`None`），再取一帧。
+    ///
+    /// 单输入线性链的便捷入口；多输入图请用 [`Self::push_frame_to`] /
+    /// [`Self::receive_frame_from`] 指明是哪一路。
     pub fn process_frame(&mut self, frame: Option<AVFrame>) -> Result<Option<AVFrame>> {
+        self.push_frame_to(0, frame)?;
+        self.receive_frame_from(0)
+    }
+
+    /// 把一帧（`Some`）或 EOF（`None`）推入第 `input` 路输入。
+    ///
+    /// EOF 只会推一次：重复 `av_buffersrc_add_frame(src, NULL)` 会返回
+    /// `AVERROR_EOF`，所以第二次起直接返回 `Ok(())`。
+    pub fn push_frame_to(&mut self, input: usize, frame: Option<AVFrame>) -> Result<()> {
         if !self.is_initialized() {
             return Err(RsmediaError::msg("Filter graph not initialized"));
         }
+        if input >= self.eof_sent.len() {
+            return Err(RsmediaError::invalid_config(format!(
+                "input index {input} out of range: graph has {} inputs",
+                self.eof_sent.len()
+            )));
+        }
+        if frame.is_none() {
+            if self.eof_sent[input] {
+                return Ok(());
+            }
+            self.eof_sent[input] = true;
+        }
 
-        {
-            // Get source context and send the frame
-            let mut src_ctx = self.get_src_context()?;
-            src_ctx
-                .buffersrc_add_frame(frame, None)
-                .context("Error submitting the frame to the filter graph.")?;
-        } // src_ctx is dropped here, releasing the mutable borrow
+        // src_ctx 在本块结束时释放借用
+        let mut src_ctx = self.get_src_context(input)?;
+        src_ctx
+            .buffersrc_add_frame(frame, None)
+            .context("Error submitting the frame to the filter graph.")
+    }
+
+    /// 从第 `output` 路输出取一帧：`Ok(Some)` 是产出帧，`Ok(None)` 表示暂时无帧
+    /// （图被 drain，该路状态置为 `Drained`）或已到流末尾（状态置为 `Flushed`）。
+    pub fn receive_frame_from(&mut self, output: usize) -> Result<Option<AVFrame>> {
+        if output >= self.states.len() {
+            return Err(RsmediaError::invalid_config(format!(
+                "output index {output} out of range: graph has {} outputs",
+                self.states.len()
+            )));
+        }
 
         let filter_result = {
-            // safely get a new mutable borrow for sink_ctx
-            let mut sink_ctx = self.get_sink_context()?;
+            // 借用在块结束时释放，避免与后面的状态更新冲突
+            let mut sink_ctx = self.get_sink_context(output)?;
             sink_ctx.buffersink_get_frame(None)
-        }; // sink_ctx is dropped here, releasing the mutable borrow
+        };
 
         // 获取处理后的帧
         match filter_result {
             Ok(frame) => Ok(Some(frame)),
             Err(rsmpeg::error::RsmpegError::BufferSinkDrainError) => {
                 tracing::debug!("filter graph: buffer sink drain error");
-                self.state = FilterGraphState::Drained;
+                self.states[output] = ProcessState::Drained;
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::BufferSinkEofError) => {
                 tracing::debug!("filter graph: buffer sink eof error");
-                self.state = FilterGraphState::Flushed;
+                self.states[output] = ProcessState::Flushed;
                 Ok(None)
             }
             Err(e) => Err(RsmediaError::FFmpeg(e)),
         }
     }
 
-    /// 刷新过滤器链
+    /// 刷新过滤器链：给**所有**输入推一次 EOF，再把主输出（下标 0）缓存的帧全部取出。
+    ///
+    /// 多输出图请对每一路调用 [`Self::drain_output`]——本方法只收主输出，其余输出上
+    /// 的帧仍留在图里，不会被丢弃。
     pub fn flush(&mut self) -> Result<Vec<AVFrame>> {
+        self.drain_output(0)
+    }
+
+    /// 给所有输入推 EOF，然后把第 `output` 路输出里缓存的帧全部取出。
+    pub fn drain_output(&mut self, output: usize) -> Result<Vec<AVFrame>> {
         if !self.is_initialized() {
             return Err(RsmediaError::msg("Filter graph not initialized"));
         }
-        if self.is_flushed() {
+        if output >= self.states.len() {
+            return Err(RsmediaError::invalid_config(format!(
+                "output index {output} out of range: graph has {} outputs",
+                self.states.len()
+            )));
+        }
+        if self.state_at(output).is_flushed() {
             tracing::debug!("Filter graph already flushed.");
             return Ok(Vec::new());
+        }
+
+        // 只有推过 EOF，图才会吐出缓冲帧（每一路都推，否则多输入图仍会等数据）。
+        for input in 0..self.eof_sent.len() {
+            self.push_frame_to(input, None)?;
         }
 
         let mut frames = Vec::new();
         let mut drained_iterations = 0usize;
 
         loop {
-            match self.process_frame(None) {
+            match self.receive_frame_from(output) {
                 Ok(Some(frame)) => {
                     drained_iterations = 0;
                     frames.push(frame);
                 }
                 Ok(None) => {
-                    if self.is_flushed() {
+                    if self.state_at(output).is_flushed() {
                         break;
                     }
                     // EAGAIN：图里仍有缓冲帧要出，继续拉取；但个别滤镜可能一直回
                     // EAGAIN 而不进入 Flushed，故设上限收尾（与解码/编码排空一致）。
+                    // 触顶时不能静默返回半截结果：残留帧会被丢掉，必须让调用者知道。
                     if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
                         tracing::error!(
                             "Filter graph keeps returning EAGAIN while flushing; \
                              giving up after {} iterations",
                             crate::MAX_DRAIN_ITERATIONS
                         );
-                        break;
+                        return Err(RsmediaError::msg(format!(
+                            "Filter graph stalled while flushing: still no output after {} \
+                             iterations; {} already-dequeued frames are discarded",
+                            crate::MAX_DRAIN_ITERATIONS,
+                            frames.len()
+                        )));
                     }
                     drained_iterations += 1;
                     tracing::trace!("Filter graph draining during flush...");
@@ -1478,35 +2266,82 @@ impl FilterGraph {
         Ok(frames)
     }
 
-    /// 动态获取源过滤器上下文
-    fn get_src_context(&mut self) -> Result<AVFilterContextMut<'_>> {
+    /// 第 `input` 路源（`buffer`/`abuffer`）的实例名。
+    fn src_name(&self, input: usize) -> Result<&CString> {
+        self.src_names.get(input).ok_or_else(|| {
+            RsmediaError::invalid_config(format!(
+                "input index {input} out of range: graph has {} inputs",
+                self.src_names.len()
+            ))
+        })
+    }
+
+    /// 第 `output` 路汇（`buffersink`/`abuffersink`）的实例名。
+    fn sink_name(&self, output: usize) -> Result<&CString> {
+        self.sink_names.get(output).ok_or_else(|| {
+            RsmediaError::invalid_config(format!(
+                "output index {output} out of range: graph has {} outputs",
+                self.sink_names.len()
+            ))
+        })
+    }
+
+    /// 动态获取第 `input` 路源过滤器上下文
+    fn get_src_context(&mut self, input: usize) -> Result<AVFilterContextMut<'_>> {
+        let name = self.src_name(input)?;
         self.graph
-            .get_filter(c"in")
+            .get_filter(name.as_c_str())
             .context("Source filter context not found")
     }
 
-    /// 动态获取目标过滤器上下文
-    fn get_sink_context(&mut self) -> Result<AVFilterContextMut<'_>> {
+    /// 动态获取第 `output` 路目标过滤器上下文
+    fn get_sink_context(&mut self, output: usize) -> Result<AVFilterContextMut<'_>> {
+        let name = self.sink_name(output)?;
         self.graph
-            .get_filter(c"out")
+            .get_filter(name.as_c_str())
             .context("Sink filter context not found")
     }
 
-    /// 滤镜输出链路的帧率（`av_buffersink_get_frame_rate`），无滤镜或不可用时返回 `None`。
+    /// 图输入路数。
+    pub fn input_count(&self) -> usize {
+        self.src_names.len()
+    }
+
+    /// 图的输出路数。
+    pub fn output_count(&self) -> usize {
+        self.sink_names.len()
+    }
+
+    /// 主输出链路的帧率（`av_buffersink_get_frame_rate`），无滤镜或不可用时返回 `None`。
     pub fn output_frame_rate(&mut self) -> Option<ffi::AVRational> {
-        let sink = self.get_sink_context().ok()?;
+        self.output_frame_rate_at(0)
+    }
+
+    /// 第 `output` 路输出链路的帧率。
+    pub fn output_frame_rate_at(&mut self, output: usize) -> Option<ffi::AVRational> {
+        let sink = self.get_sink_context(output).ok()?;
         Some(sink.get_frame_rate())
     }
 
-    /// 滤镜输出链路的时间基（`av_buffersink_get_time_base`），无滤镜或不可用时返回 `None`。
+    /// 主输出链路的时间基（`av_buffersink_get_time_base`），无滤镜或不可用时返回 `None`。
     pub fn output_time_base(&mut self) -> Option<ffi::AVRational> {
-        let sink = self.get_sink_context().ok()?;
+        self.output_time_base_at(0)
+    }
+
+    /// 第 `output` 路输出链路的时间基。
+    pub fn output_time_base_at(&mut self, output: usize) -> Option<ffi::AVRational> {
+        let sink = self.get_sink_context(output).ok()?;
         Some(sink.get_time_base())
     }
 
-    /// 滤镜输出链路的尺寸 `(width, height)`（`av_buffersink_get_w/h`），无滤镜或不可用时返回 `None`。
+    /// 主输出链路的尺寸 `(width, height)`（`av_buffersink_get_w/h`），无滤镜或不可用时返回 `None`。
     pub fn output_size(&mut self) -> Option<(i32, i32)> {
-        let sink = self.get_sink_context().ok()?;
+        self.output_size_at(0)
+    }
+
+    /// 第 `output` 路输出链路的尺寸。
+    pub fn output_size_at(&mut self, output: usize) -> Option<(i32, i32)> {
+        let sink = self.get_sink_context(output).ok()?;
         Some((sink.get_w(), sink.get_h()))
     }
 }
@@ -1521,11 +2356,677 @@ impl std::fmt::Debug for FilterGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "FilterGraph nb_filters:{}, initialized:{}, state:{:?}",
+            "FilterGraph nb_filters:{}, initialized:{}, state:{:?}, inputs:{:?}, outputs:{:?}",
             self.graph.nb_filters,
             self.is_initialized(),
-            self.state,
+            self.state_at(0),
+            self.input_labels,
+            self.output_labels,
         )
+    }
+}
+
+/// 多输入 / 多输出滤镜图的构建器（组装层）。
+///
+/// 滤镜图分四层：叶子 [`Filter`]（滤镜是什么）→ 节点 [`FilterNode`]（接线：每一路
+/// 输入接到哪个上游、输出叫什么名字）→ 端点 [`Endpoint`]（每一路进/出时的格式）→
+/// 图 [`FilterGraph`]（本构建器组装并协商出来的结果）。
+///
+/// 组装分四步：
+/// 1. [`add_input`](Self::add_input) 声明图输入（标签自动分配为 `in0`、`in1`…）；
+/// 2. [`add_node`](Self::add_node) 追加滤镜节点；多输入滤镜（`overlay`/`amix`/…）
+///    必须用 [`FilterNode::with_inputs`] 指明每一路的上游标签；
+/// 3. [`add_output`](Self::add_output)（接到指定节点标签）或
+///    [`add_output_tail`](Self::add_output_tail)（接链尾）声明图输出；
+/// 4. [`build`](Self::build) 校验接线、生成滤镜图描述并协商格式。
+///
+/// 五个高频形态有现成构造函数，直接返回建好的图：[`overlay`](Self::overlay)、
+/// [`hstack`](Self::hstack)、[`vstack`](Self::vstack)、[`concat`](Self::concat)、
+/// [`amix`](Self::amix)。需要别的形态时用上面的四步自由组装，
+/// [`Filter::new`] 仍是底层逃生舱。
+///
+/// [`build`](Self::build) 在**触碰 FFmpeg 之前**拒绝这些接线错误（都是
+/// [`RsmediaError::InvalidConfig`]）：标签非法或重名、上游标签不存在（含前向引用）、
+/// 接错媒体类型（视频/音频混接）、多输入滤镜的接线数与 pad 数不符、输出标签数与
+/// 输出 pad 数不符、某个输出没人消费（悬空）或被消费多次。FFmpeg 的 pad 是一对一
+/// 接线：fan-out 必须显式插一个复制节点——[`video::split`] / [`audio::asplit`]，
+/// 用 [`FilterNode::with_outputs`] 给每个副本标名后各接一条链路。
+///
+/// # Examples
+///
+/// 画中画：主画面 + 右下角小图，输出仍是主画面尺寸。
+///
+/// ```no_run
+/// use rsmedia::ffmpeg::ffi::AVRational;
+/// use rsmedia::filter::{FilterGraphBuilder, VideoEndpoint};
+/// use rsmedia::PixelFormat;
+///
+/// # fn main() -> rsmedia::Result<()> {
+/// let tb = AVRational { num: 1, den: 25 };
+/// let fps = AVRational { num: 25, den: 1 };
+/// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps);
+/// // 叠加层不必与主画面同尺寸、同像素格式：FFmpeg 会自动插 scale。
+/// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA, tb, fps);
+///
+/// let mut graph = FilterGraphBuilder::overlay(main, logo, "W-w-20", "H-h-20", main)?;
+/// // 图输入 0 = 主画面、图输入 1 = 叠加层；唯一的输出是合成结果。
+/// assert_eq!((graph.input_count(), graph.output_count()), (2, 1));
+/// let _ = graph.receive_frame_from(0)?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct FilterGraphBuilder {
+    /// 图输入：标签 + 端点，下标即逻辑输入序号。
+    inputs: Vec<(String, Endpoint)>,
+    /// 图输出：`None` = 接链尾（最后一个节点的输出）。
+    outputs: Vec<(Option<String>, Endpoint)>,
+    /// 滤镜节点，顺序即它们在图里的创建顺序（也就是自动接线的顺序）。
+    nodes: Vec<FilterNode>,
+}
+
+impl FilterGraphBuilder {
+    /// 建一个空的构建器。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 声明一路图输入，标签自动分配为 `in{序号}`（用
+    /// [`input_label`](Self::input_label) 读回）。
+    ///
+    /// 端点描述的是**这一路帧推进来时**的格式，不做任何预处理；各路不必一致，
+    /// FFmpeg 会在链路协商阶段自动插入 `scale` / `aresample`。
+    pub fn add_input(&mut self, endpoint: impl Into<Endpoint>) -> &mut Self {
+        let label = format!("in{}", self.inputs.len());
+        self.inputs.push((label, endpoint.into()));
+        self
+    }
+
+    /// 用指定标签声明一路图输入（标签会写进滤镜图描述，只能是 ASCII 字母、数字与
+    /// 下划线，且不能与任何节点输出标签重名）。
+    pub fn add_input_with(
+        &mut self,
+        label: impl Into<String>,
+        endpoint: impl Into<Endpoint>,
+    ) -> &mut Self {
+        self.inputs.push((label.into(), endpoint.into()));
+        self
+    }
+
+    /// 第 `index` 路图输入的标签（`None` = 该路不存在）。
+    pub fn input_label(&self, index: usize) -> Option<&str> {
+        self.inputs.get(index).map(|(label, _)| label.as_str())
+    }
+
+    /// 已声明的图输入路数。
+    pub fn input_count(&self) -> usize {
+        self.inputs.len()
+    }
+
+    /// 已声明的图输出路数。
+    pub fn output_count(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// 追加一个滤镜节点。
+    ///
+    /// 节点的接线为空（[`FilterNode::new`]）时自动接链尾：第一个节点接图输入 `in0`，
+    /// 其余接上一个节点的输出。多输入滤镜必须用 [`FilterNode::with_inputs`] 显式
+    /// 接线，否则建图时以「接线数与 pad 数不符」报错。
+    pub fn add_node(&mut self, node: impl Into<FilterNode>) -> &mut Self {
+        self.nodes.push(node.into());
+        self
+    }
+
+    /// 声明一路图输出，接在 `upstream` 指定的节点输出标签上。
+    pub fn add_output(
+        &mut self,
+        upstream: impl Into<String>,
+        endpoint: impl Into<Endpoint>,
+    ) -> &mut Self {
+        self.outputs.push((Some(upstream.into()), endpoint.into()));
+        self
+    }
+
+    /// 声明一路图输出，接在**最后一个节点**的输出（链尾）上。
+    pub fn add_output_tail(&mut self, endpoint: impl Into<Endpoint>) -> &mut Self {
+        self.outputs.push((None, endpoint.into()));
+        self
+    }
+
+    /// 组装并协商整张图：校验接线、生成带标签的滤镜图描述、按标签建
+    /// `buffer`/`abuffersink` 端点，最后由 `avfilter_graph_config` 完成格式协商。
+    ///
+    /// 校验都在触碰 FFmpeg 之前完成，接线错误报的是 [`RsmediaError::InvalidConfig`]，
+    /// 而不是一句难以定位的 FFmpeg 解析错误。
+    pub fn build(&self) -> Result<FilterGraph> {
+        if self.inputs.is_empty() {
+            return Err(RsmediaError::invalid_config(
+                "filter graph has no input: declare one with add_input",
+            ));
+        }
+        if self.nodes.is_empty() {
+            return Err(RsmediaError::invalid_config(
+                "filter graph has no node: add one with add_node",
+            ));
+        }
+        if self.outputs.is_empty() {
+            return Err(RsmediaError::invalid_config(
+                "filter graph has no output: declare one with add_output/add_output_tail",
+            ));
+        }
+
+        // 图输入与节点输出共用一个标签命名空间：重名会让描述里的 `[label]` 指代不明。
+        let mut seen: HashSet<String> = HashSet::new();
+        for (label, _) in &self.inputs {
+            if !is_valid_label(label) {
+                return Err(invalid_label(label));
+            }
+            if !seen.insert(label.clone()) {
+                return Err(RsmediaError::invalid_config(format!(
+                    "duplicate label '{label}': graph inputs and node outputs share one namespace"
+                )));
+            }
+        }
+
+        // 节点输出标签：显式标签优先（多输出滤镜必须逐个标注），单输出滤镜没写标签时
+        // 按顺序自动分配 `n0`、`n1`…；标签个数必须与滤镜的输出 pad 数一致。
+        let mut node_labels: Vec<Vec<String>> = Vec::with_capacity(self.nodes.len());
+        for (index, node) in self.nodes.iter().enumerate() {
+            let labels: Vec<String> = if node.outputs().is_empty() {
+                vec![format!("n{index}")]
+            } else {
+                node.outputs().to_vec()
+            };
+            let (pads, dynamic) = filter_output_pads(node.filter().name())?;
+            if !dynamic && pads != labels.len() {
+                let hint = if node.outputs().is_empty() {
+                    "label every output pad with FilterNode::with_outputs"
+                } else {
+                    "use FilterNode::with_outputs to label every output pad"
+                };
+                return Err(RsmediaError::invalid_config(format!(
+                    "filter '{}' (node {index}) has {pads} output pad(s) but {} label(s) were given: \
+                     {hint}",
+                    node.filter().name(),
+                    labels.len()
+                )));
+            }
+            for label in &labels {
+                if !is_valid_label(label) {
+                    return Err(invalid_label(label));
+                }
+                if !seen.insert(label.clone()) {
+                    let auto = if node.outputs().is_empty() {
+                        " (the label was auto-assigned; give the node an explicit label)"
+                    } else {
+                        ""
+                    };
+                    return Err(RsmediaError::invalid_config(format!(
+                        "duplicate label '{label}': graph inputs and node outputs share one \
+                         namespace{auto}"
+                    )));
+                }
+            }
+            node_labels.push(labels);
+        }
+
+        // 逐节点解析接线。上游必须是**已经声明过**的标签（图输入或前序节点的输出），
+        // 所以图是顺序搭起来的，不存在前向引用。
+        let mut available: HashMap<String, MediaType> = self
+            .inputs
+            .iter()
+            .map(|(label, endpoint)| (label.clone(), endpoint.media_type()))
+            .collect();
+        // 标签被消费的次数。每个 pad 只能接一条下游链路，因此每处都必须是 1。
+        let mut consumers: HashMap<String, usize> = HashMap::new();
+        let mut wires: Vec<Vec<String>> = Vec::with_capacity(self.nodes.len());
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            let media_type = node.filter().media_type();
+            let resolved: Vec<String> = if node.inputs().is_empty() {
+                // 自动接线：链首接图输入 0，其余接上一个节点的**末位**输出 pad
+                // （单输出滤镜只有这一个 pad，多输出滤镜需要显式接线）。
+                vec![if index == 0 {
+                    self.inputs[0].0.clone()
+                } else {
+                    node_labels[index - 1]
+                        .last()
+                        .expect("every node has at least one output label")
+                        .clone()
+                }]
+            } else {
+                node.inputs().to_vec()
+            };
+
+            for label in &resolved {
+                let Some(&upstream) = available.get(label) else {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "filter '{}' (node {index}) is wired to '{label}', which is neither a \
+                         declared graph input nor the output label of an earlier node",
+                        node.filter().name()
+                    )));
+                };
+                if upstream != media_type {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "media type mismatch: filter '{}' (node {index}) is {media_type:?} but its \
+                         input '{label}' carries {upstream:?}",
+                        node.filter().name()
+                    )));
+                }
+                *consumers.entry(label.clone()).or_insert(0) += 1;
+            }
+
+            // 静态输入滤镜按 pad 数精确校验；动态输入滤镜（hstack/amix/concat…）的
+            // pad 由标签数量决定，路数与滤镜自己的 `inputs=`/`n=` 选项是否一致交由
+            // FFmpeg 在 config 阶段核对。
+            let (pads, dynamic) = filter_input_pads(node.filter().name())?;
+            if !dynamic && pads != resolved.len() {
+                return Err(RsmediaError::invalid_config(format!(
+                    "filter '{}' (node {index}) takes {pads} input(s) but {} label(s) were wired: \
+                     use FilterNode::with_inputs to wire every input pad",
+                    node.filter().name(),
+                    resolved.len()
+                )));
+            }
+
+            for label in &node_labels[index] {
+                available.insert(label.clone(), media_type);
+            }
+            wires.push(resolved);
+        }
+
+        // 图输出必须由**节点**产出：图输入是数据入口，不能直接当输出（需要直通时
+        // 插一个 null / anull 节点）。
+        let node_output_types: HashMap<&str, MediaType> = node_labels
+            .iter()
+            .enumerate()
+            .flat_map(|(index, labels)| {
+                let media_type = self.nodes[index].filter().media_type();
+                labels.iter().map(move |label| (label.as_str(), media_type))
+            })
+            .collect();
+        let mut resolved_outputs: Vec<(String, Endpoint)> = Vec::with_capacity(self.outputs.len());
+        for (index, (upstream, endpoint)) in self.outputs.iter().enumerate() {
+            let label = match upstream {
+                Some(label) => label.clone(),
+                // `add_output_tail`：接在最后一个节点的末位输出 pad 上（nodes 非空已校验）。
+                None => node_labels[node_labels.len() - 1]
+                    .last()
+                    .expect("every node has at least one output label")
+                    .clone(),
+            };
+            let Some(&producer) = node_output_types.get(label.as_str()) else {
+                return Err(RsmediaError::invalid_config(format!(
+                    "output {index} is wired to '{label}', which no node produces: graph outputs \
+                     must come from a node's output label (insert a null/anull pass-through node \
+                     to expose a graph input directly)"
+                )));
+            };
+            if producer != endpoint.media_type() {
+                return Err(RsmediaError::invalid_config(format!(
+                    "media type mismatch: output {index} is {:?} but '{label}' carries {producer:?}",
+                    endpoint.media_type()
+                )));
+            }
+            *consumers.entry(label.clone()).or_insert(0) += 1;
+            resolved_outputs.push((label, *endpoint));
+        }
+
+        // 每个标签恰好被消费一次：0 次是悬空（图里有死代码，或声明了没人用的输入），
+        // 多于 1 次是 fan-out（FFmpeg 一个输出 pad 只能接一个下游）。
+        for (label, _) in &self.inputs {
+            match consumers.get(label).copied().unwrap_or(0) {
+                1 => {}
+                0 => {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "graph input '{label}' is never used by any node: wire it into a filter or \
+                         remove it"
+                    )));
+                }
+                times => {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "graph input '{label}' is consumed {times} times: one pad feeds exactly one \
+                         downstream input; insert a split/asplit node to fan out"
+                    )));
+                }
+            }
+        }
+        for (index, labels) in node_labels.iter().enumerate() {
+            for label in labels {
+                match consumers.get(label).copied().unwrap_or(0) {
+                    1 => {}
+                    0 => {
+                        let hint = if labels.len() > 1 {
+                            " (every output pad of the node must be consumed)"
+                        } else {
+                            ""
+                        };
+                        return Err(RsmediaError::invalid_config(format!(
+                            "filter '{}' (node {index}) produces '{label}' but nothing consumes it: \
+                             wire it into a downstream node or declare it as a graph output{hint}",
+                            self.nodes[index].filter().name()
+                        )));
+                    }
+                    times => {
+                        return Err(RsmediaError::invalid_config(format!(
+                            "label '{label}' (node {index}) is consumed {times} times: one pad feeds \
+                             exactly one downstream input; insert a split/asplit node (or add a \
+                             video::split / audio::asplit node) to fan out"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 生成描述：每段一个滤镜（用 `;` 分隔 filterchain，避免 `,` 把前一个滤镜未
+        // 连接的输出自动接到后一个滤镜上），段内先写这一路的输入标签、再写滤镜、最后
+        // 写本节点的输出标签。开放端点的名字就是这些标签，FFmpeg 按名字把它们与
+        // `buffer` / `buffersink` 端点配对（见 `setup_endpoints`）。
+        let mut segments = Vec::with_capacity(self.nodes.len());
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            let mut segment = String::new();
+            for label in &wires[index] {
+                segment.push('[');
+                segment.push_str(label);
+                segment.push(']');
+            }
+            segment.push_str(&node.filter().spec());
+            // 输出标签按 pad 顺序写：多输出滤镜（`split`/`asplit`）在这里把每个 pad
+            // 显式暴露出来，下游才引用得到。
+            for label in &node_labels[index] {
+                segment.push('[');
+                segment.push_str(label);
+                segment.push(']');
+            }
+            segments.push(segment);
+        }
+        let spec = segments.join(";");
+
+        let endpoints_in: Vec<(String, Endpoint)> = self
+            .inputs
+            .iter()
+            .map(|(label, endpoint)| (label.clone(), *endpoint))
+            .collect();
+        let endpoints_out: Vec<(String, Endpoint)> = resolved_outputs
+            .iter()
+            .map(|(label, endpoint)| (label.clone(), *endpoint))
+            .collect();
+
+        let mut graph = FilterGraph::new();
+        graph.input_labels = self.inputs.iter().map(|(label, _)| label.clone()).collect();
+        graph.output_labels = resolved_outputs
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect();
+        graph.eof_sent = vec![false; self.inputs.len()];
+        graph.states = vec![ProcessState::Normal; resolved_outputs.len()];
+
+        graph
+            .setup_endpoints(&endpoints_in, &endpoints_out, &spec)
+            .with_context(|| format!("Failed to build filter graph: {spec}"))?;
+        graph
+            .graph
+            .config()
+            .with_context(|| format!("Failed to configure filter graph: {spec}"))?;
+        graph.initialized.store(true, DEFAULT_ORDERING);
+        Ok(graph)
+    }
+
+    /// 画中画 / 水印：把 `over` 叠到 `base` 上（`overlay=x:y`）。
+    ///
+    /// 叠加层通常比基底小，两路尺寸、像素格式不同都没关系（FFmpeg 会插 `scale`）。
+    /// `output` 是整图输出的端点声明，尺寸与 `base` 不同时自动补一个 `scale` 收口。
+    ///
+    /// 图输入 0 是基底（`base`）、图输入 1 是叠加层（`over`），唯一的输出是合成结果。
+    ///
+    /// ```no_run
+    /// # use rsmedia::ffmpeg::ffi::AVRational;
+    /// # use rsmedia::filter::{FilterGraphBuilder, VideoEndpoint};
+    /// # use rsmedia::PixelFormat;
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let tb = AVRational { num: 1, den: 25 };
+    /// let fps = AVRational { num: 25, den: 1 };
+    /// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps);
+    /// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA, tb, fps);
+    /// let mut graph = FilterGraphBuilder::overlay(main, logo, "W-w-20", "H-h-20", main)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn overlay(
+        base: VideoEndpoint,
+        over: VideoEndpoint,
+        x: &str,
+        y: &str,
+        output: VideoEndpoint,
+    ) -> Result<FilterGraph> {
+        let mut builder = Self::new();
+        builder.add_input_with("base", base);
+        builder.add_input_with("over", over);
+        builder.add_node(
+            FilterNode::new(video::overlay(x, y, None))
+                .with_inputs(["base", "over"])
+                .with_label("overlay"),
+        );
+        builder.finish_video_output((base.width, base.height), output)
+    }
+
+    /// 横向并排（`hstack`）：把多路视频拼成一行。
+    ///
+    /// 要求各路**高度一致**（FFmpeg 的硬性约束，不一致时报错并点名是哪一路）；输出宽度
+    /// 是各路宽度之和，`output` 声明的尺寸不同时自动补一个 `scale` 收口。
+    ///
+    /// ```no_run
+    /// # use rsmedia::ffmpeg::ffi::AVRational;
+    /// # use rsmedia::filter::{FilterGraphBuilder, VideoEndpoint};
+    /// # use rsmedia::PixelFormat;
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let tb = AVRational { num: 1, den: 25 };
+    /// let fps = AVRational { num: 25, den: 1 };
+    /// let left = VideoEndpoint::new(640, 720, PixelFormat::YUV420P, tb, fps);
+    /// let right = VideoEndpoint::new(640, 720, PixelFormat::YUV420P, tb, fps);
+    /// // 图输入 0 / 1 分别对应 left / right，输出是 1280x720。
+    /// let mut graph = FilterGraphBuilder::hstack(
+    ///     &[left, right],
+    ///     VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn hstack(inputs: &[VideoEndpoint], output: VideoEndpoint) -> Result<FilterGraph> {
+        Self::stack(inputs, output, true)
+    }
+
+    /// 纵向堆叠（`vstack`）：把多路视频叠成一列。
+    ///
+    /// 要求各路**宽度一致**；输出高度是各路高度之和，`output` 声明的尺寸不同时自动补
+    /// 一个 `scale` 收口。
+    pub fn vstack(inputs: &[VideoEndpoint], output: VideoEndpoint) -> Result<FilterGraph> {
+        Self::stack(inputs, output, false)
+    }
+
+    /// 首尾拼接（`concat`）：把多路视频按顺序接成一路。
+    ///
+    /// 要求各路**尺寸一致**（FFmpeg 的硬性约束；不一致时报错并点名是哪一路，先加
+    /// `scale` 统一即可）；`concat` 之后时间戳是连续的，`output` 声明的尺寸不同时
+    /// 自动补一个 `scale` 收口。
+    pub fn concat(inputs: &[VideoEndpoint], output: VideoEndpoint) -> Result<FilterGraph> {
+        if inputs.len() < 2 {
+            return Err(RsmediaError::invalid_config(format!(
+                "concat needs at least 2 inputs, got {}",
+                inputs.len()
+            )));
+        }
+        let (width, height) = (inputs[0].width, inputs[0].height);
+        for (index, endpoint) in inputs.iter().enumerate() {
+            if (endpoint.width, endpoint.height) != (width, height) {
+                return Err(RsmediaError::invalid_config(format!(
+                    "concat needs every input to have the same size: input 0 is {width}x{height}, \
+                     input {index} is {}x{} (insert a scale node to normalise the sizes first)",
+                    endpoint.width, endpoint.height
+                )));
+            }
+        }
+
+        let mut builder = Self::new();
+        for endpoint in inputs {
+            builder.add_input(*endpoint);
+        }
+        let labels = builder.input_labels_upto(inputs.len());
+        builder.add_node(
+            FilterNode::new(video::concat(inputs.len() as u32))
+                .with_inputs(labels)
+                .with_label("concat"),
+        );
+        builder.finish_video_output((width, height), output)
+    }
+
+    /// 混音（`amix`）：把多路音频混成一路。
+    ///
+    /// 各路采样率 / 采样格式 / 通道布局不同也没关系，FFmpeg 会自动插 `aresample`。
+    /// `duration` 取 `longest`（以最长的一路为准，最常用）、`shortest` 或 `first`。
+    ///
+    /// ```no_run
+    /// # use rsmedia::ffmpeg::ffi::AVRational;
+    /// # use rsmedia::filter::{AudioEndpoint, FilterGraphBuilder};
+    /// # use rsmedia::SampleFormat;
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let tb = AVRational { num: 1, den: 48000 };
+    /// let voice = AudioEndpoint::new(2, 48000, SampleFormat::FLTP, tb);
+    /// let music = AudioEndpoint::new(2, 48000, SampleFormat::FLTP, tb);
+    /// let mut graph = FilterGraphBuilder::amix(&[voice, music], "longest", voice)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn amix(
+        inputs: &[AudioEndpoint],
+        duration: &str,
+        output: AudioEndpoint,
+    ) -> Result<FilterGraph> {
+        if !matches!(duration, "longest" | "shortest" | "first") {
+            return Err(RsmediaError::invalid_config(format!(
+                "amix duration must be one of 'longest', 'shortest', 'first', got '{duration}'"
+            )));
+        }
+        Self::stack_audio(inputs, output, duration)
+    }
+
+    /// 前 `count` 路图输入的标签（自动标签与显式标签都涵盖）。
+    fn input_labels_upto(&self, count: usize) -> Vec<String> {
+        self.inputs
+            .iter()
+            .take(count)
+            .map(|(label, _)| label.clone())
+            .collect()
+    }
+
+    /// 末尾收口：节点输出尺寸与声明的 `output` 不一致时追加一个 `scale`，再声明图输出，
+    /// 最后 [`build`](Self::build)。
+    fn finish_video_output(
+        &mut self,
+        natural: (i32, i32),
+        output: VideoEndpoint,
+    ) -> Result<FilterGraph> {
+        if (output.width, output.height) != natural {
+            let (width, height) = (output.width, output.height);
+            self.add_node(
+                FilterNode::new(video::scale(width as u32, height as u32, None))
+                    .with_label("scale"),
+            );
+        }
+        self.add_output_tail(output);
+        self.build()
+    }
+
+    /// `hstack` / `vstack` 的公共实现：`horizontal = true` 取横向。
+    fn stack(
+        inputs: &[VideoEndpoint],
+        output: VideoEndpoint,
+        horizontal: bool,
+    ) -> Result<FilterGraph> {
+        let name = if horizontal { "hstack" } else { "vstack" };
+        if inputs.len() < 2 {
+            return Err(RsmediaError::invalid_config(format!(
+                "{name} needs at least 2 inputs, got {}",
+                inputs.len()
+            )));
+        }
+        // hstack 要求各路等高、vstack 要求各路等宽：先把不一致的那一路点名，比让
+        // config 阶段报一句 "Input 2 height does not match" 好定位。
+        let axis = if horizontal { "height" } else { "width" };
+        let common = if horizontal {
+            inputs[0].height
+        } else {
+            inputs[0].width
+        };
+        for (index, endpoint) in inputs.iter().enumerate() {
+            let got = if horizontal {
+                endpoint.height
+            } else {
+                endpoint.width
+            };
+            if got != common {
+                return Err(RsmediaError::invalid_config(format!(
+                    "{name} needs every input to have the same {axis}: input 0 is {common}, input \
+                     {index} is {got} (insert a scale node to normalise the sizes first)"
+                )));
+            }
+        }
+        let width: i32 = if horizontal {
+            inputs.iter().map(|endpoint| endpoint.width).sum()
+        } else {
+            common
+        };
+        let height: i32 = if horizontal {
+            common
+        } else {
+            inputs.iter().map(|endpoint| endpoint.height).sum()
+        };
+
+        let mut builder = Self::new();
+        for endpoint in inputs {
+            builder.add_input(*endpoint);
+        }
+        let labels = builder.input_labels_upto(inputs.len());
+        let filter = if horizontal {
+            video::hstack(inputs.len() as u32)
+        } else {
+            video::vstack(inputs.len() as u32)
+        };
+        builder.add_node(
+            FilterNode::new(filter)
+                .with_inputs(labels)
+                .with_label("stack"),
+        );
+        builder.finish_video_output((width, height), output)
+    }
+
+    /// `amix` 的公共实现：音频侧路数与时长策略。
+    fn stack_audio(
+        inputs: &[AudioEndpoint],
+        output: AudioEndpoint,
+        duration: &str,
+    ) -> Result<FilterGraph> {
+        if inputs.len() < 2 {
+            return Err(RsmediaError::invalid_config(format!(
+                "amix needs at least 2 inputs, got {}",
+                inputs.len()
+            )));
+        }
+
+        let mut builder = Self::new();
+        for endpoint in inputs {
+            builder.add_input(*endpoint);
+        }
+        let labels = builder.input_labels_upto(inputs.len());
+        builder.add_node(
+            FilterNode::new(audio::amix(inputs.len() as u32, duration))
+                .with_inputs(labels)
+                .with_label("amix"),
+        );
+        builder.add_output_tail(output);
+        builder.build()
     }
 }
 
@@ -1557,11 +3058,13 @@ mod tests {
             "Brackets should be escaped and spaces too"
         );
 
-        // Test case 4: String with multiple special characters
+        // Test case 4: 选项级转义只保证"值里的 `:` 不会截断选项"，不负责图级
+        // 分隔符——`file:///...` 作为**不带引号**的选项值还必须再经过图级转义
+        // （见 test_escape_filter_option_two_levels）。
         assert_eq!(
             escape_filter_str("file:///path/to/video.mp4"),
             "file\\:///path/to/video.mp4",
-            "Colon should be escaped"
+            "Single-level (option) escaping escapes the colon"
         );
 
         // Test case 5: String with all special characters
@@ -1623,6 +3126,36 @@ mod tests {
             long_result.ends_with("\\=\\[\\]\\:"),
             "Long strings should have special characters at the end properly escaped"
         );
+    }
+
+    #[test]
+    fn test_escape_filter_option_two_levels() {
+        // 普通值不受影响：scale/pad/yadif/adelay 等生成的 spec 依赖"简单值原样保留"。
+        for plain in ["lanczos", "send_frame", "black@0.5", "16/9"] {
+            assert_eq!(escape_filter_option(plain), plain, "plain value changed");
+        }
+
+        // `:` 是**选项级**分隔符：第一层转义后带一个反斜杠；第二层必须把该反斜杠
+        // 自身再转义（`\\`），否则图级解析会把它吃掉，值里的 `:` 又变成分隔符。
+        let path = escape_filter_option("file:///path/to/video.mp4");
+        assert!(
+            path.starts_with(r"file\\"),
+            "option-level backslash must be escaped for the graph level: {path}"
+        );
+        assert!(
+            path.contains(r"\:"),
+            "colon must stay escaped after graph-level escaping: {path}"
+        );
+
+        // `,` `;` `[` `]` 是**图级**分隔符（`movie=`/`subtitles=` 这类路径值必须防住，
+        // 否则值会被拆成多个滤镜/链路）。两层转义后每个字符前都应留有反斜杠。
+        let tricky = escape_filter_option("/tmp/a,b;c[d].mp4");
+        for ch in [',', ';', '[', ']'] {
+            assert!(
+                tricky.contains(&format!("\\{ch}")),
+                "{ch} must be escaped for the graph level: {tricky}"
+            );
+        }
     }
 
     #[test]
@@ -2047,6 +3580,645 @@ mod tests {
 
         graph.process_frame(None)?;
         assert!(graph.flush()?.is_empty());
+        Ok(())
+    }
+
+    /// 构造一个 YUV420P 帧：亮度面整体填 `luma`，两个色度面填 128（中性）。
+    fn make_yuv420p_frame(width: i32, height: i32, luma: u8) -> AVFrame {
+        use crate::pixel::PixelFormat;
+
+        let mut frame = AVFrame::new();
+        frame.set_width(width);
+        frame.set_height(height);
+        frame.set_format(PixelFormat::YUV420P.into());
+        frame
+            .alloc_buffer()
+            .context("alloc buffer for yuv420p frame")
+            .unwrap();
+        let (w, h) = (width as usize, height as usize);
+        unsafe {
+            for y in 0..h {
+                for x in 0..w {
+                    *frame.data[0]
+                        .cast::<u8>()
+                        .add(y * frame.linesize[0] as usize + x) = luma;
+                }
+            }
+            // 420 的色度面宽高各取一半。
+            for plane in [1usize, 2] {
+                for y in 0..h.div_ceil(2) {
+                    for x in 0..w.div_ceil(2) {
+                        *frame.data[plane]
+                            .cast::<u8>()
+                            .add(y * frame.linesize[plane] as usize + x) = 128;
+                    }
+                }
+            }
+        }
+        frame
+    }
+
+    /// 构造一个 YUV420P 帧：亮度面按列递增（第 x 列 = `x * 10`），用于区分「原样」
+    /// 与「水平翻转」——翻转后逐列亮度必须与原来相反。
+    fn make_ramp_frame(width: i32, height: i32) -> AVFrame {
+        use crate::pixel::PixelFormat;
+
+        let mut frame = AVFrame::new();
+        frame.set_width(width);
+        frame.set_height(height);
+        frame.set_format(PixelFormat::YUV420P.into());
+        frame.alloc_buffer().context("alloc ramp frame").unwrap();
+        let (w, h) = (width as usize, height as usize);
+        unsafe {
+            for y in 0..h {
+                for x in 0..w {
+                    *frame.data[0]
+                        .cast::<u8>()
+                        .add(y * frame.linesize[0] as usize + x) = x as u8 * 10;
+                }
+            }
+            for plane in [1usize, 2] {
+                for y in 0..h.div_ceil(2) {
+                    for x in 0..w.div_ceil(2) {
+                        *frame.data[plane]
+                            .cast::<u8>()
+                            .add(y * frame.linesize[plane] as usize + x) = 128;
+                    }
+                }
+            }
+        }
+        frame
+    }
+
+    /// 读 YUV420P 帧亮度面在 `(x, y)` 的像素值。
+    fn luma_at(frame: &AVFrame, x: i32, y: i32) -> u8 {
+        unsafe {
+            *frame.data[0]
+                .cast::<u8>()
+                .add(y as usize * frame.linesize[0] as usize + x as usize)
+        }
+    }
+
+    /// 构造一个 FLTP 音频帧，所有采样点填同一个值。
+    fn make_fltp_frame(sample_rate: i32, nb_samples: i32, value: f32) -> AVFrame {
+        let mut frame = AVFrame::new();
+        frame.set_format(SampleFormat::FLTP as _);
+        frame.set_ch_layout(AVChannelLayout::from_nb_channels(1).into_inner());
+        frame.set_sample_rate(sample_rate);
+        frame.set_nb_samples(nb_samples);
+        frame
+            .alloc_buffer()
+            .context("alloc buffer for fltp frame")
+            .unwrap();
+        unsafe {
+            let samples = frame.data[0].cast::<f32>();
+            for index in 0..nb_samples as usize {
+                *samples.add(index) = value;
+            }
+        }
+        frame
+    }
+
+    fn video_endpoint(width: i32, height: i32) -> VideoEndpoint {
+        VideoEndpoint::new(
+            width,
+            height,
+            PixelFormat::YUV420P,
+            ffi::AVRational { num: 1, den: 25 },
+            ffi::AVRational { num: 25, den: 1 },
+        )
+    }
+
+    fn audio_endpoint(sample_rate: i32) -> AudioEndpoint {
+        AudioEndpoint::new(
+            1,
+            sample_rate,
+            SampleFormat::FLTP,
+            ffi::AVRational {
+                num: 1,
+                den: sample_rate,
+            },
+        )
+    }
+
+    /// `hstack`：两路进、一路出，**端点与标签的对应关系**必须正确。
+    ///
+    /// 这是多输入图最关键的一环：`buffer` 源按名字与描述里的标签配对，名字错位或配对
+    /// 反了都不会报错，只会把帧接错路。左半填 10、右半填 200，错位会在像素上立刻暴露。
+    #[test]
+    fn test_filter_graph_builder_hstack_endpoint_order() -> Result<()> {
+        let mut graph = FilterGraphBuilder::hstack(
+            &[video_endpoint(4, 2), video_endpoint(4, 2)],
+            video_endpoint(8, 2),
+        )?;
+
+        assert_eq!(
+            (graph.input_count(), graph.output_count()),
+            (2, 1),
+            "hstack has 2 inputs and 1 output"
+        );
+        assert_eq!(graph.output_size(), Some((8, 2)), "stacked size");
+
+        graph.push_frame_to(0, Some(make_yuv420p_frame(4, 2, 10)))?;
+        graph.push_frame_to(1, Some(make_yuv420p_frame(4, 2, 200)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .expect("hstack emits a frame once both inputs have one");
+        assert_eq!((out.width, out.height), (8, 2));
+        for y in 0..2 {
+            for x in 0..8 {
+                let expected = if x < 4 { 10 } else { 200 };
+                assert_eq!(
+                    luma_at(&out, x, y),
+                    expected,
+                    "hstack wiring reversed at ({x},{y})"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 端点与标签按**名字**绑定，与它们在描述里的出现顺序无关。
+    ///
+    /// 描述里 `[b]` 先出现，但输入 0 仍是 `a`：`push_frame_to` 的序号对应"声明输入
+    /// 的顺序"，不会被描述里的书写顺序带偏（按位置配对的实现会在这里静默接错路）。
+    #[test]
+    fn test_filter_graph_builder_matches_endpoints_by_label() -> Result<()> {
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("a", video_endpoint(4, 2));
+        builder.add_input_with("b", video_endpoint(4, 2));
+        builder.add_node(
+            FilterNode::new(video::hstack(2))
+                .with_inputs(["b", "a"])
+                .with_label("stack"),
+        );
+        builder.add_output("stack", video_endpoint(8, 2));
+        let mut graph = builder.build()?;
+
+        // hstack 的 pad0 = "b"（输入 1，200）在左，pad1 = "a"（输入 0，10）在右。
+        graph.push_frame_to(0, Some(make_yuv420p_frame(4, 2, 10)))?;
+        graph.push_frame_to(1, Some(make_yuv420p_frame(4, 2, 200)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .expect("hstack emits a frame once both inputs have one");
+        for y in 0..2 {
+            for x in 0..8 {
+                let expected = if x < 4 { 200 } else { 10 };
+                assert_eq!(
+                    luma_at(&out, x, y),
+                    expected,
+                    "endpoint/label binding wrong at ({x},{y})"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `overlay`：基底走图输入 0、叠加层走图输入 1（写反了叠加位置就会露馅）。
+    #[test]
+    fn test_filter_graph_builder_overlay_endpoint_order() -> Result<()> {
+        let mut graph = FilterGraphBuilder::overlay(
+            video_endpoint(4, 4),
+            video_endpoint(2, 2),
+            "2",
+            "2",
+            video_endpoint(4, 4),
+        )?;
+        assert_eq!(graph.output_size(), Some((4, 4)), "overlay keeps base size");
+
+        graph.push_frame_to(0, Some(make_yuv420p_frame(4, 4, 0)))?;
+        graph.push_frame_to(1, Some(make_yuv420p_frame(2, 2, 255)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .expect("overlay emits a frame once both inputs have one");
+        for y in 0..4 {
+            for x in 0..4 {
+                // 叠加层贴在 (2,2)-(3,3)。
+                let inside = (2..4).contains(&x) && (2..4).contains(&y);
+                assert_eq!(
+                    luma_at(&out, x, y),
+                    if inside { 255 } else { 0 },
+                    "overlay mismatch at ({x},{y})"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `concat`：按输入顺序首尾相接——前两帧来自输入 0、后两帧来自输入 1。
+    #[test]
+    fn test_filter_graph_builder_concat_order() -> Result<()> {
+        let mut graph = FilterGraphBuilder::concat(
+            &[video_endpoint(4, 2), video_endpoint(4, 2)],
+            video_endpoint(4, 2),
+        )?;
+
+        for _ in 0..2 {
+            graph.push_frame_to(0, Some(make_yuv420p_frame(4, 2, 10)))?;
+            graph.push_frame_to(1, Some(make_yuv420p_frame(4, 2, 200)))?;
+        }
+
+        // 拉到 EAGAIN（输入 0 的两帧出完、还没推 EOF）后补 EOF 收尾。
+        let mut values = Vec::new();
+        while let Some(frame) = graph.receive_frame_from(0)? {
+            values.push(luma_at(&frame, 0, 0));
+        }
+        for frame in graph.drain_output(0)? {
+            values.push(luma_at(&frame, 0, 0));
+        }
+        assert_eq!(
+            values,
+            vec![10, 10, 200, 200],
+            "concat must keep the declared input order"
+        );
+        Ok(())
+    }
+
+    /// `amix`：两路等长音频混音，输出应覆盖最长的一路。
+    #[test]
+    fn test_filter_graph_builder_amix_two_inputs() -> Result<()> {
+        let endpoint = audio_endpoint(48000);
+        let mut graph = FilterGraphBuilder::amix(&[endpoint, endpoint], "longest", endpoint)?;
+        assert_eq!(graph.output_count(), 1);
+
+        for _ in 0..2 {
+            graph.push_frame_to(0, Some(make_fltp_frame(48000, 1024, 0.5)))?;
+            graph.push_frame_to(1, Some(make_fltp_frame(48000, 1024, -0.5)))?;
+        }
+
+        let mut frames = Vec::new();
+        while let Some(frame) = graph.receive_frame_from(0)? {
+            frames.push(frame);
+        }
+        frames.extend(graph.drain_output(0)?);
+
+        let samples: i32 = frames.iter().map(|frame| frame.nb_samples).sum();
+        assert_eq!(
+            samples, 2048,
+            "amix should emit every sample of the longest input"
+        );
+        assert!(
+            frames.iter().all(|frame| frame.sample_rate == 48000),
+            "sample rate preserved"
+        );
+        Ok(())
+    }
+
+    /// `split`：**单滤镜多输出 pad** 的 fan-out——一路输入复制成两路，各接一条链路。
+    ///
+    /// 用逐列递增的亮度图验证：`copy_a` 必须与输入逐像素相同、`copy_b` 经 `hflip`
+    /// 后必须逐列反转。两路标签写反、或 pad 顺序错位，都会在像素上立刻暴露。
+    #[test]
+    fn test_filter_graph_builder_split_fanout() -> Result<()> {
+        let endpoint = video_endpoint(4, 2);
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("src", endpoint);
+        builder.add_node(
+            FilterNode::new(video::split(2))
+                .with_inputs(["src"])
+                .with_outputs(["copy_a", "copy_b"]),
+        );
+        builder.add_node(
+            FilterNode::new(video::hflip())
+                .with_inputs(["copy_b"])
+                .with_label("mirrored"),
+        );
+        builder.add_output("copy_a", endpoint);
+        builder.add_output("mirrored", endpoint);
+        let mut graph = builder.build()?;
+
+        assert_eq!(
+            (graph.input_count(), graph.output_count()),
+            (1, 2),
+            "one input fans out to two outputs"
+        );
+
+        graph.push_frame_to(0, Some(make_ramp_frame(4, 2)))?;
+        let straight = graph.receive_frame_from(0)?.context("copy_a frame")?;
+        let mirrored = graph.receive_frame_from(1)?.context("copy_b frame")?;
+        for y in 0..2 {
+            for x in 0..4 {
+                assert_eq!(
+                    luma_at(&straight, x, y),
+                    x as u8 * 10,
+                    "copy_a must be the untouched original at ({x},{y})"
+                );
+                assert_eq!(
+                    luma_at(&mirrored, x, y),
+                    (3 - x) as u8 * 10,
+                    "copy_b must be horizontally flipped at ({x},{y})"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `asplit`：音频 fan-out 后两路各自进 `amix` 混回来，采样值应保持不变
+    /// （两路内容相同，`amix` 又按路数归一化）。
+    #[test]
+    fn test_filter_graph_builder_asplit_two_outputs() -> Result<()> {
+        let endpoint = audio_endpoint(48000);
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("src", endpoint);
+        builder.add_node(
+            FilterNode::new(audio::asplit(2))
+                .with_inputs(["src"])
+                .with_outputs(["dry", "wet"]),
+        );
+        builder.add_node(
+            FilterNode::new(audio::amix(2, "longest"))
+                .with_inputs(["dry", "wet"])
+                .with_label("mixed"),
+        );
+        builder.add_output("mixed", endpoint);
+        let mut graph = builder.build()?;
+
+        for _ in 0..2 {
+            graph.push_frame_to(0, Some(make_fltp_frame(48000, 512, 0.5)))?;
+        }
+        let mut frames = Vec::new();
+        while let Some(frame) = graph.receive_frame_from(0)? {
+            frames.push(frame);
+        }
+        frames.extend(graph.drain_output(0)?);
+
+        let samples: i32 = frames.iter().map(|frame| frame.nb_samples).sum();
+        assert_eq!(samples, 1024, "asplit must feed amix both copies");
+        for frame in &frames {
+            unsafe {
+                for index in 0..frame.nb_samples as usize {
+                    let value = *frame.data[0].cast::<f32>().add(index);
+                    assert!(
+                        (value - 0.5).abs() <= 1e-6,
+                        "asplit+amix must preserve the sample, got {value}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 自由组装：两路输入（视频 + 音频）各自成链、各自输出，验证 **m 路输出**的
+    /// 端点映射（输出 0 是视频、输出 1 是音频，配错会在 `config` 阶段就报类型不符）。
+    #[test]
+    fn test_filter_graph_builder_two_outputs() -> Result<()> {
+        let video_in = video_endpoint(4, 2);
+        let audio_in = audio_endpoint(48000);
+
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video_in); // 自动标签 in0
+        builder.add_input(audio_in); // 自动标签 in1
+        assert_eq!(builder.input_label(0), Some("in0"));
+        assert_eq!(builder.input_label(1), Some("in1"));
+        // 第一个节点不写接线 → 自动接 in0；第二个节点显式接 in1。
+        builder.add_node(FilterNode::new(video::hflip()).with_label("flipped"));
+        builder.add_output("flipped", video_in);
+        // 第二个节点显式接 in1。音频侧用 `volume`（逐帧直通）而不是 `areverse`：
+        // areverse 要缓存整个流、EOF 前吐不出帧，验证不了「推一帧取一帧」。
+        builder.add_node(
+            FilterNode::new(audio::volume(1.0))
+                .with_inputs(["in1"])
+                .with_label("level"),
+        );
+        builder.add_output("level", audio_in);
+        let mut graph = builder.build()?;
+
+        assert_eq!(graph.output_count(), 2);
+        assert_eq!(graph.input_count(), 2);
+        // 输出 1 的时间基来自音频端点，说明 sink 与逻辑输出的映射正确。
+        let audio_tb = graph
+            .output_time_base_at(1)
+            .expect("output 1 is the audio sink");
+        assert_eq!(
+            (audio_tb.num, audio_tb.den),
+            (1, 48000),
+            "output 1 must be the audio sink"
+        );
+
+        graph.push_frame_to(0, Some(make_yuv420p_frame(4, 2, 40)))?;
+        let video_out = graph
+            .receive_frame_from(0)?
+            .expect("filtered video frame from output 0");
+        assert_eq!((video_out.width, video_out.height), (4, 2));
+
+        graph.push_frame_to(1, Some(make_fltp_frame(48000, 512, 0.25)))?;
+        let audio_out = graph
+            .receive_frame_from(1)?
+            .expect("filtered audio frame from output 1");
+        assert_eq!(audio_out.sample_rate, 48000);
+        assert_eq!(audio_out.nb_samples, 512);
+        Ok(())
+    }
+
+    /// 接线错误在建图前（未触碰 FFmpeg 的解析/协商）就被拒，且错误信息可定位。
+    #[test]
+    fn test_filter_graph_builder_rejects_bad_wiring() {
+        let video = video_endpoint(4, 2);
+        let audio = audio_endpoint(48000);
+
+        // 双输入滤镜塞进线性链：接线数（1）≠ pad 数（2）。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video);
+        builder.add_node(FilterNode::new(video::overlay("0", "0", None)));
+        builder.add_output_tail(video);
+        let err = builder.build().unwrap_err();
+        assert!(err.is_invalid_config(), "{err}");
+        assert!(err.to_string().contains("takes 2 input(s)"), "{err}");
+
+        // 上游标签不存在（也涵盖前向引用：后面的节点标签此时还没声明）。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video);
+        builder.add_node(FilterNode::new(video::hflip()).with_inputs(["nope"]));
+        builder.add_output_tail(video);
+        let err = builder.build().unwrap_err();
+        assert!(
+            err.to_string().contains("neither a declared graph input"),
+            "{err}"
+        );
+
+        // 前向引用：节点 0 引用节点 1 的标签。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video);
+        builder.add_node(
+            FilterNode::new(video::hflip())
+                .with_inputs(["later"])
+                .with_label("early"),
+        );
+        builder.add_node(FilterNode::new(video::hflip()).with_label("later"));
+        builder.add_output("early", video);
+        let err = builder.build().unwrap_err();
+        assert!(
+            err.is_invalid_config(),
+            "forward reference must be rejected: {err}"
+        );
+
+        // fan-out：同一个输出标签被两处消费。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video);
+        builder.add_node(FilterNode::new(video::hflip()).with_label("once"));
+        builder.add_node(
+            FilterNode::new(video::hflip())
+                .with_inputs(["once"])
+                .with_label("a"),
+        );
+        builder.add_node(
+            FilterNode::new(video::hflip())
+                .with_inputs(["once"])
+                .with_label("b"),
+        );
+        builder.add_output("a", video);
+        builder.add_output("b", video);
+        let err = builder.build().unwrap_err();
+        assert!(err.to_string().contains("insert a split"), "{err}");
+
+        // 输出标签数与 pad 数不符：单输出滤镜标了两个名字。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video);
+        builder.add_node(
+            FilterNode::new(video::hflip())
+                .with_inputs(["in0"])
+                .with_outputs(["a", "b"]),
+        );
+        builder.add_output("a", video);
+        builder.add_output("b", video);
+        let err = builder.build().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("has 1 output pad(s) but 2 label(s)"),
+            "{err}"
+        );
+
+        // 多输出滤镜只标了一个 pad：`split` 的 pad 数由它自己的 `outputs=` 选项决定
+        // （动态 pad，构建期看不到），所以这里由 FFmpeg 在协商阶段拒掉——错误信息里
+        // 带着出错的滤镜图描述，足以定位。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video);
+        builder.add_node(
+            FilterNode::new(video::split(2))
+                .with_inputs(["in0"])
+                .with_label("only_one"),
+        );
+        builder.add_output("only_one", video);
+        let err = builder.build().unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to configure filter graph")
+                && err.to_string().contains("split=2[only_one]"),
+            "{err}"
+        );
+
+        // 多输出滤镜的某个 pad 没人消费（split 的两路里只接了一路）。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video);
+        builder.add_node(
+            FilterNode::new(video::split(2))
+                .with_inputs(["in0"])
+                .with_outputs(["used", "dead"]),
+        );
+        builder.add_node(FilterNode::new(video::hflip()).with_inputs(["used"]));
+        builder.add_output_tail(video);
+        let err = builder.build().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("every output pad of the node must be consumed"),
+            "{err}"
+        );
+
+        // 悬空：节点输出既没被下游消费、也没声明为图输出。
+        // （自动接线会把节点串成链，所以这里必须显式接线才能造出真正的悬空输出。）
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("a", video);
+        builder.add_input_with("b", video);
+        builder.add_node(
+            FilterNode::new(video::hflip())
+                .with_inputs(["a"])
+                .with_label("dead"),
+        );
+        builder.add_node(
+            FilterNode::new(video::hflip())
+                .with_inputs(["b"])
+                .with_label("alive"),
+        );
+        builder.add_output("alive", video);
+        let err = builder.build().unwrap_err();
+        assert!(err.to_string().contains("nothing consumes it"), "{err}");
+
+        // 媒体类型混接：把音频端点接进视频滤镜。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(audio);
+        builder.add_node(FilterNode::new(video::hflip()).with_inputs(["in0"]));
+        builder.add_output_tail(video);
+        let err = builder.build().unwrap_err();
+        assert!(err.to_string().contains("media type mismatch"), "{err}");
+
+        // 图输入没人用。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video);
+        builder.add_input(video);
+        builder.add_node(FilterNode::new(video::hflip()).with_inputs(["in1"]));
+        builder.add_output_tail(video);
+        let err = builder.build().unwrap_err();
+        assert!(err.to_string().contains("never used"), "{err}");
+
+        // 图输出直接引用图输入（需要显式的直通节点）。
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input(video);
+        builder.add_node(FilterNode::new(video::hflip()).with_label("flipped"));
+        builder.add_output("in0", video);
+        let err = builder.build().unwrap_err();
+        assert!(err.to_string().contains("no node produces"), "{err}");
+    }
+
+    /// 组合形态的尺寸约束在构建期报错，并点名是哪一路。
+    #[test]
+    fn test_filter_graph_builder_rejects_bad_sizes() {
+        // hstack 要求等高。
+        let err = FilterGraphBuilder::hstack(
+            &[video_endpoint(4, 2), video_endpoint(4, 4)],
+            video_endpoint(8, 2),
+        )
+        .unwrap_err();
+        assert!(
+            err.is_invalid_config() && err.to_string().contains("input 1"),
+            "{err}"
+        );
+
+        // vstack 要求等宽。
+        let err = FilterGraphBuilder::vstack(
+            &[video_endpoint(4, 2), video_endpoint(6, 2)],
+            video_endpoint(4, 4),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("same width"), "{err}");
+
+        // concat 要求尺寸一致。
+        let err = FilterGraphBuilder::concat(
+            &[video_endpoint(4, 2), video_endpoint(2, 2)],
+            video_endpoint(4, 2),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("same size"), "{err}");
+
+        // amix 的 duration 只认三个档位。
+        let endpoint = audio_endpoint(48000);
+        let err = FilterGraphBuilder::amix(&[endpoint, endpoint], "long", endpoint).unwrap_err();
+        assert!(err.to_string().contains("duration"), "{err}");
+    }
+
+    /// 输出尺寸与合成结果的天然尺寸不符时自动补 `scale` 收口。
+    #[test]
+    fn test_filter_graph_builder_hstack_scales_to_declared_output() -> Result<()> {
+        let mut graph = FilterGraphBuilder::hstack(
+            &[video_endpoint(4, 2), video_endpoint(4, 2)],
+            video_endpoint(2, 2),
+        )?;
+        assert_eq!(graph.output_size(), Some((2, 2)), "output收口到声明尺寸");
+
+        graph.push_frame_to(0, Some(make_yuv420p_frame(4, 2, 10)))?;
+        graph.push_frame_to(1, Some(make_yuv420p_frame(4, 2, 200)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .expect("scaled frame should come out");
+        assert_eq!((out.width, out.height), (2, 2));
         Ok(())
     }
 }

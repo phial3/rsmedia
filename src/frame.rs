@@ -158,6 +158,18 @@ impl<T> FrameData<T> {
     /// * the plane's array is not contiguous, so no flat view exists — use
     ///   [`plane_samples`](Self::plane_samples) when a copy is acceptable.
     pub fn plane(&self, plane: usize) -> Result<ArrayView2<'_, T>> {
+        self.flat_view(plane)
+    }
+
+    /// Plane `plane` as a flat mutable view; see [`plane`](Self::plane).
+    pub fn plane_mut(&mut self, plane: usize) -> Result<ArrayViewMut2<'_, T>> {
+        self.flat_view_mut(plane)
+    }
+
+    /// The one implementation behind [`plane`](Self::plane) and
+    /// [`map_planes`](Self::map_planes) — see [`plane`](Self::plane) for the two
+    /// ways it can fail.
+    fn flat_view(&self, plane: usize) -> Result<ArrayView2<'_, T>> {
         match self {
             Self::Packed(array) => {
                 if plane != 0 {
@@ -177,8 +189,8 @@ impl<T> FrameData<T> {
         }
     }
 
-    /// Plane `plane` as a flat mutable view; see [`plane`](Self::plane).
-    pub fn plane_mut(&mut self, plane: usize) -> Result<ArrayViewMut2<'_, T>> {
+    /// The mutable mirror of [`flat_view`](Self::flat_view).
+    fn flat_view_mut(&mut self, plane: usize) -> Result<ArrayViewMut2<'_, T>> {
         match self {
             Self::Packed(array) => {
                 if plane != 0 {
@@ -285,14 +297,7 @@ impl<T: ElementType> FrameData<T> {
         match self {
             Self::Packed(array) => {
                 let (rows, cols, components) = array.dim();
-                let view = ArrayView2::from_shape(
-                    (rows, cols * components),
-                    array
-                        .as_slice()
-                        .ok_or_else(|| RsmediaError::msg("Interleaved frame must be contiguous"))?,
-                )
-                .context("Failed to view interleaved plane")?;
-                let mapped = f(0, view)?;
+                let mapped = f(0, self.flat_view(0)?)?;
                 let samples: Vec<U> = mapped.iter().cloned().collect();
                 Ok(FrameData::Packed(
                     Array3::from_shape_vec((rows, cols, components), samples).map_err(|e| {
@@ -302,8 +307,8 @@ impl<T: ElementType> FrameData<T> {
             }
             Self::Planar(planes) => {
                 let mut mapped = Vec::with_capacity(planes.len());
-                for (index, plane) in planes.iter().enumerate() {
-                    mapped.push(f(index, plane.view())?);
+                for index in 0..planes.len() {
+                    mapped.push(f(index, self.flat_view(index)?)?);
                 }
                 Ok(FrameData::Planar(mapped))
             }
@@ -314,7 +319,8 @@ impl<T: ElementType> FrameData<T> {
     ///
     /// Unlike [`plane`](Self::plane) this **tolerates a non-contiguous array**:
     /// the samples are copied out anyway, and `as_standard_layout` materialises
-    /// them in row-major order on demand.
+    /// them in row-major order on demand. A sample the cast cannot represent is
+    /// an error rather than a silent zero.
     pub fn plane_samples<U: ElementType>(&self, plane: usize) -> Result<Vec<U>> {
         let samples: Vec<T> = match self {
             Self::Packed(array) => {
@@ -331,10 +337,7 @@ impl<T: ElementType> FrameData<T> {
                 .copied()
                 .collect(),
         };
-        Ok(samples
-            .into_iter()
-            .map(|value| num_traits::cast::<T, U>(value).unwrap_or(U::zero()))
-            .collect())
+        cast_samples::<T, U>(samples)
     }
 }
 
@@ -349,6 +352,35 @@ fn not_contiguous(plane: usize, layout: &str) -> RsmediaError {
         "Plane {plane} of a {layout} frame is not contiguous, so it has no flat view; \
          use `plane_samples` (which copies) or make the array standard layout"
     ))
+}
+
+/// 转换结果的颜色范围与色度位置。
+///
+/// 换了像素格式，源帧的色域元数据不能整套照搬——最典型的现象是 full range 的
+/// `RGB`/`GRAY` 样本沿用源帧的 limited range 标签，下游再压缩一次就发灰。
+///
+/// * `AV_PIX_FMT_FLAG_RGB` 覆盖 RGB/BGR 与 GRAY 家族：这些格式的样本按定义就是
+///   full range（`0..2^n-1`），因此结果恒标 `AVCOL_RANGE_JPEG`；
+/// * YUV/NV 族的实际范围由 `color_range` 声明，转换以源帧声明的范围为输入，
+///   故随源帧保留（`UNSPECIFIED` 按 FFmpeg 约定等同 limited）；
+/// * `chroma_location` 描述色度采样点相对亮度栅格的位置，只对带色度平面的目标有意义。
+fn converted_color(
+    dst: PixelFormat,
+    color_range: ffi::AVColorRange,
+    chroma_location: ffi::AVChromaLocation,
+) -> (ffi::AVColorRange, ffi::AVChromaLocation) {
+    if is_full_range_format(dst) {
+        (ffi::AVCOL_RANGE_JPEG, ffi::AVCHROMA_LOC_UNSPECIFIED)
+    } else {
+        (color_range, chroma_location)
+    }
+}
+
+/// `format` 的样本是否按 full range 编码（RGB/BGR/GRAY 家族）。
+fn is_full_range_format(format: PixelFormat) -> bool {
+    format
+        .descriptor()
+        .is_ok_and(|desc| desc.flags as u32 & ffi::AV_PIX_FMT_FLAG_RGB != 0)
 }
 
 /// Converts a packed `RGB24` frame into a planar `YUV420P` frame.
@@ -411,10 +443,12 @@ fn rgb24_to_yuv420p<T: ElementType>(
 /// Converts a planar `YUV420P` frame into a packed `RGB24` frame.
 ///
 /// The size comes from the luma plane, whose `(height, width)` shape the
-/// `YUV420P` layout fixes.
+/// `YUV420P` layout fixes. `range` is the range the *source* samples are in;
+/// `RGB24` output is always full range.
 fn yuv420p_to_rgb24<T: ElementType>(
     data: &FrameData<T>,
     matrix: YuvStandardMatrix,
+    range: YuvRange,
 ) -> Result<FrameData<T>> {
     let (height, width) = yuv420p_extent(data)?;
     let (uv_width, uv_height) = (width / 2, height / 2);
@@ -438,17 +472,11 @@ fn yuv420p_to_rgb24<T: ElementType>(
         height: height as u32,
     };
     let mut rgb = vec![0u8; width * height * 3];
-    yuv::yuv420_to_rgb(
-        &planar,
-        &mut rgb,
-        (width * 3) as u32,
-        YuvRange::Full,
-        matrix,
-    )
-    .context("Failed to convert YUV420P to RGB24")?;
+    yuv::yuv420_to_rgb(&planar, &mut rgb, (width * 3) as u32, range, matrix)
+        .context("Failed to convert YUV420P to RGB24")?;
 
     Ok(FrameData::Packed(
-        Array3::from_shape_vec((height, width, 3), cast_samples::<u8, T>(rgb))
+        Array3::from_shape_vec((height, width, 3), cast_samples::<u8, T>(rgb)?)
             .context("Failed to build RGB24 frame")?,
     ))
 }
@@ -874,6 +902,36 @@ where
         self.pts = pts;
     }
 
+    /// 把本帧标记为关键帧（I 帧 / IDR），令编码器在此处强制插入关键帧。
+    ///
+    /// 不调用时关键帧位置完全由编码器按 GOP
+    /// （[`with_gop_size`](crate::EncoderBuilder::with_gop_size)）自行决定；调用后
+    /// 这一帧必为关键帧，供点播切片、随机访问点、seek 友好性等场景使用。
+    ///
+    /// 同时置位两处：`pict_type = AV_PICTURE_TYPE_I`（编码器据此插入关键帧）与
+    /// `key_frame`（即 `AV_FRAME_FLAG_KEY`，FFmpeg 7+ 对"该帧是关键帧"的规范标记）。
+    /// 两者都给才完整：实测 libx264、mpeg4 只认 `pict_type`，而 `key_frame` 是
+    /// 下游（滤镜、容器、解码器）读取关键帧信息的字段。
+    ///
+    /// 帧经缩放转换（如 RGB24 输入转编码器要求的 YUV420P）时 `pict_type`/`flags`
+    /// 由 `av_frame_copy_props` 原样带过，该标记不会在转换中丢失。
+    ///
+    /// ```
+    /// use rsmedia::{MediaFrame, PixelFormat};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut frame = MediaFrame::<u8>::new_video_frame(64, 64, PixelFormat::RGB24)?;
+    /// frame.set_pts(100);
+    /// frame.force_key_frame();
+    /// assert!(frame.key_frame);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn force_key_frame(&mut self) {
+        self.pict_type = ffi::AV_PICTURE_TYPE_I;
+        self.key_frame = true;
+    }
+
     /// Returns the frame's unified format: [`FrameFormat::Pixel`] for video,
     /// [`FrameFormat::Sample`] for audio; `None` for other media types.
     #[inline]
@@ -929,7 +987,12 @@ where
         // 判断依据：nb_samples 是音频帧专属字段（视频帧恒为 0），
         // 是最可靠的音频信号；width/height 是视频帧的固有属性。
         if frame.nb_samples > 0 {
-            let sample_format = SampleFormat::from(format);
+            // 帧格式来自解码器，可能超出本 crate 收录的范围：报错而不是 panic。
+            let sample_format = SampleFormat::from_ffi_checked(format).ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "Unsupported sample format {format} on a decoded AVFrame"
+                ))
+            })?;
             let frame_format = FrameFormat::Sample(sample_format);
             let element_bytes = sample_format
                 .get_bytes_per_sample()
@@ -954,7 +1017,12 @@ where
             media.copy_avframe_meta(frame);
             Ok(media)
         } else if width > 0 && height > 0 {
-            let pixel_format = PixelFormat::from(format);
+            // 同上：像素格式来自解码器，未收录时返回 `Err`。
+            let pixel_format = PixelFormat::from_ffi_checked(format).ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "Unsupported pixel format {format} on a decoded AVFrame"
+                ))
+            })?;
             let frame_format = FrameFormat::Pixel(pixel_format);
             let element_bytes = pixel_format
                 .bytes_per_component()
@@ -1105,6 +1173,9 @@ where
             metadata,
             side_data,
         } = self;
+        // 色域元数据不能整套照搬：目标像素格式决定了样本范围的含义。
+        let (color_range, chroma_location) =
+            converted_color(format, *color_range, *chroma_location);
         Self {
             pts: *pts,
             pkt_dts: *pkt_dts,
@@ -1126,8 +1197,8 @@ where
             colorspace: *colorspace,
             color_primaries: *color_primaries,
             color_trc: *color_trc,
-            color_range: *color_range,
-            chroma_location: *chroma_location,
+            color_range,
+            chroma_location,
             sample_aspect_ratio: *sample_aspect_ratio,
             crop_top: *crop_top,
             crop_bottom: *crop_bottom,
@@ -1251,7 +1322,9 @@ where
     /// The YUV matrix comes from the frame's own colour metadata
     /// (`colorspace`, falling back to a resolution heuristic) — see
     /// [`convert_rgb24_to_yuv420p_with_matrix`](Self::convert_rgb24_to_yuv420p_with_matrix)
-    /// to pin it. Samples are always full-range.
+    /// to pin it. Samples are always full-range, and the result is marked
+    /// `AVCOL_RANGE_JPEG` so downstream does not read them as limited and grey
+    /// them out.
     ///
     /// This is the fast path for exactly this pair: it runs in the `yuv` crate
     /// rather than through a scaler, and sits next to
@@ -1279,18 +1352,37 @@ where
     pub fn convert_rgb24_to_yuv420p_with_matrix(&self, matrix: YuvStandardMatrix) -> Result<Self> {
         self.ensure_video_format(FrameFormat::Pixel(PixelFormat::RGB24), "RGB24")?;
         let data = rgb24_to_yuv420p(&self.data, matrix)?;
-        Ok(self.with_data(data, PixelFormat::YUV420P))
+        let mut converted = self.with_data(data, PixelFormat::YUV420P);
+        // `yuv::rgb_to_yuv420` 以 `YuvRange::Full` 产出样本，因此结果恒为 full range：
+        // 源 RGB 帧未声明 range 时（例如 `from_dynamic_image`）沿用它的
+        // `UNSPECIFIED` 会被下游按 limited 解释，白色变 235 而发灰。
+        converted.color_range = ffi::AVCOL_RANGE_JPEG;
+        Ok(converted)
     }
 
     /// Converts a planar `YUV420P` video frame to packed `RGB24`.
     ///
     /// The inverse of [`convert_rgb24_to_yuv420p`](Self::convert_rgb24_to_yuv420p);
-    /// chroma is read at its native (half) size and the matrix is derived from
-    /// colour metadata.
+    /// chroma is read at its native (half) size and both the matrix and the
+    /// sample range are derived from colour metadata. `RGB24` output is full
+    /// range.
     pub fn convert_yuv420p_to_rgb24(&self) -> Result<Self> {
         self.ensure_video_format(FrameFormat::Pixel(PixelFormat::YUV420P), "YUV420P")?;
-        let data = yuv420p_to_rgb24(&self.data, self.yuv_matrix())?;
+        let data = yuv420p_to_rgb24(&self.data, self.yuv_matrix(), self.yuv_range())?;
         Ok(self.with_data(data, PixelFormat::RGB24))
+    }
+
+    /// 源帧样本所处的范围，用于选择 `yuv` crate 的输入范围。
+    ///
+    /// 与 [`yuv_matrix`](Self::yuv_matrix) 同源：都读帧自己的色域元数据。FFmpeg
+    /// 约定 YUV 的 `UNSPECIFIED` 按 limited 处理（swscale 亦然），只有显式
+    /// `AVCOL_RANGE_JPEG` 才是 full range。
+    fn yuv_range(&self) -> YuvRange {
+        if self.color_range == ffi::AVCOL_RANGE_JPEG {
+            YuvRange::Full
+        } else {
+            YuvRange::Limited
+        }
     }
 
     /// Converts this video frame to any pixel format FFmpeg's swscale can reach.
@@ -1359,15 +1451,24 @@ where
 
         let src = self.to_avframe()?;
         // 尺寸不变，只换格式：swscale 的同一上下文即可完成格式与色彩空间转换。
-        let converted = crate::scale::Scaler::new().scale_frame(
-            &src,
-            self.width as i32,
-            self.height as i32,
-            dst,
-        )?;
+        // `Scaler` 按源/目标几何与格式缓存 `SwsContext`（见 `scale.rs`），因此每线程
+        // 复用一个即可，不必为每帧新建上下文；缩放后的样本仍要拷回 `FrameData`，
+        // 这是 `Scaler` 只吃 `AVFrame` 的接口所决定的。
+        let converted = CONVERT_SCALER.with_borrow_mut(|scaler| {
+            scaler.scale_frame(&src, self.width as i32, self.height as i32, dst)
+        })?;
         let data = read_samples::<T>(&converted, &dst_layout)?;
         Ok(self.with_data(data, dst))
     }
+}
+
+thread_local! {
+    /// [`MediaFrame::convert_to`] 用的复用缩放器。
+    ///
+    /// `SwsContext` 的构建远贵于一次转换本身，而 `Scaler` 自己会在几何或格式变化时
+    /// 重建上下文，所以每线程留一个就够了。
+    static CONVERT_SCALER: std::cell::RefCell<crate::scale::Scaler> =
+        std::cell::RefCell::new(crate::scale::Scaler::new());
 }
 
 #[cfg(feature = "image")]
@@ -1413,6 +1514,42 @@ fn plane_ptr(frame: &AVFrame, plane: usize) -> *mut u8 {
     }
 }
 
+/// `AVFrame.linesize[plane]` as a validated **sample** stride.
+///
+/// `linesize` is a byte distance and negative for bottom-up frames, so it is
+/// divided by the element size only when that division is exact: a linesize that
+/// is not a whole number of elements (or cannot hold one row of `row_len`
+/// samples) would make the row-wise copy walk outside the plane. One-row planes —
+/// every audio plane — never apply the stride, so nothing is validated for them.
+fn plane_stride<T: ElementType>(
+    frame: &AVFrame,
+    plane: usize,
+    rows: usize,
+    row_len: usize,
+) -> Result<i64> {
+    let element_size = std::mem::size_of::<T>() as i64;
+    // `linesize` is only as long as FFmpeg's inline plane array (8); planes beyond
+    // it — a multichannel audio frame's extra channels — have no entry. Reading
+    // past the array would panic, and those planes are one row tall anyway, so
+    // the missing entry is treated as "no stride".
+    let linesize = frame.linesize.get(plane).copied().unwrap_or(0) as i64;
+    if rows <= 1 {
+        return Ok(linesize / element_size);
+    }
+    if linesize % element_size != 0 {
+        return Err(RsmediaError::msg(format!(
+            "Frame plane {plane} has linesize {linesize}, not a multiple of the {element_size}-byte element size"
+        )));
+    }
+    let stride = linesize / element_size;
+    if row_len as i64 > stride.abs() {
+        return Err(RsmediaError::msg(format!(
+            "Frame plane {plane} holds {stride} samples per row, but {row_len} are needed"
+        )));
+    }
+    Ok(stride)
+}
+
 /// Reads `rows` rows of `row_len` samples each out of one `AVFrame` plane.
 ///
 /// `AVFrame.linesize[plane]` is the byte distance between consecutive rows, so
@@ -1431,11 +1568,12 @@ fn read_plane<T: ElementType>(
     if source.is_null() {
         return Err(RsmediaError::msg(format!("Frame plane {plane} is null")));
     }
-    let stride = frame.linesize[plane] as i64 / std::mem::size_of::<T>() as i64;
+    let stride = plane_stride::<T>(frame, plane, rows, row_len)?;
 
     let mut samples = Vec::with_capacity(rows * row_len);
-    // SAFETY: FFmpeg allocated this plane for `linesize * rows` addressable bytes
-    // and every read stays within `row_len` samples of its row start.
+    // SAFETY: FFmpeg allocated this plane for `linesize * rows` addressable bytes,
+    // `plane_stride` just checked the row length fits the stride, and every read
+    // stays within `row_len` samples of its row start.
     unsafe {
         for row in 0..rows {
             let row_ptr = source.offset(row as isize * stride as isize);
@@ -1447,7 +1585,10 @@ fn read_plane<T: ElementType>(
 
 /// Writes `rows` rows of `row_len` samples each into one `AVFrame` plane.
 ///
-/// The mirror of [`read_plane`], with the same one-row-tall shortcut for audio.
+/// The mirror of [`read_plane`], with the same one-row-tall shortcut for audio
+/// and the same validation of the destination pointer and stride: an
+/// unallocated plane or a stride that cannot hold a row is reported instead of
+/// being written through.
 fn write_plane<T: ElementType>(
     frame: &mut AVFrame,
     plane: usize,
@@ -1463,10 +1604,16 @@ fn write_plane<T: ElementType>(
         )));
     }
     let destination = plane_ptr(frame, plane) as *mut T;
-    let stride = frame.linesize[plane] as i64 / std::mem::size_of::<T>() as i64;
+    if destination.is_null() {
+        return Err(RsmediaError::msg(format!(
+            "Frame plane {plane} is null: is the frame allocated?"
+        )));
+    }
+    let stride = plane_stride::<T>(frame, plane, rows, row_len)?;
 
-    // SAFETY: `alloc_buffer` sized this plane for `linesize * rows` writable bytes
-    // and the frame outlives the copies; each write stays within `row_len`.
+    // SAFETY: `alloc_buffer` sized this plane for `linesize * rows` writable bytes,
+    // `plane_stride` just checked the row length fits the stride, and the frame
+    // outlives the copies; each write stays within `row_len`.
     unsafe {
         for row in 0..rows {
             std::ptr::copy_nonoverlapping(
@@ -1588,16 +1735,27 @@ fn plane_from<S: ElementType, T: ElementType>(
     rows: usize,
     cols: usize,
 ) -> Result<Array2<T>> {
-    Array2::from_shape_vec((rows, cols), cast_samples::<S, T>(samples))
+    Array2::from_shape_vec((rows, cols), cast_samples::<S, T>(samples)?)
         .map_err(|e| RsmediaError::msg(format!("Failed to build frame plane: {e}")))
 }
 
-/// Casts flat samples from `S` to `T`, falling back to zero for values the
-/// conversion cannot represent.
-fn cast_samples<S: ElementType, T: ElementType>(samples: Vec<S>) -> Vec<T> {
+/// Casts flat samples from `S` to `T`, failing on a value the conversion cannot
+/// represent.
+///
+/// `num_traits::cast` reports `None` for a value outside `T`'s range (or a NaN
+/// turned integer); writing a zero in its place would silently corrupt the
+/// frame, so it is reported instead.
+fn cast_samples<S: ElementType, T: ElementType>(samples: Vec<S>) -> Result<Vec<T>> {
     samples
         .into_iter()
-        .map(|value| num_traits::cast::<S, T>(value).unwrap_or(T::zero()))
+        .map(|value| {
+            num_traits::cast::<S, T>(value).ok_or_else(|| {
+                RsmediaError::msg(format!(
+                    "Sample {value:?} is out of range for {}",
+                    std::any::type_name::<T>()
+                ))
+            })
+        })
         .collect()
 }
 

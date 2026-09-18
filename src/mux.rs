@@ -2,7 +2,7 @@ use crate::error::{Context, Result, RsmediaError};
 use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, Writer};
-use crate::options::Metadata;
+use crate::options::{Metadata, Options};
 use crate::stream::{MediaType, StreamInfo};
 use crate::subtitle::SubtitleSegment;
 use crate::{
@@ -21,9 +21,14 @@ use std::collections::HashMap;
 /// matching what `ffmetadata` and most container tooling use.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chapter {
-    /// Unique chapter id; `0` means auto-assign sequential ids (0, 1, 2, ...)
-    /// when the header is written.
-    pub id: i64,
+    /// Chapter id requested from the container; `None` (the [`Chapter::new`]
+    /// default) means "auto-assign".
+    ///
+    /// The muxer decides which ids actually reach the file: MP4 (`movenc`) numbers
+    /// chapters by position from 0, Matroska from 1 — an explicit `Some(..)` is not
+    /// round-tripped. Reading chapters back therefore always yields `Some(..)`,
+    /// holding the value the container chose.
+    pub id: Option<i64>,
     /// Human-readable chapter title, stored as the chapter's `title` metadata.
     pub title: String,
     /// Chapter start time in seconds.
@@ -33,10 +38,10 @@ pub struct Chapter {
 }
 
 impl Chapter {
-    /// Creates a chapter with an auto-assigned id.
+    /// Creates a chapter with an auto-assigned id and the given title.
     pub fn new(title: impl Into<String>, start: f64, end: f64) -> Self {
         Self {
-            id: 0,
+            id: None,
             title: title.into(),
             start,
             end,
@@ -81,6 +86,13 @@ pub struct Muxer<W: Writer> {
     pub writer: W,
     streams: Vec<MuxerStream>,
     interleaved: bool,
+    /// `true` 时把提交进来的时间戳整体平移到 0 起点，见
+    /// [`Muxer::set_normalize_timestamps`]。
+    normalize_timestamps: bool,
+    /// 归一化基准（微秒，`AV_TIME_BASE`），首个带有效时间戳的提交单元建立。
+    /// 存微秒而**不是**某个流的时间基单位：视频（1/fps）与音频（1/sample_rate）
+    /// 减的必须是同一物理时刻，否则会破坏音视频同步。
+    pts_base_us: Option<i64>,
     have_written_header: bool,
     have_written_trailer: bool,
     /// Container-level metadata (e.g. "title", "artist"), applied to the
@@ -92,6 +104,10 @@ pub struct Muxer<W: Writer> {
     stream_metadata: HashMap<usize, Metadata>,
     /// Container chapters, applied right before the header is written.
     chapters: Vec<Chapter>,
+    /// `true` once [`Self::apply_chapters`] has transferred the chapter nodes to
+    /// the format context, so a retried header write does not allocate a second
+    /// set of nodes and leak the first one.
+    chapters_applied: bool,
 }
 
 /// 单个输出流。既可以是编码流（持有 [`Encoder`]，由 [`Muxer::add_encoder`]
@@ -139,6 +155,64 @@ impl Muxer<StreamWriter> {
         let writer = StreamWriter::new(destination)?;
         Ok(Self::new_from_writer(writer))
     }
+
+    /// 打开**分段录制**输出：按时间/大小把输出切成多个文件（`segment` muxer）。
+    ///
+    /// `pattern` 是文件名模板，`%d`/`%03d` 由 `segment` muxer 按段序号展开
+    /// （如 `"out_%03d.mp4"`）；切分条件与段内参数经 `options` 给出，常用的有：
+    ///
+    /// | 选项 | 含义 |
+    /// |------|------|
+    /// | `segment_time` | 每段时长（秒，支持 `"2.5"`；默认由 muxer 决定） |
+    /// | `segment_time_delta` | 切点容差（秒），吸收时间戳抖动，避免段长忽长忽短 |
+    /// | `segment_size` | 每段字节上限（与 `segment_time` 取先到者） |
+    /// | `segment_format` / `segment_format_options` | 段容器与段容器参数（默认取模板扩展名） |
+    /// | `reset_timestamps` | `1` = 每段时间戳从 0 重新开始（播放器/上传友好） |
+    ///
+    /// 切点落在**关键帧**上：默认只在参考流的关键帧处开新段（`break_non_keyframes=1`
+    /// 可放宽）。要精确控制切点，用
+    /// [`MediaFrame::force_key_frame`](crate::MediaFrame::force_key_frame) 在
+    /// 目标位置强制插关键帧，并让
+    /// [`with_gop_size`](crate::EncoderBuilder::with_gop_size) 与段长相称。
+    ///
+    /// 与 [`Muxer::new`] 的差别只在打开方式：`segment` 是 `AVFMT_NOFILE` 容器，
+    /// 由它自己按模板开/关每个段文件，因此**必须**显式指定格式，模板也不会被
+    /// 当成一个真实文件名创建。
+    ///
+    /// ```no_run
+    /// use rsmedia::mux::Muxer;
+    /// use rsmedia::options::Options;
+    /// use rsmedia::{EncoderBuilder, MediaFrame, PixelFormat};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut opts = Options::new();
+    /// opts.insert("segment_time", "10");
+    /// opts.insert("reset_timestamps", "1");
+    /// let mut muxer = Muxer::new_segmented("/tmp/out_%03d.mp4", opts)?;
+    ///
+    /// let encoder = EncoderBuilder::new_video(640, 480).with_fps(25.0).build()?;
+    /// let tb = encoder.time_base();
+    /// let idx = muxer.add_encoder(encoder)?;
+    /// let mut frame = MediaFrame::<u8>::new_video_frame(640, 480, PixelFormat::RGB24)?;
+    /// frame.set_pts(0);
+    /// let mut av = frame.to_avframe()?;
+    /// av.set_time_base(tb);
+    /// muxer.mux(av, idx)?;
+    /// muxer.finish()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_segmented(
+        pattern: impl Into<Location>,
+        options: impl Into<Option<Options>>,
+    ) -> Result<Self> {
+        let writer = crate::io::StreamWriterBuilder::new(pattern)
+            .with_format("segment")
+            .with_options(options)
+            .build()
+            .context("Failed to open segmented output")?;
+        Ok(Self::new_from_writer(writer))
+    }
 }
 
 impl<W: Writer> Muxer<W> {
@@ -151,11 +225,16 @@ impl<W: Writer> Muxer<W> {
             // 非交错直写会让 FLV 等容器报 "Packets poorly interleaved / not in
             // the proper order with respect to DTS"（AVERROR(EINVAL)）。
             interleaved: true,
+            // 默认不平移：库不悄悄改用户给的时间戳，需要的人显式开启
+            // （live 采集的 wallclock/epoch 时间戳等，见 set_normalize_timestamps）。
+            normalize_timestamps: false,
+            pts_base_us: None,
             have_written_header: false,
             have_written_trailer: false,
             metadata: Metadata::new(),
             stream_metadata: HashMap::new(),
             chapters: Vec::new(),
+            chapters_applied: false,
         }
     }
 
@@ -178,8 +257,61 @@ impl<W: Writer> Muxer<W> {
     /// 透传（remux）单流等场景可关闭，回到逐包直写
     /// （`av_write_frame`）的旧行为。
     pub fn set_interleaved(&mut self, interleaved: bool) -> &mut Self {
+        // header 写出后 `AVFormatContext` 的写队列已按当时的设置建立（交错写入
+        // 的内部 buffer 属于 muxer），此时再改只影响后续包，语义静默改变——
+        // 与 metadata/chapter 一致地告警。
+        if self.have_written_header {
+            tracing::warn!(
+                "set_interleaved({interleaved}) after header write only affects subsequent \
+                 packets; set it before the first mux()/mux_packet()"
+            );
+        }
         self.interleaved = interleaved;
         self
+    }
+
+    /// 开关时间戳归一化：以**首个带有效时间戳的提交单元**为基准，把全部流的时间戳
+    /// 平移到 0 起点，等价于 ffmpeg CLI 默认的 `ts_offset`（把输入起点移到 0）行为。
+    ///
+    /// 用于时间戳本身很大的输入——live 采集的 wallclock/epoch 时间戳（`avformat`
+    /// 的 `use_wallclock_as_timestamps=1`）、SDI 时间码、带绝对起点的 RTP 流等。
+    /// **FLV/RTMP 的时间戳字段只有 32 位毫秒**，直接透传 epoch 值会溢出回绕：产物
+    /// 起始 pts 落在几十万秒处，播放器的时长/缓冲计算随之失真。
+    ///
+    /// 只做整体平移，帧间间隔（真实到达节奏、卡顿造成的 PTS 跳变）完全保留；
+    /// 基准跨流共享同一物理时刻（内部按微秒存储、逐流换算回各自时间基），
+    /// 因此音视频同步不受影响。`AV_NOPTS_VALUE`（未设 pts，由编码器自动编号）
+    /// 原样透传，也不参与基准建立。
+    ///
+    /// 应在写入任何数据**之前**调用；header 写出后才开启时基准只能从下一个提交
+    /// 单元建立，先前写出的包保持原值，时间戳会出现回跳（此处会告警）。
+    pub fn set_normalize_timestamps(&mut self, normalize: bool) -> &mut Self {
+        if normalize && self.have_written_header {
+            tracing::warn!(
+                "set_normalize_timestamps(true) after header write: the base is taken from the \
+                 next submitted frame/packet; already-written packets keep their original values"
+            );
+        }
+        self.normalize_timestamps = normalize;
+        self.pts_base_us = None;
+        self
+    }
+
+    /// 把一个时间戳平移到归一化基准（`tb` 是该值当前所在的时间基）。
+    ///
+    /// 首个有效时间戳建立基准并把自身恰好平移到 0（避免换算取整后首帧落在 ±1 tick）；
+    /// 后续值减去同一基准。未开启归一化或时间戳为 `AV_NOPTS_VALUE` 时原样返回。
+    fn normalize_ts(&mut self, ts: i64, tb: ffi::AVRational) -> i64 {
+        if !self.normalize_timestamps || ts == ffi::AV_NOPTS_VALUE {
+            return ts;
+        }
+        match self.pts_base_us {
+            Some(base_us) => ts - rsmpeg::avutil::av_rescale_q(base_us, ffi::AV_TIME_BASE_Q, tb),
+            None => {
+                self.pts_base_us = Some(rsmpeg::avutil::av_rescale_q(ts, tb, ffi::AV_TIME_BASE_Q));
+                0
+            }
+        }
     }
 
     pub fn add_encoder(&mut self, encoder: Encoder) -> Result<usize> {
@@ -194,7 +326,7 @@ impl<W: Writer> Muxer<W> {
         }
         let stream_idx = self
             .writer
-            .add_stream(encoder.codecpar(), encoder.time_base());
+            .add_stream(encoder.codecpar(), encoder.time_base())?;
         let stream_info = StreamInfo::from_writer(&self.writer, stream_idx)?;
         self.streams
             .push(MuxerStream::new_encoded(encoder, stream_info));
@@ -220,20 +352,54 @@ impl<W: Writer> Muxer<W> {
         let src_time_base = src_info.time_base;
         let stream_idx = self
             .writer
-            .add_stream(src_info.codec_parameters.clone(), src_info.time_base);
+            .add_stream(src_info.codec_parameters.clone(), src_info.time_base)?;
         // 拷贝的 codec_parameters 携带源容器专属的 codec_tag（如 `mp4a`
         // /`avc1`）。跨容器 remux（mp4→mkv 等）时这些 tag 与目标 muxer 不
         // 兼容，清空后由目标 muxer 在 write_header 时自行指派正确 tag。
         // 与 ffmpeg remux 的 `codec_tag = 0` 语义一致。
+        let stream = self.stream_ptr(stream_idx)?;
+        let codecpar = unsafe { (*stream).codecpar };
+        if codecpar.is_null() {
+            return Err(RsmediaError::msg(format!(
+                "output stream {stream_idx} has no codec parameters"
+            )));
+        }
         unsafe {
-            let ctx = self.writer.output_mut().as_mut_ptr();
-            let stream = *(*ctx).streams.add(stream_idx);
-            (*(*stream).codecpar).codec_tag = 0;
+            (*codecpar).codec_tag = 0;
         }
         let stream_info = StreamInfo::from_writer(&self.writer, stream_idx)?;
         self.streams
             .push(MuxerStream::new_copy(stream_info, src_time_base));
         Ok(stream_idx)
+    }
+
+    /// 取得输出上下文中第 `idx` 条流的裸指针（由 `avformat_new_stream` 分配，
+    /// 生命周期同 context）。
+    ///
+    /// [`add_stream`](crate::io::Writer::add_stream) 是公开扩展点，自定义
+    /// `Writer` 实现可以返回任意索引；这里统一做边界检查，避免用越界索引写
+    /// 裸指针（UB）。rsmpeg 只暴露不可变的 `AVStreamRef`，而 `codec_tag` /
+    /// `disposition` 必须在 `write_header` 前就地修改，故取裸指针。
+    ///
+    /// 调用方只应在 `write_header` 之前使用返回的指针（此时 context 由
+    /// `self.writer` 独占，无并发访问），并在同一语句内完成修改。
+    fn stream_ptr(&mut self, idx: usize) -> Result<*mut ffi::AVStream> {
+        let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
+        let nb_streams = ctx.nb_streams as usize;
+        if idx >= nb_streams {
+            return Err(RsmediaError::msg(format!(
+                "output stream index {idx} out of range (nb_streams={nb_streams})"
+            )));
+        }
+        // SAFETY: `ctx.streams` holds `nb_streams` non-null pointers owned by the
+        // output context; `idx` was bounds-checked above.
+        let stream = unsafe { *ctx.streams.add(idx) };
+        if stream.is_null() {
+            return Err(RsmediaError::msg(format!(
+                "output stream {idx} is a null pointer (nb_streams={nb_streams})"
+            )));
+        }
+        Ok(stream)
     }
 
     pub fn get_stream(&self, index: usize) -> Result<&MuxerStream> {
@@ -417,17 +583,9 @@ impl<W: Writer> Muxer<W> {
         // output stream array immutably, so the raw stream array is accessed
         // here instead; sound because the writer exclusively owns the context
         // and the disposition must be set before `write_header`.
-        let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
-        let streams =
-            unsafe { std::slice::from_raw_parts_mut(ctx.streams, ctx.nb_streams as usize) };
-        let Some(stream) = streams.get_mut(stream_idx) else {
-            return Err(RsmediaError::msg(format!(
-                "cover art stream index {stream_idx} out of range (nb_streams={})",
-                ctx.nb_streams
-            )));
-        };
+        let stream = self.stream_ptr(stream_idx)?;
         unsafe {
-            (**stream).disposition |= ffi::AV_DISPOSITION_ATTACHED_PIC as i32;
+            (*stream).disposition |= ffi::AV_DISPOSITION_ATTACHED_PIC as i32;
         }
 
         // The cover must have a valid pts so the muxer timestamps it correctly.
@@ -450,8 +608,12 @@ impl<W: Writer> Muxer<W> {
     /// Failure handling：任一 chapter 或指针数组分配失败时，释放所有已分配的
     /// chapter 节点并保持 `ctx.chapters` 未被设置（FFmpeg 视为无章节），既避免
     /// 内存泄漏，也避免 `nb_chapters > 0` 时数组中出现空指针导致 FFmpeg 解引用崩溃。
+    ///
+    /// 幂等：节点所有权一旦转移给 format context，[`Self::chapters_applied`]
+    /// 即置位，重试写 header（上一次 `write_header` 失败后再次 mux）不会重复
+    /// 分配节点并覆盖 `ctx.chapters`（那会泄漏上一批节点）。
     fn apply_chapters(&mut self) {
-        if self.chapters.is_empty() {
+        if self.chapters.is_empty() || self.chapters_applied {
             return;
         }
         let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
@@ -473,11 +635,8 @@ impl<W: Writer> Muxer<W> {
                 return;
             }
             unsafe {
-                (*chapter_ptr).id = if chapter.id != 0 {
-                    chapter.id
-                } else {
-                    i as i64
-                };
+                // 未指定 id 时按顺序自动编号（FFmpeg 要求章节 id 唯一）。
+                (*chapter_ptr).id = chapter.id.unwrap_or(i as i64);
                 (*chapter_ptr).time_base = ffi::AVRational { num: 1, den: 1000 };
                 (*chapter_ptr).start = start_ms;
                 (*chapter_ptr).end = end_ms;
@@ -510,6 +669,7 @@ impl<W: Writer> Muxer<W> {
         // 时统一释放数组与其内节点。
         ctx.chapters = chapters_ptr;
         ctx.nb_chapters = count as u32;
+        self.chapters_applied = true;
     }
 
     /// 释放一组尚未转移所有权的 chapter 节点（`av_free` 对空指针安全）。
@@ -567,10 +727,36 @@ impl<W: Writer> Muxer<W> {
         // 只有 header 真正写出后才置位：否则一次失败会被记成"已写"，后续 `mux`
         // 会往无头容器里塞包、`finish` 还会补一个 trailer，错误被彻底掩盖。
         self.have_written_header = true;
-        self.refresh_stream_info()?;
+        // 刷新失败只告警：header 字节此刻已经从 writer 的内部累积里取出，若让
+        // 错误上抛，这些字节就永远不会到达调用方（缓冲型 Writer 会拿到缺头的
+        // 容器）。缓存仍是 header 之前的（旧）时间基，包按旧时间基换算——退化为
+        // 与"未刷新"一致的行为，而不是丢掉已经写出的 header。
+        if let Err(err) = self.refresh_stream_info() {
+            tracing::warn!(
+                "Failed to refresh stream info after write_header: {err:#}; \
+                 packet timestamps keep using the pre-header time bases"
+            );
+        }
         let mut collected = W::Accum::default();
         W::merge_out(&mut collected, header);
         Ok(collected)
+    }
+
+    /// [`Self::mux_packet`] / [`Self::mux_subtitle_segment`] 的公共前置：必要时先写
+    /// header，已写 trailer 则拒绝。
+    ///
+    /// `av_write_trailer` 之后 format context 已封闭（muxer 的内部队列被释放、
+    /// 索引已回填），继续写包不是"追加数据"而是把容器写坏。编码流路径
+    /// （[`Self::mux`]）不需要这里的判断：它的 packet 由 encoder 产出，而已 flush
+    /// 的 encoder 自己就会拒绝再编码。
+    fn begin_packet_write(&mut self) -> Result<W::Accum> {
+        if self.have_written_trailer {
+            return Err(RsmediaError::invalid_config(
+                "Cannot write more packets after the trailer has been written; \
+                 finish() already closed the container",
+            ));
+        }
+        self.ensure_header_written()
     }
 
     /// 将已调整好流索引与时间戳的 packet 写入输出容器，返回容器的写入结果。
@@ -586,6 +772,25 @@ impl<W: Writer> Muxer<W> {
         }
     }
 
+    /// 三条写包路径的公共出口：把 packet 归一到 `stream_idx` 输出流后写出。
+    ///
+    /// * `tb_from` - packet 时间戳当前所处的时间基（编码流为编码器时间基，
+    ///   透传流为源流时间基）；目标时间基取流缓存的 **post-header** 值
+    ///   （见 [`Self::refresh_stream_info`]），与 [`Self::finish`] 的 flush 路径
+    ///   同源。
+    fn write_out_packet(
+        &mut self,
+        packet: &mut AVPacket,
+        stream_idx: usize,
+        tb_from: ffi::AVRational,
+    ) -> Result<W::Out> {
+        let out_time_base = self.get_stream(stream_idx)?.stream_info.time_base;
+        packet.set_pos(-1);
+        packet.set_stream_index(stream_idx as i32);
+        packet.rescale_ts(tb_from, out_time_base);
+        self.write_packet(packet)
+    }
+
     /// Mux a single frame through an encoder stream.
     ///
     /// 只适用于通过 [`Self::add_encoder`] 添加的编码流；若目标是透传流
@@ -595,8 +800,34 @@ impl<W: Writer> Muxer<W> {
     ///
     /// * `frame` - [`AVFrame`] to encode and mux.
     /// * `stream_idx` - Index of the target output stream.
-    pub fn mux(&mut self, frame: AVFrame, stream_idx: usize) -> Result<W::Accum> {
+    pub fn mux(&mut self, mut frame: AVFrame, stream_idx: usize) -> Result<W::Accum> {
+        // 先校验目标流是编码流，再提交 header（见 `ensure_header_written`）：拿
+        // 透传流调 `mux()` 属于参数错误，不该把 header 不可逆地写出去。
+        let enc_time_base = self
+            .get_stream(stream_idx)?
+            .encoder
+            .as_ref()
+            .ok_or_else(|| {
+                RsmediaError::msg(format!(
+                    "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
+                ))
+            })?
+            .time_base();
         let mut collected = self.ensure_header_written()?;
+
+        // 归一化在**编码前**应用：编码器内部的自动编号与 flush 出的延迟包就都在同一
+        // 坐标系里，输出侧（含 `finish()` 的 flush 路径）无需再区分处理。
+        // 帧自带有效时间基时以它为准；否则 pts 已按编码器时间基计数（见
+        // `MediaFrame.time_base` 的约定）。
+        let frame_time_base = if frame.time_base.num > 0 && frame.time_base.den > 0 {
+            frame.time_base
+        } else {
+            enc_time_base
+        };
+        let normalized = self.normalize_ts(frame.pts, frame_time_base);
+        if normalized != frame.pts {
+            frame.set_pts(normalized);
+        }
 
         let mux_stream = self.get_stream_mut(stream_idx)?;
         let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
@@ -604,8 +835,6 @@ impl<W: Writer> Muxer<W> {
                 "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
             ))
         })?;
-        let enc_time_base = encoder.time_base();
-        let out_time_base = mux_stream.stream_info.time_base;
         let packets = encoder.encode_raw(frame)?;
         // 编码器输出的 packet 常不带 duration（mpeg4 等），若缺失则按
         // 帧率/采样率补上，否则 MP4 等交错 muxer 无法推导**最后一帧**的
@@ -617,16 +846,10 @@ impl<W: Writer> Muxer<W> {
         // header 的输出一起）逐包累积而不能只留最后一个：缓冲型 Writer 的 `Out`
         // 是**增量**字节，覆盖它会让调用方拿到被截断的流。
         for mut packet in packets {
-            packet.set_pos(-1);
-            packet.set_stream_index(stream_idx as i32);
             if packet.duration <= 0 {
                 packet.set_duration(duration_fallback);
             }
-            // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
-            // encode_ctx_timebase => out_stream_time_base
-            packet.rescale_ts(enc_time_base, out_time_base);
-
-            let out = self.write_packet(&mut packet)?;
+            let out = self.write_out_packet(&mut packet, stream_idx, enc_time_base)?;
             W::merge_out(&mut collected, out);
         }
         Ok(collected)
@@ -652,9 +875,24 @@ impl<W: Writer> Muxer<W> {
         segment: &SubtitleSegment,
         stream_idx: usize,
     ) -> Result<W::Accum> {
+        // 先校验目标流是字幕编码流，再提交 header（见 `begin_packet_write`）。
+        {
+            let mux_stream = self.get_stream(stream_idx)?;
+            let encoder = mux_stream.encoder.as_ref().ok_or_else(|| {
+                RsmediaError::msg(format!(
+                    "Stream {stream_idx} is a copy stream: subtitle segments require an encoder stream"
+                ))
+            })?;
+            if encoder.media_type() != MediaType::SUBTITLE {
+                return Err(RsmediaError::invalid_config(format!(
+                    "mux_subtitle_segment requires a subtitle encoder, got {}",
+                    encoder.media_type()
+                )));
+            }
+        }
         // header 的输出要并入返回值（见 `ensure_header_written`），且必须在
         // 借出 `mux_stream` 之前调用。
-        let mut collected = self.ensure_header_written()?;
+        let mut collected = self.begin_packet_write()?;
 
         let mux_stream = self.get_stream_mut(stream_idx)?;
         let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
@@ -662,23 +900,22 @@ impl<W: Writer> Muxer<W> {
                 "Stream {stream_idx} is a copy stream: subtitle segments require an encoder stream"
             ))
         })?;
-        if encoder.media_type() != MediaType::SUBTITLE {
-            return Err(RsmediaError::invalid_config(format!(
-                "mux_subtitle_segment requires a subtitle encoder, got {}",
-                encoder.media_type()
-            )));
-        }
         let enc_time_base = encoder.time_base();
-        let out_time_base = mux_stream.stream_info.time_base;
         let packets = encoder.encode_subtitle_segment(segment)?;
 
-        // 与 `mux` 相同的累积写法（字幕段通常是 0/1 个 packet，但没理由与
-        // `mux` 用两套语义）。
+        // 与 `mux` 相同的累积写法（字幕段通常是 0/1 个 packet，但没理由与 `mux` 用两套语义）。
         for mut packet in packets {
-            packet.set_pos(-1);
-            packet.set_stream_index(stream_idx as i32);
-            packet.rescale_ts(enc_time_base, out_time_base);
-            let out = self.write_packet(&mut packet)?;
+            // 与 `mux` 一致：归一化在写包前应用（字幕包的 pts/dts 在编码器的
+            // 1/1000 时间基里），基准与音视频流共享，不破坏同步。
+            let pts = self.normalize_ts(packet.pts, enc_time_base);
+            let dts = self.normalize_ts(packet.dts, enc_time_base);
+            if pts != packet.pts {
+                packet.set_pts(pts);
+            }
+            if dts != packet.dts {
+                packet.set_dts(dts);
+            }
+            let out = self.write_out_packet(&mut packet, stream_idx, enc_time_base)?;
             W::merge_out(&mut collected, out);
         }
         Ok(collected)
@@ -696,28 +933,29 @@ impl<W: Writer> Muxer<W> {
     ///   会在写入前被改写为输出流 index。
     /// * `stream_idx` - [`Self::add_copy_stream`] 返回的输出流 index。
     pub fn mux_packet(&mut self, packet: &mut AVPacket, stream_idx: usize) -> Result<W::Accum> {
-        let mut collected = self.ensure_header_written()?;
+        // 先确认这是透传流并取出源时间基（在 `begin_packet_write` 之前）：拿编码流调
+        // `mux_packet()` 属于参数错误，不该把 header 不可逆地写出去。
+        let src_time_base = self.get_stream(stream_idx)?.src_time_base.ok_or_else(|| {
+            RsmediaError::msg(format!(
+                "Stream {stream_idx} is not a copy stream: use mux() instead of mux_packet()"
+            ))
+        })?;
+        let mut collected = self.begin_packet_write()?;
 
-        let (src_time_base, out_time_base) = {
-            let mux_stream = self.get_stream(stream_idx)?;
-            let src_time_base = mux_stream.src_time_base.ok_or_else(|| {
-                RsmediaError::msg(format!(
-                    "Stream {stream_idx} is not a copy stream: use mux() instead of mux_packet()"
-                ))
-            })?;
-            // 输出流时间基取缓存值：`refresh_stream_info` 已在写 header 之后
-            // 把它刷成 muxer 的实际值，所有写包路径共用同一来源。
-            let out_time_base = mux_stream.stream_info.time_base;
-            (src_time_base, out_time_base)
-        };
+        // 与 `mux` 一致：归一化在写包前应用（透传包的 pts/dts 在源流时间基里），
+        // 基准与编码流共享同一物理时刻。
+        let pts = self.normalize_ts(packet.pts, src_time_base);
+        let dts = self.normalize_ts(packet.dts, src_time_base);
+        if pts != packet.pts {
+            packet.set_pts(pts);
+        }
+        if dts != packet.dts {
+            packet.set_dts(dts);
+        }
 
-        packet.set_pos(-1);
-        packet.set_stream_index(stream_idx as i32);
         // src_stream_time_base => out_stream_time_base（重复调用会重复换算，
         // 因此只在我们自己保存的源时间基与输出时间基之间进行一次换算）
-        packet.rescale_ts(src_time_base, out_time_base);
-
-        let out = self.write_packet(packet)?;
+        let out = self.write_out_packet(packet, stream_idx, src_time_base)?;
         W::merge_out(&mut collected, out);
         Ok(collected)
     }
@@ -753,8 +991,10 @@ impl<W: Writer> Muxer<W> {
         // 已写 header 且未写 trailer 时才写 trailer；header + trailer 均已写说明
         // 是重复调用 finish()，此时幂等返回已累积的内容，避免重复写 trailer。
         if !self.have_written_trailer {
-            self.have_written_trailer = true;
             let trailer = self.writer.write_trailer()?;
+            // 写成功后才置位：否则一次失败会被永久记成"已完成"，重试的 finish()
+            // 直接返回 Ok，缺 trailer 的容器被当成正常收尾。
+            self.have_written_trailer = true;
             W::merge_out(&mut collected, trailer);
         }
         Ok(collected)
@@ -808,6 +1048,29 @@ impl<W: Writer> Drop for Muxer<W> {
         // 仅当已写过 header 时才处理，未 mux 过的空文件不做无意义写入。
         self.flush_if_needed();
     }
+}
+
+/// 校验 `writer` 尚未被写过 header（处女态）。
+///
+/// [`Writer`] 自己记录 header 状态（[`Writer::is_header_written`]），但该路径还要
+/// 建自己的流，因此判据是"输出上下文里没有任何流、也没写过 header"：header 一旦
+/// 写出，`AVFormatContext` 的流数组即固定，此时再 `add_stream` + `write_header`
+/// 会让 FFmpeg 内部仍持有的旧指针失效（实测 SIGSEGV）。
+///
+/// 绕开 [`Muxer`] 直接操作 writer 的辅助函数（见
+/// [`encode_subtitle_segments`](crate::subtitle::encode_subtitle_segments)）
+/// 必须显式确认这一点。
+pub(crate) fn ensure_writer_pristine<W: Writer>(writer: &W) -> Result<()> {
+    let nb_streams = writer.output().nb_streams as usize;
+    if writer.is_header_written() || nb_streams > 0 {
+        return Err(RsmediaError::invalid_config(format!(
+            "This writer is no longer pristine ({nb_streams} stream(s), header written: {}): \
+             direct container writing needs a fresh writer (pass one through Muxer to have \
+             header/trailer state tracked)",
+            writer.is_header_written()
+        )));
+    }
+    Ok(())
 }
 
 /// stream definition for demuxer
@@ -1006,6 +1269,9 @@ impl<R: Reader> Demuxer<R> {
 
     /// Reads back the container chapters (title/start/end in seconds).
     ///
+    /// `id` 是容器里记录的实际 id（因此总是 `Some(..)`：读回来的就是具体值，
+    /// 不存在"自动编号"这一说）。
+    ///
     /// Returns an empty list for containers without chapter support.
     pub fn chapters(&self) -> Vec<Chapter> {
         let input = self.reader.input();
@@ -1028,7 +1294,7 @@ impl<R: Reader> Demuxer<R> {
                 let tb = (*c).time_base;
                 let tb_secs = tb.num as f64 / tb.den as f64;
                 chapters.push(Chapter {
-                    id: (*c).id,
+                    id: Some((*c).id),
                     title,
                     start: (*c).start as f64 * tb_secs,
                     end: (*c).end as f64 * tb_secs,
@@ -1052,11 +1318,17 @@ impl<R: Reader> Demuxer<R> {
             .ok_or_else(|| RsmediaError::msg(format!("Stream index: {index} not found")))
     }
 
-    /// 返回输入容器第 `index` 个流的 [`StreamInfo`]（从 reader 实时读取）。
+    /// 返回输入容器第 `index` 个流的 [`StreamInfo`]。
     ///
-    /// 在透传模式（remux）下同样可用，用于把某条输入流喂给
-    /// [`Muxer::add_copy_stream`] 建立对应的输出透传流。
+    /// 优先返回构建解码器时缓存的 [`DemuxerStream::stream_info`]（与
+    /// [`Self::streams`] / [`Self::get_stream`] 看到的完全一致），避免同一份
+    /// 信息存在"缓存"与"实时读取"两个真相源。透传模式没有解码器、也就没有
+    /// 缓存，此时回退为实时读取——该模式正是用它来给 [`Muxer::add_copy_stream`]
+    /// 建立输出透传流的。
     pub fn stream_info(&self, index: usize) -> Result<StreamInfo> {
+        if let Some(demux_stream) = self.streams.iter().find(|s| s.stream_index == index) {
+            return Ok(demux_stream.stream_info.clone());
+        }
         StreamInfo::from_reader(&self.reader, index)
     }
 
@@ -1738,7 +2010,7 @@ mod tests {
         };
 
         output
-            .dump(0, strutils::str_to_cstring(output_path).as_c_str())
+            .dump(0, strutils::str_to_cstring(output_path)?.as_c_str())
             .context("Dump output format context failed.")?;
 
         output
@@ -1877,6 +2149,15 @@ mod tests {
         }
         muxer.finish()?;
 
+        // trailer 之后再写字幕段必须被拒绝（否则数据被追加到已封闭的容器尾部）
+        let err = muxer
+            .mux_subtitle_segment(&segments[0], subtitle_index)
+            .expect_err("mux_subtitle_segment after finish must fail");
+        assert!(
+            err.is_invalid_config(),
+            "post-trailer write must be an invalid_config error: {err}"
+        );
+
         // 回读：字幕解码通道逐段无损还原。
         let mut reader = StreamReader::new(&output_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
@@ -1914,6 +2195,11 @@ mod tests {
 
         muxer.add_chapter(Chapter::new("Intro", 0.0, 1.0))?;
         muxer.add_chapter(Chapter::new("Part Two", 1.0, 2.0))?;
+        // 显式 id（`None` 才自动编号）：写进 AVChapter，但容器会自行编号，见下方断言。
+        muxer.add_chapter(Chapter {
+            id: Some(42),
+            ..Chapter::new("Explicit", 2.0, 3.0)
+        })?;
 
         // 1 秒视频（30fps）
         for index in 0..encoder_time_base.den as i64 {
@@ -1927,13 +2213,20 @@ mod tests {
         // 回读：标题 + 秒级起止
         let demuxer = Demuxer::new(&output_path)?;
         let chapters = demuxer.chapters();
-        assert_eq!(chapters.len(), 2, "expected 2 chapters, got {chapters:?}");
+        assert_eq!(chapters.len(), 3, "expected 3 chapters, got {chapters:?}");
         assert_eq!(chapters[0].title, "Intro");
         assert!((chapters[0].start - 0.0).abs() < 1e-6);
         assert!((chapters[0].end - 1.0).abs() < 1e-6);
         assert_eq!(chapters[1].title, "Part Two");
         assert!((chapters[1].start - 1.0).abs() < 1e-6);
         assert!((chapters[1].end - 2.0).abs() < 1e-6);
+        // id 语义：未指定时自动编号（0, 1, ...）；回读一律是具体值（`Some`）。
+        assert_eq!(chapters[0].id, Some(0), "auto-assigned ids start at 0");
+        assert_eq!(chapters[1].id, Some(1));
+        // MP4（movenc）把章节写成文本轨并自行顺次编号，因此显式 id 不会保留；
+        // 回读拿到的仍是具体值（`Some`），只是由容器决定。
+        assert_eq!(chapters[2].id, Some(2));
+        assert_eq!(chapters[2].title, "Explicit");
 
         // MKV 使用原生 chapter atom（非 MP4 文本轨），同样必须完整回传
         let mkv_path = crate::test_support::test_output_path("mux", "test_mux_chapters.mkv");
@@ -1942,7 +2235,11 @@ mod tests {
         let mut muxer = Muxer::new(&mkv_path)?;
         let video_index = muxer.add_encoder(video_encoder)?;
         muxer.add_chapter(Chapter::new("MKV Intro", 0.0, 1.0))?;
-        for index in 0..encoder_time_base.den as i64 {
+        muxer.add_chapter(Chapter {
+            id: Some(7),
+            ..Chapter::new("MKV Explicit", 1.0, 2.0)
+        })?;
+        for index in 0..(encoder_time_base.den as i64 * 2) {
             let mut frame = generate_video_frame(width, height, index);
             frame.set_pts(index * encoder_time_base.den as i64);
             frame.set_time_base(encoder_time_base);
@@ -1954,11 +2251,17 @@ mod tests {
         let chapters = demuxer.chapters();
         assert_eq!(
             chapters.len(),
-            1,
-            "expected 1 mkv chapter, got {chapters:?}"
+            2,
+            "expected 2 mkv chapters, got {chapters:?}"
         );
         assert_eq!(chapters[0].title, "MKV Intro");
         assert!((chapters[0].end - 1.0).abs() < 1e-6);
+        // Matroska 同样忽略显式 id，按位置从 1 编号（ffprobe 看到的 uid 就是 1、2）。
+        assert_eq!(chapters[0].id, Some(1), "matroska ids start at 1");
+        assert_eq!(chapters[1].id, Some(2));
+        assert_eq!(chapters[1].title, "MKV Explicit");
+        assert!((chapters[1].start - 1.0).abs() < 1e-6);
+        assert!((chapters[1].end - 2.0).abs() < 1e-6);
 
         Ok(())
     }
@@ -2167,6 +2470,10 @@ mod tests {
         fn output_mut(&mut self) -> &mut AVFormatContextOutput {
             self.inner.output_mut()
         }
+
+        fn is_header_written(&self) -> bool {
+            self.inner.is_header_written()
+        }
     }
 
     /// header 与一帧编出的多个 packet（B 帧重排序、编码器内部缓冲）的输出都必须
@@ -2319,6 +2626,79 @@ mod tests {
         Ok(())
     }
 
+    /// `set_normalize_timestamps(true)`：epoch 级起点（模拟 `use_wallclock_as_timestamps=1`
+    /// 的墙钟 pts）在 FLV 里被平移到 0，帧间间隔与采集卡顿造成的跳变逐 tick 保留。
+    /// 默认（false）时相对间隔虽在、但起点被 FLV 的 32 位毫秒字段回绕成垃圾值。
+    #[test]
+    fn test_normalize_timestamps_shifts_epoch_pts_to_zero() -> Result<()> {
+        // 25fps + ultrafast（无 B 帧）：pts/dts 同坐标，容器不做负时间戳平移，
+        // 可以把回读的 pts 与注入值逐个精确比对。
+        const EPOCH_TICKS: i64 = 1_789_635_572 * 25;
+        // 第 5 帧前模拟一次 1s 的采集卡顿（正常间隔 40ms = 1 tick），其后恢复。
+        let delta_ticks = |i: i64| if i >= 5 { 25 + (i - 5) } else { i };
+
+        let run = |normalize: bool, name: &str| -> Result<Vec<i64>> {
+            let path = crate::test_support::test_output_path("mux", name);
+            {
+                let mut muxer = Muxer::new(&path)?;
+                muxer.set_normalize_timestamps(normalize);
+                let mut options = crate::Options::new();
+                options.insert("preset", "ultrafast");
+                let encoder = EncoderBuilder::new_video(64, 64)
+                    .with_fps(25.0)
+                    .with_options(options)
+                    .build()?;
+                let index = muxer.add_encoder(encoder)?;
+                for i in 0..10i64 {
+                    let mut frame = generate_video_frame(64, 64, i);
+                    frame.set_pts(EPOCH_TICKS + delta_ticks(i));
+                    muxer.mux(frame, index)?;
+                }
+                muxer.finish()?;
+            }
+
+            let reader = StreamReader::new(&path)?;
+            let tb = reader.input().streams()[0].time_base;
+            let mut demuxer = Demuxer::new_passthrough(reader)?;
+            let mut pts_us: Vec<i64> = demuxer
+                .packets()
+                .map(|item| {
+                    item.map(|(_, packet)| {
+                        rsmpeg::avutil::av_rescale_q(packet.pts, tb, ffi::AV_TIME_BASE_Q)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // 包顺序受 dts 交错影响，比较排序后的时间轴。
+            pts_us.sort_unstable();
+            crate::test_support::remove_test_output(&path);
+            Ok(pts_us)
+        };
+
+        let normalized = run(true, "test_normalize_ts_on.flv")?;
+        let raw = run(false, "test_normalize_ts_off.flv")?;
+        assert_eq!(normalized.len(), 10, "帧数不对：{normalized:?}");
+
+        // 归一化后：首个提交单元落在 0，后续间隔（含 1s 卡顿）逐 tick 保留。
+        let expected: Vec<i64> = (0..10i64).map(|i| delta_ticks(i) * 40_000).collect();
+        assert_eq!(
+            normalized, expected,
+            "normalize=true 的时间轴应为 0 起点且保留真实间隔"
+        );
+        // 未开启时：相对间隔仍在，但 FLV 的时间戳字段只有 32 位毫秒，epoch 起点被
+        // 回绕成垃圾值（文件 start 落在几十万秒处）——这正是必须归一化的原因。
+        let raw_deltas: Vec<i64> = raw.windows(2).map(|w| w[1] - w[0]).collect();
+        let expected_deltas: Vec<i64> = (1..10i64)
+            .map(|i| (delta_ticks(i) - delta_ticks(i - 1)) * 40_000)
+            .collect();
+        assert_eq!(raw_deltas, expected_deltas, "回绕不应破坏相对间隔");
+        assert_ne!(
+            raw.first().copied().unwrap_or(0),
+            EPOCH_TICKS * 40_000,
+            "normalize=false 时 FLV 承载不了 epoch 起点"
+        );
+        Ok(())
+    }
+
     /// 编码流与透传流不能混用：两条入口各自拒绝另一类流，并给出可读的错误。
     #[test]
     fn test_mux_rejects_wrong_stream_kind() -> Result<()> {
@@ -2404,6 +2784,35 @@ mod tests {
             frames += 1;
         }
         assert!(frames > 0, "the finished container decoded no frames");
+
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// trailer 写出后透传路径同样不能再写包：否则数据会被追加到已封闭的容器
+    /// 尾部（`mux_packet` 早先缺这条守卫）。
+    #[test]
+    fn test_mux_packet_after_finish_is_rejected() -> Result<()> {
+        let path = crate::test_support::test_output_path("mux", "test_copy_after_finish.mp4");
+        crate::test_support::remove_test_output(&path);
+
+        let mut demuxer = Demuxer::new_passthrough(StreamReader::new("assets/mp4.mp4")?)?;
+        let info = demuxer.stream_info(0)?;
+        let mut muxer = Muxer::new(&path)?;
+        let index = muxer.add_copy_stream(&info)?;
+
+        let (_, mut packet) = demuxer.demux_packet()?.expect("asset has packets");
+        muxer.mux_packet(&mut packet, index)?;
+        muxer.finish()?;
+
+        let (_, mut packet) = demuxer.demux_packet()?.expect("asset has more packets");
+        let err = muxer
+            .mux_packet(&mut packet, index)
+            .expect_err("mux_packet after finish must fail");
+        assert!(
+            err.is_invalid_config(),
+            "post-trailer write must be an invalid_config error: {err}"
+        );
 
         crate::test_support::remove_test_output(&path);
         Ok(())

@@ -55,9 +55,9 @@ fn encode_container(path: &Path, enc_threads: usize) -> Result<()> {
         .build()?;
 
     let mut writer = StreamWriter::new(path)?;
-    let v_idx = writer.add_stream(v_enc.codecpar(), v_enc.time_base());
-    let a_idx = writer.add_stream(a_enc.codecpar(), a_enc.time_base());
-    let s_idx = writer.add_stream(s_enc.codecpar(), s_enc.time_base());
+    let v_idx = writer.add_stream(v_enc.codecpar(), v_enc.time_base())?;
+    let a_idx = writer.add_stream(a_enc.codecpar(), a_enc.time_base())?;
+    let s_idx = writer.add_stream(s_enc.codecpar(), s_enc.time_base())?;
     writer.write_header()?;
     let (v_tb, a_tb, s_tb) = (
         writer.stream_time_base(v_idx)?,

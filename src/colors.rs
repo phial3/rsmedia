@@ -367,10 +367,15 @@ pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> [f32; 3] {
 /// Convert HSV to RGB color space.
 ///
 /// The inverse of [`rgb_to_hsv`], with the same convention: `h` is in **degrees**
-/// (0-360) and `s` / `v` are **percentages** (0-100). The channels are converted to
-/// integers before the conversion, so fractional parts are truncated.
+/// (0-360) and `s` / `v` are **percentages** (0-100). All three channels keep
+/// their fractional part — they are *not* rounded to integers before the
+/// conversion (which would quantise hue to whole degrees and s/v to whole
+/// percent), so [`rgb_to_hsv`] → `hsv_to_rgb` round-trips within ±1.
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
-    let rgb = colorutils_rs::Hsv::new(h as u16, s as u16, v as u16).to_rgb8();
+    // `Hsv` itself stores s/v as fractions (0..=1), while this API takes
+    // percentages — hence the `/ 100.0` (matching `rgb_to_hsv`'s `* 100.0`).
+    let hsv = colorutils_rs::Hsv::from_components(h, s / 100.0, v / 100.0);
+    let rgb = hsv.to_rgb8();
     [rgb.r, rgb.g, rgb.b]
 }
 
@@ -482,24 +487,24 @@ mod tests {
         for &(r, g, b, eh, es, ev) in cases {
             let [h, s, v] = rgb_to_hsv(r, g, b);
             assert!(
-                (h - eh).abs() < 2.0,
+                (h - eh).abs() < 0.5,
                 "Hue mismatch for RGB({r},{g},{b}): {h} vs {eh}"
             );
             assert!(
-                (s - es).abs() <= 2.0,
+                (s - es).abs() <= 0.5,
                 "S mismatch for RGB({r},{g},{b}): {s} vs {es}"
             );
             assert!(
-                (v - ev).abs() <= 2.0,
+                (v - ev).abs() <= 0.5,
                 "V mismatch for RGB({r},{g},{b}): {v} vs {ev}"
             );
 
-            // 往返转换允许 ±2 的取整误差
+            // 往返转换只允许 ±1 的浮点舍入（s/v 不再被截断成整数百分比）
             let [r2, g2, b2] = hsv_to_rgb(h, s, v);
             assert!(
-                (r as i32 - r2 as i32).abs() <= 2
-                    && (g as i32 - g2 as i32).abs() <= 2
-                    && (b as i32 - b2 as i32).abs() <= 2,
+                (r as i32 - r2 as i32).abs() <= 1
+                    && (g as i32 - g2 as i32).abs() <= 1
+                    && (b as i32 - b2 as i32).abs() <= 1,
                 "roundtrip mismatch for RGB({r},{g},{b}): [{r2},{g2},{b2}]"
             );
         }
@@ -518,10 +523,10 @@ mod tests {
             let [h, s, v] = rgb_to_hsv(r, g, b);
             let [r2, g2, b2] = hsv_to_rgb(h, s, v);
 
-            // 允许 ±3 的误差（浮点舍入 + u8 整型截断）
-            assert!((r as i32 - r2 as i32).abs() <= 3);
-            assert!((g as i32 - g2 as i32).abs() <= 3);
-            assert!((b as i32 - b2 as i32).abs() <= 3);
+            // 只允许 ±1 的误差（f32 舍入 + u8 截断）
+            assert!((r as i32 - r2 as i32).abs() <= 1);
+            assert!((g as i32 - g2 as i32).abs() <= 1);
+            assert!((b as i32 - b2 as i32).abs() <= 1);
         }
     }
 

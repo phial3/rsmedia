@@ -35,6 +35,10 @@ pub enum RsmediaError {
     /// The requested container format does not exist in this FFmpeg build.
     #[error("format not found in this FFmpeg build: '{0}'")]
     FormatNotFound(String),
+    /// The requested filter does not exist in this FFmpeg build (e.g. `drawtext`
+    /// needs libfreetype, `subtitles` needs libass).
+    #[error("filter not found in this FFmpeg build: '{0}'")]
+    FilterNotFound(String),
     /// The operation is not supported on this platform, build or codec.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
@@ -96,6 +100,11 @@ impl RsmediaError {
         RsmediaError::FormatNotFound(name.into())
     }
 
+    /// Build an [`RsmediaError::FilterNotFound`].
+    pub fn filter_not_found(name: impl Into<String>) -> Self {
+        RsmediaError::FilterNotFound(name.into())
+    }
+
     /// Build an [`RsmediaError::Unsupported`].
     pub fn unsupported(reason: impl Into<String>) -> Self {
         RsmediaError::Unsupported(reason.into())
@@ -129,6 +138,14 @@ impl RsmediaError {
     /// build ([`RsmediaError::FormatNotFound`]).
     pub fn is_format_not_found(&self) -> bool {
         matches!(self.root(), RsmediaError::FormatNotFound(_))
+    }
+
+    /// Whether the root cause is an FFmpeg filter missing from this FFmpeg build
+    /// ([`RsmediaError::FilterNotFound`]) — e.g. a build without libfreetype
+    /// (`drawtext`) or without libass (`subtitles`). Use this to skip gracefully
+    /// instead of matching error strings.
+    pub fn is_filter_not_found(&self) -> bool {
+        matches!(self.root(), RsmediaError::FilterNotFound(_))
     }
 
     /// Whether the root cause is an operation unsupported on this platform,
@@ -238,6 +255,10 @@ mod tests {
             "format not found in this FFmpeg build: 'mkv'"
         );
         assert_eq!(
+            RsmediaError::filter_not_found("drawtext").to_string(),
+            "filter not found in this FFmpeg build: 'drawtext'"
+        );
+        assert_eq!(
             RsmediaError::unsupported("qsv on this platform").to_string(),
             "unsupported operation: qsv on this platform"
         );
@@ -287,6 +308,10 @@ mod tests {
             (
                 RsmediaError::codec_not_found("nope"),
                 RsmediaError::is_codec_not_found as fn(&RsmediaError) -> bool,
+            ),
+            (
+                RsmediaError::filter_not_found("nope"),
+                RsmediaError::is_filter_not_found as fn(&RsmediaError) -> bool,
             ),
             (
                 RsmediaError::unsupported("nope"),

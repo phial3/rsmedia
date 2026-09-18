@@ -773,6 +773,14 @@ fn test_packed_formats_lossless_roundtrip() -> Result<()> {
             DataLayout::Interleaved { components, .. } => components,
             DataLayout::Planar(_) => panic!("{fmt:?} should be interleaved"),
         };
+        // 行宽按 FFmpeg 的 linesize 语义取整到整个色度单元：水平 4:2:2 的
+        // 交错格式（YUYV422/UYVY422）以 2 像素为一个单元，65 像素占 66 列；
+        // 其余 packed 格式每像素一个单元，列数等于 width。
+        let cols = if matches!(fmt, PixelFormat::YUYV422 | PixelFormat::UYVY422) {
+            width.div_ceil(2) * 2
+        } else {
+            width
+        };
 
         let av = create_test_packed_frame(fmt, width, height);
         let media = MediaFrame::<u8>::from_avframe(&av)?;
@@ -782,7 +790,7 @@ fn test_packed_formats_lossless_roundtrip() -> Result<()> {
             .expect("packed formats are interleaved");
         assert_eq!(
             packed.dim(),
-            (height, width, elements),
+            (height, cols, elements),
             "{fmt:?}: shape mismatch"
         );
         assert_eq!(

@@ -30,10 +30,10 @@ pub mod time;
 pub use bsf::Bsf;
 pub use codec::{CodecConfig, FormatInfo, Profile};
 pub use colors::Color;
-pub use decode::{Decoder, DecoderBuilder};
+pub use decode::{Decoder, DecoderBuilder, ErrRecognition, SkipFrame};
 pub use encode::{Encoder, EncoderBuilder};
 pub use error::{Result, RsmediaError};
-pub use filter::Filter;
+pub use filter::{Filter, FilterGraph, FilterGraphBuilder, FilterNode};
 pub use fmt::{DataLayout, FrameFormat, SampleFormat};
 pub use frame::{ElementType, FrameData, FrameSideData, MediaFrame};
 pub use hwaccel::{HWDeviceConfig, HWDeviceType};
@@ -52,6 +52,7 @@ pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
 pub use time::Time;
 
+pub(crate) mod state;
 pub(crate) const MAX_DRAIN_ITERATIONS: usize = 1_000;
 
 #[cfg(feature = "image")]
