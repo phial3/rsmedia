@@ -245,7 +245,7 @@ mod tests {
             let os_str = path.as_os_str();
             let wide_chars: Vec<u16> = os_str.encode_wide().collect();
             let os_string = OsString::from_wide(&wide_chars);
-            let cstring = path_to_cstring(&os_string);
+            let cstring = path_to_cstring(&os_string).unwrap();
             let result_path = cstr_to_path(&cstring);
             assert_eq!(result_path.to_str().unwrap(), test_str);
         }
