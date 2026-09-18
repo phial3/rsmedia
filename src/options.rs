@@ -119,7 +119,10 @@ impl Options {
                 tracing::warn!("Skip option with interior NUL: {k:?}={v:?}");
                 continue;
             }
-            let (key, value) = (strutils::str_to_cstring(k), strutils::str_to_cstring(v));
+            let (key, value) = (
+                strutils::str_to_cstring(k).unwrap(),
+                strutils::str_to_cstring(v).unwrap(),
+            );
             dict = match dict {
                 Some(dict) => Some(dict.set(&key, &value, 0)),
                 None => Some(AVDictionary::new(&key, &value, 0)),

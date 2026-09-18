@@ -1,4 +1,4 @@
-use crate::codec::{AVCodecFlag, CodecContextState};
+use crate::codec::AVCodecFlag;
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::fmt::FrameFormat;
@@ -9,6 +9,7 @@ use crate::options::Options;
 use crate::resample;
 use crate::resize::Resize;
 use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
+use crate::state::ProcessState;
 use crate::stream::StreamInfo;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
@@ -20,6 +21,67 @@ use rsmpeg::avutil::{self, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
 
 use std::sync::Arc;
+
+ffi_enum_wrap_from!(
+    /// 帧丢弃粒度（`AVCodecContext.skip_frame`，`AVDiscard`）。
+    ///
+    /// 只影响**解码器是否把解出的帧交出来**，不省去比特流解析/解码本身
+    /// （`skip_frame` 之上还有 `AV_CODEC_FLAG2_SKIP_MANUAL`、`avcodec_send_packet`
+    /// 层面的跳过，本类型不涉及）。用于只要关键帧的场景：生成缩略图/预览、
+    /// 快速粗剪、按关键帧建索引等。
+    #[allow(non_camel_case_types)]
+    SkipFrame => ffi::AVDiscard,
+    repr = i32,
+    fallback = panic {
+        /// 不丢弃任何帧（FFmpeg 默认行为之外的最宽松档，`AVDISCARD_NONE`）。
+        NONE => ffi::AVDISCARD_NONE;
+        /// FFmpeg 默认：只丢弃 AVI 里长度为 0 的"无用包"这类帧。
+        DEFAULT => ffi::AVDISCARD_DEFAULT;
+        /// 丢弃非参考帧（`AVDISCARD_NONREF`）。
+        NONREF => ffi::AVDISCARD_NONREF;
+        /// 丢弃双向预测帧（B 帧，`AVDISCARD_BIDIR`）。
+        BIDIR => ffi::AVDISCARD_BIDIR;
+        /// 丢弃所有非帧内编码的帧（`AVDISCARD_NONINTRA`）。
+        NONINTRA => ffi::AVDISCARD_NONINTRA;
+        /// 丢弃所有非关键帧（`AVDISCARD_NONKEY`）：只剩 I 帧。
+        NONKEY => ffi::AVDISCARD_NONKEY;
+        /// 丢弃全部帧（`AVDISCARD_ALL`）——解码器只推进状态、不产出帧。
+        ALL => ffi::AVDISCARD_ALL;
+    }
+);
+
+ffi_enum!(
+    /// 解码错误识别力度（`AVCodecContext.err_recognition`，`AV_EF_*` 位）。
+    ///
+    /// 决定解码器**把什么当错误**，以及发现后是"带伤继续"还是直接失败：
+    /// 默认（仅 [`CRCCHECK`](Self::CRCCHECK)）是宽松容错，损坏的码流会被掩盖
+    /// 成错帧/糊帧继续输出；要"宁可失败也不出错帧"就加上
+    /// [`EXPLODE`](Self::EXPLODE)，解码 API 会以 `Err` 报告而不是静默继续。
+    ///
+    /// 位可组合（`ErrRecognition::BUFFER | ErrRecognition::EXPLODE`，结果为原始
+    /// `i32` 掩码）；[`IGNORE_ERR`](Self::IGNORE_ERR) 与
+    /// [`EXPLODE`](Self::EXPLODE) 语义相反，FFmpeg 按位判断，同时置位时行为由
+    /// FFmpeg 内部顺序决定，调用方不应同时给出。
+    #[allow(non_camel_case_types)]
+    ErrRecognition, i32 {
+        /// 校验 CRC 之类的校验和（默认开启，`AV_EF_CRCCHECK`）。
+        CRCCHECK => ffi::AV_EF_CRCCHECK;
+        /// 把码流层（比特流语法）的异常当错误（`AV_EF_BITSTREAM`）。
+        BITSTREAM => ffi::AV_EF_BITSTREAM;
+        /// 把不完整/越界的缓冲当错误（`AV_EF_BUFFER`）。
+        BUFFER => ffi::AV_EF_BUFFER;
+        /// 发现错误立即**失败**而不是尽力掩盖（`AV_EF_EXPLODE`）。
+        EXPLODE => ffi::AV_EF_EXPLODE;
+        /// 忽略可忽略的错误，继续解码（`AV_EF_IGNORE_ERR`）。
+        IGNORE_ERR => ffi::AV_EF_IGNORE_ERR;
+        /// "谨慎"档：更多一致性检查（`AV_EF_CAREFUL`，慢）。
+        CAREFUL => ffi::AV_EF_CAREFUL;
+        /// "严格合规"档：只接受完全符合标准的内容（`AV_EF_COMPLIANT`，更慢）。
+        COMPLIANT => ffi::AV_EF_COMPLIANT;
+        /// "激进"档：为找错误而做的检查（`AV_EF_AGGRESSIVE`，最慢）。
+        AGGRESSIVE => ffi::AV_EF_AGGRESSIVE;
+    }
+);
 
 /// Builds a [`Decoder`].
 #[derive(Debug)]
@@ -45,6 +107,10 @@ pub struct DecoderBuilder {
     pix_fmt: Option<PixelFormat>,
     /// 解码输出目标采样格式（仅音频）。`None` 表示保留编解码器原生格式。
     sample_fmt: Option<SampleFormat>,
+    /// 帧丢弃粒度（`AVCodecContext.skip_frame`）。`None` = FFmpeg 默认（不丢弃）。
+    skip_frame: Option<SkipFrame>,
+    /// 错误识别掩码（`AVCodecContext.err_recognition`）。`None` = FFmpeg 默认。
+    err_recognition: Option<i32>,
 }
 
 impl DecoderBuilder {
@@ -68,6 +134,8 @@ impl DecoderBuilder {
             resize: None,
             pix_fmt: None,
             sample_fmt: None,
+            skip_frame: None,
+            err_recognition: None,
         }
     }
 
@@ -216,6 +284,70 @@ impl DecoderBuilder {
         self
     }
 
+    /// 设置帧丢弃粒度（`AVCodecContext.skip_frame`）：让解码器只交出部分帧。
+    ///
+    /// 典型用法是 [`SkipFrame::NONKEY`] —— 只要关键帧，用来出缩略图、建索引、
+    /// 快速预览而不必解码全部内容。被丢弃的帧**不会**出现在
+    /// [`decode`](Decoder::decode) 的结果里：调用方看到的帧数就是保留下来的帧数
+    /// （帧的 pts 仍是原时间戳，所以能按时间对齐回原流）。丢弃发生在解码器内部，
+    /// 越靠后的档位（[`NONINTRA`](SkipFrame::NONINTRA)、
+    /// [`NONKEY`](SkipFrame::NONKEY)）省下的工作量越多，但**都不会**省掉比特流
+    /// 解析本身。
+    ///
+    /// 关键帧判定由解码器按码流给出的 `AV_PKT_FLAG_KEY` 决定，与容器无关；
+    /// [`ALL`](SkipFrame::ALL) 会让解码器只推进状态、不产出任何帧。
+    ///
+    /// 注意：这是**解码端**的丢弃策略，与"让编码器在某帧强制插关键帧"
+    /// （[`MediaFrame::force_key_frame`](crate::MediaFrame::force_key_frame)）
+    /// 是两端配合的关系 —— 没有关键帧的码流上使用 `NONKEY` 只会得到空结果。
+    ///
+    /// ```
+    /// use rsmedia::{DecoderBuilder, MediaType, SkipFrame};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut reader = rsmedia::StreamReader::new("assets/mp4.mp4")?;
+    /// let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+    ///     .with_skip_frame(SkipFrame::NONKEY)
+    ///     .build_from_reader(&reader)?;
+    /// // 每次调用都返回一个关键帧，非关键帧在解码器内部被丢弃。
+    /// while let Some(frame) = decoder.decode_frame(&mut reader)? {
+    ///     println!("key frame at pts {}", frame.pts);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_skip_frame(mut self, skip_frame: SkipFrame) -> Self {
+        self.skip_frame = Some(skip_frame);
+        self
+    }
+
+    /// 设置错误识别掩码（`AVCodecContext.err_recognition`）。
+    ///
+    /// 默认只有 [`ErrRecognition::CRCCHECK`]，即**宽松容错**：损坏的码流会被
+    /// 解码器尽力掩盖（`error_concealment`）成错帧继续输出，调用方拿到的是
+    /// "看起来正常"的画面。需要"宁可失败也不出错帧"时，把
+    /// [`ErrRecognition::EXPLODE`] 加进来，解码 API 就会以 `Err` 报告损坏，
+    /// 由调用方决定重试/跳过/中止。
+    ///
+    /// 可传单个位，也可传组合出的原始掩码（见 [`ErrRecognition`]）。
+    ///
+    /// ```
+    /// use rsmedia::{DecoderBuilder, MediaType, ErrRecognition};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let strict = ErrRecognition::BUFFER | ErrRecognition::EXPLODE;
+    /// let mut reader = rsmedia::StreamReader::new("assets/mp4.mp4")?;
+    /// let _decoder = DecoderBuilder::new(MediaType::VIDEO)
+    ///     .with_err_recognition(strict)
+    ///     .build_from_reader(&reader)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_err_recognition(mut self, err_recognition: impl Into<i32>) -> Self {
+        self.err_recognition = Some(err_recognition.into());
+        self
+    }
+
     /// 校验像素格式能否以数据平面承载（非位流/调色板/硬件格式）。
     fn ensure_pix_fmt_storable(fmt: PixelFormat) -> Result<()> {
         if !fmt.is_plane_storable() {
@@ -254,6 +386,19 @@ impl DecoderBuilder {
 
         crate::codec::set_thread_count(decoder, self.thread_count.unwrap_or_else(num_cpus::get));
 
+        // 稳定性策略：rsmpeg 未生成 skip_frame / err_recognition 访问器，直接写字段
+        // （encode.rs 写 rc_max_rate 同例）。两项都必须在 `avcodec_open2` 之前生效，
+        // 否则不会进入解码器初始化。
+        unsafe {
+            let raw = decoder.as_mut_ptr();
+            if let Some(skip_frame) = self.skip_frame {
+                (*raw).skip_frame = skip_frame.into();
+            }
+            if let Some(err_recognition) = self.err_recognition {
+                (*raw).err_recognition = err_recognition;
+            }
+        }
+
         Ok(())
     }
 
@@ -268,6 +413,13 @@ impl DecoderBuilder {
         }
         if self.flags.is_some() {
             owned.push(("flags", "with_flags"));
+        }
+        if self.skip_frame.is_some() {
+            owned.push(("skip_frame", "with_skip_frame"));
+        }
+        if self.err_recognition.is_some() {
+            // AVOption 名是 `err_detect`（`err_recognition` 字段的选项拼写）。
+            owned.push(("err_detect", "with_err_recognition"));
         }
         owned
     }
@@ -303,7 +455,7 @@ impl DecoderBuilder {
         // 的返回值）。这两个名字来自不同来源，不要写在同名绑定里——那样两个分支
         // 看起来一模一样，实际解析到不同的变量。
         let codec_name = self.codec_name.as_deref().unwrap_or(&codec_name);
-        let codec = AVCodec::find_decoder_by_name(&strutils::str_to_cstring_checked(codec_name)?)
+        let codec = AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name)?)
             .context(format!("Failed to find decoder by name: '{codec_name}'"))?;
 
         let duration = Time::new(Some(input_stream.duration), input_stream.time_base);
@@ -484,7 +636,7 @@ impl DecoderBuilder {
             hw_context,
             filter_graph,
             context: decode_ctx,
-            state: CodecContextState::Normal,
+            state: ProcessState::Normal,
             scaler: Scaler::new_with_options(self.scale_algorithm, self.scale_quality)
                 .with_buffer_pool(self.scale_pool),
             resize: self.resize,
@@ -501,7 +653,7 @@ impl DecoderBuilder {
 /// The graph and its inputs are one unit on purpose: the pipeline can only be
 /// restarted by rebuilding the graph (see `FilterGraph::rebuild`), which needs
 /// those exact parameters, so keeping them apart would let them drift. The same
-/// reasoning as `CodecContextState`: one fact, one place.
+/// reasoning as `ProcessState`: one fact, one place.
 struct DecodeFilterChain {
     graph: FilterGraph,
     params: FilterParams,
@@ -529,7 +681,7 @@ pub struct Decoder {
     duration: Time,
     stream_index: usize,
     media_type: MediaType,
-    state: CodecContextState,
+    state: ProcessState,
     scaler: Scaler,
     resize: Option<Resize>,
     /// 解码输出目标像素格式（仅视频）
@@ -664,7 +816,7 @@ impl Decoder {
 
     /// Check if decoder is in draining mode.
     pub fn is_drained(&self) -> bool {
-        self.state == CodecContextState::Drained
+        self.state.is_drained()
     }
 
     /// Whether the decoder itself has reached EOF.
@@ -674,7 +826,7 @@ impl Decoder {
     /// delayed filter such as `framerate`), so stopping here would drop them. Use
     /// [`is_finished`](Self::is_finished) for that.
     pub fn is_flushed(&self) -> bool {
-        self.state == CodecContextState::Flushed
+        self.state.is_flushed()
     }
 
     /// Whether the decode pipeline is fully done: the decoder reached EOF **and**
@@ -698,7 +850,7 @@ impl Decoder {
     /// "Decoder is already flushed"/EINVAL，调用方看不出该怎么办；这里统一
     /// 快速失败，并提示唯一的出路是 [`reset`](Self::reset)。
     fn ensure_normal(&self) -> Result<()> {
-        if self.state == CodecContextState::Normal {
+        if self.state.is_normal() {
             Ok(())
         } else {
             Err(RsmediaError::invalid_config(format!(
@@ -868,7 +1020,7 @@ impl Decoder {
                     }
                 }
                 None => {
-                    self.state = CodecContextState::Flushed;
+                    self.state = ProcessState::Flushed;
                     tracing::debug!("Subtitle decoder flushed. EOF reached.");
                     return Ok(None);
                 }
@@ -952,11 +1104,11 @@ impl Decoder {
     /// 使用，可逐 packet 送入解码器并排空缓冲帧。需要 [`MediaFrame`] 的高级调用请使用
     /// [`drain`](Self::drain)。
     pub fn drain_raw(&mut self) -> Result<Option<AVFrame>> {
-        if self.state == CodecContextState::Normal {
+        if self.state.is_normal() {
             self.send_packet_to_decoder(None)?;
             // 已发送 EOS，进入 draining 模式。此后 EAGAIN 表示"仍在 drain"，
             // 而非 read 阶段缺包，因此在此处显式置位。
-            self.state = CodecContextState::Drained;
+            self.state = ProcessState::Drained;
         }
         self.receive_normalized_frame()
     }
@@ -970,7 +1122,7 @@ impl Decoder {
     /// rejected by the graph.
     pub fn reset(&mut self) -> Result<()> {
         self.flush_buffers()?;
-        self.state = CodecContextState::Normal;
+        self.state = ProcessState::Normal;
         Ok(())
     }
 
@@ -1042,9 +1194,9 @@ impl Decoder {
                 // - Flushed：解码器到达 EOF，此时驱动 filter graph 冲刷内部缓冲帧
                 //   （如 fps/setpts 等带延迟滤镜）。逐帧调用 `process_frame(None)`，
                 //   每帧返回一帧，直到 graph 进入 Flushed 状态。
-                match self.state {
-                    CodecContextState::Normal | CodecContextState::Drained => return Ok(None),
-                    CodecContextState::Flushed => {
+                return match self.state {
+                    ProcessState::Normal | ProcessState::Drained => Ok(None),
+                    ProcessState::Flushed => {
                         if let Some(chain) = self.filter_graph.as_mut()
                             && !chain.graph.is_flushed()
                         {
@@ -1056,7 +1208,7 @@ impl Decoder {
                                 }
                             }
                         }
-                        return Ok(None);
+                        Ok(None)
                     }
                 }
             }
@@ -1180,7 +1332,7 @@ impl Decoder {
             }
             Err(rsmpeg::error::RsmpegError::DecoderFlushedError) => {
                 tracing::debug!("Decoder flushed. EOF reached.");
-                self.state = CodecContextState::Flushed;
+                self.state = ProcessState::Flushed;
                 Ok(None)
             }
             Err(e) => {
@@ -1289,8 +1441,8 @@ impl Drop for Decoder {
         //    - `Drained`：EOS 已送过，直接排空（重复送 NULL 只会拿到
         //      AVERROR_EOF 并打出无意义的告警）；
         //    - `Flushed`：已无帧可排，整个步骤跳过。
-        if self.state != CodecContextState::Flushed {
-            let eos_sent = if self.state == CodecContextState::Normal {
+        if !self.state.is_flushed() {
+            let eos_sent = if self.state.is_normal() {
                 match self.send_packet_to_decoder(None) {
                     Ok(()) => true,
                     Err(e) => {
@@ -1852,6 +2004,160 @@ mod tests {
             assert!(err.is_invalid_config(), "{err}");
             assert!(err.to_string().contains("reset()"), "{err}");
         }
+        Ok(())
+    }
+
+    /// 造一段可预测的视频：`content` 为 `true` 时逐像素填噪声（损坏实验用，
+    /// 噪声让码流对字节翻转更敏感），否则留空（静态画面）。
+    fn write_test_clip(path: &std::path::Path, frames: i64, gop: i32, noise: bool) -> Result<()> {
+        let mut muxer = crate::Muxer::new(path)?;
+        let encoder = crate::EncoderBuilder::new_video(160, 120)
+            .with_fps(25.0)
+            .with_gop_size(gop)
+            .with_bit_rate(600_000)
+            .build()?;
+        let index = muxer.add_encoder(encoder)?;
+        for i in 0..frames {
+            let mut frame = AVFrame::new();
+            frame.set_width(160);
+            frame.set_height(120);
+            frame.set_format(i32::from(PixelFormat::YUV420P));
+            frame
+                .alloc_buffer()
+                .context("Failed to allocate frame buffer")?;
+            if noise {
+                // 线性同余发生器：同样的序号得到同样的画面，损坏实验因此可复现。
+                let mut state = (i as u32 + 1) | 1;
+                let y = frame.data[0];
+                let stride = frame.linesize[0] as usize;
+                // SAFETY: `alloc_buffer` 已按 160x120 的 YUV420P 分配好平面；
+                // 这里只写 Y 平面的有效行/列（不含行末对齐填充）。
+                unsafe {
+                    for row in 0..120usize {
+                        for col in 0..160usize {
+                            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            *y.add(row * stride + col) = (state >> 16) as u8;
+                        }
+                    }
+                }
+            }
+            frame.set_pts(i);
+            muxer.mux(frame, index)?;
+        }
+        muxer.finish()
+    }
+
+    /// 解出全部帧的 pts；遇到错误时返回 `Err`（附带已解出的帧数）。
+    fn decode_all_pts(path: &std::path::Path, strict: bool) -> Result<Vec<i64>> {
+        let mut reader = StreamReader::new(path)?;
+        let builder = DecoderBuilder::new(MediaType::VIDEO);
+        let builder = if strict {
+            builder.with_err_recognition(ErrRecognition::BUFFER | ErrRecognition::EXPLODE)
+        } else {
+            builder
+        };
+        let mut decoder = builder.build_from_reader(&reader)?;
+        let mut pts = Vec::new();
+        while let Some(frame) = decoder.decode_frame(&mut reader)? {
+            pts.push(frame.pts);
+        }
+        Ok(pts)
+    }
+
+    /// `with_skip_frame(SkipFrame::NONKEY)`：解码器只交出关键帧，帧数从 50 降到
+    /// 关键帧数，且**交出来的正是默认解码里被标记为关键帧的那些**（pts 逐一相同）。
+    #[test]
+    fn test_skip_frame_nonkey_yields_only_key_frames() -> Result<()> {
+        const FRAMES: i64 = 50;
+        const GOP: i32 = 25;
+        let path = crate::test_support::test_output_path("decode", "test_skip_frame.mp4");
+        write_test_clip(&path, FRAMES, GOP, false)?;
+
+        let mut reader = StreamReader::new(&path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        let mut all = Vec::new();
+        let mut key_pts = Vec::new();
+        while let Some(frame) = decoder.decode_frame(&mut reader)? {
+            if frame.key_frame {
+                key_pts.push(frame.pts);
+            }
+            all.push(frame.pts);
+        }
+        assert_eq!(all.len() as i64, FRAMES, "默认解码应给出全部帧");
+        // 断言的依据是"两个通道对**同一批**帧的判断一致"，不是关键帧恰好落在哪个
+        // 序号上：编码器何时插关键帧属于编码器策略（GOP 之外还有场景切换判定），
+        // 不由这里负责。但要确认关键帧确实存在且不是全部，否则下面的相等断言
+        // 会因为两边都退化成"什么都没跳过"而变得没有意义。
+        assert!(
+            !key_pts.is_empty() && key_pts.len() < all.len(),
+            "默认解码应给出部分（而非全部/零个）关键帧，实测 {key_pts:?}"
+        );
+
+        let mut reader = StreamReader::new(&path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_skip_frame(SkipFrame::NONKEY)
+            .build_from_reader(&reader)?;
+        let mut kept = Vec::new();
+        while let Some(frame) = decoder.decode_frame(&mut reader)? {
+            kept.push(frame.pts);
+        }
+        assert_eq!(
+            kept, key_pts,
+            "NONKEY 必须只交出关键帧，且 pts 与默认解码的关键帧一一对应"
+        );
+        // `ALL` 是更极端的档：什么都不交出来（但仍然把码流走完）。
+        let mut reader = StreamReader::new(&path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_skip_frame(SkipFrame::ALL)
+            .build_from_reader(&reader)?;
+        let mut none = 0usize;
+        while decoder.decode_frame(&mut reader)?.is_some() {
+            none += 1;
+        }
+        assert_eq!(none, 0, "ALL 不应交出任何帧");
+        Ok(())
+    }
+
+    /// `with_err_recognition(EXPLODE)`：损坏的码流必须以 `Err` 报告，而不是被
+    /// 解码器的容错（错误掩盖）悄悄糊过去。
+    ///
+    /// 同一份单字节翻转的产物解两遍：默认配置容错继续、完整解出全部帧；加上
+    /// `BUFFER | EXPLODE` 后必须解不动。翻的是容器中段的负载字节（moov 与容器
+    /// 结构不动），因此失败必然来自解码器而非解封装。
+    #[test]
+    fn test_err_recognition_explode_surfaces_corruption() -> Result<()> {
+        const FRAMES: i64 = 50;
+        const GOP: i32 = 25;
+        let path = crate::test_support::test_output_path("decode", "test_err_recognition.mp4");
+        write_test_clip(&path, FRAMES, GOP, true)?;
+        let clean = std::fs::read(&path)?;
+
+        let mut strict_failures = 0usize;
+        for percent in [20usize, 40, 60, 80] {
+            let mut bytes = clean.clone();
+            let at = clean.len() * percent / 100;
+            bytes[at] ^= 0xFF;
+            let corrupt = crate::test_support::test_output_path(
+                "decode",
+                &format!("test_err_recognition_{percent}.mp4"),
+            );
+            std::fs::write(&corrupt, &bytes)?;
+
+            let tolerant = decode_all_pts(&corrupt, false)?;
+            assert_eq!(
+                tolerant.len() as i64,
+                FRAMES,
+                "{percent}% 处的单字节损坏应被默认容错掩盖，而不是中断解码"
+            );
+
+            if decode_all_pts(&corrupt, true).is_err() {
+                strict_failures += 1;
+            }
+        }
+        assert!(
+            strict_failures > 0,
+            "EXPLODE 必须至少把一处被默认容错掩盖的损坏报成错误"
+        );
         Ok(())
     }
 }

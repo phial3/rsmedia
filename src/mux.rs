@@ -2,7 +2,7 @@ use crate::error::{Context, Result, RsmediaError};
 use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, Writer};
-use crate::options::Metadata;
+use crate::options::{Metadata, Options};
 use crate::stream::{MediaType, StreamInfo};
 use crate::subtitle::SubtitleSegment;
 use crate::{
@@ -153,6 +153,64 @@ impl MuxerStream {
 impl Muxer<StreamWriter> {
     pub fn new(destination: impl Into<Location>) -> Result<Self> {
         let writer = StreamWriter::new(destination)?;
+        Ok(Self::new_from_writer(writer))
+    }
+
+    /// 打开**分段录制**输出：按时间/大小把输出切成多个文件（`segment` muxer）。
+    ///
+    /// `pattern` 是文件名模板，`%d`/`%03d` 由 `segment` muxer 按段序号展开
+    /// （如 `"out_%03d.mp4"`）；切分条件与段内参数经 `options` 给出，常用的有：
+    ///
+    /// | 选项 | 含义 |
+    /// |------|------|
+    /// | `segment_time` | 每段时长（秒，支持 `"2.5"`；默认由 muxer 决定） |
+    /// | `segment_time_delta` | 切点容差（秒），吸收时间戳抖动，避免段长忽长忽短 |
+    /// | `segment_size` | 每段字节上限（与 `segment_time` 取先到者） |
+    /// | `segment_format` / `segment_format_options` | 段容器与段容器参数（默认取模板扩展名） |
+    /// | `reset_timestamps` | `1` = 每段时间戳从 0 重新开始（播放器/上传友好） |
+    ///
+    /// 切点落在**关键帧**上：默认只在参考流的关键帧处开新段（`break_non_keyframes=1`
+    /// 可放宽）。要精确控制切点，用
+    /// [`MediaFrame::force_key_frame`](crate::MediaFrame::force_key_frame) 在
+    /// 目标位置强制插关键帧，并让
+    /// [`with_gop_size`](crate::EncoderBuilder::with_gop_size) 与段长相称。
+    ///
+    /// 与 [`Muxer::new`] 的差别只在打开方式：`segment` 是 `AVFMT_NOFILE` 容器，
+    /// 由它自己按模板开/关每个段文件，因此**必须**显式指定格式，模板也不会被
+    /// 当成一个真实文件名创建。
+    ///
+    /// ```no_run
+    /// use rsmedia::mux::Muxer;
+    /// use rsmedia::options::Options;
+    /// use rsmedia::{EncoderBuilder, MediaFrame, PixelFormat};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut opts = Options::new();
+    /// opts.insert("segment_time", "10");
+    /// opts.insert("reset_timestamps", "1");
+    /// let mut muxer = Muxer::new_segmented("/tmp/out_%03d.mp4", opts)?;
+    ///
+    /// let encoder = EncoderBuilder::new_video(640, 480).with_fps(25.0).build()?;
+    /// let tb = encoder.time_base();
+    /// let idx = muxer.add_encoder(encoder)?;
+    /// let mut frame = MediaFrame::<u8>::new_video_frame(640, 480, PixelFormat::RGB24)?;
+    /// frame.set_pts(0);
+    /// let mut av = frame.to_avframe()?;
+    /// av.set_time_base(tb);
+    /// muxer.mux(av, idx)?;
+    /// muxer.finish()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_segmented(
+        pattern: impl Into<Location>,
+        options: impl Into<Option<Options>>,
+    ) -> Result<Self> {
+        let writer = crate::io::StreamWriterBuilder::new(pattern)
+            .with_format("segment")
+            .with_options(options)
+            .build()
+            .context("Failed to open segmented output")?;
         Ok(Self::new_from_writer(writer))
     }
 }
@@ -1952,7 +2010,7 @@ mod tests {
         };
 
         output
-            .dump(0, strutils::str_to_cstring(output_path).as_c_str())
+            .dump(0, strutils::str_to_cstring(output_path)?.as_c_str())
             .context("Dump output format context failed.")?;
 
         output

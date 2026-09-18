@@ -350,7 +350,7 @@ fn open_input_custom(
     // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
     let fmt_opt = match format {
         Some(name) => {
-            let name_c = strutils::str_to_cstring_checked(name)?;
+            let name_c = strutils::str_to_cstring(name)?;
             AVInputFormat::find(&name_c)
         }
         None => None,
@@ -379,7 +379,7 @@ fn build_output_custom(
     io_context: AVIOContextCustom,
     format: &str,
 ) -> Result<AVFormatContextOutput> {
-    let format_cstr = strutils::str_to_cstring_checked(format)?;
+    let format_cstr = strutils::str_to_cstring(format)?;
     AVFormatContextOutput::builder()
         .format_name(&format_cstr)
         .io_context(AVIOContextContainer::Custom(io_context))
@@ -631,7 +631,7 @@ impl<'a> StreamReaderBuilder<'a> {
 
     /// Build [`StreamReader`].
     pub fn build(self) -> Result<StreamReader> {
-        let filename = strutils::path_to_cstring(&self.source.as_path());
+        let filename = strutils::path_to_cstring(&self.source.as_path())?;
         let protocol = unsafe { ffi::avio_find_protocol_name(filename.as_ptr()) };
         if protocol.is_null() {
             return Err(RsmediaError::msg(format!(
@@ -648,7 +648,7 @@ impl<'a> StreamReaderBuilder<'a> {
         // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
         let fmt_opt = match self.format {
             Some(name) => {
-                let name_c = strutils::str_to_cstring_checked(name)?;
+                let name_c = strutils::str_to_cstring(name)?;
                 AVInputFormat::find(&name_c)
             }
             None => None,
@@ -1229,10 +1229,10 @@ impl<'a> StreamWriterBuilder<'a> {
 
     /// Build [`StreamWriter`].
     pub fn build(self) -> Result<StreamWriter> {
-        let filename = strutils::path_to_cstring(&self.destination.as_path());
+        let filename = strutils::path_to_cstring(&self.destination.as_path())?;
         // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
         let format = match self.format {
-            Some(name) => Some(strutils::str_to_cstring_checked(name)?),
+            Some(name) => Some(strutils::str_to_cstring(name)?),
             None => None,
         };
         let mut dict = self.options.and_then(|opts| opts.into_dict());
@@ -2077,7 +2077,7 @@ pub fn output_protocols() -> Vec<String> {
 /// 返回将处理该 URL 的协议名（如 `"file"`、`"http"`），无匹配协议时为 `None`。
 pub fn find_protocol_name(url: &str) -> Option<String> {
     // URL 来自调用者：含 NUL 字节的 URL 不可能匹配任何协议，返回 None 不 panic。
-    let url_c = strutils::str_to_cstring_checked(url).ok()?;
+    let url_c = strutils::str_to_cstring(url).ok()?;
     rsmpeg::avformat::AVIOProtocol::find_protocol_name(&url_c)
         .map(|p| p.to_string_lossy().into_owned())
 }

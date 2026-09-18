@@ -1,4 +1,4 @@
-use crate::codec::{CodecConfig, CodecContextState};
+use crate::codec::CodecConfig;
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::fmt::FrameFormat;
@@ -9,6 +9,7 @@ use crate::options::{self, CRF_CAPABLE_CODECS, Options, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
 use crate::resample;
 use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
+use crate::state::ProcessState;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
 use crate::time::{self, Rescale};
@@ -40,6 +41,10 @@ pub struct EncoderBuilder {
     /// 目标码率；`None` = 按媒体类型取默认值（视频 [`Self::VIDEO_BIT_RATE`]、
     /// 音频 [`Self::AUDIO_BIT_RATE`]，与 ffmpeg CLI 一致）。
     bit_rate: Option<i64>,
+    /// 瞬时码率上限（`AVCodecContext.rc_max_rate`，ffmpeg CLI 的 `-maxrate`）。
+    max_bit_rate: Option<i64>,
+    /// VBV 缓冲大小（`AVCodecContext.rc_buffer_size`，ffmpeg CLI 的 `-bufsize`）。
+    buffer_size: Option<i64>,
     /// 关键帧间隔；`None` = 不设置，沿用编解码器自身默认值。
     gop_size: Option<i32>,
     /// B 帧上限；`None` = 不设置，沿用编解码器自身默认值（FFmpeg 的 `bf` 默认
@@ -204,6 +209,32 @@ impl EncoderBuilder {
     /// 的 `-b:a` 默认一致）。
     pub fn with_bit_rate(mut self, bit_rate: i64) -> Self {
         self.bit_rate = Some(bit_rate);
+        self
+    }
+
+    /// 限制瞬时码率（`rc_max_rate`，等价 ffmpeg CLI 的 `-maxrate`）。
+    ///
+    /// 目标码率 [`Self::with_bit_rate`] 是**整段平均**，编码器可以在复杂段落大幅超
+    /// 出它；`max_bit_rate` 把瞬时码率也压在上限内（VBV）。与 [`Self::with_buffer_size`]
+    /// 一起设置、并令 `max_bit_rate == bit_rate` 时即为 CBR（恒定码率）——推流场景
+    /// 常用它避免突发码率把上行打满。
+    ///
+    /// 必须为正；≤ 0 时 [`Self::build`] 报 [`RsmediaError::InvalidConfig`]。
+    pub fn with_max_bit_rate(mut self, max_bit_rate: i64) -> Self {
+        self.max_bit_rate = Some(max_bit_rate);
+        self
+    }
+
+    /// 设置 VBV 缓冲大小（`rc_buffer_size`，等价 ffmpeg CLI 的 `-bufsize`）。
+    ///
+    /// 缓冲越大，码率在 `max_bit_rate` 附近的短期波动越自由（质量更稳、上限更松）；
+    /// 越小则越贴近严格 CBR，但画面质量波动更明显。必须与
+    /// [`Self::with_max_bit_rate`] 配套使用，否则编码器只看到一个巨大的缓冲，
+    /// 起不到限流作用。
+    ///
+    /// 必须为正；≤ 0 时 [`Self::build`] 报 [`RsmediaError::InvalidConfig`]。
+    pub fn with_buffer_size(mut self, buffer_size: i64) -> Self {
+        self.buffer_size = Some(buffer_size);
         self
     }
 
@@ -499,11 +530,29 @@ impl EncoderBuilder {
             )));
         }
 
+        // 速率控制的可选约束（VBV）：rsmpeg 未生成 rc_* 访问器，直接写字段
+        // （普通整型，无所有权/无缓冲）——与 `crate::codec::set_thread_count` 同法。
+        unsafe {
+            let raw = encoder.as_mut_ptr();
+            if let Some(max_bit_rate) = self.max_bit_rate {
+                (*raw).rc_max_rate = max_bit_rate;
+            }
+            if let Some(buffer_size) = self.buffer_size {
+                (*raw).rc_buffer_size = i32::try_from(buffer_size).map_err(|_| {
+                    RsmediaError::invalid_config(format!(
+                        "buffer_size {buffer_size} exceeds the i32 range of AVCodecContext.rc_buffer_size"
+                    ))
+                })?;
+            }
+        }
+
         // 参数集进 extradata（容器格式）还是随每个关键帧 in-band（裸流），
         // 由 `with_global_header` 决定，见该方法。
+        let mut flags = encoder.flags;
         if self.global_header {
-            encoder.set_flags(encoder.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
+            flags |= ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
         }
+        encoder.set_flags(flags);
         crate::codec::set_thread_count(encoder, self.thread_count.unwrap_or_else(num_cpus::get));
 
         Ok(())
@@ -588,6 +637,12 @@ impl EncoderBuilder {
         if self.bit_rate.is_some() {
             owned.push(("b", "with_bit_rate"));
         }
+        if self.max_bit_rate.is_some() {
+            owned.push(("maxrate", "with_max_bit_rate"));
+        }
+        if self.buffer_size.is_some() {
+            owned.push(("bufsize", "with_buffer_size"));
+        }
         if matches!(self.quality, Some(Quality::Crf(_))) {
             owned.push(("crf", "with_quality(Quality::Crf)"));
         }
@@ -630,6 +685,18 @@ impl EncoderBuilder {
                 "fps must be a positive, finite number, got {fps}"
             )));
         }
+        for (value, setter) in [
+            (self.max_bit_rate, "max_bit_rate"),
+            (self.buffer_size, "buffer_size"),
+        ] {
+            if let Some(value) = value
+                && value <= 0
+            {
+                return Err(RsmediaError::invalid_config(format!(
+                    "{setter} must be positive, got {value}"
+                )));
+            }
+        }
         let codec_name: String = match &self.codec_name {
             Some(codec_name) => codec_name.clone(),
             None => match media_type {
@@ -645,7 +712,7 @@ impl EncoderBuilder {
         };
         // `find_encoder_by_name` 不区分"名字拼错"与"该 FFmpeg 构建未编译此编码器",
         // 都归入 CodecNotFound —— 调用方据此跳过当前构建不可用的编码器。
-        let codec = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(&codec_name))
+        let codec = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(&codec_name)?)
             .ok_or_else(|| RsmediaError::codec_not_found(codec_name.clone()))?;
 
         // CRF 速率控制：仅对支持 crf 私有选项的视频编码器生效，其余编码器
@@ -859,7 +926,7 @@ impl EncoderBuilder {
             filter_input_format,
             filter_graph,
             context: encode_ctx,
-            state: CodecContextState::Normal,
+            state: ProcessState::Normal,
             scaler: Scaler::new_with_options(self.scale_algorithm, self.scale_quality)
                 .with_buffer_pool(self.scale_pool),
             pending_packets: VecDeque::new(),
@@ -880,6 +947,8 @@ impl Default for EncoderBuilder {
             height: 0,
             pixel_format: None,
             bit_rate: None,
+            max_bit_rate: None,
+            buffer_size: None,
             frame_rate: time::new_rational(Self::FRAME_RATE, 1),
             requested_fps: None,
             gop_size: None,
@@ -931,14 +1000,14 @@ pub struct Encoder {
     filter_input_format: Option<FrameFormat>,
     hw_context: Option<Arc<HWContext>>,
     media_type: MediaType,
-    /// 编解码上下文的阶段，与解码器共用一套 [`CodecContextState`]：
+    /// 编解码上下文的阶段，与解码器共用一套 [`ProcessState`]：
     /// `Normal`（在读帧）→ `Drained`（EOS 已送出、仍在出包）→ `Flushed`（EOF）。
     ///
     /// **只有真正送出 EOS 才允许推进到 `Drained`。** `receive_packet` 的 EAGAIN
     /// 只表示"此刻暂无包可出"，read 阶段的编码器（B 帧、lookahead 缓冲）同样会
     /// 返回它；把 EAGAIN 记成 `Drained` 会让 [`is_drained`](Self::is_drained) 在流
     /// 中段就永久为真，于是 `flush` 的排空循环在没有 EOS 的情况下空转。
-    state: CodecContextState,
+    state: ProcessState,
     scaler: Scaler,
     /// 编码器缓冲满（send_frame 返回 EAGAIN）时，先行排空的已就绪包暂存于此， 由 `receive_packet` 优先取出，
     /// 避免丢包。按 FIFO 出队（`pop_front`）， 保证与编码器输出顺序一致（否则 dts 会乱序、mux 报错）。
@@ -1013,12 +1082,12 @@ impl Encoder {
     /// the phase. The phase is read straight off the encoder's state — the same
     /// single flag [`Decoder::is_drained`](crate::Decoder::is_drained) uses.
     pub fn is_drained(&self) -> bool {
-        self.state == CodecContextState::Drained
+        self.state.is_drained()
     }
 
     /// Returns `true` if the encoder is fully flushed and finished.
     pub fn is_flushed(&self) -> bool {
-        self.state == CodecContextState::Flushed
+        self.state.is_flushed()
     }
 
     /// Encode a high-level frame (a single frame ndarray-based)
@@ -1045,7 +1114,7 @@ impl Encoder {
     /// 所有已就绪的编码包。一次输入帧可能（在编码器缓冲满、滤镜升帧率等场景下）
     /// 产出 0 或多包，因此返回集合而非单个包。
     pub fn encode_raw(&mut self, frame: AVFrame) -> Result<Vec<AVPacket>> {
-        if self.state != CodecContextState::Normal {
+        if !self.state.is_normal() {
             return Err(RsmediaError::invalid_config(format!(
                 "Encoder cannot encode after being flushed (state {:?}); \
                  an FFmpeg encoder cannot be un-flushed, build a new one",
@@ -1664,7 +1733,7 @@ impl Encoder {
             }
             Err(rsmpeg::error::RsmpegError::EncoderFlushedError) => {
                 tracing::debug!("Encoder flushed, EOF reached.");
-                self.state = CodecContextState::Flushed;
+                self.state = ProcessState::Flushed;
                 Ok(None)
             }
             Err(err) => Err(RsmediaError::FFmpeg(err)),
@@ -1700,7 +1769,7 @@ impl Encoder {
         // 已经 flush 过就幂等返回：EOS 只能送一次，重复送会拿到 FFmpeg 的
         // `EncoderFlushedError`。`Muxer::finish` 每个流都会调用本方法，而它自己
         // 承诺可重复调用，所以第二次必须是 no-op 而不是错误。
-        if self.state != CodecContextState::Normal {
+        if !self.state.is_normal() {
             tracing::debug!("Encoder already flushed ({:?}), nothing to do.", self.state);
             return Ok(W::Accum::default());
         }
@@ -1710,7 +1779,7 @@ impl Encoder {
         // 仍然标记 Flushed：对字幕而言"排空"没有下一步可做，且 Drop 的
         // "未 flush" 告警只应针对真的丢了缓冲的编码器。
         if self.media_type == MediaType::SUBTITLE {
-            self.state = CodecContextState::Flushed;
+            self.state = ProcessState::Flushed;
             return Ok(W::Accum::default());
         }
 
@@ -1730,7 +1799,7 @@ impl Encoder {
         // 只有 EOS 真正送出、才进入排空阶段（此后不允许再送帧）。置位点必须在这里，
         // 而不是在 `receive_packet` 的 EAGAIN 分支——那里 read 阶段也会走到。
         // 与 `Decoder::drain_raw` 同一写法：阶段只由 `state` 表示。
-        self.state = CodecContextState::Drained;
+        self.state = ProcessState::Drained;
 
         // drain the items still on the queue before giving up.
         // EOF 已发送，理论上编码器最终会返回 EOF；但为防御个别编码器在 EOS 后
@@ -1870,8 +1939,7 @@ mod tests {
     /// 立即报错（fail fast），而不是把帧转进去后在写入阶段才失败。
     #[test]
     fn test_resolve_pixel_format_negotiation() -> Result<()> {
-        let codec = strutils::str_to_cstring("libx264");
-        let config = CodecConfig::new_with_name(&codec)?;
+        let config = CodecConfig::new_with_name(c"libx264")?;
 
         // 未指定 → 协商为 YUV420P（兼容性最好的默认值）。
         let builder = EncoderBuilder::new_video(64, 64);
@@ -1920,8 +1988,7 @@ mod tests {
     #[test]
     fn test_resolve_sample_format_negotiation() -> Result<()> {
         // pcm_s16le 只接受 S16，而默认优先级是 FLTP → 落到列表首个 S16。
-        let codec = strutils::str_to_cstring("pcm_s16le");
-        let config = CodecConfig::new_with_name(&codec)?;
+        let config = CodecConfig::new_with_name(c"pcm_s16le")?;
         let builder = EncoderBuilder::default()
             .with_media_type(MediaType::AUDIO)
             .with_codec_name("pcm_s16le".to_string())
@@ -1943,8 +2010,7 @@ mod tests {
         );
 
         // aac 原生平面浮点 → 未指定时协商为 FLTP。
-        let codec = strutils::str_to_cstring("aac");
-        let config = CodecConfig::new_with_name(&codec)?;
+        let config = CodecConfig::new_with_name(c"aac")?;
         let builder = EncoderBuilder::default()
             .with_media_type(MediaType::AUDIO)
             .with_codec_name("aac".to_string())

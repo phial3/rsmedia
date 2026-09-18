@@ -902,6 +902,36 @@ where
         self.pts = pts;
     }
 
+    /// 把本帧标记为关键帧（I 帧 / IDR），令编码器在此处强制插入关键帧。
+    ///
+    /// 不调用时关键帧位置完全由编码器按 GOP
+    /// （[`with_gop_size`](crate::EncoderBuilder::with_gop_size)）自行决定；调用后
+    /// 这一帧必为关键帧，供点播切片、随机访问点、seek 友好性等场景使用。
+    ///
+    /// 同时置位两处：`pict_type = AV_PICTURE_TYPE_I`（编码器据此插入关键帧）与
+    /// `key_frame`（即 `AV_FRAME_FLAG_KEY`，FFmpeg 7+ 对"该帧是关键帧"的规范标记）。
+    /// 两者都给才完整：实测 libx264、mpeg4 只认 `pict_type`，而 `key_frame` 是
+    /// 下游（滤镜、容器、解码器）读取关键帧信息的字段。
+    ///
+    /// 帧经缩放转换（如 RGB24 输入转编码器要求的 YUV420P）时 `pict_type`/`flags`
+    /// 由 `av_frame_copy_props` 原样带过，该标记不会在转换中丢失。
+    ///
+    /// ```
+    /// use rsmedia::{MediaFrame, PixelFormat};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut frame = MediaFrame::<u8>::new_video_frame(64, 64, PixelFormat::RGB24)?;
+    /// frame.set_pts(100);
+    /// frame.force_key_frame();
+    /// assert!(frame.key_frame);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn force_key_frame(&mut self) {
+        self.pict_type = ffi::AV_PICTURE_TYPE_I;
+        self.key_frame = true;
+    }
+
     /// Returns the frame's unified format: [`FrameFormat::Pixel`] for video,
     /// [`FrameFormat::Sample`] for audio; `None` for other media types.
     #[inline]

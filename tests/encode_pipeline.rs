@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rsmedia::error::Context;
+use rsmedia::options::Options;
 use rsmedia::strutils;
 use rsmedia::time;
 use rsmedia::{
@@ -258,12 +259,12 @@ mod video {
 
         let codec_name = spec.codec.unwrap_or("libx264");
         // 编码器存在性取决于 FFmpeg 构建配置（如 libtheora/libx265），缺失时跳过
-        if AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)).is_none() {
+        if AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?).is_none() {
             return Err(RsmediaError::codec_not_found(format!(
                 "encoder {codec_name} not available in this FFmpeg build"
             )));
         }
-        let codec_name = strutils::str_to_cstring(codec_name);
+        let codec_name = strutils::str_to_cstring(codec_name)?;
         let codec_config = CodecConfig::new_with_name(&codec_name)?;
         assert!(
             codec_config.is_encoder(),
@@ -1083,6 +1084,252 @@ mod video {
         }
         Ok(())
     }
+
+    // ================================================================
+    // 编码器高级模式：VBV 码率上限 / 强制关键帧
+    // ================================================================
+
+    /// 伪随机噪声帧（RGB24，逐像素随机）。
+    ///
+    /// 噪声内容**不可压缩**：编码器无法靠"画面简单"省下码率，因此目标码率与
+    /// `maxrate` 都会成为真实约束——这正是验证码率控制生效所需的内容，
+    /// 用渐变/纯色画面会让码率上限完全看不出来。
+    fn noise_video_frame(w: usize, h: usize, seed: u32) -> MediaFrame<u8> {
+        let mut frame = MediaFrame::<u8>::new_video_frame(w, h, PixelFormat::RGB24)
+            .expect("RGB24 frame allocation");
+        let samples = frame
+            .data
+            .as_packed_mut()
+            .expect("RGB24 frames are interleaved");
+        // 线性同余发生器：无需引入随机数依赖，且同样的 seed 得到同样的画面。
+        let mut state = seed | 1;
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    samples[[y, x, c]] = (state >> 16) as u8;
+                }
+            }
+        }
+        frame
+    }
+
+    /// 用 `builder` 编码 `n_frames` 帧噪声到 `path`，返回产物字节数。
+    fn encode_noise_sequence(
+        builder: EncoderBuilder,
+        path: &Path,
+        width: usize,
+        height: usize,
+        n_frames: i64,
+    ) -> Result<u64> {
+        let encoder = builder.build()?;
+        let enc_tb = encoder.time_base();
+        let mut muxer = rsmedia::mux::Muxer::new(path)?;
+        let idx = muxer.add_encoder(encoder)?;
+        for i in 0..n_frames {
+            let mut frame = noise_video_frame(width, height, i as u32 + 1);
+            frame.set_pts(i);
+            let mut av = frame.to_avframe()?;
+            av.set_time_base(enc_tb);
+            muxer.mux(av, idx)?;
+        }
+        muxer.finish()?;
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    /// 统计 `path` 可解码出的视频帧数。
+    fn count_decoded_video_frames(path: &Path) -> Result<usize> {
+        let mut reader = rsmedia::StreamReader::new(path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        let mut decoded = 0usize;
+        while decoder.decode_frame(&mut reader)?.is_some() {
+            decoded += 1;
+        }
+        Ok(decoded)
+    }
+
+    /// VBV（`with_max_bit_rate` / `with_buffer_size`，等价 `-maxrate`/`-bufsize`）
+    /// 必须真正限制住瞬时码率，而不只是把参数写进 `AVCodecContext`。
+    ///
+    /// 同一段不可压缩的噪声画面、同一目标码率（800 kbps）下编码两次：加了 200 kbps
+    /// 上限的产物必须显著小于不加的产物。两份产物都要能完整解码回原帧数 ——
+    /// 限流不能以损坏流为代价。
+    #[test]
+    fn test_vbv_rate_control_caps_bitrate() -> Result<()> {
+        let width = 320usize;
+        let height = 240usize;
+        let fps = 25.0;
+        let n_frames = 40i64;
+        let bit_rate = 800_000;
+        let max_bit_rate = 200_000;
+
+        let baseline_path = common::test_output_path("encode", "rsmedia_vbv_baseline.mp4");
+        let capped_path = common::test_output_path("encode", "rsmedia_vbv_capped.mp4");
+        common::remove_test_output(&baseline_path);
+        common::remove_test_output(&capped_path);
+
+        let base_builder = || {
+            EncoderBuilder::new_video(width, height)
+                .with_fps(fps)
+                .with_bit_rate(bit_rate)
+        };
+        let baseline =
+            encode_noise_sequence(base_builder(), &baseline_path, width, height, n_frames)?;
+        let capped = encode_noise_sequence(
+            base_builder()
+                .with_max_bit_rate(max_bit_rate)
+                .with_buffer_size(max_bit_rate),
+            &capped_path,
+            width,
+            height,
+            n_frames,
+        )?;
+        println!(
+            "VBV: baseline {baseline} bytes vs capped {capped} bytes (bit_rate={bit_rate}, maxrate=bufsize={max_bit_rate})"
+        );
+        assert!(
+            capped * 3 < baseline,
+            "VBV must cap the bit rate: capped {capped} bytes is not clearly below the \
+             uncapped {baseline} bytes"
+        );
+
+        for path in [&baseline_path, &capped_path] {
+            let decoded = count_decoded_video_frames(path)?;
+            assert_eq!(
+                decoded,
+                n_frames as usize,
+                "{}: rate control must not corrupt the stream",
+                path.display()
+            );
+        }
+
+        common::remove_test_output(&baseline_path);
+        common::remove_test_output(&capped_path);
+        Ok(())
+    }
+
+    /// 强制关键帧：`gop_size = 1000` 时正常不会出现第二个关键帧，但第 10 帧调用
+    /// [`MediaFrame::force_key_frame`] 后，产物里它必须是关键帧。
+    ///
+    /// 端到端验证走「编码 → mp4 → 解码回」，用解码帧的 `key_frame` 判定关键帧位置
+    /// （关闭 B 帧后解码序即显示序，帧序可直接对位）。输入帧是 RGB24 而编码器要
+    /// YUV420P，因此这条用例同时覆盖「标记经 scaler 转换后仍保留」。
+    #[test]
+    fn test_force_key_frame() -> Result<()> {
+        let width = 64usize;
+        let height = 64usize;
+        let n_frames = 20usize;
+        let forced_index = 10usize;
+        let path = common::test_output_path("encode", "rsmedia_force_key_frame.mp4");
+        common::remove_test_output(&path);
+
+        // 画面固定（seed 不变）→ 没有场景切换，关键帧只可能来自 GOP 或本次强制。
+        let encoder = EncoderBuilder::new_video(width, height)
+            .with_fps(25.0)
+            .with_gop_size(1000)
+            .with_max_b_frames(0)
+            .build()?;
+        let enc_tb = encoder.time_base();
+        let mut muxer = rsmedia::mux::Muxer::new(&path)?;
+        let idx = muxer.add_encoder(encoder)?;
+        for i in 0..n_frames as i64 {
+            let mut frame = noise_video_frame(width, height, 7);
+            frame.set_pts(i);
+            if i as usize == forced_index {
+                frame.force_key_frame();
+            }
+            let mut av = frame.to_avframe()?;
+            av.set_time_base(enc_tb);
+            muxer.mux(av, idx)?;
+        }
+        // 编码器有内部缓冲，flush（`finish`）之后包里才有全部帧。
+        muxer.finish()?;
+
+        let mut key_frames = Vec::new();
+        let mut reader = rsmedia::StreamReader::new(&path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        let mut decoded = 0usize;
+        while let Some(frame) = decoder.decode_frame(&mut reader)? {
+            if frame.key_frame {
+                key_frames.push(decoded);
+            }
+            decoded += 1;
+        }
+        assert_eq!(decoded, n_frames, "decoded frame count mismatch");
+        assert_eq!(
+            key_frames,
+            vec![0, forced_index],
+            "expected exactly the first frame and the forced frame {forced_index} to be key frames"
+        );
+
+        common::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// 分段录制（`Muxer::new_segmented`，等价 CLI 的 `-f segment -segment_time`）：
+    /// 一次编码必须按时间落到**多个**文件上，且每段都是可独立解码的完整容器。
+    ///
+    /// 断言的落点是段边界：25 fps 下 `segment_time=1` 每段恰好 25 帧，
+    /// `gop_size=25` 让切点正好压在关键帧上（segment muxer 默认只在参考流的
+    /// 关键帧处开新段，否则会一直等到下一个关键帧）。50 帧因此必须是两段、
+    /// 每段 25 帧、每段都能单独解出 25 帧。
+    #[test]
+    fn test_segmented_recording_splits_into_playable_files() -> Result<()> {
+        const FPS: f32 = 25.0;
+        const GOP: i32 = 25;
+        const FRAMES: i64 = 50;
+        // 独立的输出目录：段文件数量断言要求目录中只有本用例的产物，
+        // 且结尾的清理不能波及并行运行的其他用例（它们共用 `encode` 目录）。
+        let pattern = common::test_output_path("encode_segments", "segment_%03d.mp4");
+        let dir = pattern.parent().expect("pattern has a parent dir");
+
+        let mut options = Options::new();
+        options.insert("segment_time", "1");
+        options.insert("reset_timestamps", "1");
+        let mut muxer =
+            rsmedia::mux::Muxer::new_segmented(pattern.to_string_lossy().to_string(), options)?;
+        let encoder = EncoderBuilder::new_video(160, 120)
+            .with_codec_name(String::from("libx264"))
+            .with_fps(FPS)
+            .with_gop_size(GOP)
+            .with_bit_rate(400_000)
+            .build()?;
+        let enc_tb = encoder.time_base();
+        let idx = muxer.add_encoder(encoder)?;
+        for i in 0..FRAMES {
+            let mut frame = noise_video_frame(160, 120, i as u32 + 1);
+            frame.set_pts(i);
+            let mut av = frame.to_avframe()?;
+            av.set_time_base(enc_tb);
+            muxer.mux(av, idx)?;
+        }
+        muxer.finish()?;
+
+        let mut segments: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<std::io::Result<_>>()?;
+        segments.sort();
+        assert_eq!(
+            segments.len(),
+            2,
+            "50 帧 @25fps 配 segment_time=1 应切成两段，实际：{segments:?}"
+        );
+
+        // 每段都是独立完整的容器：单独打开就能解出这一段的全部帧。
+        for (n, segment) in segments.iter().enumerate() {
+            let frames = count_decoded_video_frames(segment)?;
+            assert_eq!(
+                frames,
+                (FRAMES as usize) / 2,
+                "第 {n} 段应能独立解出 {} 帧，实际 {frames}",
+                FRAMES / 2
+            );
+        }
+
+        // 清理本用例产生的段文件（模板目录是本用例独占的）。
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
 }
 
 // ====================================================================
@@ -1158,7 +1405,7 @@ mod audio {
 
         let codec_name = spec.codec.unwrap_or("aac");
         // 编码器存在性取决于 FFmpeg 构建配置（如 libmp3lame/libopus），缺失时跳过
-        let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name))
+        let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?)
         else {
             return Err(RsmediaError::codec_not_found(format!(
                 "encoder {codec_name} not available in this FFmpeg build"

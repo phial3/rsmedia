@@ -236,8 +236,7 @@ impl HWContext {
             // 含内部 NUL 的输入只能是调用者的错误：报错而不是 panic。
             let device = match config.device_id.as_deref() {
                 Some(device_id) => Some(
-                    strutils::os_str_to_cstring_checked(device_id)
-                        .context("Invalid hardware device id")?,
+                    strutils::os_str_to_cstring(device_id).context("Invalid hardware device id")?,
                 ),
                 None => None,
             };
