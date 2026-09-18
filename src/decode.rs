@@ -301,7 +301,7 @@ impl DecoderBuilder {
     /// （[`MediaFrame::force_key_frame`](crate::MediaFrame::force_key_frame)）
     /// 是两端配合的关系 —— 没有关键帧的码流上使用 `NONKEY` 只会得到空结果。
     ///
-    /// ```
+    /// ```no_run
     /// use rsmedia::{DecoderBuilder, MediaType, SkipFrame};
     ///
     /// # fn main() -> rsmedia::Result<()> {
@@ -331,7 +331,7 @@ impl DecoderBuilder {
     ///
     /// 可传单个位，也可传组合出的原始掩码（见 [`ErrRecognition`]）。
     ///
-    /// ```
+    /// ```no_run
     /// use rsmedia::{DecoderBuilder, MediaType, ErrRecognition};
     ///
     /// # fn main() -> rsmedia::Result<()> {
