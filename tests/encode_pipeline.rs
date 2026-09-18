@@ -275,16 +275,10 @@ mod video {
             codec_name
         );
 
-        // drawtext 依赖 libfreetype 编译进 FFmpeg，部分构建未启用，不可用时降级为仅 scale+crop
-        let mut filters = vec![filter::video::scale(640, 360, None)];
-        if rsmpeg::avfilter::AVFilter::get_by_name(c"drawtext").is_some() {
-            // DrawText 缺省字体为项目内 fonts/Arial.ttf（见 DrawText::build），
-            filters
-                .push(filter::video::DrawText::new("Watermark", 50, 50, 24, "white@0.5").build());
-        } else {
-            println!("SKIP drawtext (libfreetype not available)");
-        }
-        filters.push(filter::video::crop(0, 0, 640, 360));
+        let filters = vec![
+            filter::video::scale(640, 360, None),
+            filter::video::crop(0, 0, 640, 360),
+        ];
 
         // 视频编码参数
         let width = 640;

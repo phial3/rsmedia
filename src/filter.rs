@@ -1646,9 +1646,11 @@ fn invalid_label(label: &str) -> RsmediaError {
 /// pad 数精确校验接线，动态滤镜的 pad 由标签数量生成、交由 FFmpeg 在 `config`
 /// 阶段核对选项。
 fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
-    let name_c = strutils::str_to_cstring(name)?;
-    let filter =
-        AVFilter::get_by_name(&name_c).ok_or_else(|| RsmediaError::filter_not_found(name))?;
+    let filter = get_by_name(name)?;
+    if filter.is_none() {
+        return Err(RsmediaError::filter_not_found(name));
+    }
+    let filter = filter.unwrap();
     // SAFETY: `filter` 指向 FFmpeg 的静态滤镜定义，`avfilter_filter_pad_count` 只读
     // 其中以 NULL 结尾的 pad 数组（`is_output = 0` 取输入侧）。
     let pads = unsafe { ffi::avfilter_filter_pad_count(filter.as_ptr(), 0) } as usize;
@@ -1666,9 +1668,11 @@ fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
 /// ——多标一个标签会生成 `filter[a][b]` 这种 pad 数对不上的描述，FFmpeg 只会给出一句
 /// 难懂的解析错误，所以在这里提前拒掉。
 fn filter_output_pads(name: &str) -> Result<(usize, bool)> {
-    let name_c = strutils::str_to_cstring(name)?;
-    let filter =
-        AVFilter::get_by_name(&name_c).ok_or_else(|| RsmediaError::filter_not_found(name))?;
+    let filter = get_by_name(name)?;
+    if filter.is_none() {
+        return Err(RsmediaError::filter_not_found(name));
+    }
+    let filter = filter.unwrap();
     // SAFETY: 同 `filter_input_pads`，`is_output = 1` 取输出侧。
     let pads = unsafe { ffi::avfilter_filter_pad_count(filter.as_ptr(), 1) } as usize;
     Ok((
@@ -1910,8 +1914,7 @@ impl FilterGraph {
             endpoint.pixel_aspect.den,
         ))?;
 
-        let buffersrc =
-            AVFilter::get_by_name(c"buffer").context("Failed to get video filter 'buffer'.")?;
+        let buffersrc = get_by_name("buffer")?.context("Failed to get video filter 'buffer'.")?;
         self.graph
             .create_filter_context(&buffersrc, name, Some(&args))
             .context("Failed to create video buffer source")
@@ -1925,8 +1928,8 @@ impl FilterGraph {
         name: &CStr,
         format: PixelFormat,
     ) -> Result<AVFilterContextMut<'_>> {
-        let buffersink = AVFilter::get_by_name(c"buffersink")
-            .context("Failed to get video filter 'buffersink'.")?;
+        let buffersink =
+            get_by_name("buffersink")?.context("Failed to get video filter 'buffersink'.")?;
 
         let mut sink_ctx = self
             .graph
@@ -1975,8 +1978,8 @@ impl FilterGraph {
             channel_desc,
         ))?;
 
-        let buffersrc = AVFilter::get_by_name(c"abuffer")
-            .context("Failed to get audio filter buffer 'abuffer'.")?;
+        let buffersrc =
+            get_by_name("abuffer")?.context("Failed to get audio filter buffer 'abuffer'.")?;
         self.graph
             .create_filter_context(&buffersrc, name, Some(&args))
             .context("Failed to create audio buffer source")
@@ -1991,7 +1994,7 @@ impl FilterGraph {
         name: &CStr,
         endpoint: &AudioEndpoint,
     ) -> Result<AVFilterContextMut<'_>> {
-        let buffersink = AVFilter::get_by_name(c"abuffersink")
+        let buffersink = get_by_name("abuffersink")?
             .context("Failed to get audio filter buffer 'abuffersink'.")?;
 
         let mut sink_ctx = self
