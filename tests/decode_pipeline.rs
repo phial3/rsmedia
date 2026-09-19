@@ -11,8 +11,8 @@ mod common;
 
 use rsmedia::colors;
 use rsmedia::{
-    DecoderBuilder, EncoderBuilder, Filter, MediaFrame, MediaType, Muxer, PixelFormat, Result,
-    StreamReader,
+    DecoderBuilder, Demuxer, EncoderBuilder, Filter, MediaFrame, MediaType, Muxer, PixelFormat,
+    Result, StreamReader,
 };
 
 /// 生成 `n_frames` 帧、`fps` 帧率的纯色小视频（不含 B 帧），供延迟滤镜 EOF 回归测试使用。
@@ -90,6 +90,44 @@ fn test_decode_delayed_filter_eof() -> Result<()> {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+/// `Demuxer` 的排空阶段同样不能因为"这一拍没帧"就结束迭代。
+///
+/// 回归对象：[`Demuxer::demux`](rsmedia::Demuxer::demux) 曾对每个流**只调一次**
+/// `drain_raw`：解码器在 Drained 态返回 `None` 只表示 EAGAIN（多线程解码 / B 帧
+/// lookahead 常见），却被当成结束信号，而 `Iterator::next` 把 `Ok(None)` 映射为
+/// 迭代终止 —— 解码器（以及延迟滤镜）里还压着的帧就永远取不出来。
+/// 停止谓词也必须是 `is_finished()`（含滤镜图排空）而非 `is_flushed()`。
+#[test]
+fn test_demuxer_drain_does_not_stop_on_eagain() -> Result<()> {
+    let width = 64usize;
+    let height = 64usize;
+    // (滤镜名, 参数, 输入帧数, fps, 期望最小输出帧数)
+    let cases: &[(&str, &str, usize, f32, usize)] = &[
+        ("framerate", "framerate=fps=30", 30, 30.0, 30),
+        ("fps", "fps=15", 30, 30.0, 15),
+        ("setpts", "setpts=PTS*2", 24, 24.0, 23),
+    ];
+
+    for (i, (name, spec, n_frames, fps, min_frames)) in cases.iter().enumerate() {
+        let path = common::test_output_path("decode", &format!("rsmedia_demux_drain_{i}.mp4"));
+        common::remove_test_output(&path);
+        make_test_video(&path, width, height, *n_frames, *fps)?;
+
+        let filters = vec![Filter::new(name, MediaType::VIDEO, spec.to_string())];
+        let reader = StreamReader::new(&path)?;
+        let demuxer = Demuxer::new_from_reader(reader, Some(filters), None)?;
+        let count = demuxer.count();
+
+        assert!(
+            count >= *min_frames,
+            "{name} Demuxer dropped frames while draining: got {count}, expected >= {min_frames}"
+        );
+
+        common::remove_test_output(&path);
     }
     Ok(())
 }

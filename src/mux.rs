@@ -1420,30 +1420,55 @@ impl<R: Reader> Demuxer<R> {
                     }
                 }
             } else {
-                // Drain every decoder that has not reached EOF yet. The
-                // decoder's own state (`Decoder::is_flushed`) is the single
-                // source of truth here: a decoder is skipped only once it truly
-                // flushed, so a transient EAGAIN in the middle of draining never
-                // causes buffered frames to be dropped. The loop is bounded, so
-                // a decoder that keeps reporting "no frame yet" simply ends this
-                // `demux()` call with `Ok(None)`.
-                for demux_stream in self.streams.iter_mut() {
-                    if demux_stream.decoder.is_flushed() {
-                        continue;
+                // 排空阶段：反复 drain 每个尚未结束的解码器，而不是"每轮一次"。
+                //
+                // 两个要点（旧实现两处都做错了）：
+                // 1. `drain_raw` 返回 `Ok(None)` 在 Drained 态只表示"这一拍没帧"
+                //    （EAGAIN —— 多线程解码、B 帧 lookahead 都会出现），**不是**
+                //    结束信号。据此结束本次 `demux()`，`Iterator::next` 会把
+                //    `Ok(None)` 当成迭代终止，解码器里还压着的帧就永远取不出来了。
+                // 2. 停止谓词是 [`Decoder::is_finished`](crate::Decoder::is_finished)
+                //    而不是 `is_flushed`：带滤镜图时解码器到 EOF 后，滤镜（如
+                //    fps/framerate 这类有延迟的）仍可能压着帧，按 `is_flushed`
+                //    跳过会丢掉它们。
+                //
+                // 循环以 `MAX_DRAIN_ITERATIONS` 为上限，与 `Decoder::drain` 一致：
+                // 个别编解码器在 EOS 后可能一直回"暂无帧"，没有上限就是挂死。
+                let mut drain_iterations = 0usize;
+                loop {
+                    let mut pending = false;
+                    for demux_stream in self.streams.iter_mut() {
+                        if demux_stream.decoder.is_finished() {
+                            continue;
+                        }
+                        pending = true;
+                        let stream_idx = demux_stream.stream_index;
+                        match demux_stream.decoder.drain_raw() {
+                            Ok(Some(frame)) => return Ok(Some((stream_idx, frame))),
+                            Ok(None) => {
+                                tracing::trace!(
+                                    "Stream: [{stream_idx}] has no frame ready this pass; retrying drain"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!("Stream: [{stream_idx}] Decoder Drain Error: {e}");
+                                return Err(e);
+                            }
+                        }
                     }
-                    let stream_idx = demux_stream.stream_index;
-                    match demux_stream.decoder.drain_raw() {
-                        Ok(Some(frame)) => return Ok(Some((stream_idx, frame))),
-                        Ok(None) => {
-                            tracing::debug!("Stream: [{stream_idx}] produced no frame this pass.");
-                        }
-                        Err(e) => {
-                            tracing::error!("Stream: [{stream_idx}] Decoder Drain Error: {e}");
-                            return Err(e);
-                        }
+                    // 所有解码器都真正结束（含滤镜图排空）→ 迭代到此为止。
+                    if !pending {
+                        return Ok(None);
+                    }
+                    drain_iterations += 1;
+                    if drain_iterations >= crate::MAX_DRAIN_ITERATIONS {
+                        tracing::warn!(
+                            "Demuxer: decoders produced no frame after {} drain iterations; ending demux()",
+                            crate::MAX_DRAIN_ITERATIONS
+                        );
+                        return Ok(None);
                     }
                 }
-                return Ok(None);
             }
         }
     }
