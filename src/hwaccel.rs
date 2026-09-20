@@ -978,14 +978,26 @@ mod tests {
             HWDeviceType::MEDIACODEC,
             HWDeviceType::VULKAN,
         ];
-        // 这三个变体本身按 FFmpeg 版本门控，测试也要跟着门控才编得过。
-        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
-        types.push(HWDeviceType::D3D12VA);
-        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-        types.push(HWDeviceType::AMF);
-        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-        types.push(HWDeviceType::OHCODEC);
+        types.extend(version_gated_types());
         types
+    }
+
+    /// 按 FFmpeg 版本门控的变体：低于对应版本的构建返回空表。
+    /// D3D12VA 需要 ffmpeg7+，AMF / OHCODEC 需要 ffmpeg8+。
+    #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
+    fn version_gated_types() -> Vec<HWDeviceType> {
+        Vec::new()
+    }
+
+    #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+    fn version_gated_types() -> Vec<HWDeviceType> {
+        let mut gated = vec![HWDeviceType::D3D12VA];
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        {
+            gated.push(HWDeviceType::AMF);
+            gated.push(HWDeviceType::OHCODEC);
+        }
+        gated
     }
 
     /// 自动探测并创建硬件上下文；探不到就返回 `None` 让调用方跳过。
@@ -1040,26 +1052,28 @@ mod tests {
         }
     }
 
+    /// ✅ DRM 是 Linux 内核子系统（Direct Rendering Manager）
+    /// ❌ Windows：不存在 DRM 内核子系统，完全不支持
+    /// ❌ macOS：无 DRM，不支持
+    /// 注意：WSL2（Linux 子系统）可以使用，前提是 WSL 启用 GPU passthrough，内核带 DRM、宿主机驱动支持。
+    ///
     /// DRM 是唯一例外：必须给出一个真实节点，绝不能是 `NULL`。
     ///
-    /// `open(NULL, O_RDWR)` 在 Rosetta 转译的 x86_64 上会 SIGSEGV（原生 aarch64
-    /// 只是干净地返回 `EFAULT`），所以本机没有 `/dev/dri` 节点时正确行为是
-    /// **干净地报错**，而不是退化成 `NULL`。
+    /// `open(NULL, O_RDWR)` 在 Rosetta 转译的 x86_64 上会 SIGSEGV（原生 aarch64 只是干净地返回 `EFAULT`）
+    /// 所以本机没有 `/dev/dri` 节点时正确行为是 **干净地报错**，而不是退化成 `NULL`
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_drm_never_falls_back_to_null_device() {
         match default_device_string(HWDeviceType::DRM) {
             Ok(Some(node)) => {
                 // 有节点：必须是真实存在的路径（拿它去 open 才可能成功）。
-                #[cfg(unix)]
-                {
-                    use std::os::unix::ffi::OsStrExt;
-                    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(node.as_bytes()));
-                    assert!(
-                        path.starts_with("/dev/dri"),
-                        "DRM 节点应落在 /dev/dri 下，实际 {path:?}"
-                    );
-                    assert!(path.exists(), "挑到的 DRM 节点不存在: {path:?}");
-                }
+                use std::os::unix::ffi::OsStrExt;
+                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(node.as_bytes()));
+                assert!(
+                    path.starts_with("/dev/dri"),
+                    "DRM 节点应落在 /dev/dri 下，实际 {path:?}"
+                );
+                assert!(path.exists(), "挑到的 DRM 节点不存在: {path:?}");
             }
             Ok(None) => panic!("DRM 不允许回退到 NULL：open(NULL) 会在部分平台崩进程"),
             // 本机没有 /dev/dri（macOS / Windows / 容器）：干净报错即为正确。
