@@ -582,6 +582,12 @@ mod tests {
             "aformat=sample_fmts=fltp".to_string(),
         )
         .with_input_format(SampleFormat::FLT);
+
+        // 没有这个filter，不用测试
+        if crate::filter::get_by_name(filter.name())?.is_none() {
+            return Ok(());
+        }
+
         let encoder =
             EncoderBuilder::new_audio(128_000, channels as i32, in_rate as i32, SampleFormat::FLTP)
                 .with_filters(vec![filter])

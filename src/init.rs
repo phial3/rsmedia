@@ -15,6 +15,10 @@
 //! Callers who want full control without consulting the environment use
 //! [`init_with_level`] / [`init_with`]. All entry points are idempotent: the
 //! first call wins, later calls are no-ops (the AVLog callback is global).
+//!
+//! Every entry point also registers all libavdevice devices
+//! (`avdevice_register_all`), so input/output devices such as `lavfi` are
+//! discoverable without any extra FFI on the caller's side.
 
 use crate::error::{Result, RsmediaError};
 use crate::io::init_logging;
@@ -68,12 +72,22 @@ pub fn init_with_level(level: AVLogLevel) -> Result<()> {
 
 /// Initialize with full control over level and flags; the environment is not
 /// consulted. Idempotent — the first call wins.
+///
+/// Also registers all libavdevice devices (see the [module docs](self)).
 pub fn init_with(level: AVLogLevel, flag: AVLogFlag) -> Result<()> {
     INIT.get_or_try_init(|| {
-        // Redirect logging to the Rust logging facade.
+        // 1. Register all libavdevice devices.
+        //    The call itself is idempotent and thread-safe on the FFmpeg side
+        //    (`avpriv_register_devices` stores the static lists with atomic
+        //    stores), but keeping it inside the once-guard keeps ALL init work
+        //    under the documented "first call wins" semantics.
+        unsafe { ffi::avdevice_register_all() };
+
+        // 2. Redirect logging to the Rust logging facade.
         init_logging(level, flag);
         Ok::<(), RsmediaError>(())
     })?;
+
     Ok(())
 }
 

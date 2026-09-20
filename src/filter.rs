@@ -10,7 +10,7 @@ use crate::pixel::PixelFormat;
 use crate::state::ProcessState;
 use crate::strutils;
 
-use rsmpeg::avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut};
+use rsmpeg::avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut, AVFilterRef};
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
 
@@ -219,16 +219,12 @@ impl From<Filter> for FilterNode {
     }
 }
 
-/// Whether the named FFmpeg filter exists in this build（如 `drawtext` 依赖
-/// libfreetype，许多发行版构建不含）。用于**前置**跳过不可用滤镜，避免依赖
-/// FFmpeg 运行时错误字符串来判断。
-pub fn is_available(name: &str) -> bool {
-    // 名字来自调用者，可能含 NUL 字节；转换失败即视为"不存在"
-    let Ok(name_c) = strutils::str_to_cstring(name) else {
-        return false;
-    };
-    // SAFETY: `name_c` 是合法的 NUL 结尾 C 字符串；查询函数只读且线程安全。
-    unsafe { !ffi::avfilter_get_by_name(name_c.as_ptr()).is_null() }
+/// Whether the named FFmpeg filter exists in this build
+/// （如 `drawtext` 依赖 libfreetype、`subtitles` 依赖 libass）
+/// 用于**前置**跳过不可用滤镜，避免依赖 FFmpeg 运行时错误字符串来判断
+pub fn get_by_name(name: &str) -> Result<Option<AVFilterRef<'static>>> {
+    let filter_name = strutils::str_to_cstring(name)?;
+    Ok(AVFilter::get_by_name(&filter_name))
 }
 
 /// Escapes characters that are special within FFmpeg filtergraph descriptions.
@@ -452,9 +448,6 @@ pub mod video {
     /// （`drawtext` 报找不到字体文件），不会 panic。
     /// 也支持给文字加描边盒子（`boxed`）。
     ///
-    /// Requires `drawtext`, i.e. an FFmpeg built with libfreetype; check with
-    /// [`crate::filter::is_available`] beforehand.
-    ///
     /// # Examples
     ///
     /// ```
@@ -615,13 +608,12 @@ pub mod video {
     /// let filters = Delogo::new()
     ///     .add_region(10, 10, 120, 30)
     ///     .add_region(640, 10, 120, 30)
-    ///     .band(2)
     ///     .show()
     ///     .build();
     /// ```
     pub struct Delogo {
         regions: Vec<(i32, i32, u32, u32)>,
-        band: i32,
+        band: Option<i32>,
         show: bool,
     }
 
@@ -636,7 +628,7 @@ pub mod video {
         pub fn new() -> Self {
             Self {
                 regions: Vec::new(),
-                band: 1,
+                band: None,
                 show: false,
             }
         }
@@ -647,9 +639,14 @@ pub mod video {
             self
         }
 
-        /// 扫描带宽度（插值取样宽度，默认 1）。
+        /// 扫描带宽度（插值取样宽度）。
+        ///
+        /// **版本差异**：`band` 选项仅 FFmpeg ≤ 7 提供（旧名 `t`），FFmpeg 8+
+        /// 已从 `delogo` 移除。因此默认**不输出**该选项（保证在新版可用），
+        /// 只有显式调用本方法时才会写入 —— 在 FFmpeg 8+ 上调用会得到
+        /// FFmpeg 自己的 "Option not found" 错误。
         pub fn band(mut self, band: i32) -> Self {
-            self.band = band;
+            self.band = Some(band);
             self
         }
 
@@ -664,7 +661,10 @@ pub mod video {
             self.regions
                 .into_iter()
                 .map(|(x, y, w, h)| {
-                    let mut params = format!("delogo=x={x}:y={y}:w={w}:h={h}:band={}", self.band);
+                    let mut params = format!("delogo=x={x}:y={y}:w={w}:h={h}");
+                    if let Some(band) = self.band {
+                        params.push_str(&format!(":band={band}"));
+                    }
                     if self.show {
                         params.push_str(":show=1");
                     }
@@ -862,8 +862,13 @@ pub mod video {
 
     /// Gamma 校正（画质增强）。
     /// `gamma` 为 gamma 值（通常 0.5-2.0，1.0 表示不变）。
+    /// 伽马校正。
+    ///
+    /// **版本差异**：FFmpeg 8+ 移除了独立的 `gamma` 滤镜，该功能并入 `eq`
+    /// （`eq=gamma=…`）。为在新版本上可用，这里直接生成 `eq` 滤镜，
+    /// 语义与旧 `gamma` 滤镜一致。
     pub fn gamma(gamma: f32) -> Filter {
-        Filter::new("gamma", MediaType::VIDEO, format!("gamma=g={gamma}"))
+        Filter::new("eq", MediaType::VIDEO, format!("eq=gamma={gamma}"))
     }
 
     /// 饱和度调节（画质增强）。
@@ -1653,9 +1658,11 @@ fn invalid_label(label: &str) -> RsmediaError {
 /// pad 数精确校验接线，动态滤镜的 pad 由标签数量生成、交由 FFmpeg 在 `config`
 /// 阶段核对选项。
 fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
-    let name_c = strutils::str_to_cstring(name)?;
-    let filter =
-        AVFilter::get_by_name(&name_c).ok_or_else(|| RsmediaError::filter_not_found(name))?;
+    let filter = get_by_name(name)?;
+    if filter.is_none() {
+        return Err(RsmediaError::filter_not_found(name));
+    }
+    let filter = filter.unwrap();
     // SAFETY: `filter` 指向 FFmpeg 的静态滤镜定义，`avfilter_filter_pad_count` 只读
     // 其中以 NULL 结尾的 pad 数组（`is_output = 0` 取输入侧）。
     let pads = unsafe { ffi::avfilter_filter_pad_count(filter.as_ptr(), 0) } as usize;
@@ -1673,9 +1680,11 @@ fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
 /// ——多标一个标签会生成 `filter[a][b]` 这种 pad 数对不上的描述，FFmpeg 只会给出一句
 /// 难懂的解析错误，所以在这里提前拒掉。
 fn filter_output_pads(name: &str) -> Result<(usize, bool)> {
-    let name_c = strutils::str_to_cstring(name)?;
-    let filter =
-        AVFilter::get_by_name(&name_c).ok_or_else(|| RsmediaError::filter_not_found(name))?;
+    let filter = get_by_name(name)?;
+    if filter.is_none() {
+        return Err(RsmediaError::filter_not_found(name));
+    }
+    let filter = filter.unwrap();
     // SAFETY: 同 `filter_input_pads`，`is_output = 1` 取输出侧。
     let pads = unsafe { ffi::avfilter_filter_pad_count(filter.as_ptr(), 1) } as usize;
     Ok((
@@ -1747,6 +1756,21 @@ pub struct FilterGraph {
     /// `buffersink` / `abuffersink` 汇实例名，按逻辑输出序号排列；命名规则同
     /// [`Self::src_names`]（名字 = 该路输出在 spec 里的标签）。
     sink_names: Vec<CString>,
+    /// 各图输入端点的人类可读描述（`base=64x48/yuv420p …`），**只用于错误信息**：
+    /// 取帧失败时最常见的原因是某路输入帧的像素/采样格式或尺寸与声明的端点不符，
+    /// 而 FFmpeg 只会回一句 `EINVAL`，没有这份描述用户无从下手。
+    input_specs: Vec<String>,
+}
+
+/// 端点的人类可读描述（错误信息用）。
+fn describe_endpoint(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Video(v) => format!(
+            "{}x{} {:?} {}fps",
+            v.width, v.height, v.format, v.frame_rate.num
+        ),
+        Endpoint::Audio(a) => format!("{}ch {:?} {}Hz", a.nb_channels, a.format, a.sample_rate),
+    }
 }
 
 impl FilterGraph {
@@ -1760,6 +1784,7 @@ impl FilterGraph {
             output_labels: Vec::new(),
             src_names: Vec::new(),
             sink_names: Vec::new(),
+            input_specs: Vec::new(),
         }
     }
 
@@ -1878,10 +1903,9 @@ impl FilterGraph {
 
     /// 校验单个滤镜：是否存在于本次构建、媒体类型是否与图一致。
     fn check_filter(filter: &Filter, media_type: MediaType) -> Result<()> {
-        // 名字必须是本 FFmpeg 构建里真实存在的滤镜：`drawtext` 需要
-        // libfreetype、`subtitles` 需要 libass，缺失时在此前置报错，
+        // 名字必须是本 FFmpeg 构建里真实存在的滤镜：缺失时在此前置报错，
         // 而不是等到 parse 阶段返回一句难以定位的字符串错误。
-        if !is_available(filter.name()) {
+        if get_by_name(filter.name())?.is_none() {
             return Err(RsmediaError::filter_not_found(filter.name()));
         }
         if filter.media_type() != media_type {
@@ -1918,8 +1942,7 @@ impl FilterGraph {
             endpoint.pixel_aspect.den,
         ))?;
 
-        let buffersrc =
-            AVFilter::get_by_name(c"buffer").context("Failed to get video filter 'buffer'.")?;
+        let buffersrc = get_by_name("buffer")?.context("Failed to get video filter 'buffer'.")?;
         self.graph
             .create_filter_context(&buffersrc, name, Some(&args))
             .context("Failed to create video buffer source")
@@ -1933,8 +1956,8 @@ impl FilterGraph {
         name: &CStr,
         format: PixelFormat,
     ) -> Result<AVFilterContextMut<'_>> {
-        let buffersink = AVFilter::get_by_name(c"buffersink")
-            .context("Failed to get video filter 'buffersink'.")?;
+        let buffersink =
+            get_by_name("buffersink")?.context("Failed to get video filter 'buffersink'.")?;
 
         let mut sink_ctx = self
             .graph
@@ -1983,8 +2006,8 @@ impl FilterGraph {
             channel_desc,
         ))?;
 
-        let buffersrc = AVFilter::get_by_name(c"abuffer")
-            .context("Failed to get audio filter buffer 'abuffer'.")?;
+        let buffersrc =
+            get_by_name("abuffer")?.context("Failed to get audio filter buffer 'abuffer'.")?;
         self.graph
             .create_filter_context(&buffersrc, name, Some(&args))
             .context("Failed to create audio buffer source")
@@ -1999,7 +2022,7 @@ impl FilterGraph {
         name: &CStr,
         endpoint: &AudioEndpoint,
     ) -> Result<AVFilterContextMut<'_>> {
-        let buffersink = AVFilter::get_by_name(c"abuffersink")
+        let buffersink = get_by_name("abuffersink")?
             .context("Failed to get audio filter buffer 'abuffersink'.")?;
 
         let mut sink_ctx = self
@@ -2191,7 +2214,14 @@ impl FilterGraph {
                 self.states[output] = ProcessState::Flushed;
                 Ok(None)
             }
-            Err(e) => Err(RsmediaError::FFmpeg(e)),
+            Err(e) => Err(RsmediaError::from(e).with_context(format!(
+                "filter graph output {output} produced no frame; a frequent cause is an input \
+                 frame whose pixel/sample format or size differs from the one declared for that \
+                 graph input, which FFmpeg reports only as EINVAL. Declared inputs: [{}]. \
+                 Convert the frame to the declared format (e.g. MediaFrame::convert_to) or \
+                 declare the format you actually feed",
+                self.input_specs.join(", ")
+            ))),
         }
     }
 
@@ -2436,6 +2466,11 @@ impl FilterGraphBuilder {
     ///
     /// 端点描述的是**这一路帧推进来时**的格式，不做任何预处理；各路不必一致，
     /// FFmpeg 会在链路协商阶段自动插入 `scale` / `aresample`。
+    ///
+    /// 注意"各路不一致"指的是**端点之间**可以不同，而推进来的帧应当与它对应的
+    /// 端点声明一致：多输入图里基底那一路若喂了别的像素格式/尺寸，FFmpeg 只会在
+    /// 取帧时回一句 `EINVAL`（错误信息里会列出各输入声明的格式以便定位）。
+    /// 需要转换时先用 `MediaFrame::convert_to` / [`crate::Scaler`] 转好再推。
     pub fn add_input(&mut self, endpoint: impl Into<Endpoint>) -> &mut Self {
         let label = format!("in{}", self.inputs.len());
         self.inputs.push((label, endpoint.into()));
@@ -2756,6 +2791,11 @@ impl FilterGraphBuilder {
 
         let mut graph = FilterGraph::new();
         graph.input_labels = self.inputs.iter().map(|(label, _)| label.clone()).collect();
+        graph.input_specs = self
+            .inputs
+            .iter()
+            .map(|(label, endpoint)| format!("{label}={}", describe_endpoint(endpoint)))
+            .collect();
         graph.output_labels = resolved_outputs
             .iter()
             .map(|(label, _)| label.clone())
@@ -3328,7 +3368,7 @@ mod tests {
                 VIDEO,
             ),
             ("nlmeans=s=1.5".into(), video::nlmeans(1.5).spec(), VIDEO),
-            ("gamma=g=1.2".into(), video::gamma(1.2).spec(), VIDEO),
+            ("eq=gamma=1.2".into(), video::gamma(1.2).spec(), VIDEO),
             (
                 "eq=saturation=1.5".into(),
                 video::saturation(1.5).spec(),
