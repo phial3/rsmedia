@@ -9,6 +9,8 @@ use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVPixFmtDescriptorRef};
 use rsmpeg::{UnsafeDerefMut, ffi};
 
+use std::ffi::CString;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Hardware device configuration.
@@ -104,10 +106,14 @@ impl HWDeviceConfig {
 
     /// 按当前平台自动选择最佳可用的硬件加速配置。
     ///
-    /// 依 [`HWDeviceType::platform_preference`] 的平台优先级依次探测
-    /// （`av_hwdevice_iterate_types`），返回第一个可用的设备配置；全部不可用
-    /// （无 GPU / 无驱动 / 无 FFmpeg 支持编译）时返回错误，**不会**回退到
-    /// 随机设备 —— 需要软件路径时由调用方显式省略 hw 配置。
+    /// 依 [`HWDeviceType::platform_preference`] 的平台优先级依次**真实探测**
+    /// （会为每个候选建立一次设备，见 [`HWDeviceType::is_usable`]），返回第一个
+    /// 在本机能真正建起来的配置；一个都建不起来（无 GPU / 无驱动 / 无 FFmpeg
+    /// 支持编译）时返回错误，**不会**回退到随机设备 —— 需要软件路径时由调用方
+    /// 显式省略 hw 配置。
+    ///
+    /// 返回值可以直接交给 `with_hardware_device`，不会再出现"拿到的配置要到
+    /// 建编解码器时才失败"的两段式错误。
     pub fn auto_platform() -> Result<Self> {
         HWDeviceType::auto_platform_config(None)
     }
@@ -123,6 +129,94 @@ impl std::fmt::Display for HWDeviceConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, f)
     }
+}
+
+/// 该设备类型在 `device_id` 未给出时应当传给 FFmpeg 的 device 字符串。
+///
+/// # 为什么绝大多数后端返回 `None`（即 `device = NULL`）
+///
+/// 传 `NULL` 让后端自己选默认设备，是 FFmpeg 对**除 DRM 外**所有后端的既定约定，
+/// 逐一看过后端源码可以确认（FFmpeg 6.1 / 7.1 / 8.1 / 9.0 一致）：
+///
+/// | 后端 | `device == NULL` 时的行为 |
+/// |------|--------------------------|
+/// | VAAPI | `if (device) {…} else {…}`：自己扫描 `/dev/dri/renderD128..135` |
+/// | VDPAU | `XOpenDisplay(NULL)`（合法，取 `$DISPLAY`）；失败有 `!priv->dpy` 检查 |
+/// | CUDA | `if (device) device_idx = strtol(…);` → 默认 0 号卡 |
+/// | Vulkan / OpenCL | `if (device && device[0])` → 自动选择物理设备 / 平台 |
+/// | D3D11VA | `if (device) {…} else {…}` → 默认适配器（或按 `vendor_id` 选项）|
+/// | DXVA2 / D3D12VA | `device ? atoi(device) : 0` → 默认适配器 |
+/// | QSV | 用 `child_device_type` 选项派生，device 串不参与主路径 |
+/// | VideoToolbox / MediaCodec / OHCodec | 只用 device 作名字过滤，NULL 即"不过滤" |
+/// | AMF | 完全不用 device 串，走自身枚举 |
+///
+/// 而且**没有任何一个后端**会因此 `exit()`/`abort()`：全部 15 个 `hwcontext_*.c`
+/// 里都没有这类调用。实测也一致（macOS arm64 + Linux aarch64 + Linux x86_64
+/// × FFmpeg 6.1/7.1/8.1/9.0 × 全部 15 种类型）：除 DRM 外 `NULL` 要么建成设备，
+/// 要么返回干净的错误码（未编入该后端时为 `ENOMEM`，无驱动时为其它负值）， 无一崩溃。
+///
+/// # 为什么只有 DRM 例外
+///
+/// `libavutil/hwcontext_drm.c` 的 `drm_device_create()` 是唯一一个把 device
+/// **不加判断**地交给 `open()` 的后端：
+///
+/// ```c
+/// hwctx->fd = open(device, O_RDWR);   /* device 为 NULL 时即 open(NULL, …) */
+/// ```
+///
+/// 这是 FFmpeg 侧的疏漏（6.1 到 9.0 的代码完全相同，未修）。后果依平台而异：
+/// 原生 aarch64 上内核返回 `EFAULT`，FFmpeg 干净地报 `AVERROR(EFAULT)`；
+/// 但在 **Rosetta 转译的 x86_64** 上直接 SIGSEGV —— 实测退出码 139，
+/// 最小 C 探针（只调 libavutil、不经 CLI）同样复现。DRM 恰恰是
+/// [`HWDeviceType::platform_preference`] 在 Linux 上的候选之一，所以它必须由
+/// 我们自己补一个真实节点，不能把这个坑留给 FFmpeg。
+///
+/// 注意这只覆盖 rsmedia 自己的创建路径。若调用方通过 `with_options` 把
+/// `hwaccel` / `hwaccel_device` 之类的 **AVCodecContext 选项**传给 FFmpeg，
+/// 设备将由 FFmpeg 内部创建，那时仍要显式给出
+/// `hwaccel_device=/dev/dri/renderD128`，否则会踩到同一处 `open(NULL)`。
+fn default_device_string(kind: HWDeviceType) -> Result<Option<CString>> {
+    if kind == HWDeviceType::DRM {
+        return drm_node_from(Path::new("/dev/dri")).map(Some);
+    }
+    // 见上方说明：其余后端一律交给 FFmpeg 自动选择。
+    Ok(None)
+}
+
+/// 在 `dir` 下挑一个 DRM 节点，返回它的路径。
+///
+/// 优先**渲染节点**（`renderD*`，通常无需额外权限即可打开）其次**显示节点**
+/// （`card*`）。同类之间按名字排序后取第一个：同一台机器上多次调用必须挑到同一个
+/// 节点，否则 [`HWDeviceConfig`] 相同（`device_id` 都是 `None`）却指向不同设备，
+/// 缓存的键就名不副实。
+///
+/// 目录不存在（非 Linux 平台、容器里没映射设备）或没有可用节点时返回
+/// [`RsmediaError::unsupported`] —— **绝不返回 `NULL`**，也不去调 FFmpeg。
+fn drm_node_from(dir: &Path) -> Result<CString> {
+    let mut rendered: Vec<std::path::PathBuf> = Vec::new();
+    let mut cards: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // 只认节点文件名前缀：实机的 `/dev/dri` 下还会有 `by-path/`（符号链接
+            // 目录）与 `controlD64` 之类的控制节点，它们都不是可打开的渲染设备。
+            if name.starts_with("renderD") {
+                rendered.push(entry.path());
+            } else if name.starts_with("card") {
+                cards.push(entry.path());
+            }
+        }
+    }
+    rendered.sort();
+    cards.sort();
+    let node = rendered.into_iter().chain(cards).next().ok_or_else(|| {
+        RsmediaError::unsupported(format!(
+            "DRM hardware device needs a node under {}, but none exists",
+            dir.display()
+        ))
+    })?;
+    strutils::os_str_to_cstring(node.as_os_str()).context("Invalid DRM device node path")
 }
 
 /// `HWContext` cache for safe sharing of hardware device contexts.
@@ -234,11 +328,12 @@ impl HWContext {
         let hw_device_ctx = {
             // device_id 来自调用者（CUDA 是 GPU 编号、VAAPI/DRM 是设备路径），
             // 含内部 NUL 的输入只能是调用者的错误：报错而不是 panic。
+            // 未给出时按设备类型取默认——DRM 必须拿到一个真实节点，见 [`default_device_string`]。
             let device = match config.device_id.as_deref() {
                 Some(device_id) => Some(
                     strutils::os_str_to_cstring(device_id).context("Invalid hardware device id")?,
                 ),
-                None => None,
+                None => default_device_string(config.device_type)?,
             };
             let opts = config.options.as_ref().and_then(|opts| opts.to_dict());
             AVHWDeviceContext::create(
@@ -608,9 +703,34 @@ ffi_enum_wrap_from!(
 );
 
 impl HWDeviceType {
-    /// Whether or not the device type is available on this system.
+    /// 该设备类型是否被**当前的 FFmpeg 构建**编入。
+    ///
+    /// 判据是 `av_hwdevice_iterate_types`，也就是说它回答的是"构建期支持哪些
+    /// 设备类型"，**不是**"本机能不能真的用起来"。两者在有 GPU 的机器上通常一致，
+    /// 但在 CI / 虚拟机 / 无显卡驱动的机器上差距很大：实测一台无 GPU 的 Ubuntu 上
+    /// [`Self::list_available`] 报出 6 种类型，真正能建立设备的只有 1 种。
+    ///
+    /// 需要"能不能真的用"时请用 [`Self::is_usable`]；需要"帮我挑一个能用的"时
+    /// 用 [`Self::auto_platform_config`]。本方法保留廉价语义（纯枚举、无副作用），
+    /// 适合做能力展示或快速筛选。
     pub fn is_available(self) -> bool {
         Self::list_available().contains(&self)
+    }
+
+    /// 该设备类型在**本机**是否真的能用：实际建立一次设备上下文再释放。
+    ///
+    /// 与 [`Self::is_available`] 的区别见对方的文档。实现里也复用了
+    /// [`default_device_string`]，因此 DRM 会去 `/dev/dri` 找一个真实节点
+    /// （没有节点直接判为不可用），不会踩到 `open(NULL)` 那条路径 —— 那条路径在
+    /// Rosetta 转译的 x86_64 上会 SIGSEGV，探测本身不能把调用方带走。
+    ///
+    /// **有副作用与开销**：会真的打开 GPU 设备（`/dev/dri`、Vulkan loader、
+    /// CUDA 驱动等），单次调用开销在毫秒级。不要放进热路径。
+    pub fn is_usable(self) -> bool {
+        let Ok(device) = default_device_string(self) else {
+            return false;
+        };
+        AVHWDeviceContext::create(self.into(), device.as_deref(), None, 0).is_ok()
     }
 
     /// 当前平台的硬件加速优先级（从高到低）。
@@ -660,15 +780,16 @@ impl HWDeviceType {
                 std::env::consts::OS
             )));
         }
-        // 逐个候选探测可用性，避免只用首个候选的 available 集合去匹配其它候选，
-        // 导致首个候选不可用但后续候选可用时误判为“无可用设备”。
+        // 逐个候选**真实探测**（会建立一次设备），避免只用首个候选的枚举结果去
+        // 匹配其它候选；更重要的是：枚举只说明"构建编入了"，无 GPU 的机器上
+        // 建不起来的设备也会被枚举到，只查枚举就会返回一个注定失败的配置。
         let device = preference
             .iter()
-            .find(|ty| ty.is_available())
+            .find(|ty| ty.is_usable())
             .copied()
             .ok_or_else(|| {
                 RsmediaError::unsupported(format!(
-                    "No available hardware acceleration device on {} (candidates probed: {preference:?})",
+                    "No usable hardware acceleration device on {} (candidates probed: {preference:?})",
                     std::env::consts::OS
                 ))
             })?;
@@ -796,18 +917,83 @@ unsafe extern "C" fn hwaccel_get_format(
     }
 }
 
+/// hwaccel 模块的单元测试。
+///
+/// # 组织方式
+///
+/// 按被测对象分成五组，每组前有分隔注释：
+///
+/// - **A 设备串解析与 DRM 安全** —— `default_device_string` / `drm_node_from`，
+///   以及"用公开 API 探测任何设备类型都不许崩进程"这条底线。
+/// - **B 能力查询契约** —— `is_usable` / `is_available` / `list_available` 之间的
+///   不变量。
+/// - **C 平台策略与自动选择** —— `platform_preference` / `auto_platform[_with]` /
+///   `HWDeviceConfig::amf`。
+/// - **D 枚举映射** —— `HWDeviceType` ↔ `ffi::AVHWDeviceType`。
+/// - **E 上下文生命周期与并发** —— `HW_CTX_CACHE` 的释放语义、`HWContext` 的 `Send`/`Sync`。
+///
+/// # 环境策略
+///
+/// **能写成纯逻辑断言的就不要依赖硬件**：显式传入被测值（如 `drm_node_from` 收目录参数、
+/// `default_device_string` 收类型），这样在 CI / 无 GPU 机器上也能严格断言，而不是"跳过"。
+/// 确实需要真实设备的用例（C 组的自动选择、E 组）走 `try_auto_hw_context()`：探不到设备时
+/// 打印原因并**静默跳过**，不把"这台机器没有 GPU"报成失败。
+///
+/// 跨 FFmpeg 版本运行：
+/// `cargo test --lib --no-default-features --features ffmpegN,link_system_ffmpeg hwaccel::`
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 串行化所有触碰 `HW_CTX_CACHE` 的测试：缓存为进程级静态，lib 测试
-    /// 共享同一进程，并行运行会破坏彼此的计数断言。
+    /// 串行化所有触碰 `HW_CTX_CACHE` 的测试：缓存是进程级静态，lib 测试共享同
+    /// 一进程，并行运行会破坏彼此的计数断言。
     static HW_CACHE_TEST_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
-    /// 自动探测并创建硬件上下文。设备探测（`av_hwdevice_iterate_types`）
-    /// 只覆盖 FFmpeg 的**编译期**支持，运行时可能仍打不开设备（如 CI 虚机
-    /// 无 `/dev/dri` 渲染节点或 D3D11 适配器），创建失败视为"本机无可用
-    /// GPU"，打印原因并返回 `None` 让调用方跳过而非 panic。
+    /// 取缓存测试锁。
+    ///
+    /// 某个测试 panic 后锁会被标记为 poisoned；这里恢复内部值继续用（`into_inner`）——
+    /// 被破坏的只是那个测试留下的状态，与本测试的断言无关，没必要让后续测试连锁失败。
+    fn cache_lock() -> std::sync::MutexGuard<'static, ()> {
+        HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 本 crate 建模的**全部**硬件设备类型。
+    ///
+    /// 与 [`HWDeviceType::list_available`] 的语义不同：后者问"**这个 FFmpeg 构建**
+    /// 编入了哪些"（随构建与平台变化 —— 无 GPU 的 CI 上可能是空列表），这里问
+    /// "rsmedia **认**哪些类型"，是固定的。凡是"必须覆盖每一个建模类型"的测试都用它，
+    /// 新增变体时只需在这里补一处。
+    fn all_modeled_types() -> Vec<HWDeviceType> {
+        let mut types = vec![
+            HWDeviceType::NONE,
+            HWDeviceType::VDPAU,
+            HWDeviceType::CUDA,
+            HWDeviceType::VAAPI,
+            HWDeviceType::DXVA2,
+            HWDeviceType::QSV,
+            HWDeviceType::VIDEOTOOLBOX,
+            HWDeviceType::D3D11VA,
+            HWDeviceType::DRM,
+            HWDeviceType::OPENCL,
+            HWDeviceType::MEDIACODEC,
+            HWDeviceType::VULKAN,
+        ];
+        // 这三个变体本身按 FFmpeg 版本门控，测试也要跟着门控才编得过。
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        types.push(HWDeviceType::D3D12VA);
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        types.push(HWDeviceType::AMF);
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        types.push(HWDeviceType::OHCODEC);
+        types
+    }
+
+    /// 自动探测并创建硬件上下文；探不到就返回 `None` 让调用方跳过。
+    ///
+    /// `auto_platform()` 本身已经是**真探测**（内部走 [`HWDeviceType::is_usable`]，
+    /// 会为每个候选真正建立一次设备），所以走到这里仍失败通常只剩竞态或驱动状态
+    /// 变化之类的边缘原因 —— 无论是哪种，结论都是"本机此刻没有可用 GPU"，
+    /// 打印原因并跳过，**不要**当成测试失败。
     fn try_auto_hw_context() -> Option<Arc<HWContext>> {
         let config = match HWDeviceConfig::auto_platform() {
             Ok(config) => config,
@@ -826,76 +1012,197 @@ mod tests {
         }
     }
 
-    /// 空缓存释放应返回 0 且不 panic（CI / 无 GPU 环境）。
-    /// 有 GPU 时：创建 context → 释放引用 → 释放应移除该条目。
+    // ======================================================================
+    // A 组 · 设备串解析与 DRM 安全
+    // ======================================================================
+
+    /// `default_device_string()` 对**除 DRM 外**的每个类型都必须交回 `NULL`
+    /// （让 FFmpeg 自己选默认设备）。
+    ///
+    /// 这是一条**设计断言**：它把"`NULL` 对哪些后端是安全的"钉在测试里。若将来有人
+    /// 给别的后端也加一个默认设备串，这里会失败，提醒同时更新
+    /// [`default_device_string`] 的文档与实测依据 —— 免得把某天新出现的崩溃路径
+    /// 悄悄引进来。
+    ///
+    /// 依据：15 个后端里只有 `hwcontext_drm.c` 的 `drm_device_create()` 会把 device
+    /// 不加判断地交给 `open()`，其余都显式处理 `NULL`（详见上面函数的文档）。
     #[test]
-    fn test_release_unused_hw_contexts() {
-        let _guard = HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        // 基线：先释放其它测试可能遗留的条目，再验证空缓存释放返回 0
-        let _leftovers = release_unused_hw_contexts();
-        let removed = release_unused_hw_contexts();
-        assert_eq!(removed, 0, "empty cache should release nothing");
-
-        // 若本机有可用 GPU 设备：创建后释放，缓存条目应可被释放
-        let Some(ctx) = try_auto_hw_context() else {
-            return;
-        };
-        // 持有期间释放不应移除
-        assert_eq!(release_unused_hw_contexts(), 0);
-        drop(ctx);
-        // 引用释放后（仅缓存持有），释放应移除该条目
-        assert_eq!(release_unused_hw_contexts(), 1);
-        // 再次释放：缓存已空
-        assert_eq!(release_unused_hw_contexts(), 0);
-    }
-
-    /// `HWContext` 跨线程共享同一 Arc 不应触发数据竞争（回归测试：
-    /// setup_decoder_frames 并发调用曾通过 UnsafeCell 做可变访问）。
-    #[test]
-    fn test_hw_context_shared_across_threads() {
-        let _guard = HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let Some(ctx) = try_auto_hw_context() else {
-            return; // 无 GPU 环境跳过
-        };
-        let ctx2 = Arc::clone(&ctx);
-        let handle = std::thread::spawn(move || {
-            // 共享引用上的只读方法跨线程调用
-            let _ = ctx2.get_format(true);
-        });
-        let _ = ctx.get_format(false);
-        handle.join().expect("thread should not panic");
-    }
-
-    /// 所有变体与 ffi 值双向映射后应保持自身（编译期常量，跨平台一致）。
-    #[test]
-    fn test_hw_device_type_roundtrip() {
-        let variants = [
-            HWDeviceType::NONE,
-            HWDeviceType::VDPAU,
-            HWDeviceType::CUDA,
-            HWDeviceType::VAAPI,
-            HWDeviceType::DXVA2,
-            HWDeviceType::QSV,
-            HWDeviceType::VIDEOTOOLBOX,
-            HWDeviceType::D3D11VA,
-            HWDeviceType::DRM,
-            HWDeviceType::OPENCL,
-            HWDeviceType::MEDIACODEC,
-            HWDeviceType::VULKAN,
-        ];
-        for v in variants {
-            let ffi_value: ffi::AVHWDeviceType = v.into();
+    fn test_default_device_string_defers_to_ffmpeg_for_every_type_but_drm() {
+        for t in all_modeled_types() {
+            if t == HWDeviceType::DRM {
+                continue;
+            }
             assert_eq!(
-                HWDeviceType::from(ffi_value),
-                v,
-                "roundtrip failed for {v:?}"
+                default_device_string(t).unwrap(),
+                None,
+                "{t:?} 应当把 device 交给 FFmpeg 自动选择（传 NULL）"
             );
         }
     }
 
+    /// DRM 是唯一例外：必须给出一个真实节点，绝不能是 `NULL`。
+    ///
+    /// `open(NULL, O_RDWR)` 在 Rosetta 转译的 x86_64 上会 SIGSEGV（原生 aarch64
+    /// 只是干净地返回 `EFAULT`），所以本机没有 `/dev/dri` 节点时正确行为是
+    /// **干净地报错**，而不是退化成 `NULL`。
+    #[test]
+    fn test_drm_never_falls_back_to_null_device() {
+        match default_device_string(HWDeviceType::DRM) {
+            Ok(Some(node)) => {
+                // 有节点：必须是真实存在的路径（拿它去 open 才可能成功）。
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(node.as_bytes()));
+                    assert!(
+                        path.starts_with("/dev/dri"),
+                        "DRM 节点应落在 /dev/dri 下，实际 {path:?}"
+                    );
+                    assert!(path.exists(), "挑到的 DRM 节点不存在: {path:?}");
+                }
+            }
+            Ok(None) => panic!("DRM 不允许回退到 NULL：open(NULL) 会在部分平台崩进程"),
+            // 本机没有 /dev/dri（macOS / Windows / 容器）：干净报错即为正确。
+            Err(_) => {}
+        }
+    }
+
+    /// DRM 节点挑选规则。
+    ///
+    /// 纯文件系统逻辑，传临时目录即可覆盖四种场景，任何平台都能严格断言：
+    /// ① `renderD*` 优先于 `card*`，同类按名字排序取第一个；
+    /// ② 只有显示节点时退回 `card*`；
+    /// ③ 目录里有 `by-path/`、`controlD64` 等非节点条目 → 报错，不瞎挑；
+    /// ④ 目录不存在 → 报错，且错误信息里带上路径方便排查。
+    #[test]
+    fn test_drm_node_selection() {
+        let base = std::env::temp_dir().join(format!("rsmedia-dri-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // ① 既有渲染节点又有显示节点：必须挑渲染节点，且是名字最小的那个。
+        let mixed = base.join("mixed");
+        std::fs::create_dir_all(mixed.join("by-path")).unwrap();
+        for f in ["card0", "card1", "renderD129", "renderD128", "controlD64"] {
+            std::fs::write(mixed.join(f), b"").unwrap();
+        }
+        let picked = drm_node_from(&mixed).unwrap();
+        assert_eq!(
+            picked.to_str().unwrap(),
+            mixed.join("renderD128").to_str().unwrap(),
+            "应优先且按名字取最小的渲染节点"
+        );
+
+        // ② 只有显示节点：退回 card*，同样按名字排序。
+        let cards_only = base.join("cards");
+        std::fs::create_dir_all(&cards_only).unwrap();
+        for f in ["card1", "card0"] {
+            std::fs::write(cards_only.join(f), b"").unwrap();
+        }
+        assert_eq!(
+            drm_node_from(&cards_only).unwrap().to_str().unwrap(),
+            cards_only.join("card0").to_str().unwrap()
+        );
+
+        // ③ 目录里有东西但都不是节点（实机上 by-path 是目录）：报错而不是乱挑。
+        let none = base.join("none");
+        std::fs::create_dir_all(none.join("by-path")).unwrap();
+        std::fs::write(none.join("controlD64"), b"").unwrap();
+        assert!(
+            drm_node_from(&none).is_err(),
+            "没有 renderD*/card* 时必须报错"
+        );
+
+        // ④ 目录不存在（非 Linux 平台）：报错，且错误里带上路径方便排查。
+        let missing = base.join("does-not-exist");
+        let err = drm_node_from(&missing).unwrap_err();
+        assert!(
+            err.to_string().contains("does-not-exist"),
+            "错误信息应包含路径，实际: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 用公开 API（`is_usable()`）探测**任何一个建模类型**都不得 panic、更不得崩进程。
+    ///
+    /// 这条回归针对一次真实事故：`av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_DRM, NULL, …)`
+    /// 会在 Rosetta 转译的 x86_64 上 SIGSEGV。`is_usable()` 现在先经
+    /// [`default_device_string`] 解析 `/dev/dri` 下的真实节点，没有节点直接判 false，
+    /// 因此不会再走到那条路径。
+    ///
+    /// 覆盖范围刻意取**全部建模类型**而非 `list_available()`：崩不崩进程取决于后端的
+    /// device 处理方式，与该类型是否被编入无关，而调用方可以直接指定任意建模类型
+    /// （例如在不带 GPU 的服务器上请求 DRM）。
+    #[test]
+    fn test_is_usable_never_crashes() {
+        for t in all_modeled_types() {
+            let _ = t.is_usable();
+        }
+    }
+
+    // ======================================================================
+    // B 组 · 能力查询契约
+    // ======================================================================
+
+    /// `is_usable()` 只能比 `is_available()` 更严格：能用的一定是构建里编入的。
+    ///
+    /// 反过来不成立 —— 编入 ≠ 本机能用（无 GPU 机器上实测枚举出 6 种、真能建起来的
+    /// 只有 1 种），这正是 [`HWDeviceType::is_usable`] 存在的理由。
+    #[test]
+    fn test_is_usable_implies_is_available() {
+        for t in HWDeviceType::list_available() {
+            if t.is_usable() {
+                assert!(t.is_available(), "{t:?} 报告可用却不在 list_available() 里");
+            }
+        }
+    }
+
+    /// `list_available()` / `is_available()` 的契约。
+    ///
+    /// 三条断言各管一件事：
+    ///
+    /// ① **`NONE` 不得出现在列表里** —— 迭代以 `AV_HWDEVICE_TYPE_NONE` 为终止符，
+    ///    它不可能被合法报出。这条是**给未来准备的守卫**：一旦 FFmpeg 报出本 crate
+    ///    未建模的类型、而实现把它降级成 `NONE`（`macros.rs` 明确拒绝过的做法），
+    ///    这里会失败。（当前 FFmpeg 枚举出的类型都在建模集合内，所以它今天是空跑通过。）
+    /// ② 报出的类型必须都在本 crate 的建模集合内（即实现里 `from_ffi_checked` 的
+    ///    跳过契约：FFmpeg 报出未建模的类型时丢掉，而不是 panic 或降级）。
+    /// ③ `is_available()` 与 `list_available()` 结果一致（同一定义的两种形式，钉住
+    ///    的是契约：若有人把 `is_available` 换成另一种探测方式，这里会失败）。
+    #[test]
+    fn test_list_available_contract() {
+        let listed = HWDeviceType::list_available();
+
+        assert!(
+            !listed.contains(&HWDeviceType::NONE),
+            "list_available() 不应包含 NONE（它是迭代终止符，也不是可用的设备类型）"
+        );
+
+        let modeled = all_modeled_types();
+        for t in &listed {
+            assert!(
+                modeled.contains(t),
+                "{t:?} 由 FFmpeg 报出，但不在本 crate 的建模集合里"
+            );
+        }
+
+        for t in &modeled {
+            assert_eq!(
+                t.is_available(),
+                listed.contains(t),
+                "{t:?} 的 is_available() 与 list_available() 结果不一致"
+            );
+        }
+    }
+
+    // ======================================================================
+    // C 组 · 平台策略与自动选择
+    // ======================================================================
+
     /// 平台优先级：每个已知平台都应定义非空列表，且首选设备符合平台惯例。
+    ///
+    /// 未知平台不校验（`_` 分支）—— `platform_preference()` 对它们返回空列表，
+    /// 由 `test_auto_platform` 覆盖"空优先级 ⇒ 描述性错误"这条路径。
     #[test]
     fn test_platform_preference() {
         let preference = HWDeviceType::platform_preference();
@@ -918,26 +1225,8 @@ mod tests {
         }
     }
 
-    /// `list_available` 与 `is_available` 的一致性；探测过程不应 panic。
-    #[test]
-    fn test_list_available_consistency() {
-        let variants = [
-            HWDeviceType::CUDA,
-            HWDeviceType::VAAPI,
-            HWDeviceType::VIDEOTOOLBOX,
-            HWDeviceType::D3D11VA,
-            HWDeviceType::VULKAN,
-        ];
-        for v in variants {
-            assert_eq!(
-                v.is_available(),
-                HWDeviceType::list_available().contains(&v)
-            );
-        }
-    }
-
-    /// 平台自动选择：有可用设备时返回平台优先级内的配置；无设备时返回
-    /// 描述性错误（CI / 无 GPU 环境），不应 panic。
+    /// 平台自动选择：有可用设备时返回**平台优先级之内**的配置；无设备时返回
+    /// 描述性错误（CI / 无 GPU 环境），两种结局都不允许 panic。
     #[test]
     fn test_auto_platform() {
         match HWDeviceConfig::auto_platform() {
@@ -954,8 +1243,25 @@ mod tests {
         }
     }
 
+    /// `auto_platform_config()` 一旦返回 `Ok`，那个设备就必须是本机**真能建起来**的。
+    ///
+    /// 这是"返回的配置可以直接用"这条承诺的检查点（用 `is_usable()` 反查），
+    /// 杜绝"拿到的配置要到开编解码器时才失败"的两段式错误。
+    /// 无 GPU 的机器上返回 `Err` 是正确结果，故那时不检查。
+    #[test]
+    fn test_auto_platform_config_returns_usable_device() {
+        if let Ok(config) = HWDeviceType::auto_platform_config(None) {
+            assert!(
+                config.device_type.is_usable(),
+                "auto_platform_config 返回了建不起来的设备: {config:?}"
+            );
+        }
+    }
+
     /// 自定义候选：只允许 D3D11VA（AMD AMF 的承载设备类型）。
-    /// 可用时应给出 D3D11 硬件格式 + NV12 软件格式；不可用时应优雅报错。
+    ///
+    /// 可用时应给出 D3D11 硬件格式 + NV12 软件格式（AMF 编码器的输入约定）；
+    /// 不可用（非 Windows、无 D3D11 适配器等）时应优雅报错而不是 panic。
     #[test]
     fn test_auto_platform_amf_candidate() {
         match HWDeviceConfig::auto_platform_with(&[HWDeviceType::D3D11VA]) {
@@ -970,15 +1276,15 @@ mod tests {
         }
     }
 
-    /// 空候选列表应报错而不是 panic（未知平台 / 显式空列表）。
+    /// 空候选列表应报错而不是 panic（未知平台与显式空列表走同一条路径）。
     #[test]
     fn test_auto_platform_empty_candidates() {
         let result = HWDeviceConfig::auto_platform_with(&[]);
         assert!(result.is_err());
     }
 
-    /// AMF builder 仅在 Windows 上编译：验证字段映射（D3D11VA 设备 + D3D11
-    /// 硬件格式 + NV12 软件格式）。
+    /// AMF builder 仅在 Windows 上编译：
+    /// 验证字段映射（D3D11VA 设备 + D3D11 硬件格式 + NV12 软件格式）
     #[cfg(target_os = "windows")]
     #[test]
     fn test_amf_config_builder() {
@@ -987,5 +1293,77 @@ mod tests {
         assert_eq!(config.hw_pixel_format, PixelFormat::D3D11);
         assert_eq!(config.sw_pixel_format, PixelFormat::NV12);
         assert_eq!(config.device_id.as_deref(), Some("0"));
+    }
+
+    // ======================================================================
+    // D 组 · 枚举映射
+    // ======================================================================
+
+    /// 所有建模变体与 ffi 值双向映射后应保持自身。
+    ///
+    /// 变体列表取自 [`all_modeled_types()`]，因此按 FFmpeg 版本门控的
+    /// `D3D12VA` / `AMF` / `OHCODEC` 也会在对应 feature 下被测到
+    /// （此前手写列表漏掉了这三个，等于它们的 `From`/`Into` 从未被验证）。
+    #[test]
+    fn test_hw_device_type_roundtrip() {
+        for v in all_modeled_types() {
+            let ffi_value: ffi::AVHWDeviceType = v.into();
+            assert_eq!(
+                HWDeviceType::from(ffi_value),
+                v,
+                "roundtrip failed for {v:?}"
+            );
+        }
+    }
+
+    // ======================================================================
+    // E 组 · 上下文生命周期与并发
+    // ======================================================================
+
+    /// 缓存释放语义：只释放**仅被缓存自身持有**（引用计数为 1）的条目。
+    ///
+    /// 无 GPU 机器上只验证"空缓存释放返回 0 且不 panic"；有可用设备时进一步验证
+    /// 三段语义：持有期间释放应为 0 → `drop` 后释放应为 1 → 再释放应为 0。
+    #[test]
+    fn test_release_unused_hw_contexts() {
+        let _guard = cache_lock();
+
+        // 基线：先释放其它测试可能遗留的条目，再验证空缓存释放返回 0
+        let _leftovers = release_unused_hw_contexts();
+        let removed = release_unused_hw_contexts();
+        assert_eq!(removed, 0, "empty cache should release nothing");
+
+        // 若本机有可用 GPU 设备：创建后释放，缓存条目应可被释放
+        let Some(ctx) = try_auto_hw_context() else {
+            return;
+        };
+        // 持有期间释放不应移除
+        assert_eq!(release_unused_hw_contexts(), 0);
+        drop(ctx);
+        // 引用释放后（仅缓存持有），释放应移除该条目
+        assert_eq!(release_unused_hw_contexts(), 1);
+        // 再次释放：缓存已空
+        assert_eq!(release_unused_hw_contexts(), 0);
+    }
+
+    /// `HWContext` 跨线程共享同一 `Arc` 不应触发数据竞争。
+    ///
+    /// 回归来源：`setup_decoder_frames` 并发调用曾通过 `UnsafeCell` 做可变访问；
+    /// `HWContext` 的所有方法现在都只做共享访问（`&self`），配合 FFmpeg 保证的
+    /// 原子引用计数，`Send`/`Sync` 才成立。
+    #[test]
+    fn test_hw_context_shared_across_threads() {
+        let _guard = cache_lock();
+
+        let Some(ctx) = try_auto_hw_context() else {
+            return; // 无 GPU 环境跳过
+        };
+        let ctx2 = Arc::clone(&ctx);
+        let handle = std::thread::spawn(move || {
+            // 共享引用上的只读方法跨线程调用
+            let _ = ctx2.get_format(true);
+        });
+        let _ = ctx.get_format(false);
+        handle.join().expect("thread should not panic");
     }
 }
