@@ -306,25 +306,91 @@ fn seek_file(
     Ok(())
 }
 
-/// 内存 seek 共享逻辑：基于 `pos` 与数据总长 `len` 计算 whence 语义。
+////////////////////////////////////////
+// 内存 IO 的定位计算（BufferReader / BufferWriter 共享）
+////////////////////////////////////////
+
+/// 是否为 `AVSEEK_SIZE` 查询：只取数据总长，**不**移动当前位置。
+fn is_seek_size_query(whence: i32) -> bool {
+    whence & (ffi::AVSEEK_SIZE as i32) != 0
+}
+
+/// 按 `whence` 语义计算定位后的偏移，结果夹在 `[0, len]`。
 ///
-/// 返回定位后的偏移；`AVSEEK_SIZE` 时返回数据总长。
-fn memory_seek(pos: &AtomicUsize, len: usize, offset: i64, whence: i32) -> i64 {
+/// 返回 `None` 表示 `whence` 非法：调用方应返回 -1 且保持当前位置不变
+/// （与 POSIX `lseek` 一致），而不是把 -1 当成新位置存下去。
+fn seek_offset(pos: i64, len: usize, offset: i64, whence: i32) -> Option<i64> {
     let len = len as i64;
-    if whence & (ffi::AVSEEK_SIZE as i32) != 0 {
-        return len;
-    }
     // 去掉 AVSEEK_FORCE 位后按 POSIX whence 解释（常量取自 libc，禁止手写）
     let base = whence & !(ffi::AVSEEK_FORCE as i32);
     let target = match base {
         libc::SEEK_SET => offset,
-        libc::SEEK_CUR => pos.load(Ordering::Relaxed) as i64 + offset,
+        libc::SEEK_CUR => pos + offset,
         libc::SEEK_END => len + offset,
-        _ => return -1,
+        _ => return None,
     };
-    let target = target.clamp(0, len);
-    pos.store(target as usize, Ordering::Relaxed);
-    target
+    Some(target.clamp(0, len))
+}
+
+////////////////////////////////////////
+// Builder 共享 setter
+////////////////////////////////////////
+
+/// 为 reader builder 生成 `with_format` / `with_options` / `with_interrupt`，
+/// 三者都只写 [`ReaderSpec`]。
+///
+/// 三个 reader builder 的这三项语义完全相同（含 `impl Into<Option<_>>` 的取值
+/// 方式），因此只在这里写一遍：builder 只需持有 `spec: ReaderSpec<'a>`。
+macro_rules! impl_reader_builder_setters {
+    () => {
+        /// Specify a custom format for the reader.
+        ///
+        /// # Arguments
+        ///
+        /// * `format` - Container format to use.
+        pub fn with_format(mut self, format: &'a str) -> Self {
+            self.spec.format = Some(format);
+            self
+        }
+
+        /// Specify options for the backend.
+        ///
+        /// # Arguments
+        ///
+        /// * `options` - Options to pass on to input.
+        pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+            self.spec.options = options.into();
+            self
+        }
+
+        /// Attach an [`Interrupt`] handle to cancel blocked operations.
+        ///
+        /// 覆盖范围见 [`Interrupt`]：URL 输入（`StreamReader`）的打开与协议层
+        /// 阻塞读都能被取消；自定义 IO 输入（`BufferReader` / `IoReader`）只有
+        /// 探测循环生效，回调自身的阻塞读不受保护。
+        pub fn with_interrupt(mut self, interrupt: impl Into<Option<Interrupt>>) -> Self {
+            self.spec.interrupt = interrupt.into();
+            self
+        }
+    };
+}
+
+/// 为 writer builder 生成 `with_options`（只写 [`WriterSpec`]）。
+///
+/// `with_format` 不在其中：`StreamWriter` 的格式可省略（由扩展名推断），
+/// 内存 / 自定义 IO writer 则必填，两者的存储类型不同。
+macro_rules! impl_writer_builder_setters {
+    () => {
+        /// Specify options for the backend.
+        ///
+        /// # Arguments
+        ///
+        /// * `options` - Options to pass on to output.
+        pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+            self.spec.options = options.into();
+            self
+        }
+    };
 }
 
 ////////////////////////////////////////
@@ -406,6 +472,9 @@ fn build_output_custom(
 ///   取决于解复用器内部是否还要读数据（本地文件 seek 无阻塞，不需要中断）；
 /// - 自定义 IO 输入（`BufferReader`/`IoReader` 等）不经过协议层，只有 format
 ///   context 层生效（探测循环），用户回调自身的阻塞读不受保护。
+///
+/// 输出侧对称性：写出方向（[`StreamWriter`] / [`BufferWriter`] / [`IoWriter`]）
+/// 没有对应入口，推流这类阻塞写目前不可取消。
 #[derive(Clone)]
 pub struct Interrupt {
     data: Arc<InterruptData>,
@@ -564,6 +633,17 @@ fn install_interrupt(ctx: &mut AVFormatContextInput, interrupt: &Interrupt) {
 // StreamReader（Location/URL 输入）
 ////////////////////////////////////////
 
+/// 三个 reader builder 的共享后端字段（格式名、options、中断句柄）。
+///
+/// setter 由 [`impl_reader_builder_setters`] 生成，
+/// 因此三个 builder 的公开语义只有一份定义
+#[derive(Default)]
+struct ReaderSpec<'a> {
+    format: Option<&'a str>,
+    options: Option<Options>,
+    interrupt: Option<Interrupt>,
+}
+
 /// Builds a [`StreamReader`].
 ///
 /// # Example
@@ -582,9 +662,7 @@ fn install_interrupt(ctx: &mut AVFormatContextInput, interrupt: &Interrupt) {
 /// ```
 pub struct StreamReaderBuilder<'a> {
     source: Location,
-    format: Option<&'a str>,
-    options: Option<Options>,
-    interrupt: Option<Interrupt>,
+    spec: ReaderSpec<'a>,
 }
 
 impl<'a> StreamReaderBuilder<'a> {
@@ -596,67 +674,40 @@ impl<'a> StreamReaderBuilder<'a> {
     pub fn new(source: impl Into<Location>) -> Self {
         Self {
             source: source.into(),
-            format: None,
-            options: None,
-            interrupt: None,
+            spec: ReaderSpec::default(),
         }
     }
 
-    /// Specify a custom format for the reader.
-    ///
-    /// # Arguments
-    ///
-    /// * `format` - Container format to use.
-    pub fn with_format(mut self, format: &'a str) -> Self {
-        self.format = Some(format);
-        self
-    }
-
-    /// Specify options for the backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `options` - Options to pass on to input.
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.options = options.into();
-        self
-    }
-
-    /// Attach an [`Interrupt`] handle for cancelling blocked reads/seeks
-    /// (network streams). See [`Interrupt`] for coverage limits.
-    pub fn with_interrupt(mut self, interrupt: impl Into<Option<Interrupt>>) -> Self {
-        self.interrupt = interrupt.into();
-        self
-    }
+    impl_reader_builder_setters!();
 
     /// Build [`StreamReader`].
     pub fn build(self) -> Result<StreamReader> {
-        let filename = strutils::path_to_cstring(&self.source.as_path())?;
+        let Self { source, spec } = self;
+        let filename = strutils::path_to_cstring(&source.as_path())?;
         let protocol = unsafe { ffi::avio_find_protocol_name(filename.as_ptr()) };
         if protocol.is_null() {
             return Err(RsmediaError::msg(format!(
-                "Unsupported input source protocol: {}",
-                self.source
+                "Unsupported input source protocol: {source}"
             )));
         }
         tracing::debug!(
             "Using input protocol: [{}], source: {}",
             unsafe { strutils::c_char_to_str(protocol) },
-            self.source
+            source
         );
 
         // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
-        let fmt_opt = match self.format {
+        let fmt_opt = match spec.format {
             Some(name) => {
                 let name_c = strutils::str_to_cstring(name)?;
                 AVInputFormat::find(&name_c)
             }
             None => None,
         };
-        let mut dict = self.options.and_then(|opts| opts.into_dict());
-        let mut ctx_input = match &self.interrupt {
+        let mut dict = spec.options.and_then(|opts| opts.into_dict());
+        let mut ctx_input = match &spec.interrupt {
             // 带中断句柄时必须让回调先于 `avformat_open_input` 存在，见
-            // [`open_input_with_interrupt`]；无中断时走 rsmpeg 的常规 builder。
+            // `open_input_with_interrupt`；无中断时走 rsmpeg 的常规 builder。
             Some(interrupt) => {
                 open_input_with_interrupt(&filename, fmt_opt.as_deref(), &mut dict, interrupt)?
             }
@@ -671,10 +722,43 @@ impl<'a> StreamReaderBuilder<'a> {
             .dump(0, &filename)
             .context("Dump input format context failed.")?;
         Ok(StreamReader {
-            source: self.source,
-            input: ctx_input,
-            interrupt: self.interrupt,
+            source,
+            core: ReaderCore::new(ctx_input, spec.interrupt),
         })
+    }
+}
+
+////////////////////////////////////////
+// 内置 Reader 共享状态
+////////////////////////////////////////
+
+/// 三个内置 Reader 的共享状态：输入上下文 + 中断句柄的保活。
+///
+/// `interrupt` 只在构建期被装进 format context，其回调 `opaque` 指向该
+/// `Arc` 的堆内容；本字段负责在 context 存活期间保活它（只持有、不读取）。
+/// 声明顺序即 drop 顺序：`input` 先释放，回调数据后释放——反过来会让仍在
+/// 进行中的阻塞操作触发回调时读到悬挂指针（use-after-free）。
+struct ReaderCore {
+    input: AVFormatContextInput,
+    _interrupt: Option<Interrupt>,
+}
+
+impl ReaderCore {
+    fn new(input: AVFormatContextInput, interrupt: Option<Interrupt>) -> Self {
+        Self {
+            input,
+            _interrupt: interrupt,
+        }
+    }
+}
+
+impl Reader for ReaderCore {
+    fn input(&self) -> &AVFormatContextInput {
+        &self.input
+    }
+
+    fn input_mut(&mut self) -> &mut AVFormatContextInput {
+        &mut self.input
     }
 }
 
@@ -684,13 +768,8 @@ impl<'a> StreamReaderBuilder<'a> {
 /// network sources (http/rtsp) depend on the protocol and the server — see the
 /// capability table on [`Seekable`].
 pub struct StreamReader {
-    pub source: Location,
-    pub input: AVFormatContextInput,
-    // 仅在构建期安装到 context 的 interrupt_callback，其 `opaque` 指向 Arc
-    // 堆内容；本字段负责在 context 存活期间保活该 Arc（只持有、不读取）。
-    // 不能提前 drop，否则后续阻塞操作触发回调时会悬挂指针（use-after-free）。
-    #[allow(dead_code)]
-    interrupt: Option<Interrupt>,
+    source: Location,
+    core: ReaderCore,
 }
 
 impl StreamReader {
@@ -703,15 +782,20 @@ impl StreamReader {
     pub fn new(source: impl Into<Location>) -> Result<Self> {
         StreamReaderBuilder::new(source).build()
     }
+
+    /// The source this reader was opened with.
+    pub fn source(&self) -> &Location {
+        &self.source
+    }
 }
 
 impl Reader for StreamReader {
     fn input(&self) -> &AVFormatContextInput {
-        &self.input
+        self.core.input()
     }
 
     fn input_mut(&mut self) -> &mut AVFormatContextInput {
-        &mut self.input
+        self.core.input_mut()
     }
 }
 
@@ -736,9 +820,7 @@ unsafe impl Send for StreamReader {}
 /// ```
 pub struct BufferReaderBuilder<'a> {
     data: Vec<u8>,
-    format: Option<&'a str>,
-    options: Option<Options>,
-    interrupt: Option<Interrupt>,
+    spec: ReaderSpec<'a>,
 }
 
 impl<'a> BufferReaderBuilder<'a> {
@@ -750,42 +832,16 @@ impl<'a> BufferReaderBuilder<'a> {
     pub fn new(data: Vec<u8>) -> Self {
         Self {
             data,
-            format: None,
-            options: None,
-            interrupt: None,
+            spec: ReaderSpec::default(),
         }
     }
 
-    /// Specify a custom format for the reader.
-    ///
-    /// # Arguments
-    ///
-    /// * `format` - Container format to use.
-    pub fn with_format(mut self, format: &'a str) -> Self {
-        self.format = Some(format);
-        self
-    }
-
-    /// Specify options for the backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `options` - Options to pass on to input.
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.options = options.into();
-        self
-    }
-
-    /// Attach an [`Interrupt`] handle. Mainly useful when the buffer backs
-    /// a blocking custom source; pure in-memory reads never block.
-    pub fn with_interrupt(mut self, interrupt: impl Into<Option<Interrupt>>) -> Self {
-        self.interrupt = interrupt.into();
-        self
-    }
+    impl_reader_builder_setters!();
 
     /// Build [`BufferReader`].
     pub fn build(self) -> Result<BufferReader> {
-        let data = Arc::new(self.data);
+        let Self { data, spec } = self;
+        let data = Arc::new(data);
         let pos = Arc::new(AtomicUsize::new(0));
 
         let read_data = data.clone();
@@ -801,7 +857,19 @@ impl<'a> BufferReaderBuilder<'a> {
         let seek_data = data.clone();
         let seek_pos = pos.clone();
         let seek: SeekCallback = Box::new(move |_opaque, offset, whence| {
-            memory_seek(&seek_pos, seek_data.len(), offset, whence)
+            let len = seek_data.len();
+            if is_seek_size_query(whence) {
+                return len as i64;
+            }
+            let pos = seek_pos.load(Ordering::Relaxed) as i64;
+            match seek_offset(pos, len, offset, whence) {
+                Some(target) => {
+                    seek_pos.store(target as usize, Ordering::Relaxed);
+                    target
+                }
+                // 非法 whence：报 -1 且不移动位置。
+                None => -1,
+            }
         });
 
         let io_context = AVIOContextCustom::alloc_context(
@@ -814,14 +882,13 @@ impl<'a> BufferReaderBuilder<'a> {
         );
         let ctx_input = open_input_custom(
             io_context,
-            self.format,
-            self.options,
-            self.interrupt.as_ref(),
+            spec.format,
+            spec.options,
+            spec.interrupt.as_ref(),
             c"memory",
         )?;
         Ok(BufferReader {
-            input: ctx_input,
-            interrupt: self.interrupt,
+            core: ReaderCore::new(ctx_input, spec.interrupt),
         })
     }
 }
@@ -832,10 +899,7 @@ impl<'a> BufferReaderBuilder<'a> {
 /// installs a seek callback, so FFmpeg sets `AVIO_SEEKABLE_NORMAL` and
 /// [`Seekable::is_byte_seekable`] is always `true`.
 pub struct BufferReader {
-    input: AVFormatContextInput,
-    // 保活 interrupt_callback 的 opaque 数据，见 [`StreamReader::interrupt`]。
-    #[allow(dead_code)]
-    interrupt: Option<Interrupt>,
+    core: ReaderCore,
 }
 
 impl BufferReader {
@@ -852,11 +916,11 @@ impl BufferReader {
 
 impl Reader for BufferReader {
     fn input(&self) -> &AVFormatContextInput {
-        &self.input
+        self.core.input()
     }
 
     fn input_mut(&mut self) -> &mut AVFormatContextInput {
-        &mut self.input
+        self.core.input_mut()
     }
 }
 
@@ -872,9 +936,7 @@ unsafe impl Send for BufferReader {}
 /// Builds an [`IoReader`].
 pub struct IoReaderBuilder<'a, R> {
     reader: R,
-    format: Option<&'a str>,
-    options: Option<Options>,
-    interrupt: Option<Interrupt>,
+    spec: ReaderSpec<'a>,
 }
 
 impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
@@ -886,42 +948,16 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
     pub fn new(reader: R) -> Self {
         Self {
             reader,
-            format: None,
-            options: None,
-            interrupt: None,
+            spec: ReaderSpec::default(),
         }
     }
 
-    /// Specify a custom format for the reader.
-    ///
-    /// # Arguments
-    ///
-    /// * `format` - Container format to use.
-    pub fn with_format(mut self, format: &'a str) -> Self {
-        self.format = Some(format);
-        self
-    }
-
-    /// Specify options for the backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `options` - Options to pass on to input.
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.options = options.into();
-        self
-    }
-
-    /// Attach an [`Interrupt`] handle for cancelling blocked reads on the
-    /// underlying stream (sockets, pipes, ...).
-    pub fn with_interrupt(mut self, interrupt: impl Into<Option<Interrupt>>) -> Self {
-        self.interrupt = interrupt.into();
-        self
-    }
+    impl_reader_builder_setters!();
 
     /// Build [`IoReader`].
     pub fn build(self) -> Result<IoReader> {
-        let mut reader = self.reader;
+        let Self { reader, spec } = self;
+        let mut reader = reader;
         let read_packet: ReadPacketCallback = Box::new(move |_opaque, buf: &mut [u8]| {
             loop {
                 match reader.read(buf) {
@@ -946,14 +982,13 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
         );
         let ctx_input = open_input_custom(
             io_context,
-            self.format,
-            self.options,
-            self.interrupt.as_ref(),
+            spec.format,
+            spec.options,
+            spec.interrupt.as_ref(),
             c"stream",
         )?;
         Ok(IoReader {
-            input: ctx_input,
-            interrupt: self.interrupt,
+            core: ReaderCore::new(ctx_input, spec.interrupt),
         })
     }
 }
@@ -964,10 +999,7 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
 /// [`Seekable`]. Because `avformat_open_input` needs to probe, `reader` must be
 /// re-readable; no seeking is required since probing only moves forward.
 pub struct IoReader {
-    input: AVFormatContextInput,
-    // 保活 interrupt_callback 的 opaque 数据，见 [`StreamReader::interrupt`]。
-    #[allow(dead_code)]
-    interrupt: Option<Interrupt>,
+    core: ReaderCore,
 }
 
 impl IoReader {
@@ -984,11 +1016,11 @@ impl IoReader {
 
 impl Reader for IoReader {
     fn input(&self) -> &AVFormatContextInput {
-        &self.input
+        self.core.input()
     }
 
     fn input_mut(&mut self) -> &mut AVFormatContextInput {
-        &mut self.input
+        self.core.input_mut()
     }
 }
 
@@ -1012,14 +1044,13 @@ unsafe impl Send for IoReader {}
 /// chunk 列表的指针移动（`push`/`extend`），没有任何字节级 memcpy。
 pub trait Writer {
     /// 单次 `write_*` 调用产生的输出类型：
-    /// [`StreamWriter`] 为 `()`（数据直接写出），
-    /// [`BufferWriter`] 为 [`Bytes`]（本次调用新增的字节块），
-    /// [`PacketizedBufWriter`] 为 `Vec<Bytes>`（按包切分的字节块）。
+    /// [`StreamWriter`] / [`IoWriter`] 为 `()`（数据直接写出），
+    /// [`BufferWriter`] 为 [`Bytes`]（本次调用新增的字节块）。
     type Out;
 
     /// 跨多次 `write_*` 累积 [`Out`](Self::Out) 的容器；空累积器即
     /// `Default::default()`，因此"从零开始累积"无需 `Option` 包装。
-    /// [`StreamWriter`] 为 `()`，两个缓冲型 writer 均为 `Vec<Bytes>`。
+    /// [`StreamWriter`] / [`IoWriter`] 为 `()`，[`BufferWriter`] 为 `Vec<Bytes>`。
     type Accum: Default;
 
     /// Write the container header.
@@ -1152,19 +1183,106 @@ fn flush_avio(output: &mut AVFormatContextOutput) {
     }
 }
 
-/// [`Writer::write_header`] 的前置检查：容器头只能写一次。
+////////////////////////////////////////
+// 内置 Writer 共享状态
+////////////////////////////////////////
+
+/// writer builder 的共享后端字段（options）；setter 由
+/// [`impl_writer_builder_setters`] 生成。
 ///
-/// 四个内置实现都在写之前调用它，从而把"二次写 header"挡在 FFmpeg 之前；
-/// 检查通过后各实现自己把状态位置为 `true`（只在成功后置位，失败时仍是处女态，
-/// 允许修好参数重试）。
-fn ensure_header_not_written<W: Writer>(writer: &W) -> Result<()> {
-    if writer.is_header_written() {
-        return Err(RsmediaError::invalid_config(
-            "write_header() was already called on this writer: a container header is written \
-             exactly once, before any packet",
-        ));
+/// `format` 不在其中：`StreamWriter` 的格式可省略（按扩展名推断），
+/// 内存 / 自定义 IO writer 则必填，两者的存储类型不同。
+#[derive(Default)]
+struct WriterSpec {
+    options: Option<Options>,
+}
+
+/// 三个内置 Writer 的共享内核：输出上下文、options、header 状态，以及
+/// "每次写后是否 flush avio"的策略。
+///
+/// [`Writer`] 的固定语义都收在这里，只写一遍：
+/// - 容器头**恰好写一次**（二次调用在触到 FFmpeg 之前就报错；只在成功后
+///   置位 `header_written`，失败时仍是处女态，允许修好参数重试）；
+/// - 构建阶段未消费的 options 在 `write_header` 时透传给 muxer；
+/// - 内存/流式 Writer 每次写完 `avio_flush`，保证字节立即送达回调；
+///   文件/URL Writer 交给 FFmpeg 自己缓冲。
+///
+/// 因此各 Writer 实现只剩 `Out`/`Accum` 的差异（见各类型自己的 `impl Writer`）。
+struct WriterCore {
+    output: AVFormatContextOutput,
+    options: Option<AVDictionary>,
+    /// [`Writer::is_header_written`] 的记录。
+    header_written: bool,
+    /// 是否在每次 `write_*` 后 flush avio。
+    flush_after_write: bool,
+}
+
+impl WriterCore {
+    fn new(
+        output: AVFormatContextOutput,
+        options: Option<AVDictionary>,
+        flush_after_write: bool,
+    ) -> Self {
+        Self {
+            output,
+            options,
+            header_written: false,
+            flush_after_write,
+        }
     }
-    Ok(())
+
+    fn write_header(&mut self) -> Result<()> {
+        if self.header_written {
+            return Err(RsmediaError::invalid_config(
+                "write_header() was already called on this writer: a container header is written \
+                 exactly once, before any packet",
+            ));
+        }
+        let mut dict = self.options.take();
+        write_header_with_options(&mut self.output, &mut dict)?;
+        self.header_written = true;
+        self.flush();
+        Ok(())
+    }
+
+    fn is_header_written(&self) -> bool {
+        self.header_written
+    }
+
+    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
+        self.output.write_frame(packet)?;
+        self.flush();
+        Ok(())
+    }
+
+    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()> {
+        self.output.interleaved_write_frame(packet)?;
+        self.flush();
+        Ok(())
+    }
+
+    fn write_trailer(&mut self) -> Result<()> {
+        self.output
+            .write_trailer()
+            .context("Failed to write trailer")?;
+        self.flush();
+        Ok(())
+    }
+
+    /// flush avio 内部缓冲（`flush_after_write` 为假时是空操作）。
+    fn flush(&mut self) {
+        if self.flush_after_write {
+            flush_avio(&mut self.output);
+        }
+    }
+
+    fn output(&self) -> &AVFormatContextOutput {
+        &self.output
+    }
+
+    fn output_mut(&mut self) -> &mut AVFormatContextOutput {
+        &mut self.output
+    }
 }
 
 ////////////////////////////////////////
@@ -1175,7 +1293,7 @@ fn ensure_header_not_written<W: Writer>(writer: &W) -> Result<()> {
 pub struct StreamWriterBuilder<'a> {
     destination: Location,
     format: Option<&'a str>,
-    options: Option<Options>,
+    spec: WriterSpec,
 }
 
 impl<'a> StreamWriterBuilder<'a> {
@@ -1188,7 +1306,7 @@ impl<'a> StreamWriterBuilder<'a> {
         Self {
             destination: destination.into(),
             format: None,
-            options: None,
+            spec: WriterSpec::default(),
         }
     }
 
@@ -1217,25 +1335,22 @@ impl<'a> StreamWriterBuilder<'a> {
         self
     }
 
-    /// Specify options for the backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.options = options.into();
-        self
-    }
+    impl_writer_builder_setters!();
 
     /// Build [`StreamWriter`].
     pub fn build(self) -> Result<StreamWriter> {
-        let filename = strutils::path_to_cstring(&self.destination.as_path())?;
+        let Self {
+            destination,
+            format,
+            spec,
+        } = self;
+        let filename = strutils::path_to_cstring(&destination.as_path())?;
         // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
-        let format = match self.format {
+        let format = match format {
             Some(name) => Some(strutils::str_to_cstring(name)?),
             None => None,
         };
-        let mut dict = self.options.and_then(|opts| opts.into_dict());
+        let mut dict = spec.options.and_then(|opts| opts.into_dict());
         let output_ctx = AVFormatContextOutput::builder()
             .filename(&filename)
             .maybe_format_name(format.as_deref())
@@ -1246,10 +1361,8 @@ impl<'a> StreamWriterBuilder<'a> {
             .build()
             .context("Create output format context failed.")?;
         Ok(StreamWriter {
-            destination: self.destination,
-            output: output_ctx,
-            options: dict,
-            header_written: false,
+            destination,
+            core: WriterCore::new(output_ctx, dict, false),
         })
     }
 }
@@ -1260,12 +1373,12 @@ impl<'a> StreamWriterBuilder<'a> {
 ///
 /// Create a video writer that produces fragmented MP4:
 ///
-/// ```ignore
-/// let mut options = HashMap::new();
-/// options.insert(
-///     "movflags".to_string(),
-///     "frag_keyframe+empty_moov".to_string(),
-/// );
+/// ```no_run
+/// use rsmedia::io::StreamWriterBuilder;
+/// use rsmedia::Options;
+///
+/// let mut options = Options::new();
+/// options.insert("movflags", "frag_keyframe+empty_moov");
 ///
 /// let mut writer = StreamWriterBuilder::new("my_file.mp4")
 ///     .with_options(Some(options))
@@ -1273,12 +1386,8 @@ impl<'a> StreamWriterBuilder<'a> {
 ///     .unwrap();
 /// ```
 pub struct StreamWriter {
-    pub destination: Location,
-    pub output: AVFormatContextOutput,
-    /// 构建阶段未被 avio 层消费的 options，write_header 时传给 muxer。
-    pub(crate) options: Option<AVDictionary>,
-    /// `write_header` 是否成功过（见 [`Writer::is_header_written`]）。
-    header_written: bool,
+    destination: Location,
+    core: WriterCore,
 }
 
 impl StreamWriter {
@@ -1291,6 +1400,11 @@ impl StreamWriter {
     pub fn new(destination: impl Into<Location>) -> Result<Self> {
         StreamWriterBuilder::new(destination).build()
     }
+
+    /// The destination this writer was opened with.
+    pub fn destination(&self) -> &Location {
+        &self.destination
+    }
 }
 
 impl Writer for StreamWriter {
@@ -1301,40 +1415,31 @@ impl Writer for StreamWriter {
     fn merge_accum(_acc: &mut (), _other: ()) {}
 
     fn write_header(&mut self) -> Result<()> {
-        ensure_header_not_written(self)?;
-        let mut dict = self.options.take();
-        write_header_with_options(&mut self.output, &mut dict)?;
-        self.header_written = true;
-        Ok(())
+        self.core.write_header()
     }
 
     fn is_header_written(&self) -> bool {
-        self.header_written
+        self.core.is_header_written()
     }
 
     fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
-        self.output.write_frame(packet)?;
-        Ok(())
+        self.core.write_frame(packet)
     }
 
     fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()> {
-        self.output.interleaved_write_frame(packet)?;
-        Ok(())
+        self.core.write_interleaved(packet)
     }
 
     fn write_trailer(&mut self) -> Result<()> {
-        self.output
-            .write_trailer()
-            .context("Failed to write trailer")?;
-        Ok(())
+        self.core.write_trailer()
     }
 
     fn output(&self) -> &AVFormatContextOutput {
-        &self.output
+        self.core.output()
     }
 
     fn output_mut(&mut self) -> &mut AVFormatContextOutput {
-        &mut self.output
+        self.core.output_mut()
     }
 }
 
@@ -1388,16 +1493,24 @@ fn mem_seek(state: &Mutex<MemWriterState>, offset: i64, whence: i32) -> i64 {
         Ok(guard) => guard,
         Err(_) => return -1,
     };
-    let pos = AtomicUsize::new(st.pos);
-    let target = memory_seek(&pos, st.data.len(), offset, whence);
-    st.pos = pos.load(Ordering::Relaxed);
-    target
+    let len = st.data.len();
+    if is_seek_size_query(whence) {
+        return len as i64;
+    }
+    match seek_offset(st.pos as i64, len, offset, whence) {
+        Some(target) => {
+            st.pos = target as usize;
+            target
+        }
+        // 非法 whence：报 -1 且不移动写位置。
+        None => -1,
+    }
 }
 
 /// Build a [`BufferWriter`].
 pub struct BufferWriterBuilder<'a> {
     format: &'a str,
-    options: Option<Options>,
+    spec: WriterSpec,
 }
 
 impl<'a> BufferWriterBuilder<'a> {
@@ -1409,22 +1522,15 @@ impl<'a> BufferWriterBuilder<'a> {
     pub fn new(format: &'a str) -> Self {
         Self {
             format,
-            options: None,
+            spec: WriterSpec::default(),
         }
     }
 
-    /// Specify options for the backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.options = options.into();
-        self
-    }
+    impl_writer_builder_setters!();
 
     /// Build [`BufferWriter`].
     pub fn build(self) -> Result<BufferWriter> {
+        let Self { format, spec } = self;
         let state = Arc::new(Mutex::new(MemWriterState::default()));
 
         let write_state = state.clone();
@@ -1445,12 +1551,10 @@ impl<'a> BufferWriterBuilder<'a> {
             Some(write_packet),
             Some(seek),
         );
-        let output = build_output_custom(io_context, self.format)?;
+        let output = build_output_custom(io_context, format)?;
         Ok(BufferWriter {
-            output,
+            core: WriterCore::new(output, spec.options.and_then(|opts| opts.into_dict()), true),
             state,
-            options: self.options.and_then(|opts| opts.into_dict()),
-            header_written: false,
         })
     }
 }
@@ -1463,16 +1567,18 @@ impl<'a> BufferWriterBuilder<'a> {
 ///
 /// # Example
 ///
-/// ```ignore
-/// let mut writer = BufferWriter::new("mp4").unwrap();
-/// let bytes = writer.write_header()?;
+/// ```no_run
+/// use rsmedia::io::{BufferWriter, Writer};
+///
+/// # fn main() -> rsmedia::error::Result<()> {
+/// let mut writer = BufferWriter::new("mpegts")?;
+/// let _header = writer.write_header()?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct BufferWriter {
-    pub(crate) output: AVFormatContextOutput,
+    core: WriterCore,
     state: Arc<Mutex<MemWriterState>>,
-    options: Option<AVDictionary>,
-    /// `write_header` 是否成功过（见 [`Writer::is_header_written`]）。
-    header_written: bool,
 }
 
 impl BufferWriter {
@@ -1503,12 +1609,8 @@ impl BufferWriter {
     /// 回写的字节，必须用本方法获取最终完整结果。应在 `write_trailer` 之后
     /// 调用。
     pub fn into_bytes(self) -> Vec<u8> {
-        let Self {
-            output,
-            state,
-            options: _,
-            header_written: _,
-        } = self;
+        let Self { core, state } = self;
+        let WriterCore { output, .. } = core;
         // 先释放 format context（连带 IO 回调释放其持有的 state 引用）
         drop(output);
         match Arc::try_unwrap(state) {
@@ -1535,42 +1637,35 @@ impl Writer for BufferWriter {
     }
 
     fn write_header(&mut self) -> Result<Bytes> {
-        ensure_header_not_written(self)?;
-        let mut dict = self.options.take();
-        write_header_with_options(&mut self.output, &mut dict)?;
-        self.header_written = true;
-        flush_avio(&mut self.output);
+        self.core.write_header()?;
         Ok(self.take_written())
     }
 
     fn is_header_written(&self) -> bool {
-        self.header_written
+        self.core.is_header_written()
     }
 
     fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Bytes> {
-        self.output.write_frame(packet)?;
-        flush_avio(&mut self.output);
+        self.core.write_frame(packet)?;
         Ok(self.take_written())
     }
 
     fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Bytes> {
-        self.output.interleaved_write_frame(packet)?;
-        flush_avio(&mut self.output);
+        self.core.write_interleaved(packet)?;
         Ok(self.take_written())
     }
 
     fn write_trailer(&mut self) -> Result<Bytes> {
-        self.output.write_trailer()?;
-        flush_avio(&mut self.output);
+        self.core.write_trailer()?;
         Ok(self.take_written())
     }
 
     fn output(&self) -> &AVFormatContextOutput {
-        &self.output
+        self.core.output()
     }
 
     fn output_mut(&mut self) -> &mut AVFormatContextOutput {
-        &mut self.output
+        self.core.output_mut()
     }
 }
 
@@ -1578,186 +1673,17 @@ impl Writer for BufferWriter {
 unsafe impl Send for BufferWriter {}
 
 ////////////////////////////////////////
-// PacketizedBufWriter（按包切分的内存输出）
+// IoWriter（任意 std::io::Write 输出）
 ////////////////////////////////////////
 
-/// Build a [`PacketizedBufWriter`].
-pub struct PacketizedBufWriterBuilder<'a> {
-    format: &'a str,
-    options: Option<Options>,
-}
-
-impl<'a> PacketizedBufWriterBuilder<'a> {
-    /// Create a new writer that writes to a packetized buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `format` - Container format to use.
-    pub fn new(format: &'a str) -> Self {
-        Self {
-            format,
-            options: None,
-        }
-    }
-
-    /// Specify options for the backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.options = options.into();
-        self
-    }
-
-    /// Build [`PacketizedBufWriter`].
-    pub fn build(self) -> Result<PacketizedBufWriter> {
-        let buffers = Arc::new(Mutex::new(Vec::<Bytes>::new()));
-
-        // 回调在 FFI 调用栈中执行，严禁 panic：锁中毒返回 AVERROR(EIO)。
-        // 包数据必须从 FFmpeg 复用的 avio 缓冲中拷出；用 [`Bytes`] 承载，
-        // 下游切片/共享/跨线程分发均为廉价引用计数而非深拷贝。
-        let write_buffers = buffers.clone();
-        let write_packet: WritePacketCallback =
-            Box::new(move |_opaque, buf: &[u8]| match write_buffers.lock() {
-                Ok(mut guard) => {
-                    guard.push(Bytes::copy_from_slice(buf));
-                    buf.len() as i32
-                }
-                Err(_) => AVERROR_EIO,
-            });
-
-        // avio 缓冲大小与 max_packet_size 一致（分包写出的前提）
-        let mut io_context = AVIOContextCustom::alloc_context(
-            AVMem::new(PacketizedBufWriter::PACKET_SIZE),
-            true,
-            Vec::new(),
-            None,
-            Some(write_packet),
-            None,
-        );
-        // rsmpeg 未暴露可变字段访问，经裸指针设置 max_packet_size。
-        // SAFETY: io_context 独占持有该 context，此处处于挂载前的初始化阶段。
-        unsafe {
-            (*io_context.as_mut_ptr()).max_packet_size = PacketizedBufWriter::PACKET_SIZE as _;
-        }
-        let output = build_output_custom(io_context, self.format)?;
-        Ok(PacketizedBufWriter {
-            output,
-            buffers,
-            options: self.options.and_then(|opts| opts.into_dict()),
-            header_written: false,
-        })
-    }
-}
-
-/// Video writer that writes multiple packets to a buffer and returns the resulting
-/// bytes for each packet.
-///
-/// # Example
-///
-/// ```ignore
-/// let mut writer = BufPacketizedWriter::new("rtp").unwrap();
-/// let bytes = writer.write_header()?;
-/// ```
-pub struct PacketizedBufWriter {
-    pub(crate) output: AVFormatContextOutput,
-    buffers: Arc<Mutex<Vec<Bytes>>>,
-    options: Option<AVDictionary>,
-    /// `write_header` 是否成功过（见 [`Writer::is_header_written`]）。
-    header_written: bool,
-}
-
-impl PacketizedBufWriter {
-    /// Actual packet size. Value should be below MTU.
-    const PACKET_SIZE: usize = 1024;
-
-    /// Create a video writer that writes multiple packets to a buffer and returns the resulting
-    /// bytes for each packet.
-    ///
-    /// # Arguments
-    ///
-    /// * `format` - Container format to use.
-    #[inline]
-    pub fn new(format: &str) -> Result<Self> {
-        PacketizedBufWriterBuilder::new(format).build()
-    }
-
-    #[inline]
-    fn take_buffers(&mut self) -> Vec<Bytes> {
-        std::mem::take(&mut *self.buffers.lock().expect("packet buffers poisoned"))
-    }
-}
-
-impl Writer for PacketizedBufWriter {
-    type Out = Vec<Bytes>;
-    type Accum = Vec<Bytes>;
-
-    /// chunk 列表 `extend`：只移动 `Bytes` 句柄，零字节拷贝。
-    fn merge_out(acc: &mut Vec<Bytes>, out: Vec<Bytes>) {
-        acc.extend(out);
-    }
-
-    /// chunk 列表 `extend`：只移动 `Bytes` 句柄，零字节拷贝。
-    fn merge_accum(acc: &mut Vec<Bytes>, other: Vec<Bytes>) {
-        acc.extend(other);
-    }
-
-    fn write_header(&mut self) -> Result<Vec<Bytes>> {
-        ensure_header_not_written(self)?;
-        let mut dict = self.options.take();
-        write_header_with_options(&mut self.output, &mut dict)?;
-        self.header_written = true;
-        flush_avio(&mut self.output);
-        Ok(self.take_buffers())
-    }
-
-    fn is_header_written(&self) -> bool {
-        self.header_written
-    }
-
-    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Vec<Bytes>> {
-        self.output.write_frame(packet)?;
-        flush_avio(&mut self.output);
-        Ok(self.take_buffers())
-    }
-
-    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<Vec<Bytes>> {
-        self.output.interleaved_write_frame(packet)?;
-        flush_avio(&mut self.output);
-        Ok(self.take_buffers())
-    }
-
-    fn write_trailer(&mut self) -> Result<Vec<Bytes>> {
-        self.output.write_trailer()?;
-        flush_avio(&mut self.output);
-        Ok(self.take_buffers())
-    }
-
-    fn output(&self) -> &AVFormatContextOutput {
-        &self.output
-    }
-
-    fn output_mut(&mut self) -> &mut AVFormatContextOutput {
-        &mut self.output
-    }
-}
-
-/// 仅承诺可移动到其他线程独占使用。
-unsafe impl Send for PacketizedBufWriter {}
-
-////////////////////////////////////////
-// CustomIoWriter（任意 std::io::Write 输出）
-////////////////////////////////////////
-
-/// Builds a [`CustomIoWriter`].
-pub struct CustomIoWriterBuilder<'a, W> {
+/// Builds a [`IoWriter`].
+pub struct IoWriterBuilder<'a, W> {
     writer: W,
     format: &'a str,
-    options: Option<Options>,
+    spec: WriterSpec,
 }
 
-impl<'a, W: std::io::Write + Send + 'static> CustomIoWriterBuilder<'a, W> {
+impl<'a, W: std::io::Write + Send + 'static> IoWriterBuilder<'a, W> {
     /// Create a new writer wrapping any [`std::io::Write`] implementor.
     ///
     /// # Arguments
@@ -1768,23 +1694,20 @@ impl<'a, W: std::io::Write + Send + 'static> CustomIoWriterBuilder<'a, W> {
         Self {
             writer,
             format,
-            options: None,
+            spec: WriterSpec::default(),
         }
     }
 
-    /// Specify options for the backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `options` - Options to pass on to output.
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.options = options.into();
-        self
-    }
+    impl_writer_builder_setters!();
 
-    /// Build [`CustomIoWriter`].
-    pub fn build(self) -> Result<CustomIoWriter<W>> {
-        let inner = Arc::new(Mutex::new(self.writer));
+    /// Build [`IoWriter`].
+    pub fn build(self) -> Result<IoWriter<W>> {
+        let Self {
+            writer,
+            format,
+            spec,
+        } = self;
+        let inner = Arc::new(Mutex::new(writer));
 
         let write_inner = inner.clone();
         // 回调在 FFI 调用栈中执行，严禁 panic：锁中毒或写入失败均返回 AVERROR(EIO)。
@@ -1796,7 +1719,7 @@ impl<'a, W: std::io::Write + Send + 'static> CustomIoWriterBuilder<'a, W> {
             match w.write_all(buf) {
                 Ok(()) => buf.len() as i32,
                 Err(e) => {
-                    tracing::error!("CustomIoWriter write error: {e}");
+                    tracing::error!("IoWriter write error: {e}");
                     AVERROR_EIO
                 }
             }
@@ -1810,12 +1733,10 @@ impl<'a, W: std::io::Write + Send + 'static> CustomIoWriterBuilder<'a, W> {
             Some(write_packet),
             None,
         );
-        let output = build_output_custom(io_context, self.format)?;
-        Ok(CustomIoWriter {
-            output,
+        let output = build_output_custom(io_context, format)?;
+        Ok(IoWriter {
+            core: WriterCore::new(output, spec.options.and_then(|opts| opts.into_dict()), true),
             inner,
-            options: self.options.and_then(|opts| opts.into_dict()),
-            header_written: false,
         })
     }
 }
@@ -1823,15 +1744,12 @@ impl<'a, W: std::io::Write + Send + 'static> CustomIoWriterBuilder<'a, W> {
 /// Video writer that writes to any [`std::io::Write`] implementor.
 ///
 /// 每次 `write_*` 调用后会 flush avio 缓冲，字节及时送达底层流。
-pub struct CustomIoWriter<W: std::io::Write + Send + 'static> {
-    pub(crate) output: AVFormatContextOutput,
+pub struct IoWriter<W: std::io::Write + Send + 'static> {
+    core: WriterCore,
     inner: Arc<Mutex<W>>,
-    options: Option<AVDictionary>,
-    /// `write_header` 是否成功过（见 [`Writer::is_header_written`]）。
-    header_written: bool,
 }
 
-impl<W: std::io::Write + Send + 'static> CustomIoWriter<W> {
+impl<W: std::io::Write + Send + 'static> IoWriter<W> {
     /// Create a video writer wrapping any [`std::io::Write`] implementor.
     ///
     /// # Arguments
@@ -1840,17 +1758,13 @@ impl<W: std::io::Write + Send + 'static> CustomIoWriter<W> {
     /// * `writer` - Destination stream to write to.
     #[inline]
     pub fn new(format: &str, writer: W) -> Result<Self> {
-        CustomIoWriterBuilder::new(format, writer).build()
+        IoWriterBuilder::new(format, writer).build()
     }
 
     /// 消耗 writer 并取回底层 [`std::io::Write`] 实现（应在 `write_trailer` 之后调用）。
     pub fn into_inner(self) -> std::io::Result<W> {
-        let Self {
-            output,
-            inner,
-            options: _,
-            header_written: _,
-        } = self;
+        let Self { core, inner } = self;
+        let WriterCore { output, .. } = core;
         // 先释放 format context（连带 IO 回调释放其持有的 inner 引用）
         drop(output);
         match Arc::try_unwrap(inner) {
@@ -1866,7 +1780,7 @@ impl<W: std::io::Write + Send + 'static> CustomIoWriter<W> {
     }
 }
 
-impl<W: std::io::Write + Send + 'static> Writer for CustomIoWriter<W> {
+impl<W: std::io::Write + Send + 'static> Writer for IoWriter<W> {
     type Out = ();
     type Accum = ();
 
@@ -1874,47 +1788,36 @@ impl<W: std::io::Write + Send + 'static> Writer for CustomIoWriter<W> {
     fn merge_accum(_acc: &mut (), _other: ()) {}
 
     fn write_header(&mut self) -> Result<()> {
-        ensure_header_not_written(self)?;
-        let mut dict = self.options.take();
-        write_header_with_options(&mut self.output, &mut dict)?;
-        self.header_written = true;
-        flush_avio(&mut self.output);
-        Ok(())
+        self.core.write_header()
     }
 
     fn is_header_written(&self) -> bool {
-        self.header_written
+        self.core.is_header_written()
     }
 
     fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
-        self.output.write_frame(packet)?;
-        flush_avio(&mut self.output);
-        Ok(())
+        self.core.write_frame(packet)
     }
 
     fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()> {
-        self.output.interleaved_write_frame(packet)?;
-        flush_avio(&mut self.output);
-        Ok(())
+        self.core.write_interleaved(packet)
     }
 
     fn write_trailer(&mut self) -> Result<()> {
-        self.output.write_trailer()?;
-        flush_avio(&mut self.output);
-        Ok(())
+        self.core.write_trailer()
     }
 
     fn output(&self) -> &AVFormatContextOutput {
-        &self.output
+        self.core.output()
     }
 
     fn output_mut(&mut self) -> &mut AVFormatContextOutput {
-        &mut self.output
+        self.core.output_mut()
     }
 }
 
 /// 仅承诺可移动到其他线程独占使用（内部 writer 与回调均为 `Send`）。
-unsafe impl<W: std::io::Write + Send + 'static> Send for CustomIoWriter<W> {}
+unsafe impl<W: std::io::Write + Send + 'static> Send for IoWriter<W> {}
 
 ////////////////////////////////////////
 // Logging
@@ -2400,10 +2303,10 @@ mod tests {
         Ok(())
     }
 
-    /// CustomIoWriter：写任意 std::io::Write 汇（Vec<u8>），结束后取回数据。
+    /// IoWriter：写任意 std::io::Write 汇（Vec<u8>），结束后取回数据。
     #[test]
-    fn test_custom_io_writer() -> Result<()> {
-        let writer = CustomIoWriter::new("mpegts", Vec::new())?;
+    fn test_io_writer() -> Result<()> {
+        let writer = IoWriter::new("mpegts", Vec::new())?;
         let mut muxer = Muxer::new_from_writer(writer);
         let encoder = EncoderBuilder::new_video(64, 48).build()?;
         let tb = encoder.time_base();

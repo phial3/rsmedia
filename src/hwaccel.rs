@@ -982,21 +982,22 @@ mod tests {
         types
     }
 
-    /// 按 FFmpeg 版本门控的变体：低于对应版本的构建返回空表。
-    /// D3D12VA 需要 ffmpeg7+，AMF / OHCODEC 需要 ffmpeg8+。
     #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
     fn version_gated_types() -> Vec<HWDeviceType> {
         Vec::new()
     }
 
-    #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+    /// D3D12VA 需要 ffmpeg7+，AMF / OHCODEC 需要 ffmpeg8+。
+    #[cfg(feature = "ffmpeg7")]
+    fn version_gated_types() -> Vec<HWDeviceType> {
+        vec![HWDeviceType::D3D12VA]
+    }
+
+    #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
     fn version_gated_types() -> Vec<HWDeviceType> {
         let mut gated = vec![HWDeviceType::D3D12VA];
-        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-        {
-            gated.push(HWDeviceType::AMF);
-            gated.push(HWDeviceType::OHCODEC);
-        }
+        gated.push(HWDeviceType::AMF);
+        gated.push(HWDeviceType::OHCODEC);
         gated
     }
 

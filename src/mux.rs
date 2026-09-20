@@ -1017,7 +1017,7 @@ impl<W: Writer> Muxer<W> {
     ///
     /// 应在 [`Self::finish`] 之后调用；此时 trailer 已写出，可从 writer 中
     /// 取回最终输出（如 [`crate::io::BufferWriter::into_bytes`] 或
-    /// [`crate::io::CustomIoWriter::into_inner`]）。若忘记调用 `finish()`，
+    /// [`crate::io::IoWriter::into_inner`]）。若忘记调用 `finish()`，
     /// 此处会自动补写 trailer（与 `Drop` 的兜底行为一致）。
     pub fn into_writer(mut self) -> W {
         // 先补写 trailer，使 Drop 的自动 flush 逻辑成为空操作。
