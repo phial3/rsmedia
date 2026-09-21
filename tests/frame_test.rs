@@ -588,7 +588,7 @@ fn test_dynamic_image_conversion() -> Result<()> {
     }
 
     // DynamicImage -> MediaFrame
-    let back = MediaFrame::<u8>::from_dynamic_image(&img)?;
+    let back = MediaFrame::<u8>::from_dynamic_image(img)?;
     assert_eq!(back.format, FrameFormat::Pixel(PixelFormat::RGB24));
     assert_eq!(
         back.data.as_packed().map(|a| a.dim()),
@@ -602,7 +602,7 @@ fn test_dynamic_image_conversion() -> Result<()> {
         TEST_HEIGHT as u32,
         image::Rgba([10, 20, 30, 255]),
     ));
-    let from_rgba = MediaFrame::<u8>::from_dynamic_image(&rgba)?;
+    let from_rgba = MediaFrame::<u8>::from_dynamic_image(rgba)?;
     let packed = from_rgba.data.as_packed().unwrap();
     assert_eq!(packed[[0, 0, 0]], 10);
     assert_eq!(packed[[0, 0, 1]], 20);

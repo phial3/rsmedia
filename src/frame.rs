@@ -1496,26 +1496,56 @@ thread_local! {
 impl MediaFrame<u8> {
     /// Converts this video frame into an [`image::DynamicImage`].
     ///
-    /// Every pixel format FFmpeg can decode to RGB is accepted: `RGB24`, `RGBA`
-    /// and `GRAY8` are built straight from the samples, anything else (YUV, BGR,
-    /// NV, ...) goes through swscale first. That is
+    /// Packed 8-bit frames (`RGB24` / `RGBA` / `GRAY8`) are built straight from
+    /// [`MediaFrame::data`](Self::data) with no `AVFrame` intermediate, saving a
+    /// full-frame copy. Every other pixel format goes through
     /// [`imgutils::to_dynamic_image`](crate::imgutils::to_dynamic_image) on this
-    /// frame's `AVFrame`, so the free function and this method cannot disagree
-    /// about which formats they handle.
+    /// frame's `AVFrame` (swscale conversion for YUV, BGR, NV, ...), so the free
+    /// function and this method cannot disagree about which formats they handle.
     pub fn to_dynamic_image(&self) -> Result<image::DynamicImage> {
+        // Fast path: standard-layout packed samples map 1:1 onto image buffers.
+        if let (FrameFormat::Pixel(fmt), Some(packed)) = (self.format, self.data.as_packed()) {
+            let (height, width, _) = packed.dim();
+            let (width, height) = (width as u32, height as u32);
+            let samples = packed.as_slice().unwrap_or_default();
+            let dynamic = match fmt {
+                PixelFormat::RGB24 => image::RgbImage::from_raw(width, height, samples.to_vec())
+                    .map(image::DynamicImage::from),
+                PixelFormat::RGBA => image::RgbaImage::from_raw(width, height, samples.to_vec())
+                    .map(image::DynamicImage::from),
+                PixelFormat::GRAY8 => image::GrayImage::from_raw(width, height, samples.to_vec())
+                    .map(image::DynamicImage::from),
+                _ => None,
+            };
+            if let Some(img) = dynamic {
+                return Ok(img);
+            }
+            // Length/shape mismatch: fall through to the AVFrame path, which
+            // re-derives geometry from the frame itself.
+        }
         crate::imgutils::to_dynamic_image(&self.to_avframe()?)
     }
 
-    /// Builds an RGB24 video frame from an [`image::DynamicImage`].
+    /// Builds an RGB24 video frame from an image convertible into
+    /// [`image::DynamicImage`] (`DynamicImage`, `RgbImage`, `RgbaImage`, ...).
     ///
-    /// Any colour mode (RGB / RGBA / grey, ...) is converted to RGB8 first, and the
-    /// frame takes the image's own dimensions. Like every video frame it starts
-    /// with no time base (see [`time_base`](MediaFrame::time_base)).
-    pub fn from_dynamic_image(img: &image::DynamicImage) -> Result<Self> {
-        let rgb = img.to_rgb8();
-        let (width, height) = rgb.dimensions();
-        let (width, height) = (width as usize, height as usize);
-        let array = Array3::from_shape_vec((height, width, 3), rgb.into_raw())
+    /// Any colour mode (RGB / RGBA / grey, ...) is converted to RGB8 first —
+    /// already-RGB8 input moves its buffer in with no copy — and the frame takes
+    /// the image's own dimensions. Like every video frame it starts with no time
+    /// base (see [`time_base`](Self::time_base)).
+    pub fn from_dynamic_image(img: impl Into<image::DynamicImage>) -> Result<Self> {
+        let (width, height, raw) = match img.into() {
+            image::DynamicImage::ImageRgb8(rgb) => {
+                let (width, height) = rgb.dimensions();
+                (width as usize, height as usize, rgb.into_raw())
+            }
+            other => {
+                let rgb = other.to_rgb8();
+                let (width, height) = rgb.dimensions();
+                (width as usize, height as usize, rgb.into_raw())
+            }
+        };
+        let array = Array3::from_shape_vec((height, width, 3), raw)
             .context("Failed to build ndarray from image")?;
         Self::new_video(width, height, PixelFormat::RGB24, array)
     }
@@ -2522,6 +2552,107 @@ mod tests {
             other => panic!("audio format = {other:?}"),
         }
 
+        Ok(())
+    }
+
+    /// RGB24 packed 帧直读 `data` 构建 `DynamicImage`（fast path），逐像素一致。
+    #[test]
+    #[cfg(feature = "image")]
+    fn test_to_dynamic_image_rgb24() -> Result<()> {
+        let mut frame =
+            MediaFrame::<u8>::new_video_frame(TEST_WIDTH, TEST_HEIGHT, PixelFormat::RGB24)?;
+        {
+            let packed = frame.data.as_packed_mut().unwrap();
+            for ((_, _, c), v) in packed.indexed_iter_mut() {
+                *v = (c * 61 + 17) as u8;
+            }
+        }
+
+        let rgb = frame.to_dynamic_image()?.to_rgb8();
+        assert_eq!(
+            (rgb.width() as usize, rgb.height() as usize),
+            (TEST_WIDTH, TEST_HEIGHT)
+        );
+        let expected = frame
+            .data
+            .as_packed()
+            .unwrap()
+            .clone()
+            .into_raw_vec_and_offset()
+            .0;
+        assert_eq!(rgb.into_raw(), expected);
+        Ok(())
+    }
+
+    /// RGBA / GRAY8 packed 帧同样走 fast path，通道数与内容保持一致。
+    #[test]
+    #[cfg(feature = "image")]
+    fn test_to_dynamic_image_rgba_gray8() -> Result<()> {
+        let mut rgba =
+            MediaFrame::<u8>::new_video_frame(TEST_WIDTH, TEST_HEIGHT, PixelFormat::RGBA)?;
+        rgba.data.as_packed_mut().unwrap().fill(7);
+        let img = rgba.to_dynamic_image()?;
+        assert!(img.as_rgba8().is_some(), "RGBA frame must stay RGBA8");
+        assert_eq!(img.to_rgba8().into_raw(), {
+            let mut expected = vec![0u8; TEST_WIDTH * TEST_HEIGHT * 4];
+            expected.fill(7);
+            expected
+        });
+
+        let mut gray =
+            MediaFrame::<u8>::new_video_frame(TEST_WIDTH, TEST_HEIGHT, PixelFormat::GRAY8)?;
+        gray.data.as_packed_mut().unwrap().fill(99);
+        let img = gray.to_dynamic_image()?;
+        assert!(img.as_luma8().is_some(), "GRAY8 frame must stay Luma8");
+        assert_eq!(
+            img.to_luma8().into_raw(),
+            vec![99u8; TEST_WIDTH * TEST_HEIGHT]
+        );
+        Ok(())
+    }
+
+    /// `from_dynamic_image`：RGB8 输入零拷贝搬入，RGBA 输入先转 RGB8，
+    /// 帧数据与原图逐字节一致。
+    #[test]
+    #[cfg(feature = "image")]
+    fn test_from_dynamic_image() -> Result<()> {
+        // RGB8 输入（零拷贝路径）
+        let rgb = image::RgbImage::from_fn(TEST_WIDTH as u32, TEST_HEIGHT as u32, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 233) as u8])
+        });
+        let frame = MediaFrame::<u8>::from_dynamic_image(rgb.clone())?;
+        assert_eq!((frame.width, frame.height), (TEST_WIDTH, TEST_HEIGHT));
+        assert_eq!(
+            frame
+                .data
+                .as_packed()
+                .unwrap()
+                .clone()
+                .into_raw_vec_and_offset()
+                .0,
+            rgb.into_raw()
+        );
+
+        // RGBA 输入（to_rgb8 转换路径）
+        let rgba = image::RgbaImage::from_fn(TEST_WIDTH as u32, TEST_HEIGHT as u32, |x, y| {
+            image::Rgba([(x % 251) as u8, (y % 241) as u8, ((x + y) % 233) as u8, 255])
+        });
+        let expected = image::DynamicImage::from(rgba.clone()).to_rgb8().into_raw();
+        let frame = MediaFrame::<u8>::from_dynamic_image(rgba)?;
+        assert_eq!(
+            frame
+                .data
+                .as_packed()
+                .unwrap()
+                .clone()
+                .into_raw_vec_and_offset()
+                .0,
+            expected
+        );
+
+        // 往返一致：to_dynamic_image(from_dynamic_image) 逐字节还原
+        let img = frame.to_dynamic_image()?;
+        assert_eq!(img.to_rgb8().into_raw(), expected);
         Ok(())
     }
 }
