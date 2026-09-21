@@ -387,7 +387,7 @@ impl<W: Writer> Muxer<W> {
         let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
         let nb_streams = ctx.nb_streams as usize;
         if idx >= nb_streams {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::invalid_config(format!(
                 "output stream index {idx} out of range (nb_streams={nb_streams})"
             )));
         }
@@ -406,14 +406,14 @@ impl<W: Writer> Muxer<W> {
         self.streams
             .iter()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| RsmediaError::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::invalid_config(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut MuxerStream> {
         self.streams
             .iter_mut()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| RsmediaError::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::invalid_config(format!("Stream index: {index} not found")))
     }
 
     /// Sets a container-level metadata entry, e.g. `title`, `artist`,
@@ -808,7 +808,7 @@ impl<W: Writer> Muxer<W> {
             .encoder
             .as_ref()
             .ok_or_else(|| {
-                RsmediaError::msg(format!(
+                RsmediaError::invalid_config(format!(
                     "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
                 ))
             })?
@@ -831,7 +831,7 @@ impl<W: Writer> Muxer<W> {
 
         let mux_stream = self.get_stream_mut(stream_idx)?;
         let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
-            RsmediaError::msg(format!(
+            RsmediaError::invalid_config(format!(
                 "Stream {stream_idx} is a copy stream: use mux_packet() instead of mux()"
             ))
         })?;
@@ -879,7 +879,7 @@ impl<W: Writer> Muxer<W> {
         {
             let mux_stream = self.get_stream(stream_idx)?;
             let encoder = mux_stream.encoder.as_ref().ok_or_else(|| {
-                RsmediaError::msg(format!(
+                RsmediaError::invalid_config(format!(
                     "Stream {stream_idx} is a copy stream: subtitle segments require an encoder stream"
                 ))
             })?;
@@ -896,7 +896,7 @@ impl<W: Writer> Muxer<W> {
 
         let mux_stream = self.get_stream_mut(stream_idx)?;
         let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
-            RsmediaError::msg(format!(
+            RsmediaError::invalid_config(format!(
                 "Stream {stream_idx} is a copy stream: subtitle segments require an encoder stream"
             ))
         })?;
@@ -936,7 +936,7 @@ impl<W: Writer> Muxer<W> {
         // 先确认这是透传流并取出源时间基（在 `begin_packet_write` 之前）：拿编码流调
         // `mux_packet()` 属于参数错误，不该把 header 不可逆地写出去。
         let src_time_base = self.get_stream(stream_idx)?.src_time_base.ok_or_else(|| {
-            RsmediaError::msg(format!(
+            RsmediaError::invalid_config(format!(
                 "Stream {stream_idx} is not a copy stream: use mux() instead of mux_packet()"
             ))
         })?;
@@ -1148,8 +1148,10 @@ impl<R: Reader> Demuxer<R> {
         let media_type = stream_info.media_type;
         let device_type = device_config.as_ref().map(|c| c.device_type);
         let Some(codec_name) = stream_info.find_decoder_name(device_type) else {
-            return Err(RsmediaError::msg(format!(
-                "No decoder found for codec_id {:#x} (stream {})",
+            // 本构建里这个 codec_id 没有可用解码器：同样是"配置/使用者期望在本次
+            // 构建上无法满足"，与编码器名不存在归一处（换输入或换构建即可）。
+            return Err(RsmediaError::invalid_config(format!(
+                "decoder for codec_id {:#x} (stream {}) is not available in this FFmpeg build",
                 stream_info.codec_id, stream_info.index
             )));
         };
@@ -1176,7 +1178,10 @@ impl<R: Reader> Demuxer<R> {
                     .build_from_reader(reader)
                     .context("Failed to build decoder (hw and software both failed)")
             }
-            Err(e) => Err(RsmediaError::msg(format!("Failed to build decoder: {e:#}"))),
+            // 用 `context` 而不是把 `{e:#}` 拼成一句话：后者会把带类型的**分类**
+            // （`InvalidConfig` / `Unsupported` 等）降级成无类型消息，调用方再也
+            // 没法按变体处理。
+            Err(e) => Err(e).context("Failed to build decoder"),
         }
     }
 
@@ -1308,14 +1313,14 @@ impl<R: Reader> Demuxer<R> {
         self.streams
             .iter()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| RsmediaError::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::invalid_config(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut DemuxerStream> {
         self.streams
             .iter_mut()
             .find(|s| s.stream_index == index)
-            .ok_or_else(|| RsmediaError::msg(format!("Stream index: {index} not found")))
+            .ok_or_else(|| RsmediaError::invalid_config(format!("Stream index: {index} not found")))
     }
 
     /// 返回输入容器第 `index` 个流的 [`StreamInfo`]。
@@ -2753,6 +2758,10 @@ mod tests {
             Ok(_) => panic!("mux_packet must reject an encoder stream"),
             Err(e) => e,
         };
+        assert!(
+            err.is_invalid_config(),
+            "mux_packet on an encoder stream is a caller mistake: {err}"
+        );
         assert!(err.to_string().contains("not a copy stream"), "{err}");
 
         // 透传流 -> mux：必须是"是透传流"的错误。透传流的编解码参数取自源流。
@@ -2766,6 +2775,10 @@ mod tests {
             Ok(_) => panic!("mux must reject a copy stream"),
             Err(e) => e,
         };
+        assert!(
+            err.is_invalid_config(),
+            "mux on a copy stream is a caller mistake: {err}"
+        );
         assert!(err.to_string().contains("use mux_packet"), "{err}");
 
         for path in [&source, &encoder_side, &copy_side] {

@@ -9,6 +9,7 @@ use rsmedia::error::{Result, RsmediaError};
 use rsmedia::{
     DecoderBuilder, EncoderBuilder, MediaType, Muxer, PixelFormat, Scaler, StreamReader,
 };
+use rsmpeg::avcodec::AVCodec;
 use rsmpeg::avutil::AVFrame;
 
 /// 生成一张带非零图案的 YUV420P 源帧（不依赖 ndarray）。
@@ -48,25 +49,37 @@ fn make_source_frame(width: i32, height: i32, seed: u8) -> Result<AVFrame> {
     Ok(frame)
 }
 
-/// 编码器缺失（FFmpeg 构建不含 libx264 等）时跳过而不是失败：匹配类型化
-/// [`RsmediaError::CodecNotFound`] 变体，而非错误字符串。
-fn is_encoder_unavailable(e: &RsmediaError) -> bool {
-    e.is_codec_not_found()
+/// 本构建是否提供该编码器（FFmpeg 编译配置差异：缺失时跳过而不是失败）。
+///
+/// 用**预先探测可用性**而不是拿库的错误变体当"跳过"标记：库已把"名字在本构建
+/// 不存在"并入 `InvalidConfig`，与真正的配置错误无法区分。
+fn encoder_available(name: &str) -> bool {
+    std::ffi::CString::new(name)
+        .ok()
+        .is_some_and(|name| AVCodec::find_encoder_by_name(&name).is_some())
 }
+
+/// 默认视频编码器缺失时跳过该用例（返回 `true` 表示"已跳过"）。
+fn skip_without_default_video_encoder(test_name: &str) -> Result<bool> {
+    if encoder_available(DEFAULT_VIDEO_CODEC) {
+        return Ok(false);
+    }
+    eprintln!("skip {test_name}: {DEFAULT_VIDEO_CODEC} is not in this FFmpeg build");
+    Ok(true)
+}
+
+/// 这些用例用默认视频编码器编码（见 `EncoderBuilder::new_video`）。
+const DEFAULT_VIDEO_CODEC: &str = "libx264";
 
 #[test]
 fn test_pooled_scaler_encode_roundtrip() -> Result<()> {
     let out = std::env::temp_dir().join("rsmedia_scale_pool_roundtrip.mp4");
     let _ = std::fs::remove_file(&out);
 
-    let encoder = match EncoderBuilder::new_video(32, 32).with_fps(30.0).build() {
-        Ok(encoder) => encoder,
-        Err(e) if is_encoder_unavailable(&e) => {
-            eprintln!("skip test_pooled_scaler_encode_roundtrip: {e}");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
+    if skip_without_default_video_encoder("test_pooled_scaler_encode_roundtrip")? {
+        return Ok(());
+    }
+    let encoder = EncoderBuilder::new_video(32, 32).with_fps(30.0).build()?;
     let enc_time_base = encoder.time_base();
 
     let mut muxer = Muxer::new(&out)?;
@@ -112,14 +125,10 @@ fn test_pooled_and_plain_frames_interleave() -> Result<()> {
     let out = std::env::temp_dir().join("rsmedia_scale_pool_mixed.mp4");
     let _ = std::fs::remove_file(&out);
 
-    let encoder = match EncoderBuilder::new_video(32, 32).with_fps(30.0).build() {
-        Ok(encoder) => encoder,
-        Err(e) if is_encoder_unavailable(&e) => {
-            eprintln!("skip test_pooled_and_plain_frames_interleave: {e}");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
+    if skip_without_default_video_encoder("test_pooled_and_plain_frames_interleave")? {
+        return Ok(());
+    }
+    let encoder = EncoderBuilder::new_video(32, 32).with_fps(30.0).build()?;
     let enc_time_base = encoder.time_base();
 
     let mut muxer = Muxer::new(&out)?;
@@ -186,18 +195,13 @@ fn test_encoder_with_scale_pool_roundtrip() -> Result<()> {
     let out = std::env::temp_dir().join("rsmedia_encoder_scale_pool.mp4");
     let _ = std::fs::remove_file(&out);
 
-    let encoder = match EncoderBuilder::new_video(32, 32)
+    if skip_without_default_video_encoder("test_encoder_with_scale_pool_roundtrip")? {
+        return Ok(());
+    }
+    let encoder = EncoderBuilder::new_video(32, 32)
         .with_fps(30.0)
         .with_scale_pool(true)
-        .build()
-    {
-        Ok(encoder) => encoder,
-        Err(e) if is_encoder_unavailable(&e) => {
-            eprintln!("skip test_encoder_with_scale_pool_roundtrip: {e}");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
+        .build()?;
     let enc_time_base = encoder.time_base();
 
     let mut muxer = Muxer::new(&out)?;

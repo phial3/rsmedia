@@ -70,26 +70,26 @@ pub fn fill_plane_sizes<I: IntoIterator<Item = u32>>(
     // `linesizes[0..planes]`，个数不符时多传的部分会被静默忽略、少传则读到未初始化值。
     let planes = format.count_planes()? as usize;
     if planes > MAX_FFMPEG_PLANES {
-        return Err(format_err!(
-            "{format:?} has {planes} planes, the API supports at most {MAX_FFMPEG_PLANES}"
-        ));
+        return Err(RsmediaError::unsupported(format!(
+            "{format:?} has {planes} planes, this helper supports at most {MAX_FFMPEG_PLANES}"
+        )));
     }
 
     let mut linesizes_buf = [0; MAX_FFMPEG_PLANES];
     let mut count = 0;
     for (i, linesize) in linesizes.into_iter().enumerate() {
         if i >= planes {
-            return Err(format_err!(
+            return Err(RsmediaError::invalid_config(format!(
                 "Too many linesizes for {format:?}: it has {planes} planes"
-            ));
+            )));
         }
         linesizes_buf[i] = linesize as _;
         count += 1;
     }
     if count != planes {
-        return Err(format_err!(
+        return Err(RsmediaError::invalid_config(format!(
             "Wrong number of linesizes for {format:?}: expected {planes}, got {count}"
-        ));
+        )));
     }
     let mut plane_sizes_buf = [0; MAX_FFMPEG_PLANES];
 
@@ -155,7 +155,7 @@ pub fn copy_frame_metadata(src: &AVFrame, dst: &mut AVFrame, copy_data: bool) ->
         if copy_data {
             // 目标 AVFrame 需已分配内存：这是调用方的错误，按 `Err` 上报而不是 panic。
             if !dst.is_allocated() {
-                return Err(RsmediaError::msg(
+                return Err(RsmediaError::invalid_config(
                     "Destination frame is not allocated; call AVFrame::alloc_buffer first",
                 ));
             }
@@ -183,12 +183,10 @@ pub fn copy_frame_metadata(src: &AVFrame, dst: &mut AVFrame, copy_data: bool) ->
 /// 平面"的函数共用的入口，保证失败方式是 `Err` 而非中止进程。
 fn frame_pixel_format(frame: &AVFrame) -> Result<PixelFormat> {
     PixelFormat::from_ffi_checked(frame.format).ok_or_else(|| {
-        format_err!(
-            "Unsupported pixel format {} on frame ({}x{})",
-            frame.format,
-            frame.width,
-            frame.height
-        )
+        RsmediaError::unsupported(format!(
+            "pixel format {} on frame ({}x{})",
+            frame.format, frame.width, frame.height
+        ))
     })
 }
 
@@ -1026,15 +1024,16 @@ mod tests {
         // 错误4：行步长个数与格式的平面数不符
         // 多传：YUV420P 只有 3 个平面，第 4 个会被底层静默忽略
         let oversized_input = vec![640, 320, 320, 128, 64];
+        let too_many = fill_plane_sizes(yuv_fmt, oversized_input, 480)
+            .expect_err("Should reject more linesizes than the format has planes");
         assert!(
-            fill_plane_sizes(yuv_fmt, oversized_input, 480).is_err(),
-            "Should reject more linesizes than the format has planes"
+            too_many.is_invalid_config(),
+            "个数不符是调用方的入参错误，必须报 invalid_config：{too_many}"
         );
         // 少传：不得补 0 后按未初始化/错误值计算
-        assert!(
-            fill_plane_sizes(yuv_fmt, vec![640, 320], 480).is_err(),
-            "Should reject fewer linesizes than the format has planes"
-        );
+        let too_few = fill_plane_sizes(yuv_fmt, vec![640, 320], 480)
+            .expect_err("Should reject fewer linesizes than the format has planes");
+        assert!(too_few.is_invalid_config(), "{too_few}");
 
         Ok(())
     }

@@ -172,25 +172,27 @@ impl StreamInfo {
     /// * `reader` - Reader to find stream information from.
     /// * `stream_index` - Index of stream in reader.
     pub fn from_reader<R: Reader>(reader: &R, stream_index: usize) -> Result<Self> {
-        let stream = reader
-            .input()
-            .streams()
-            .get(stream_index)
-            .ok_or(RsmediaError::msg(format!(
-                "reader stream: {stream_index} not found!"
-            )))?;
+        let stream =
+            reader
+                .input()
+                .streams()
+                .get(stream_index)
+                .ok_or(RsmediaError::invalid_config(format!(
+                    "reader stream: {stream_index} not found!"
+                )))?;
 
         Self::from_stream(stream)
     }
 
     pub fn from_writer<W: Writer>(writer: &W, stream_index: usize) -> Result<Self> {
-        let stream = writer
-            .output()
-            .streams()
-            .get(stream_index)
-            .ok_or(RsmediaError::msg(format!(
-                "writer stream: {stream_index} not found!"
-            )))?;
+        let stream =
+            writer
+                .output()
+                .streams()
+                .get(stream_index)
+                .ok_or(RsmediaError::invalid_config(format!(
+                    "writer stream: {stream_index} not found!"
+                )))?;
 
         Self::from_stream(stream)
     }

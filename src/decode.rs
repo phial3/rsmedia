@@ -349,10 +349,14 @@ impl DecoderBuilder {
     }
 
     /// 校验像素格式能否以数据平面承载（非位流/调色板/硬件格式）。
+    ///
+    /// 报 `InvalidConfig`：格式是调用方通过 `with_pix_fmt` 显式指定的，与
+    /// 编码侧的约定一致（显式指定了本 crate 承载不了的格式 = 调用方的配置无效，
+    /// 而不是环境不支持）。
     fn ensure_pix_fmt_storable(fmt: PixelFormat) -> Result<()> {
         if !fmt.is_plane_storable() {
-            return Err(RsmediaError::msg(format!(
-                "Unsupported output pixel format: {fmt:?}; it cannot be stored as sample planes \
+            return Err(RsmediaError::invalid_config(format!(
+                "with_pix_fmt({fmt:?}): the format cannot be stored as sample planes \
                  (bitstream, paletted and hardware formats are not supported)"
             )));
         }
@@ -360,8 +364,11 @@ impl DecoderBuilder {
     }
 
     /// 某个仅对视频解码器生效的配置项被用于其它媒体类型时构造的错误。
+    ///
+    /// 属于调用方错误（用了只对某类解码器生效的 setter），因此报 `InvalidConfig`，
+    /// 而不是落到笼统的 `Other`。
     fn option_only_for(opt: &'static str, value: String, media_type: MediaType) -> RsmediaError {
-        RsmediaError::msg(format!(
+        RsmediaError::invalid_config(format!(
             "{opt}({value}) is only valid for {} decoders, got media type: {media_type:?}",
             media_type.get_media_name()
         ))
@@ -370,9 +377,10 @@ impl DecoderBuilder {
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
-            return Err(RsmediaError::msg(format!(
-                "Decoder codec type not supported: {:?} vs. {:?}",
-                media_type, decoder.codec_type
+            return Err(RsmediaError::invalid_config(format!(
+                "decoder was built for media type {media_type:?}, but the codec of the given \
+                 stream is {:?}",
+                decoder.codec_type
             )));
         }
 
@@ -443,13 +451,14 @@ impl DecoderBuilder {
         // 单一配置源：typed setter 与 `with_options` 不得同时配置同一项。
         crate::options::ensure_single_source(self.codec_opts.as_ref(), &self.owned_option_keys())?;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
-        let input_stream = reader
-            .input()
-            .streams()
-            .get(stream_index)
-            .ok_or(RsmediaError::msg(format!(
-                "stream: {stream_index} not found!"
-            )))?;
+        let input_stream =
+            reader
+                .input()
+                .streams()
+                .get(stream_index)
+                .ok_or(RsmediaError::invalid_config(format!(
+                    "stream: {stream_index} not found!"
+                )))?;
 
         // 优先用调用方指定的解码器名，否则用流自带的名字（`find_best_stream`
         // 的返回值）。这两个名字来自不同来源，不要写在同名绑定里——那样两个分支
@@ -488,8 +497,8 @@ impl DecoderBuilder {
                         // 拿不到合法字符串并不改变"不支持"这一结论。
                         let codec_name = strutils::cstr_to_string(codec.name())
                             .unwrap_or_else(|_| "unknown".to_owned());
-                        RsmediaError::msg(format!(
-                            "Decoder with HW acceleration is not supported for codec: {codec_name}"
+                        RsmediaError::unsupported(format!(
+                            "hardware decoding is not available for codec: {codec_name}"
                         ))
                     })?;
 
@@ -497,8 +506,8 @@ impl DecoderBuilder {
                 // 分配，配置里的值若与编解码器声明不符，会得到错误的输出格式。
                 // 未知格式（绑定/FFmpeg 版本不匹配）报错而不是 panic。
                 cfg.hw_pixel_format = PixelFormat::from_ffi_checked(hw_pixel).ok_or_else(|| {
-                    RsmediaError::msg(format!(
-                        "Codec {} reports an unknown hardware pixel format: {hw_pixel}",
+                    RsmediaError::unsupported(format!(
+                        "codec {} selected hardware pixel format {hw_pixel}, which rsmedia does not model",
                         strutils::cstr_to_string_lossy(codec.name())
                     ))
                 })?;
@@ -556,8 +565,8 @@ impl DecoderBuilder {
             (MediaType::AUDIO, None) => None,
             (MediaType::AUDIO, Some(fmt)) if fmt != SampleFormat::NONE => Some(fmt),
             (MediaType::AUDIO, Some(fmt)) => {
-                return Err(RsmediaError::msg(format!(
-                    "Unsupported output sample format: {fmt:?}"
+                return Err(RsmediaError::invalid_config(format!(
+                    "with_sample_fmt({fmt:?}): not a usable output sample format"
                 )));
             }
             (media_type, Some(fmt)) => {
@@ -607,14 +616,13 @@ impl DecoderBuilder {
                     time_base: decode_ctx.time_base,
                 }),
                 _ => {
-                    return Err(RsmediaError::msg(format!(
-                        "Unsupported filter for media type: {media_type:?}"
+                    return Err(RsmediaError::invalid_config(format!(
+                        "a {media_type:?} filter cannot be used on this stream"
                     )));
                 }
             };
 
-            // 滤镜链的媒体类型与可用性校验都在 `init` 内（缺失滤镜 →
-            // `FilterNotFound`），这里不再重复一遍。
+            // 滤镜链的媒体类型与可用性校验都在 `init` 内（缺失滤镜 → `InvalidConfig`）
             let graph = FilterGraph::build(&filter_params, filters.as_slice())?;
 
             // 参数随图一起留下：重启流水线时必须重建一张新图。
@@ -975,7 +983,7 @@ impl Decoder {
         R: Reader,
     {
         if self.media_type != MediaType::SUBTITLE {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::unsupported(format!(
                 "decode_subtitle_segment requires a subtitle decoder, got media type: {:?}",
                 self.media_type
             )));
@@ -1251,8 +1259,9 @@ impl Decoder {
                         .compute_for((sw_frame.width as u32, sw_frame.height as u32))
                         .ok_or_else(|| {
                             let (w, h) = (sw_frame.width, sw_frame.height);
-                            RsmediaError::msg(format!(
-                                "Cannot resize frame {w}x{h} into {resize:?}"
+                            // `with_resize` 里配置的策略算不出可用尺寸 ⇒ 调用方改配置即可。
+                            RsmediaError::invalid_config(format!(
+                                "the resize configuration {resize:?} yields no valid size for a {w}x{h} frame"
                             ))
                         })?,
                     None => (sw_frame.width as u32, sw_frame.height as u32),
@@ -1685,19 +1694,27 @@ mod tests {
     }
 
     /// `with_pix_fmt` 只拒绝无法表示为数据平面的格式（位流 / 调色板 / 硬件），
-    /// 且在构建时返回错误而非 panic。
+    /// 且在构建时以 `InvalidConfig` 返回错误（而不是 panic，也不是笼统的 `Other`）——
+    /// 换一个格式就能成功，所以这是调用方需要改的配置。
     #[test]
-    fn test_decode_video_with_pix_fmt_unsupported() {
+    fn test_decode_video_with_pix_fmt_not_storable() {
         for fmt in [
             PixelFormat::MONOWHITE, // 位流：分量不足一字节
             PixelFormat::PAL8,      // 调色板格式：样本指向独立调色板
             PixelFormat::VAAPI,     // 硬件格式：没有主机端样本
         ] {
             let reader = StreamReader::new("assets/mp4.mp4").unwrap();
-            let result = DecoderBuilder::new(MediaType::VIDEO)
+            let err = match DecoderBuilder::new(MediaType::VIDEO)
                 .with_pix_fmt(fmt)
-                .build_from_reader(&reader);
-            assert!(result.is_err(), "{fmt:?} should be rejected");
+                .build_from_reader(&reader)
+            {
+                Ok(_) => panic!("{fmt:?} must be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.is_invalid_config(),
+                "{fmt:?} must be reported as invalid configuration: {err}"
+            );
         }
     }
 

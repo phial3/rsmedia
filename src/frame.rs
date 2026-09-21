@@ -343,7 +343,7 @@ impl<T: ElementType> FrameData<T> {
 
 /// The error for a plane index a layout does not have.
 fn no_such_plane(plane: usize, count: usize) -> RsmediaError {
-    RsmediaError::msg(format!("Frame has no plane {plane}: it has {count}"))
+    RsmediaError::invalid_config(format!("Frame has no plane {plane}: it has {count}"))
 }
 
 /// The error for borrowing a plane whose array is not stored contiguously.
@@ -400,7 +400,8 @@ fn rgb24_to_yuv420p<T: ElementType>(
 ) -> Result<FrameData<T>> {
     let (height, width) = rgb24_extent(data)?;
     if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(RsmediaError::msg(format!(
+        // 尺寸是调用方建帧时给的，改成偶数就能成功 ⇒ 属于调用方的配置问题。
+        return Err(RsmediaError::invalid_config(format!(
             "RGB24 -> YUV420P requires even dimensions, got {width}x{height}"
         )));
     }
@@ -733,10 +734,10 @@ where
             let format = self
                 .format
                 .into_pixel()
-                .ok_or_else(|| RsmediaError::msg("Video frame needs a pixel format"))?;
+                .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
             format.data_layout(self.width, self.height).ok_or_else(|| {
-                RsmediaError::msg(format!(
-                    "Pixel format {} cannot be stored as sample planes at {}x{}",
+                RsmediaError::unsupported(format!(
+                    "pixel format {} cannot be stored as sample planes at {}x{}",
                     format.get_pix_fmt_name(),
                     self.width,
                     self.height
@@ -746,7 +747,7 @@ where
             let format = self
                 .format
                 .into_sample()
-                .ok_or_else(|| RsmediaError::msg("Audio frame needs a sample format"))?;
+                .ok_or_else(|| RsmediaError::invalid_config("Audio frame needs a sample format"))?;
             Ok(format.data_layout(self.nb_channels as usize, self.nb_samples as usize))
         }
     }
@@ -783,8 +784,8 @@ where
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
     pub fn new_video_frame(width: usize, height: usize, format: PixelFormat) -> Result<Self> {
         let layout = format.data_layout(width, height).ok_or_else(|| {
-            RsmediaError::msg(format!(
-                "Pixel format {} cannot be stored as sample planes at {width}x{height}",
+            RsmediaError::unsupported(format!(
+                "pixel format {} cannot be stored as sample planes at {width}x{height}",
                 format.get_pix_fmt_name()
             ))
         })?;
@@ -889,12 +890,23 @@ where
             self.format
                 .into_pixel()
                 .and_then(PixelFormat::bytes_per_component)
-                .ok_or_else(|| RsmediaError::msg("Unsupported pixel format"))
+                .ok_or_else(|| {
+                    RsmediaError::unsupported(format!(
+                        "pixel format {:?} has no fixed component size (bitstream, paletted and \
+                         hardware formats are not storable as sample planes)",
+                        self.format
+                    ))
+                })
         } else {
             self.format
                 .into_sample()
                 .and_then(|format| format.get_bytes_per_sample())
-                .ok_or_else(|| RsmediaError::msg("Unsupported sample format"))
+                .ok_or_else(|| {
+                    RsmediaError::unsupported(format!(
+                        "sample format {:?} has no fixed element size",
+                        self.format
+                    ))
+                })
         }
     }
 
@@ -959,7 +971,9 @@ where
     /// and audio planes are read contiguously.
     pub fn from_avframe(frame: &AVFrame) -> Result<Self> {
         if plane_ptr(frame, 0).is_null() {
-            return Err(RsmediaError::msg("Invalid frame data"));
+            return Err(RsmediaError::msg(
+                "AVFrame has no data in plane 0: is the frame allocated?",
+            ));
         }
 
         let (width, height) = (frame.width as usize, frame.height as usize);
@@ -989,14 +1003,14 @@ where
         if frame.nb_samples > 0 {
             // 帧格式来自解码器，可能超出本 crate 收录的范围：报错而不是 panic。
             let sample_format = SampleFormat::from_ffi_checked(format).ok_or_else(|| {
-                RsmediaError::unsupported(format!(
-                    "Unsupported sample format {format} on a decoded AVFrame"
-                ))
+                RsmediaError::unsupported(format!("sample format {format} on a decoded AVFrame"))
             })?;
             let frame_format = FrameFormat::Sample(sample_format);
-            let element_bytes = sample_format
-                .get_bytes_per_sample()
-                .ok_or_else(|| RsmediaError::msg("Unsupported sample format"))?;
+            let element_bytes = sample_format.get_bytes_per_sample().ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "sample format {sample_format:?} has no fixed element size"
+                ))
+            })?;
             validate_element_size::<T>(frame_format, element_bytes)?;
 
             let mut media = Self {
@@ -1019,14 +1033,14 @@ where
         } else if width > 0 && height > 0 {
             // 同上：像素格式来自解码器，未收录时返回 `Err`。
             let pixel_format = PixelFormat::from_ffi_checked(format).ok_or_else(|| {
-                RsmediaError::unsupported(format!(
-                    "Unsupported pixel format {format} on a decoded AVFrame"
-                ))
+                RsmediaError::unsupported(format!("pixel format {format} on a decoded AVFrame"))
             })?;
             let frame_format = FrameFormat::Pixel(pixel_format);
-            let element_bytes = pixel_format
-                .bytes_per_component()
-                .ok_or_else(|| RsmediaError::msg("Unsupported pixel format"))?;
+            let element_bytes = pixel_format.bytes_per_component().ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "pixel format {pixel_format:?} has no fixed component size"
+                ))
+            })?;
             validate_element_size::<T>(frame_format, element_bytes)?;
 
             let mut media = Self {
@@ -1047,7 +1061,10 @@ where
             media.copy_avframe_meta(frame);
             Ok(media)
         } else {
-            Err(RsmediaError::msg("Unsupported frame format"))
+            Err(RsmediaError::msg(
+                "frame carries neither audio samples nor video dimensions, so it holds no media \
+                 data to convert",
+            ))
         }
     }
 
@@ -1270,15 +1287,18 @@ where
     /// `expected_desc` 只用于错误消息（FFmpeg 的格式名，如 `RGB24`）。
     fn ensure_video_format(&self, expected: FrameFormat, expected_desc: &str) -> Result<()> {
         if self.media_type != MediaType::VIDEO {
-            return Err(RsmediaError::msg("Only video frames are supported"));
+            // 用错了方法（拿音频帧做像素格式转换）⇒ 调用方改调用即可。
+            return Err(RsmediaError::invalid_config(
+                "this conversion only applies to video frames, got an audio frame",
+            ));
         }
         if self.format != expected {
             let got = match self.format {
                 FrameFormat::Pixel(p) => p.get_pix_fmt_name(),
                 FrameFormat::Sample(_) => "<audio format>".to_string(),
             };
-            return Err(RsmediaError::msg(format!(
-                "Expected {expected_desc} format, got {got}"
+            return Err(RsmediaError::invalid_config(format!(
+                "this conversion requires the {expected_desc} format, but the frame is {got}"
             )));
         }
         Ok(())
@@ -1422,16 +1442,16 @@ where
     /// swscale cannot serve, and for `dst` formats with no sample planes.
     pub fn convert_to(&self, dst: PixelFormat) -> Result<Self> {
         if self.media_type != MediaType::VIDEO {
-            return Err(RsmediaError::msg(
-                "Only video frames have a pixel format to convert",
+            return Err(RsmediaError::invalid_config(
+                "converting pixel formats only applies to video frames, got an audio frame",
             ));
         }
         if self.format == FrameFormat::Pixel(dst) {
             return Ok(self.clone());
         }
         let dst_layout = dst.data_layout(self.width, self.height).ok_or_else(|| {
-            RsmediaError::msg(format!(
-                "Pixel format {} cannot be stored as sample planes at {}x{}",
+            RsmediaError::unsupported(format!(
+                "pixel format {} cannot be stored as sample planes at {}x{}",
                 dst.get_pix_fmt_name(),
                 self.width,
                 self.height
@@ -1442,8 +1462,8 @@ where
         // reinterpreted: asking for `YUV420P10LE` out of a `MediaFrame<u8>`
         // would otherwise read half a plane of garbage.
         let element_bytes = dst.bytes_per_component().ok_or_else(|| {
-            RsmediaError::msg(format!(
-                "Pixel format {} has no per-component size",
+            RsmediaError::unsupported(format!(
+                "pixel format {} has no per-component size",
                 dst.get_pix_fmt_name()
             ))
         })?;
@@ -1712,8 +1732,8 @@ fn check_layout<T>(
     height: usize,
 ) -> Result<()> {
     let layout = format.data_layout(width, height).ok_or_else(|| {
-        RsmediaError::msg(format!(
-            "Pixel format {} has no data layout at {width}x{height}",
+        RsmediaError::unsupported(format!(
+            "pixel format {} has no data layout at {width}x{height}",
             format.get_pix_fmt_name()
         ))
     })?;

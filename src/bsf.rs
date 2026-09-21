@@ -116,7 +116,7 @@ impl Bsf {
         // 已发过 EOF 的通路不能再收包：FFmpeg 此时返回 EINVAL，直接给出可读的
         // 状态错误，而不是把陌生的 AVERROR 透传给调用方。
         if self.flushed {
-            return Err(RsmediaError::msg(
+            return Err(RsmediaError::invalid_config(
                 "bitstream filter is already flushed: no more packets can be filtered",
             ));
         }

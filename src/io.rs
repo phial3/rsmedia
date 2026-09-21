@@ -257,7 +257,7 @@ pub trait Seekable: Reader {
         // 读它的时间基，越界即未定义行为（实测 segfault），而不是返回错误码。
         let nb_streams = self.input().nb_streams as usize;
         if stream_index >= nb_streams {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::invalid_config(format!(
                 "Cannot seek stream {stream_index}: the input has {nb_streams} stream(s)"
             )));
         }
@@ -686,8 +686,8 @@ impl<'a> StreamReaderBuilder<'a> {
         let filename = strutils::path_to_cstring(&source.as_path())?;
         let protocol = unsafe { ffi::avio_find_protocol_name(filename.as_ptr()) };
         if protocol.is_null() {
-            return Err(RsmediaError::msg(format!(
-                "Unsupported input source protocol: {source}"
+            return Err(RsmediaError::unsupported(format!(
+                "input source protocol: {source}"
             )));
         }
         tracing::debug!(
@@ -1134,7 +1134,7 @@ pub trait Writer {
             .get(stream_index)
             .map(|stream| stream.time_base)
             .ok_or_else(|| {
-                RsmediaError::msg(format!(
+                RsmediaError::invalid_config(format!(
                     "Output stream {stream_index} does not exist ({} streams)",
                     self.output().nb_streams
                 ))

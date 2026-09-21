@@ -75,7 +75,12 @@ impl CodecConfig {
     pub fn new(id: ffi::AVCodecID) -> Result<Self> {
         let codec = AVCodec::find_encoder(id)
             .or_else(|| AVCodec::find_decoder(id))
-            .ok_or_else(|| RsmediaError::codec_not_found(format!("{id}")))?;
+            .ok_or_else(|| {
+                // 名字/编号是调用方给的配置：本构建没有它 ⇒ `InvalidConfig`（换一个即可）。
+                RsmediaError::invalid_config(format!(
+                    "codec {id} is not available in this FFmpeg build"
+                ))
+            })?;
         #[cfg(feature = "ffmpeg6")]
         {
             Ok(Self { codec })
@@ -91,7 +96,10 @@ impl CodecConfig {
         let codec = AVCodec::find_encoder_by_name(codec_name)
             .or_else(|| AVCodec::find_decoder_by_name(codec_name))
             .ok_or_else(|| {
-                RsmediaError::codec_not_found(codec_name.to_string_lossy().into_owned())
+                RsmediaError::invalid_config(format!(
+                    "codec '{}' is not available in this FFmpeg build",
+                    codec_name.to_string_lossy()
+                ))
             })?;
         #[cfg(feature = "ffmpeg6")]
         {

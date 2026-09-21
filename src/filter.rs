@@ -1168,7 +1168,7 @@ pub mod audio {
     /// See: <https://ffmpeg.org/ffmpeg-filters.html#acompressor>
     pub fn compressor(ratio: f32, attack: Option<f32>, release: Option<f32>) -> Result<Filter> {
         if ratio < 1.0 {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::invalid_config(format!(
                 "Compressor ratio must be >= 1.0: {ratio}"
             )));
         }
@@ -1660,7 +1660,9 @@ fn invalid_label(label: &str) -> RsmediaError {
 fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
     let filter = get_by_name(name)?;
     if filter.is_none() {
-        return Err(RsmediaError::filter_not_found(name));
+        return Err(RsmediaError::invalid_config(format!(
+            "filter '{name}' is not available in this FFmpeg build"
+        )));
     }
     let filter = filter.unwrap();
     // SAFETY: `filter` 指向 FFmpeg 的静态滤镜定义，`avfilter_filter_pad_count` 只读
@@ -1682,7 +1684,9 @@ fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
 fn filter_output_pads(name: &str) -> Result<(usize, bool)> {
     let filter = get_by_name(name)?;
     if filter.is_none() {
-        return Err(RsmediaError::filter_not_found(name));
+        return Err(RsmediaError::invalid_config(format!(
+            "filter '{name}' is not available in this FFmpeg build"
+        )));
     }
     let filter = filter.unwrap();
     // SAFETY: 同 `filter_input_pads`，`is_output = 1` 取输出侧。
@@ -1829,7 +1833,7 @@ impl FilterGraph {
     /// 建一张已初始化的滤镜图（`new` + [`init`](Self::init) 的合并入口）。
     ///
     /// 解码与编码两条流水线都用它建图，转义、媒体类型校验、滤镜可用性校验
-    /// （缺失滤镜 → [`FilterNotFound`](crate::RsmediaError::FilterNotFound)）
+    /// （缺失滤镜 → [`InvalidConfig`](crate::RsmediaError::InvalidConfig)）
     /// 因此只有 [`init`](Self::init) 一处实现——调用方不需要在门外再抄一遍这些
     /// 检查，两份检查只会随 FFmpeg 版本漂移。
     pub(crate) fn build(params: &FilterParams, filters: &[Filter]) -> Result<FilterGraph> {
@@ -1867,7 +1871,9 @@ impl FilterGraph {
     /// [`FilterGraphBuilder`]。
     pub fn init(&mut self, params: &FilterParams, filters: &[Filter]) -> Result<()> {
         if self.is_initialized() {
-            return Err(RsmediaError::msg("Filter graph already initialized"));
+            return Err(RsmediaError::invalid_config(
+                "Filter graph already initialized",
+            ));
         }
         for filter in filters {
             Self::check_filter(filter, params.media_type())?;
@@ -1904,12 +1910,17 @@ impl FilterGraph {
     /// 校验单个滤镜：是否存在于本次构建、媒体类型是否与图一致。
     fn check_filter(filter: &Filter, media_type: MediaType) -> Result<()> {
         // 名字必须是本 FFmpeg 构建里真实存在的滤镜：缺失时在此前置报错，
-        // 而不是等到 parse 阶段返回一句难以定位的字符串错误。
+        // 而不是等到 parse 阶段返回一句难以定位的字符串错误。名字来自调用方配置，
+        // 缺失意味着"这个构建没编入它"（如 `drawtext` 需要 libfreetype、
+        // `subtitles` 需要 libass）⇒ 报 `InvalidConfig`。
         if get_by_name(filter.name())?.is_none() {
-            return Err(RsmediaError::filter_not_found(filter.name()));
+            return Err(RsmediaError::invalid_config(format!(
+                "filter '{}' is not available in this FFmpeg build",
+                filter.name()
+            )));
         }
         if filter.media_type() != media_type {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::invalid_config(format!(
                 "Filter '{}' media type mismatch: expected {:?}, got {:?}",
                 filter.name(),
                 media_type,
@@ -2163,7 +2174,7 @@ impl FilterGraph {
     /// `AVERROR_EOF`，所以第二次起直接返回 `Ok(())`。
     pub fn push_frame_to(&mut self, input: usize, frame: Option<AVFrame>) -> Result<()> {
         if !self.is_initialized() {
-            return Err(RsmediaError::msg("Filter graph not initialized"));
+            return Err(RsmediaError::invalid_config("Filter graph not initialized"));
         }
         if input >= self.eof_sent.len() {
             return Err(RsmediaError::invalid_config(format!(
@@ -2236,7 +2247,7 @@ impl FilterGraph {
     /// 给所有输入推 EOF，然后把第 `output` 路输出里缓存的帧全部取出。
     pub fn drain_output(&mut self, output: usize) -> Result<Vec<AVFrame>> {
         if !self.is_initialized() {
-            return Err(RsmediaError::msg("Filter graph not initialized"));
+            return Err(RsmediaError::invalid_config("Filter graph not initialized"));
         }
         if output >= self.states.len() {
             return Err(RsmediaError::invalid_config(format!(
@@ -4047,6 +4058,37 @@ mod tests {
             .expect("filtered audio frame from output 1");
         assert_eq!(audio_out.sample_rate, 48000);
         assert_eq!(audio_out.nb_samples, 512);
+        Ok(())
+    }
+
+    /// 缺失的滤镜名报 [`RsmediaError::InvalidConfig`]（名字是调用方给的配置，
+    /// 本构建没编入它 ⇒ 换一个滤镜名即可），且加了 context 之后仍能按变体识别。
+    #[test]
+    fn test_missing_filter_reports_invalid_config() -> Result<()> {
+        let params = FilterParams::Video(VideoParams {
+            width: 8,
+            height: 4,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: ffi::AVRational { num: 1, den: 25 },
+            frame_rate: ffi::AVRational { num: 25, den: 1 },
+            pixel_aspect: ffi::AVRational { num: 1, den: 1 },
+        });
+        let filters = vec![Filter::new(
+            "rsmedia_no_such_filter",
+            MediaType::VIDEO,
+            "rsmedia_no_such_filter".to_string(),
+        )];
+
+        let err = FilterGraph::build(&params, &filters).unwrap_err();
+        assert!(
+            err.is_invalid_config(),
+            "a filter this build does not have must be invalid configuration: {err}"
+        );
+        assert!(
+            err.to_string().contains("rsmedia_no_such_filter"),
+            "the message must name the missing filter: {err}"
+        );
         Ok(())
     }
 

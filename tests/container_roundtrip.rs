@@ -175,8 +175,8 @@ fn codec_id(encoder: &str) -> ffi::AVCodecID {
 /// asks for and falls back to the codec's list (Opus is fixed at 48 kHz).
 fn negotiate_audio(codec: &str, preferred_rate: u32) -> Result<(SampleFormat, u32)> {
     let Some(encoder) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec)?) else {
-        return Err(RsmediaError::codec_not_found(format!(
-            "encoder {codec} not available in this FFmpeg build"
+        return Err(RsmediaError::invalid_config(format!(
+            "encoder '{codec}' is not available in this FFmpeg build"
         )));
     };
     let config = CodecConfig::from_codec(encoder);
@@ -544,21 +544,19 @@ fn roundtrip(spec: &ContainerSpec) -> Result<()> {
     Ok(())
 }
 
-/// A codec missing from the linked FFmpeg build surfaces as `CodecNotFound` —
-/// possibly wrapped in context layers — which is the only condition under
-/// which a container is skipped rather than failed.
-fn is_encoder_unavailable(error: &RsmediaError) -> bool {
-    let mut source: Option<&dyn std::error::Error> = Some(error);
-    while let Some(err) = source {
-        if matches!(
-            err.downcast_ref::<RsmediaError>(),
-            Some(RsmediaError::CodecNotFound(_))
-        ) {
-            return true;
-        }
-        source = err.source();
-    }
-    false
+/// 本构建是否提供该编码器（`negotiate_audio` 与容器遍历据此决定跳过还是失败）。
+fn encoder_available(name: &str) -> bool {
+    std::ffi::CString::new(name)
+        .ok()
+        .is_some_and(|name| AVCodec::find_encoder_by_name(&name).is_some())
+}
+
+/// 本构建是否提供该容器需要的**全部**编码器（缺任一 ⇒ 该容器跳过）。
+fn container_codecs_available(spec: &ContainerSpec) -> bool {
+    [spec.video, spec.audio, spec.subtitle]
+        .into_iter()
+        .flatten()
+        .all(encoder_available)
 }
 
 /// Walks the matrix; a codec missing from this FFmpeg build skips its container,
@@ -570,14 +568,16 @@ fn test_common_containers_roundtrip() {
     let mut failed = Vec::new();
 
     for spec in CONTAINERS {
+        // 本构建缺这个容器需要的编码器 ⇒ 跳过（先探测可用性，而不是靠错误变体判断）。
+        if !container_codecs_available(spec) {
+            println!("SKIP {}: an encoder is not in this FFmpeg build", spec.name);
+            skipped.push(spec.name);
+            continue;
+        }
         match roundtrip(spec) {
             Ok(()) => {
                 println!("{} ok", spec.name);
                 passed.push(spec.name);
-            }
-            Err(error) if is_encoder_unavailable(&error) => {
-                println!("SKIP {}: {error:#}", spec.name);
-                skipped.push(spec.name);
             }
             Err(error) => {
                 println!("FAIL {}: {error:#}", spec.name);

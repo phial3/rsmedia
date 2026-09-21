@@ -53,12 +53,6 @@ fn skip_if_filter_unavailable(filter: &Filter, path: &Path) -> bool {
     true
 }
 
-/// 编码器因 FFmpeg 构建配置缺失（如 libmp3lame/libtheora/libx265）时跳过：
-/// 匹配类型化 [`RsmediaError::CodecNotFound`] 变体。
-fn is_encoder_unavailable(e: &RsmediaError) -> bool {
-    e.is_codec_not_found()
-}
-
 /// 汇总容器遍历测试结果：任何非跳过失败都断言失败；至少一个容器成功，
 /// 防止环境异常时测试空壳通过。
 fn assert_container_results(
@@ -256,16 +250,18 @@ mod video {
     ];
 
     /// 对指定视频容器执行「编码 10 秒视频 → flush」完整流程。
-    fn encode_video_for_container(spec: &VideoContainerSpec, fps: f64) -> Result<()> {
+    ///
+    /// 返回 `Ok(false)` 表示本构建没有该编码器，调用方跳过该容器。
+    fn encode_video_for_container(spec: &VideoContainerSpec, fps: f64) -> Result<bool> {
         use rsmedia::filter;
         use rsmedia::time::Time;
 
         let codec_name = spec.codec.unwrap_or("libx264");
-        // 编码器存在性取决于 FFmpeg 构建配置（如 libtheora/libx265），缺失时跳过
+        // 编码器存在性取决于 FFmpeg 构建配置（如 libtheora/libx265），缺失时跳过：
+        // 先探测可用性，而不是拿库的错误变体当"跳过"标记（名字不存在已归入
+        // InvalidConfig，无法与真正的配置错误区分）。
         if AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?).is_none() {
-            return Err(RsmediaError::codec_not_found(format!(
-                "encoder {codec_name} not available in this FFmpeg build"
-            )));
+            return Ok(false);
         }
         let codec_name = strutils::str_to_cstring(codec_name)?;
         let codec_config = CodecConfig::new_with_name(&codec_name)?;
@@ -349,7 +345,7 @@ mod video {
         // flush encoder
         muxer.finish().unwrap();
 
-        Ok(())
+        Ok(true)
     }
 
     /// 遍历视频容器映射表逐一编码。
@@ -365,12 +361,15 @@ mod video {
         for spec in VIDEO_CONTAINERS {
             println!("Testing format: {}...", spec.container);
             match encode_video_for_container(spec, fps) {
-                Ok(()) => {
+                Ok(true) => {
                     println!("Testing format: {} passed.", spec.container);
                     passed.push(spec.container);
                 }
-                Err(e) if is_encoder_unavailable(&e) => {
-                    println!("SKIP {}: {e:#}", spec.container);
+                Ok(false) => {
+                    println!(
+                        "SKIP {}: encoder is not in this FFmpeg build",
+                        spec.container
+                    );
                     skipped.push(spec.container);
                 }
                 Err(e) => failed.push((spec.container, format!("{e:#}"))),
@@ -1397,16 +1396,18 @@ mod audio {
 
     /// 对指定音频容器执行「编码 5 秒正弦波 → 解码校验」完整流程：
     /// 验证音频 time_base = 1/sample_rate、解码采样率/声道数不变、采样量不丢失。
-    fn encode_audio_for_container(spec: &AudioContainerSpec) -> Result<()> {
+    /// 对指定音频容器执行「编码 1 秒音频 → flush → 解码回读」完整流程。
+    ///
+    /// 返回 `Ok(false)` 表示本构建没有该编码器，调用方跳过该容器。
+    fn encode_audio_for_container(spec: &AudioContainerSpec) -> Result<bool> {
         use rsmedia::{DecoderBuilder, MediaType};
 
         let codec_name = spec.codec.unwrap_or("aac");
-        // 编码器存在性取决于 FFmpeg 构建配置（如 libmp3lame/libopus），缺失时跳过
+        // 编码器存在性取决于 FFmpeg 构建配置（如 libmp3lame/libopus），缺失时跳过：
+        // 先探测可用性，而不是拿库的错误变体当"跳过"标记。
         let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?)
         else {
-            return Err(RsmediaError::codec_not_found(format!(
-                "encoder {codec_name} not available in this FFmpeg build"
-            )));
+            return Ok(false);
         };
         let config = CodecConfig::from_codec(codec);
 
@@ -1558,7 +1559,7 @@ mod audio {
         );
 
         common::remove_test_output(&path);
-        Ok(())
+        Ok(true)
     }
 
     /// 遍历音频容器映射表逐一编码。
@@ -1726,12 +1727,16 @@ mod audio {
                 spec.channels
             );
             match encode_audio_for_container(spec) {
-                Ok(()) => {
+                Ok(true) => {
                     println!("Testing audio container: {} passed.", spec.container);
                     passed.push(spec.container);
                 }
-                Err(e) if is_encoder_unavailable(&e) => {
-                    println!("SKIP {}: {e:#}", spec.container);
+                Ok(false) => {
+                    println!(
+                        "SKIP {}: encoder {} is not in this FFmpeg build",
+                        spec.container,
+                        spec.codec.unwrap_or("aac")
+                    );
                     skipped.push(spec.container);
                 }
                 Err(e) => failed.push((spec.container, format!("{e:#}"))),

@@ -13,7 +13,7 @@ use rsmpeg::{
 
 use anyhow::{Context, Result, anyhow};
 use rsmedia::codec::CodecConfig;
-use rsmedia::{EncoderBuilder, RsmediaError, SampleFormat, filter, strutils};
+use rsmedia::{EncoderBuilder, SampleFormat, filter, strutils};
 use std::ffi::{CStr, CString};
 
 /// 生成正弦波音频样本（优化内存访问）
@@ -464,11 +464,14 @@ const COMMON_AUDIO_CONTAINERS: &[(&str, &str, i64)] = &[
 /// 使用 rsmedia `EncoderBuilder` 对常见音频容器做编码测试：
 /// 按编码器能力自动选择采样格式/采样率，套用音频滤镜链（音量/高通/变速），
 /// 编码 1 秒立体声正弦波并封装到对应容器。
-fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64) -> Result<()> {
-    // 编码器是否存在取决于 FFmpeg 编译配置（如 libmp3lame、libopus），
-    // 缺失时跳过该容器而不是失败：用类型化 CodecNotFound 标记，调用方按变体跳过
+///
+/// 返回 `Ok(false)` 表示本构建没有该编码器（如未编译 libmp3lame），调用方跳过该容器；
+/// 其余错误一律是真失败。
+fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64) -> Result<bool> {
+    // 编码器是否存在取决于 FFmpeg 编译配置，先探测再编码：不再借用库的错误变体
+    // 当"跳过"标记（"名字在本构建不存在"已归入 InvalidConfig，无法与真正的配置错误区分）。
     let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?) else {
-        return Err(RsmediaError::codec_not_found(codec_name).into());
+        return Ok(false);
     };
     let codec_config = CodecConfig::from_codec(codec);
 
@@ -532,7 +535,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
     // flush encoder and write trailer
     muxer.finish()?;
 
-    Ok(())
+    Ok(true)
 }
 
 /// 遍历常见音频容器逐一编码；编码器缺失的容器跳过并报告，
@@ -544,13 +547,11 @@ fn test_encode_audio_containers() -> Result<()> {
 
     for (container_type, codec_name, bit_rate) in COMMON_AUDIO_CONTAINERS {
         match encode_audio_container(container_type, codec_name, *bit_rate) {
-            Ok(()) => encoded += 1,
-            // 编码器缺失（如 libmp3lame）：匹配类型化 CodecNotFound 变体优雅跳过。
-            Err(e)
-                if e.downcast_ref::<RsmediaError>()
-                    .is_some_and(|e| e.is_codec_not_found()) =>
-            {
-                skipped.push(*container_type)
+            Ok(true) => encoded += 1,
+            // 本构建没有这个编码器（如 libmp3lame）：跳过该容器。
+            Ok(false) => {
+                println!("SKIP {container_type}: {codec_name} is not in this FFmpeg build");
+                skipped.push(*container_type);
             }
             Err(e) => return Err(anyhow!("encode {container_type} failed: {e:#}")),
         }

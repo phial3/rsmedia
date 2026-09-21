@@ -467,9 +467,10 @@ impl EncoderBuilder {
     ) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != encoder.codec_type {
-            return Err(RsmediaError::msg(format!(
-                "Encoder codec type not supported: {:?} vs. {:?}",
-                media_type, encoder.codec_type
+            return Err(RsmediaError::invalid_config(format!(
+                "encoder was built for media type {media_type:?}, but the codec of the given \
+                 stream is {:?}",
+                encoder.codec_type
             )));
         }
 
@@ -525,8 +526,8 @@ impl EncoderBuilder {
             encoder.set_time_base(self.effective_time_base());
             encoder.set_pkt_timebase(self.effective_time_base());
         } else {
-            return Err(RsmediaError::msg(format!(
-                "Unsupported media type: {media_type:?}"
+            return Err(RsmediaError::unsupported(format!(
+                "media type {media_type:?}"
             )));
         }
 
@@ -704,16 +705,21 @@ impl EncoderBuilder {
                 MediaType::AUDIO => Self::AUDIO_CODEC_NAME.to_string(),
                 MediaType::SUBTITLE => Self::SUBTITLE_CODEC_NAME.to_string(),
                 _ => {
-                    return Err(RsmediaError::msg(format!(
-                        "Unsupported media type:{media_type:?}",
+                    return Err(RsmediaError::unsupported(format!(
+                        "media type {media_type:?}",
                     )));
                 }
             },
         };
-        // `find_encoder_by_name` 不区分"名字拼错"与"该 FFmpeg 构建未编译此编码器",
-        // 都归入 CodecNotFound —— 调用方据此跳过当前构建不可用的编码器。
+        // `find_encoder_by_name` 不区分"名字拼错"与"该 FFmpeg 构建未编译此编码器"，
+        // 两者都是调用方给的**配置**在这台构建上没法满足 ⇒ `InvalidConfig`，
+        // 调用方换一个名字或换一个构建即可。
         let codec = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(&codec_name)?)
-            .ok_or_else(|| RsmediaError::codec_not_found(codec_name.clone()))?;
+            .ok_or_else(|| {
+                RsmediaError::invalid_config(format!(
+                    "encoder '{codec_name}' is not available in this FFmpeg build"
+                ))
+            })?;
 
         // CRF 速率控制：仅对支持 crf 私有选项的视频编码器生效，其余编码器
         // 回退到 bit_rate 控制（与 ffmpeg CLI 行为一致，只是多一个警告）。
@@ -793,13 +799,13 @@ impl EncoderBuilder {
                     })
                 }
                 _ => {
-                    return Err(RsmediaError::msg(format!(
-                        "Unsupported filter for media type: {media_type:?}"
+                    return Err(RsmediaError::invalid_config(format!(
+                        "a {media_type:?} filter cannot be used on this stream"
                     )));
                 }
             };
             // 滤镜链的媒体类型与可用性校验都在 `init` 内（缺失滤镜 →
-            // `FilterNotFound`），这里不再重复一遍。
+            // `InvalidConfig`），这里不再重复一遍。
             let graph = FilterGraph::build(&filter_params, filters.as_slice())?;
             Some(graph)
         } else {
@@ -1557,8 +1563,8 @@ impl Encoder {
             }
             _ => {
                 // do nothing
-                return Err(RsmediaError::msg(format!(
-                    "Unsupported encode frame media type: {:?}",
+                return Err(RsmediaError::unsupported(format!(
+                    "no frame conversion path for media type: {:?}",
                     self.media_type
                 )));
             }
@@ -1579,8 +1585,8 @@ impl Encoder {
                     return Ok(());
                 }
                 if !self.config.is_support_pixel_format(frame.format) {
-                    return Err(RsmediaError::msg(format!(
-                        "Unsupported video encoder frame pixel format: {:?}",
+                    return Err(RsmediaError::unsupported(format!(
+                        "this encoder cannot encode frames in pixel format {:?}",
                         frame.format
                     )));
                 }
@@ -1588,15 +1594,15 @@ impl Encoder {
 
             MediaType::AUDIO => {
                 if !self.config.is_support_sample_format(frame.format) {
-                    return Err(RsmediaError::msg(format!(
-                        "Unsupported encode audio frame sample format: {:?}",
+                    return Err(RsmediaError::unsupported(format!(
+                        "this encoder cannot encode frames in sample format {:?}",
                         frame.format
                     )));
                 }
 
                 if !self.config.is_support_sample_rate(frame.sample_rate) {
-                    return Err(RsmediaError::msg(format!(
-                        "Unsupported encode audio frame sample rate: {:?}",
+                    return Err(RsmediaError::unsupported(format!(
+                        "this encoder cannot encode audio at sample rate {:?}",
                         frame.sample_rate
                     )));
                 }
@@ -1897,6 +1903,16 @@ mod tests {
     // 音频切帧）见 `tests/encode_pipeline.rs`。
     // ====================================================================
 
+    /// 本构建是否提供默认视频编码器（`EncoderBuilder::VIDEO_CODEC_NAME`）。
+    ///
+    /// 环境差异（构建未编入 libx264）应当跳过而不是失败，所以要**先探测可用性**：
+    /// 分类合并后"名字在本构建不存在"也是 `InvalidConfig`，无法与真正的配置错误区分。
+    fn default_video_encoder_available() -> bool {
+        let name = std::ffi::CString::new(EncoderBuilder::VIDEO_CODEC_NAME)
+            .expect("codec name is a NUL-free literal");
+        AVCodec::find_encoder_by_name(&name).is_some()
+    }
+
     /// 单一配置源：typed setter 与 `with_options` 同时指定同一项时 `build` 报错；
     /// 只由其中一方指定（含"仅用透传设 `threads`"）则正常构建。
     #[test]
@@ -1967,10 +1983,10 @@ mod tests {
         Ok(())
     }
 
-    /// 编码器名在此 FFmpeg 构建中不存在时返回 `CodecNotFound`(而不是普通
-    /// Other 错误):调用方靠该变体跳过当前构建不可用的编码器。
+    /// 编码器名在此 FFmpeg 构建中不存在时返回 `InvalidConfig`（而不是含糊的
+    /// `Other`）：名字来自调用方配置，换一个即可，且带 context 后仍能按变体识别。
     #[test]
-    fn test_missing_encoder_reports_codec_not_found() {
+    fn test_missing_encoder_reports_invalid_config() {
         let Err(err) = EncoderBuilder::new_video(64, 64)
             .with_codec_name("no_such_encoder".to_string())
             .build()
@@ -1978,9 +1994,10 @@ mod tests {
             panic!("unknown codec name must fail");
         };
         assert!(
-            matches!(err, RsmediaError::CodecNotFound(ref name) if name == "no_such_encoder"),
-            "expected CodecNotFound, got {err:?}"
+            err.is_invalid_config(),
+            "expected invalid configuration, got {err:?}"
         );
+        assert!(err.to_string().contains("no_such_encoder"), "{err}");
     }
 
     /// 采样格式协商：未指定时优先 FLTP，编码器不支持 FLTP 时取支持列表首个；
@@ -2254,18 +2271,19 @@ mod tests {
     /// 输入，`receive_packet` 因此返回"暂无包"。
     #[test]
     fn test_eagain_mid_stream_is_not_the_draining_phase() -> Result<()> {
-        let mut encoder = match EncoderBuilder::new_video(64, 64)
+        // 默认编码器缺失的环境（构建不含 libx264）跳过：先按名字探测可用性，
+        // 而不是把构建错误当成"环境差异"吞掉——分类合并后后者也是 InvalidConfig。
+        if !default_video_encoder_available() {
+            println!(
+                "SKIP: {} is not in this FFmpeg build",
+                EncoderBuilder::VIDEO_CODEC_NAME
+            );
+            return Ok(());
+        }
+        let mut encoder = EncoderBuilder::new_video(64, 64)
             .with_fps(25.0)
             .with_pix_fmt(PixelFormat::YUV420P)
-            .build()
-        {
-            Ok(encoder) => encoder,
-            Err(e) if e.is_codec_not_found() => {
-                println!("SKIP: no default video encoder in this build ({e})");
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
+            .build()?;
 
         for index in 0..4i64 {
             let mut frame = AVFrame::new();
@@ -2301,12 +2319,17 @@ mod tests {
             assert!(err.is_invalid_config(), "invalid fps {fps} gave: {err}");
         }
 
-        // 合法帧率仍可构建（默认编码器缺席的环境下跳过）。
+        // 合法帧率仍可构建（默认编码器缺席的环境下跳过：先探测可用性，
+        // 免得把真正的配置错误当成环境差异）。
+        if !default_video_encoder_available() {
+            println!(
+                "SKIP: {} is not in this FFmpeg build",
+                EncoderBuilder::VIDEO_CODEC_NAME
+            );
+            return;
+        }
         match EncoderBuilder::new_video(64, 64).with_fps(24.0).build() {
             Ok(_) => {}
-            Err(e) if e.is_codec_not_found() => {
-                println!("SKIP: no default video encoder in this build ({e})");
-            }
             Err(e) => panic!("a valid fps must build: {e}"),
         }
     }
