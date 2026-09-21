@@ -269,8 +269,8 @@ pub trait Seekable: Reader {
                 flags,
             );
             if res < 0 {
-                return Err(RsmediaError::msg(format!(
-                    "Seek to frame failed: stream={stream_index}, ts={frame_ts}, flags={flags:#x}, err={res}"
+                return Err(RsmediaError::av_error(res).with_context(format!(
+                    "Failed to seek stream {stream_index} to ts={frame_ts} (flags {flags:#x})"
                 )));
             }
             Ok(())
@@ -301,7 +301,9 @@ fn seek_file(
     let res = unsafe { ffi::avformat_seek_file(input.as_mut_ptr(), stream_index, min, ts, max, 0) };
     if res < 0 {
         // >=0 on success, error code otherwise
-        return Err(RsmediaError::msg(format!("Seek file failed: {res}")));
+        return Err(RsmediaError::av_error(res).with_context(format!(
+            "Failed to seek stream {stream_index} into ts=[{min}, {max}] (target {ts})"
+        )));
     }
     Ok(())
 }
@@ -590,6 +592,12 @@ fn open_input_with_interrupt(
         .map(|d| d.as_mut_ptr())
         .unwrap_or(std::ptr::null_mut());
     let ret = unsafe {
+        // SAFETY: `ctx` is a non-null pointer to a context from
+        // `avformat_alloc_context` (checked just above) that has not been handed
+        // to FFmpeg yet, so this write to `interrupt_callback` is exclusive.
+        // `avformat_open_input` takes ownership of the context on success and, per
+        // its documentation, frees it on failure (leaving `ctx` null) — which is
+        // why the error path below must not touch `ctx` again.
         (*ctx).interrupt_callback = interrupt_cb(interrupt);
         ffi::avformat_open_input(&mut ctx, filename.as_ptr(), fmt, &mut opts)
     };
@@ -692,6 +700,9 @@ impl<'a> StreamReaderBuilder<'a> {
         }
         tracing::debug!(
             "Using input protocol: [{}], source: {}",
+            // SAFETY: `avio_find_protocol_name` returns a pointer into FFmpeg's
+            // static protocol registry (not a per-call allocation), valid for the
+            // process lifetime; the NULL case was rejected above.
             unsafe { strutils::c_char_to_str(protocol) },
             source
         );
@@ -2073,9 +2084,8 @@ mod tests {
         let dir = pattern.parent().unwrap();
         for i in 1..=n_frames {
             let file = dir.join(format!("img_{i:03}.png"));
-            let meta = std::fs::metadata(&file).map_err(|e| {
-                RsmediaError::msg(format!("expected sequence file {}: {e}", file.display()))
-            })?;
+            let meta = std::fs::metadata(&file)
+                .context(format!("expected sequence file {}", file.display()))?;
             assert!(meta.len() > 0, "sequence file {} is empty", file.display());
         }
         // 未写入的下一个编号不应存在

@@ -393,9 +393,8 @@ impl PixelFormat {
     pub fn count_planes(&self) -> Result<i32> {
         let cnt = unsafe { ffi::av_pix_fmt_count_planes((*self).into()) };
         if cnt < 0 {
-            return Err(RsmediaError::msg(format!(
-                "Failed to get plane count:{cnt}"
-            )));
+            return Err(RsmediaError::av_error(cnt)
+                .with_context(format!("Failed to count the planes of {self:?}")));
         }
         Ok(cnt)
     }
@@ -556,8 +555,11 @@ pub fn find_best_pix_fmt(
 
     match PixelFormat::from_ffi_checked(best) {
         // 返回 `AV_PIX_FMT_NONE`（或本 crate 未收录的值）都表示"没有可用的目标格式"。
-        None | Some(PixelFormat::NONE) => Err(RsmediaError::msg(format!(
-            "Failed to find a best pixel format among the candidates (got {best})"
+        // `AV_PIX_FMT_NONE` 是哨兵而非错误码，`AVError(-1)` 会渲染成语义完全无关的
+        // "Operation not permitted"，故按能力缺口上报（调用方可据此降级）。
+        None | Some(PixelFormat::NONE) => Err(RsmediaError::unsupported(format!(
+            "neither {dst_pix_fmt1:?} nor {dst_pix_fmt2:?} can represent {src_pix_fmt:?} \
+             (av_find_best_pix_fmt_of_2 found no usable target)"
         ))),
         Some(fmt) => Ok(fmt),
     }
@@ -584,17 +586,17 @@ pub fn find_codec_best_pix_fmt(
             std::ptr::null_mut(),
         )
     };
-    if ret < 0 {
-        return Err(RsmediaError::msg(format!(
-            "Failed to find codec best pix fmt, ret: {ret}"
-        )));
-    }
-    // 返回值来自外部：用 checked 转换，未收录的格式返回 Err 而不是 panic。
+    // 返回值是**选中的格式**，`AV_PIX_FMT_NONE`(-1) 只表示"候选里没有能用的"。
+    // 它既不是错误码也不是可用格式，所以直接按能力缺口上报——之前的
+    // `ret < 0` 分支会把 NONE 当成 `AVERROR(-1)`（渲染成语义完全无关的
+    // "Operation not permitted"），而真正的"无可用候选"判定在下面。
     PixelFormat::from_ffi_checked(ret)
         .filter(|fmt| *fmt != PixelFormat::NONE)
         .ok_or_else(|| {
-            RsmediaError::msg(format!(
-                "No pixel format of the candidate list is usable (got {ret})"
+            RsmediaError::unsupported(format!(
+                "none of the {} candidate pixel formats can represent {src_pix_fmt:?} \
+                 (alpha: {has_alpha})",
+                pix_fmt_list.len()
             ))
         })
 }
@@ -617,9 +619,16 @@ pub fn get_pix_fmt_loss(
         ffi::av_get_pix_fmt_loss(dst_pix_fmt.into(), src_pix_fmt.into(), has_alpha as i32)
     };
 
+    // 这个返回值**不是错误码**：FFmpeg 文档写的是"损失标志的组合（对无效
+    // `dst_pix_fmt` 返回最大损失）"，负数来自 `get_pix_fmt_score` 的内部哨兵
+    // （-1/-2 硬件格式、-3 深度查询失败、-4 描述符缺失），不是 `AVERROR(...)`——
+    // 按返回码上报会渲染出 `AVERROR(-4): 'Interrupted system call'` 这种与事实
+    // 无关的文本（实测）。故按调用方入参问题上报，并点名两个格式。
     if loss < 0 {
-        return Err(RsmediaError::msg(format!(
-            "Failed to get pix fmt loss, ret: {loss}"
+        return Err(RsmediaError::invalid_config(format!(
+            "cannot compute the loss of converting {src_pix_fmt:?} into {dst_pix_fmt:?} \
+             (alpha: {has_alpha}): hardware or unmodelled formats have no scoreable \
+             pixel-format description"
         )));
     }
 
@@ -725,5 +734,52 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// FFmpeg 调用失败必须保留返回码（`FFmpeg(AVError)`），而"没有可用的候选格式"
+    /// 是**能力缺口**（哨兵 `AV_PIX_FMT_NONE`，不是错误码）⇒ 必须报 `Unsupported`。
+    /// 两者以前都落进无类型的 `Other`，调用方无从区分。
+    #[test]
+    fn test_pixel_format_errors_are_typed() {
+        // `av_get_pix_fmt_loss` 的返回值**不是错误码**（文档：损失标志组合），
+        // 负数来自 `get_pix_fmt_score` 的内部哨兵；实测 FFmpeg 给 −4，
+        // 而 `err2str` 会把它渲染成语义完全无关的 `AVERROR(-4): 'Interrupted
+        // system call'`。所以这里必须报 invalid_config，而不是 av_error。
+        let loss = get_pix_fmt_loss(PixelFormat::YUV420P, PixelFormat::NONE, false)
+            .expect_err("an unmodelled source format must fail");
+        assert!(
+            loss.is_invalid_config(),
+            "an unscoreable pair is a caller-side argument problem: {loss:?}"
+        );
+        assert!(
+            !loss.to_string().contains("Interrupted system call"),
+            "the private sentinel must not be rendered as an errno: {loss}"
+        );
+
+        // 空候选表 ⇒ 没有任何目标格式可用：能力缺口，而不是 FFmpeg 故障。
+        let no_candidate = find_codec_best_pix_fmt(&[], PixelFormat::YUV420P, false)
+            .expect_err("an empty candidate list must fail");
+        assert!(
+            no_candidate.is_unsupported(),
+            "no usable candidate is a capability gap: {no_candidate:?}"
+        );
+        assert!(
+            !no_candidate.to_string().contains("got -1"),
+            "the AV_PIX_FMT_NONE sentinel must not leak into the message: {no_candidate}"
+        );
+
+        // 契约：只要有可用候选就必须成功（避免上面两条断言把"总是报错"当成正确）。
+        let picked = find_codec_best_pix_fmt(&[PixelFormat::RGB24], PixelFormat::BGR24, false)
+            .expect("a single valid candidate must be picked");
+        assert_eq!(picked, PixelFormat::RGB24);
+
+        // `count_planes` 的返回码同样是负数错误码，不是"0 个平面"。
+        let planes = PixelFormat::NONE
+            .count_planes()
+            .expect_err("an unmodelled format must fail");
+        assert!(
+            matches!(planes.root(), RsmediaError::FFmpeg(_)),
+            "{planes:?}"
+        );
     }
 }

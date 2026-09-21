@@ -42,6 +42,7 @@ ffi_enum!(
     /// but the enum still implements `BitOr`/`Into<u32>` so it can be combined
     /// with non-algorithm quality flags (`SWS_FULL_CHR_H_INT`, `SWS_ACCURATE_RND`,
     /// `SWS_BITEXACT`, …) before handing the assembled mask to FFI.
+    #[derive(Default)]
     #[allow(non_camel_case_types)]
     ScaleAlgorithm, u32 {
         /// fast bilinear filtering
@@ -49,6 +50,7 @@ ffi_enum!(
         /// bilinear filtering
         BILINEAR => ffi::SWS_BILINEAR;
         /// 2-tap cubic B-spline
+        #[default]
         BICUBIC => ffi::SWS_BICUBIC;
         /// experimental
         X => ffi::SWS_X;
@@ -68,13 +70,6 @@ ffi_enum!(
         SPLINE => ffi::SWS_SPLINE;
     }
 );
-
-#[allow(clippy::derivable_impls)]
-impl Default for ScaleAlgorithm {
-    fn default() -> Self {
-        Self::BICUBIC
-    }
-}
 
 ffi_enum!(
     /// Video scaler quality / behaviour flags (SWS_* non-algorithm bits, 1 << 11 .. 1 << 20).
@@ -680,8 +675,10 @@ impl Scaler {
                 )
             };
             if ret < 0 {
-                return Err(RsmediaError::msg(format!(
-                    "Failed to call sws_scale_frame, ret: {ret}"
+                return Err(RsmediaError::av_error(ret).with_context(format!(
+                    "Failed to scale {}x{} {src_pix_fmt:?} into {}x{} {dst_pix_fmt:?} \
+                     (sws_scale_frame)",
+                    src_frame.width, src_frame.height, dst_frame.width, dst_frame.height
                 )));
             }
         }
@@ -828,8 +825,9 @@ fn alloc_pooled_frame(
         )
     };
     if ret < 0 {
-        return Err(RsmediaError::msg(format!(
-            "av_image_fill_arrays failed for {fmt:?} {width}x{height}, ret: {ret}"
+        return Err(RsmediaError::av_error(ret).with_context(format!(
+            "Failed to lay out a pooled {fmt:?} frame {width}x{height} \
+             (av_image_fill_arrays)"
         )));
     }
 
@@ -887,8 +885,9 @@ unsafe fn zero_frame_padding(
     // Safety: 本地数组 + 调用方已校验的格式/尺寸。
     let ret = unsafe { ffi::av_image_fill_linesizes(visible.as_mut_ptr(), fmt.into(), width) };
     if ret < 0 {
-        return Err(RsmediaError::msg(format!(
-            "av_image_fill_linesizes failed for {fmt:?} width {width}, ret: {ret}"
+        return Err(RsmediaError::av_error(ret).with_context(format!(
+            "Failed to get the visible line sizes of {fmt:?} at width {width} \
+             (av_image_fill_linesizes)"
         )));
     }
     let visible_isize: [isize; 8] = visible.map(|bytes| bytes as isize);
@@ -903,16 +902,21 @@ unsafe fn zero_frame_padding(
         )
     };
     if ret < 0 {
-        return Err(RsmediaError::msg(format!(
-            "av_image_fill_plane_sizes failed for {fmt:?} height {height}, ret: {ret}"
+        return Err(RsmediaError::av_error(ret).with_context(format!(
+            "Failed to get the plane sizes of {fmt:?} at height {height} \
+             (av_image_fill_plane_sizes)"
         )));
     }
     // Safety: 纯查询，参数为已校验的像素格式。
     let planes = unsafe { ffi::av_pix_fmt_count_planes(fmt.into()) };
-    if planes <= 0 {
-        return Err(RsmediaError::msg(format!(
-            "cannot count the planes of {fmt:?}, av_pix_fmt_count_planes returned {planes}"
-        )));
+    if planes < 0 {
+        return Err(RsmediaError::av_error(planes)
+            .with_context(format!("Failed to count the planes of {fmt:?}")));
+    }
+    // 计数为 0 的格式没有可清空的 padding，但也没有平面可遍历；
+    // 上层只对已知有数据的格式调用本函数，走到这里说明格式假设不成立。
+    if planes == 0 {
+        return Err(RsmediaError::msg(format!("{fmt:?} reports no planes")));
     }
 
     // Safety: 下面所有写入都限制在 [buf_start, buf_start + buf_size) 内——各平面的可见区

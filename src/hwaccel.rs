@@ -408,6 +408,13 @@ impl HWContext {
         codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
         codec_ctx.set_pix_fmt(self.get_format(true));
 
+        // SAFETY: rsmpeg's wrap types do not implement `DerefMut`, so field writes
+        // must go through `UnsafeDerefMut::deref_mut`; this access is exclusive —
+        // `codec_ctx` is a `&mut` borrow held for the whole block, so no other
+        // reference to the context exists. `get_format` is set to an `extern "C"`
+        // function whose signature is exactly `AVCodecContext.get_format` (so the
+        // ABI matches and FFmpeg may call it), and `sw_pix_fmt` is the software
+        // format that same callback falls back to.
         unsafe {
             let ctx_mut_ptr = codec_ctx.deref_mut();
             ctx_mut_ptr.get_format = Some(hwaccel_get_format);

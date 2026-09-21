@@ -40,9 +40,9 @@ ffi_enum_wrap_from!(
 
 impl MediaType {
     pub fn get_media_name(&self) -> String {
-        avutil::get_media_type_string(*self as _).map_or("Unknown".to_string(), |s| {
-            strutils::cstr_to_string(s).unwrap()
-        })
+        // 同 `SampleFormat::get_sample_fmt_name`：FFmpeg 给的名字非 UTF-8 时降级显示。
+        avutil::get_media_type_string(*self as _)
+            .map_or("Unknown".to_string(), strutils::cstr_to_string_lossy)
     }
 }
 
@@ -359,6 +359,10 @@ impl StreamInfo {
         };
         let mut num: i32 = 0;
         let mut den: i32 = 1;
+        // SAFETY: `num`/`den` are two live stack `i32`s and `av_reduce` only writes
+        // those two; the numerator/denominator are computed in `i64` (no overflow on
+        // realistic dimensions) and the maximum is `i32::MAX`, matching the width of
+        // the outputs. No pointer is retained.
         unsafe {
             ffi::av_reduce(
                 &mut num,
@@ -384,6 +388,11 @@ impl StreamInfo {
         let codecpar = stream.codecpar();
         let nb_side_data = codecpar.nb_coded_side_data.max(0) as usize;
         if nb_side_data > 0 && !codecpar.coded_side_data.is_null() {
+            // SAFETY: the pointer/size pair is the demuxer-filled side-data array of
+            // this stream — `nb_coded_side_data` entries were checked non-zero and the
+            // base pointer non-null. The stream is borrowed for the call, so the array
+            // outlives this slice, which is only read (each `entry.data` is read as a
+            // 3x3 matrix after the `size >= 9 * 4` check).
             unsafe {
                 let entries = std::slice::from_raw_parts(codecpar.coded_side_data, nb_side_data);
                 for entry in entries {
@@ -404,6 +413,11 @@ impl StreamInfo {
     fn get_extra_data(stream: &AVStream) -> Option<Vec<u8>> {
         let codecpar = stream.codecpar();
         if codecpar.extradata_size > 0 && !codecpar.extradata.is_null() {
+            // SAFETY: `extradata`/`extradata_size` is the demuxer-filled private-data
+            // pair of this stream — the size was checked non-zero and the pointer
+            // non-null, and the stream is borrowed for the duration of the call, so the
+            // byte range is valid. The slice is copied into an owned `Vec` immediately
+            // and the pointer is not retained.
             let extra_data = unsafe {
                 std::slice::from_raw_parts(
                     codecpar.extradata as *const _,
@@ -567,6 +581,9 @@ impl std::fmt::Debug for StreamInfo {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let codec_name = unsafe {
             let codec_id = self.codec_id as ffi::AVCodecID;
+            // SAFETY: `avcodec_get_name` returns a pointer into FFmpeg's static codec
+            // table (never NULL, never freed); the helper copies out of it immediately
+            // and does not retain the pointer.
             strutils::c_char_to_str(ffi::avcodec_get_name(codec_id))
         };
         let format = match self.format {

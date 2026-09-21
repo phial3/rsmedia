@@ -137,10 +137,14 @@ impl CodecConfig {
     }
 
     pub fn is_encoder(&self) -> bool {
+        // SAFETY: `self.codec` holds a live `AVCodecRef` for as long as `self`
+        // exists, so the pointer stays valid; `av_codec_is_encoder` only reads
+        // the codec's descriptor.
         unsafe { ffi::av_codec_is_encoder(self.codec.as_ptr()) != 0 }
     }
 
     pub fn is_decoder(&self) -> bool {
+        // SAFETY: same as `is_encoder` — a pure read of a live descriptor.
         unsafe { ffi::av_codec_is_decoder(self.codec.as_ptr()) != 0 }
     }
 
@@ -223,6 +227,12 @@ impl CodecConfig {
             }
             #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
             {
+                // SAFETY: rsmpeg marks `get_supported_config` unsafe because the
+                // caller must match the type parameter to the config id — the
+                // request below is `AV_CODEC_CONFIG_CHANNEL_LAYOUT`, and
+                // AVChannelLayout is exactly the type FFmpeg fills for it. The
+                // returned buffer is FFmpeg-allocated and owned by the caller;
+                // `self.codec` is borrowed for the duration of the call.
                 unsafe {
                     self.context.get_supported_config::<ffi::AVChannelLayout>(
                         Some(&self.codec),
@@ -406,7 +416,15 @@ impl FormatInfo {
         Self {
             name: name.as_ref().to_string_lossy().into_owned(),
             long_name: long_name.as_ref().to_string_lossy().into_owned(),
-            extensions: unsafe { strutils::c_char_to_str_list(extensions) },
+            extensions: unsafe {
+                // SAFETY: `extensions` is the `extensions` field of an FFmpeg
+                // format descriptor taken from FFmpeg's **static** format table
+                // (`AVInputFormat` / `AVOutputFormat` are static objects that
+                // outlive the process), so the pointer stays valid; the field is
+                // either NULL or a NUL-terminated string, and the helper handles
+                // NULL without retaining the pointer.
+                strutils::c_char_to_str_list(extensions)
+            },
         }
     }
 

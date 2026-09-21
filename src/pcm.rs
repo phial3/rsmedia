@@ -239,6 +239,25 @@ impl<W: Writer> PcmSink<W> {
         );
         src.alloc_buffer()
             .context("Failed to allocate PCM input frame buffer")?;
+
+        // `T` 必须与 `sample_format` 的元素宽度一致：下面按 `interleaved.len()` 个
+        // `T` 写入 `data[0]`，而该缓冲是按 `sample_format` 分配、只有
+        // `interleaved.len() * element_bytes` 字节。这条不变量原先只靠
+        // `write_f32`/`write_i16`/`write_u8` 三个包装正确配对来维持——新增一个
+        // 包装时写错格式（或调用方误用）就是**堆越界写**，所以在这里显式校验。
+        let element_bytes = rsmpeg::avutil::get_bytes_per_sample(sample_format).unwrap_or(0);
+        if std::mem::size_of::<T>() != element_bytes {
+            return Err(RsmediaError::invalid_config(format!(
+                "PCM element type is {} byte(s) but {sample_format} stores {element_bytes}",
+                std::mem::size_of::<T>()
+            )));
+        }
+
+        // SAFETY: `src` 刚按 `nb_samples` / `ch_layout`（= `channels`）/
+        // `sample_format` 分配过缓冲，因此 `data[0]` 是 packed 格式的样本起点，
+        // 可写 `nb_samples * channels == interleaved.len()` 个样本；上面已校验
+        // `T` 与 `sample_format` 的元素宽度一致，读写范围完全落在缓冲内。`src`
+        // 是本函数的局部独占对象（引用计数 1）。
         unsafe {
             let dst = std::slice::from_raw_parts_mut(
                 (*src.as_mut_ptr()).data[0] as *mut T,

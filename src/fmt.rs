@@ -114,9 +114,10 @@ impl SampleFormat {
     }
 
     pub fn get_sample_fmt_name(&self) -> String {
-        avutil::get_sample_fmt_name(*self as _).map_or("Unknown".to_string(), |s| {
-            strutils::cstr_to_string(s).unwrap()
-        })
+        // `cstr_to_string_lossy` 而不是严格版本 + `unwrap`：名字来自 FFmpeg，
+        // 非 UTF-8 时应当降级显示，而不是 panic。
+        avutil::get_sample_fmt_name(*self as _)
+            .map_or("Unknown".to_string(), strutils::cstr_to_string_lossy)
     }
 
     pub fn get_packed_sample_fmt(&self) -> Option<SampleFormat> {

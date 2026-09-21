@@ -108,6 +108,30 @@ impl RsmediaError {
         RsmediaError::Other(msg.into())
     }
 
+    /// Build an [`RsmediaError::FFmpeg`] from a raw FFmpeg return code.
+    ///
+    /// FFmpeg APIs report failure as a negative `AVERROR(...)` code, and that
+    /// code carries more information than any hand-written message: its
+    /// `Display` renders the code **and** `av_strerror`'s text, e.g.
+    /// `AVERROR(-22): 'Invalid argument'`.
+    ///
+    /// Prefer this over splicing the number into a string
+    /// (`msg(format!("... failed: {ret}"))`), which leaves the caller with a
+    /// bare `-22` and no type. Attach what failed with
+    /// [`RsmediaError::with_context`], which keeps the code reachable:
+    ///
+    /// ```
+    /// use rsmedia::RsmediaError;
+    /// let err = RsmediaError::av_error(-22).with_context("Failed to fill plane sizes");
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "Failed to fill plane sizes: FFmpeg error: AVERROR(-22): `Invalid argument`"
+    /// );
+    /// ```
+    pub fn av_error(code: std::os::raw::c_int) -> Self {
+        RsmediaError::FFmpeg(RsmpegError::AVError(code))
+    }
+
     /// Build an [`RsmediaError::Unsupported`].
     pub fn unsupported(reason: impl Into<String>) -> Self {
         RsmediaError::Unsupported(reason.into())
@@ -181,16 +205,6 @@ impl From<image::ImageError> for RsmediaError {
 /// Library-level `Result` alias used by all public APIs.
 pub type Result<T> = std::result::Result<T, RsmediaError>;
 
-/// Internal convenience macro: build an [`RsmediaError::Other`] with
-/// `format!`-style arguments (migrates `anyhow!` call sites). Delegates to
-/// [`RsmediaError::msg`] so `Other` has exactly one construction path.
-macro_rules! format_err {
-    ($($arg:tt)*) => {
-        $crate::error::RsmediaError::msg(format!($($arg)*))
-    };
-}
-pub(crate) use format_err;
-
 /// A drop-in replacement for `anyhow::Context`, implemented for `Option` and
 /// `Result` whose error converts into [`RsmediaError`].
 pub trait Context<T> {
@@ -239,6 +253,27 @@ mod tests {
             "invalid configuration: trailer already written"
         );
         assert_eq!(RsmediaError::msg("boom").to_string(), "boom");
+    }
+
+    /// `av_error` 必须同时保住**返回码本身**和 `av_strerror` 的文本——这正是它
+    /// 相对「把返回码拼进消息字符串」的价值，也是本 crate 里 FFmpeg 调用失败的
+    /// 唯一上报方式。加了 context 之后根因仍须是 `FFmpeg(AVError)`。
+    #[test]
+    fn test_av_error_keeps_code_and_text() {
+        let err = RsmediaError::av_error(-22).with_context("Failed to fill plane sizes");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("Failed to fill plane sizes: FFmpeg error: AVERROR(-22)"),
+            "the failing call must be named and the code kept: {rendered}"
+        );
+        assert!(
+            rendered.contains("Invalid argument"),
+            "the code must be rendered through av_strerror, not left as a bare number: {rendered}"
+        );
+        match err.root() {
+            RsmediaError::FFmpeg(RsmpegError::AVError(code)) => assert_eq!(*code, -22),
+            other => panic!("root must stay FFmpeg(AVError), got {other:?}"),
+        }
     }
 
     #[test]

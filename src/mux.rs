@@ -634,6 +634,10 @@ impl<W: Writer> Muxer<W> {
                 Self::free_chapter_nodes(&mut chapter_nodes);
                 return;
             }
+            // SAFETY: `chapter_ptr` comes from `av_mallocz` and was checked non-null
+            // above; the node is exclusively owned here (it has not been linked into
+            // the format context yet) and stays alive until FFmpeg takes it over, so
+            // writing its fields through the raw pointer is exclusive and in-bounds.
             unsafe {
                 // 未指定 id 时按顺序自动编号（FFmpeg 要求章节 id 唯一）。
                 (*chapter_ptr).id = chapter.id.unwrap_or(i as i64);
@@ -1290,6 +1294,10 @@ impl<R: Reader> Demuxer<R> {
             if c.is_null() {
                 continue;
             }
+            // SAFETY: `c` is a non-null `AVChapter` pointer taken from `input.chapters`
+            // (`nb` entries, so the slice above is in bounds). The chapters belong to
+            // the input context that `input` borrows, so they stay alive for the whole
+            // loop, and only their own fields are read.
             unsafe {
                 // SAFETY: `(*c).metadata` is valid for as long as `input` is borrowed.
                 let title = Metadata::from_raw_dict((*c).metadata)

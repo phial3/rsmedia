@@ -299,10 +299,11 @@ impl<T: ElementType> FrameData<T> {
                 let (rows, cols, components) = array.dim();
                 let mapped = f(0, self.flat_view(0)?)?;
                 let samples: Vec<U> = mapped.iter().cloned().collect();
+                // `context` 而不是把 ShapeError 拼进字符串：ndarray 的错误是
+                // `External` 源，拼成文本就再也下钻不到了。
                 Ok(FrameData::Packed(
-                    Array3::from_shape_vec((rows, cols, components), samples).map_err(|e| {
-                        RsmediaError::msg(format!("Failed to rebuild interleaved frame: {e}"))
-                    })?,
+                    Array3::from_shape_vec((rows, cols, components), samples)
+                        .context("Failed to rebuild the interleaved frame")?,
                 ))
             }
             Self::Planar(planes) => {
@@ -1756,7 +1757,7 @@ fn plane_from<S: ElementType, T: ElementType>(
     cols: usize,
 ) -> Result<Array2<T>> {
     Array2::from_shape_vec((rows, cols), cast_samples::<S, T>(samples)?)
-        .map_err(|e| RsmediaError::msg(format!("Failed to build frame plane: {e}")))
+        .context(format!("Failed to build a {rows}x{cols} frame plane"))
 }
 
 /// Casts flat samples from `S` to `T`, failing on a value the conversion cannot
@@ -1862,6 +1863,7 @@ fn write_side_data(frame: &mut AVFrame, entries: &[FrameSideData]) {
 mod tests {
     use super::*;
     use crate::colors::Color;
+    use std::error::Error as _;
     use std::time::Duration;
 
     const TEST_WIDTH: usize = 320;
@@ -2073,6 +2075,29 @@ mod tests {
         assert_eq!(mapped.num_planes(), 2);
         assert_eq!(mapped.as_planes().unwrap()[0][[1, 2]], 2);
 
+        // 反向：闭包交回形状不符的数组时必须报错，**且 ndarray 的源错误要能下钻**
+        // ——这正是 `context` 相对 `msg(format!("... {e}"))` 的全部价值：错误分类
+        // 仍是 `External`，`source()` 还能拿到 `ShapeError`；拼成字符串就丢了。
+        let packed = FrameData::from(Array3::<u8>::from_elem((2, 3, 3), 4));
+        let err = packed
+            .map_planes(|_, plane| Ok(Array2::from_elem((1, 1), plane[[0, 0]])))
+            .expect_err("a plane of the wrong shape must be rejected");
+        assert!(
+            matches!(err.root(), RsmediaError::External(_)),
+            "the ndarray cause must stay typed, not flattened into a string: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("Failed to rebuild the interleaved frame"),
+            "the context must say what failed: {err}"
+        );
+        assert!(
+            err.root()
+                .source()
+                .and_then(|cause| cause.downcast_ref::<ndarray::ShapeError>())
+                .is_some(),
+            "the original ShapeError must remain reachable through source(): {err:?}"
+        );
         Ok(())
     }
 

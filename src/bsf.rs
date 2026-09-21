@@ -186,9 +186,8 @@ impl Bsf {
                     // push an empty packet downstream as if it were real data.
                     let ret = unsafe { ffi::av_packet_ref(owned.as_mut_ptr(), holder.as_ptr()) };
                     if ret < 0 {
-                        return Err(RsmediaError::msg(format!(
-                            "av_packet_ref failed while draining the bitstream filter: {ret}"
-                        )));
+                        return Err(RsmediaError::av_error(ret)
+                            .with_context("Failed to reference a bitstream-filter output packet"));
                     }
                     out.push(owned);
                 }
