@@ -860,6 +860,26 @@ pub mod video {
         Filter::new("nlmeans", MediaType::VIDEO, format!("nlmeans=s={strength}"))
     }
 
+    /// 智能模糊 / 磨皮（smartblur）
+    ///
+    /// 与整体模糊不同，smartblur 只平滑**平坦区域**、保留边缘，因此是证件照
+    /// "磨皮"的常用滤镜：`strength` 取小正值（如 `0.05~0.15`）即可抹平细纹
+    /// 而不糊掉五官轮廓。
+    ///
+    /// * `luma_strength` - 亮度平滑强度（-1~1）。**正值 = 平滑/磨皮**，
+    ///   负值 = 锐化；证件照建议 `0.05~0.2`。
+    /// * `luma_radius` - 平滑半径（0.1~5），越大越柔和，证件照建议 `3` 左右。
+    ///
+    /// 色度通道默认与亮度同参数（`chroma_mode=me`）；如需单独控制请用
+    /// [`Filter::new`] 逃生舱传完整 spec。
+    pub fn smartblur(luma_strength: f32, luma_radius: f32) -> Filter {
+        Filter::new(
+            "smartblur",
+            MediaType::VIDEO,
+            format!("smartblur=luma_radius={luma_radius}:luma_strength={luma_strength}"),
+        )
+    }
+
     /// Gamma 校正（画质增强）。
     /// `gamma` 为 gamma 值（通常 0.5-2.0，1.0 表示不变）。
     /// 伽马校正。
@@ -1064,6 +1084,57 @@ pub mod video {
             format!("fps={fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse{dither_part}"),
         )
         .with_input_format(PixelFormat::RGB24)
+    }
+
+    /// LUT 调色（lutyuv）：按亮度/色度查找表逐通道映射，证件照"美白"常用
+    /// 亮度表把中间调整体上提而不压高光。
+    ///
+    /// * `y` / `u` / `v` - 各通道的 LUT 表达式（FFmpeg eval 语法，如
+    ///   `"if(lt(val,100),val,val+20)"`），传 `None` 表示该通道不变。
+    ///   表达式中的逗号会被自动转义。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsmedia::filter::video;
+    /// // 亮度整体 +10（简单提亮美白），色度不动
+    /// let _f = video::lutyuv(Some("val+10"), None, None);
+    /// ```
+    pub fn lutyuv(y: Option<&str>, u: Option<&str>, v: Option<&str>) -> Filter {
+        let mut parts = Vec::new();
+        if let Some(y_expr) = y {
+            parts.push(format!("y={}", escape_filter_option(y_expr)));
+        }
+        if let Some(u) = u {
+            parts.push(format!("u={}", escape_filter_option(u)));
+        }
+        if let Some(v) = v {
+            parts.push(format!("v={}", escape_filter_option(v)));
+        }
+        let spec = if parts.is_empty() {
+            "lutyuv".to_string()
+        } else {
+            format!("lutyuv={}", parts.join(":"))
+        };
+        Filter::new("lutyuv", MediaType::VIDEO, spec)
+    }
+
+    /// 拼版（tile）：把多帧按 `cols x rows` 网格排成一张图，证件照"一张 6 寸
+    /// 相纸排 8 张一寸"即此滤镜。
+    ///
+    /// * `cols` / `rows` - 网格行列数（总格数 = cols*rows，输入帧数不足时
+    ///   最后一格用 `padding` 色填充）。
+    /// * `padding` - 格子间距像素（0~100）。
+    /// * `color` - 背景/填充颜色，如 `"white"`。
+    ///
+    /// 注意：tile 是**攒帧**滤镜——每 cols*rows 帧吐 1 帧，EOF 时输出残余格。
+    pub fn tile(cols: u32, rows: u32, padding: u32, color: &str) -> Filter {
+        let color = escape_filter_option(color);
+        Filter::new(
+            "tile",
+            MediaType::VIDEO,
+            format!("tile={cols}x{rows}:padding={padding}:color={color}"),
+        )
     }
 }
 

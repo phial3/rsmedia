@@ -152,3 +152,8 @@ test = false
 name = "auto_pts"
 path = "examples/auto_pts.rs"
 test = false
+
+[[example]]
+name = "id_photo"
+path = "examples/id_photo.rs"
+test = false
