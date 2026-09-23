@@ -573,8 +573,11 @@ impl<W: Writer> Muxer<W> {
     /// output stream index of the cover stream.
     pub fn add_cover_art_with(&mut self, encoder: Encoder, cover_frame: AVFrame) -> Result<usize> {
         if self.have_written_header {
+            // 调用顺序问题（封面必须在首个 mux() 之前加入），不是"本构建不支持"：
+            // 措辞上不要用 unsupported，否则与 `RsmediaError::Unsupported` 撞概念。
             return Err(RsmediaError::invalid_config(
-                "add_cover_art after header write is not supported",
+                "add_cover_art cannot be called after the header has been written: \
+                 add the cover stream before the first mux()/mux_packet()",
             ));
         }
         let stream_idx = self.add_encoder(encoder)?;
@@ -1152,9 +1155,9 @@ impl<R: Reader> Demuxer<R> {
         let media_type = stream_info.media_type;
         let device_type = device_config.as_ref().map(|c| c.device_type);
         let Some(codec_name) = stream_info.find_decoder_name(device_type) else {
-            // 本构建里这个 codec_id 没有可用解码器：同样是"配置/使用者期望在本次
-            // 构建上无法满足"，与编码器名不存在归一处（换输入或换构建即可）。
-            return Err(RsmediaError::invalid_config(format!(
+            // 本构建里这个 codec_id 没有可用解码器 ⇒ `Unsupported`：调用方改不了
+            // 自己的调用（换输入或换构建才行）。
+            return Err(RsmediaError::unsupported(format!(
                 "decoder for codec_id {:#x} (stream {}) is not available in this FFmpeg build",
                 stream_info.codec_id, stream_info.index
             )));

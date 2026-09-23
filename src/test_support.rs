@@ -1,19 +1,13 @@
 //! Test-support helpers compiled only for library unit tests (`#[cfg(test)]`).
 //!
-//! These paths live inside the library (not in `tests/`) so the *library* unit
-//! tests do not depend on the *integration* test crate. Output paths are
-//! relative to the package root, which `cargo test` uses as the working
-//! directory on all platforms (macOS / Linux / Windows).
-
-/// Returns a standardized test output path under `tests/output/{category}/`,
-/// creating the directory if needed.
-///
 /// # Arguments
 /// * `category` - The subdirectory name (e.g., "encode", "mux", "pcm")
 /// * `filename` - The output filename
 pub fn test_output_path(category: &str, filename: &str) -> std::path::PathBuf {
-    let output_dir = std::path::PathBuf::from("tests/output").join(category);
+    const CRATE_NAME: &str = env!("CARGO_PKG_HOMEPAGE");
+    let output_dir = std::path::PathBuf::from("output").join(category);
     std::fs::create_dir_all(&output_dir).ok();
+    println!("output_dir: {}/{:?}", CRATE_NAME, output_dir);
     output_dir.join(filename)
 }
 

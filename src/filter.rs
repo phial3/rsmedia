@@ -1731,7 +1731,7 @@ fn invalid_label(label: &str) -> RsmediaError {
 fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
     let filter = get_by_name(name)?;
     if filter.is_none() {
-        return Err(RsmediaError::invalid_config(format!(
+        return Err(RsmediaError::unsupported(format!(
             "filter '{name}' is not available in this FFmpeg build"
         )));
     }
@@ -1755,7 +1755,7 @@ fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
 fn filter_output_pads(name: &str) -> Result<(usize, bool)> {
     let filter = get_by_name(name)?;
     if filter.is_none() {
-        return Err(RsmediaError::invalid_config(format!(
+        return Err(RsmediaError::unsupported(format!(
             "filter '{name}' is not available in this FFmpeg build"
         )));
     }
@@ -1981,11 +1981,11 @@ impl FilterGraph {
     /// 校验单个滤镜：是否存在于本次构建、媒体类型是否与图一致。
     fn check_filter(filter: &Filter, media_type: MediaType) -> Result<()> {
         // 名字必须是本 FFmpeg 构建里真实存在的滤镜：缺失时在此前置报错，
-        // 而不是等到 parse 阶段返回一句难以定位的字符串错误。名字来自调用方配置，
-        // 缺失意味着"这个构建没编入它"（如 `drawtext` 需要 libfreetype、
-        // `subtitles` 需要 libass）⇒ 报 `InvalidConfig`。
+        // 而不是等到 parse 阶段返回一句难以定位的字符串错误。"这个构建没编入它"
+        // （如 `drawtext` 需要 libfreetype、`subtitles` 需要 libass）是**本构建
+        // 缺能力**而不是调用方配置错 ⇒ `Unsupported`，调用方据此跳过或降级。
         if get_by_name(filter.name())?.is_none() {
-            return Err(RsmediaError::invalid_config(format!(
+            return Err(RsmediaError::unsupported(format!(
                 "filter '{}' is not available in this FFmpeg build",
                 filter.name()
             )));
@@ -2024,7 +2024,9 @@ impl FilterGraph {
             endpoint.pixel_aspect.den,
         ))?;
 
-        let buffersrc = get_by_name("buffer")?.context("Failed to get video filter 'buffer'.")?;
+        let buffersrc = get_by_name("buffer")?.ok_or_else(|| {
+            RsmediaError::unsupported("filter 'buffer' is not available in this FFmpeg build")
+        })?;
         self.graph
             .create_filter_context(&buffersrc, name, Some(&args))
             .context("Failed to create video buffer source")
@@ -2038,8 +2040,9 @@ impl FilterGraph {
         name: &CStr,
         format: PixelFormat,
     ) -> Result<AVFilterContextMut<'_>> {
-        let buffersink =
-            get_by_name("buffersink")?.context("Failed to get video filter 'buffersink'.")?;
+        let buffersink = get_by_name("buffersink")?.ok_or_else(|| {
+            RsmediaError::unsupported("filter 'buffersink' is not available in this FFmpeg build")
+        })?;
 
         let mut sink_ctx = self
             .graph
@@ -2088,8 +2091,9 @@ impl FilterGraph {
             channel_desc,
         ))?;
 
-        let buffersrc =
-            get_by_name("abuffer")?.context("Failed to get audio filter buffer 'abuffer'.")?;
+        let buffersrc = get_by_name("abuffer")?.ok_or_else(|| {
+            RsmediaError::unsupported("filter 'abuffer' is not available in this FFmpeg build")
+        })?;
         self.graph
             .create_filter_context(&buffersrc, name, Some(&args))
             .context("Failed to create audio buffer source")
@@ -2104,8 +2108,9 @@ impl FilterGraph {
         name: &CStr,
         endpoint: &AudioEndpoint,
     ) -> Result<AVFilterContextMut<'_>> {
-        let buffersink = get_by_name("abuffersink")?
-            .context("Failed to get audio filter buffer 'abuffersink'.")?;
+        let buffersink = get_by_name("abuffersink")?.ok_or_else(|| {
+            RsmediaError::unsupported("filter 'abuffersink' is not available in this FFmpeg build")
+        })?;
 
         let mut sink_ctx = self
             .graph
@@ -4132,10 +4137,11 @@ mod tests {
         Ok(())
     }
 
-    /// 缺失的滤镜名报 [`RsmediaError::InvalidConfig`]（名字是调用方给的配置，
-    /// 本构建没编入它 ⇒ 换一个滤镜名即可），且加了 context 之后仍能按变体识别。
+    /// 缺失的滤镜名报 [`RsmediaError::Unsupported`]（本构建没编入它，如
+    /// `drawtext` 需要 libfreetype ⇒ 调用方只能换构建或换滤镜，跳过/降级即可），
+    /// 且加了 context 之后仍能按变体识别。
     #[test]
-    fn test_missing_filter_reports_invalid_config() -> Result<()> {
+    fn test_missing_filter_reports_unsupported() -> Result<()> {
         let params = FilterParams::Video(VideoParams {
             width: 8,
             height: 4,
@@ -4153,9 +4159,10 @@ mod tests {
 
         let err = FilterGraph::build(&params, &filters).unwrap_err();
         assert!(
-            err.is_invalid_config(),
-            "a filter this build does not have must be invalid configuration: {err}"
+            err.is_unsupported(),
+            "a filter this build does not have is a capability gap: {err}"
         );
+        assert!(!err.is_invalid_config(), "{err}");
         assert!(
             err.to_string().contains("rsmedia_no_such_filter"),
             "the message must name the missing filter: {err}"

@@ -31,8 +31,8 @@ fn picture_types(
     let path = test_output_path("encoder_options", file);
 
     // 编码器存在性取决于 FFmpeg 编译配置：先探测可用性（`Ok(None)` = 跳过），
-    // 而不是拿库的错误变体当"跳过"标记——"名字在本构建不存在"已归入
-    // `InvalidConfig`，与真正的配置错误无法区分。
+    // 而不是拿库的错误变体当"跳过"标记——`Unsupported` 覆盖的不止"缺这个编码器"
+    // （还有无可用设备、未建模格式等），拿它当跳过标记会把真正的问题一起吞掉。
     if AVCodec::find_encoder_by_name(c"libx264").is_none() {
         println!("SKIP: libx264 is not available in this build");
         return Ok(None);

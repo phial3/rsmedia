@@ -258,8 +258,8 @@ mod video {
 
         let codec_name = spec.codec.unwrap_or("libx264");
         // 编码器存在性取决于 FFmpeg 构建配置（如 libtheora/libx265），缺失时跳过：
-        // 先探测可用性，而不是拿库的错误变体当"跳过"标记（名字不存在已归入
-        // InvalidConfig，无法与真正的配置错误区分）。
+        // 先探测可用性，而不是拿库的错误变体当"跳过"标记（`Unsupported` 还包括
+        // 无可用设备、未建模格式等，拿它当跳过标记会吞掉真正的问题）。
         if AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?).is_none() {
             return Ok(false);
         }

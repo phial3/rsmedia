@@ -87,8 +87,8 @@ impl Bsf {
     ) -> Result<Self> {
         let name_c = CString::new(name).context(format!("bsf name {name:?}"))?;
         let filter = AVBitStreamFilter::find_by_name(&name_c).ok_or_else(|| {
-            RsmediaError::invalid_config(format!(
-                "bitstream filter '{name}' not found in this FFmpeg build"
+            RsmediaError::unsupported(format!(
+                "bitstream filter '{name}' is not available in this FFmpeg build"
             ))
         })?;
         let mut ctx = AVBSFContextUninit::new(&filter);
@@ -282,7 +282,9 @@ mod tests {
         assert!(list.contains(&"aac_adtstoasc".to_string()), "{list:?}");
     }
 
-    /// 不存在的 filter 名报 invalid_config，而不是 panic。
+    /// 不存在的 filter 名报 `Unsupported`（本构建没编入它 ⇒ 调用方改自己的
+    /// 调用改不动，只能换构建或换一个 filter 名），而不是 panic、也不是
+    /// `InvalidConfig`。
     #[test]
     fn test_bsf_unknown_name_rejected() {
         let codecpar = AVCodecParameters::new();
@@ -292,6 +294,8 @@ mod tests {
             ffi::AVRational { num: 1, den: 30 },
         )
         .expect_err("unknown filter must be rejected");
-        assert!(err.is_invalid_config(), "{err}");
+        assert!(err.is_unsupported(), "{err}");
+        assert!(!err.is_invalid_config(), "{err}");
+        assert!(err.to_string().contains("no_such_bsf"), "{err}");
     }
 }

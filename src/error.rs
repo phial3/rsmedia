@@ -40,24 +40,25 @@ pub enum RsmediaError {
     Io(#[from] std::io::Error),
 
     /// The requested operation cannot be carried out here — because of this build
-    /// (a codec without the necessary capability), this platform (no usable
-    /// hardware device), or data this crate does not handle (a decoded frame in an
-    /// unmodelled pixel/sample format).
+    /// (a codec, filter or bitstream filter it was not compiled with), this
+    /// platform (no usable hardware device), or data this crate does not handle
+    /// (a decoded frame in an unmodelled pixel/sample format).
     ///
     /// Distinguishing this from [`RsmediaError::InvalidConfig`] matters: an
     /// unsupported request is not the caller's mistake, so it can be handled by
-    /// skipping or degrading gracefully (see [`Self::is_unsupported`]).
+    /// skipping or degrading gracefully (see [`Self::is_unsupported`]) — a missing
+    /// encoder is exactly the case a test matrix wants to skip, not to fail on.
+    /// Build these with [`Self::unsupported`], which documents the shared wording.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
 
     /// Invalid or contradictory configuration, or an API used in the wrong order
     /// (writing after the trailer, adding a stream after the header was written,
-    /// two sources for the same setting, …). Always a caller-side mistake.
+    /// two sources for the same setting, …). Always a caller-side mistake: the
+    /// call itself has to change.
     ///
-    /// A requested codec/filter **name** this FFmpeg build does not provide lands
-    /// here too (e.g. `libx264` missing from a distro build, `drawtext` without
-    /// libfreetype): the name is part of the caller's configuration, so the fix is
-    /// on their side — pick another name, or use a build that has it.
+    /// A requested codec/filter name this FFmpeg build was **not compiled with**
+    /// is *not* this variant — see [`RsmediaError::Unsupported`].
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
@@ -132,7 +133,25 @@ impl RsmediaError {
         RsmediaError::FFmpeg(RsmpegError::AVError(code))
     }
 
-    /// Build an [`RsmediaError::Unsupported`].
+    /// Build an [`RsmediaError::Unsupported`] — the operation cannot be carried
+    /// out *here* (this build, this platform, or data this crate does not model),
+    /// unlike [`RsmediaError::invalid_config`], where the call itself has to change.
+    /// ```
+    /// use rsmedia::RsmediaError;
+    ///
+    /// let err = RsmediaError::unsupported(format!(
+    ///     "encoder 'libwebp' is not available in this FFmpeg build"
+    /// ));
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "unsupported operation: encoder 'libwebp' is not available in this FFmpeg build"
+    /// );
+    /// assert!(err.is_unsupported());
+    /// ```
+    ///
+    /// The caller cannot make `find_encoder_by_name("libwebp")` succeed by
+    /// rearranging their own call; only a different build (or a different codec)
+    /// can, which is what [`Self::is_unsupported`] lets them react to.
     pub fn unsupported(reason: impl Into<String>) -> Self {
         RsmediaError::Unsupported(reason.into())
     }
@@ -155,7 +174,8 @@ impl RsmediaError {
 
     /// Whether the root cause is an unsupported request — this build, platform or
     /// the input data cannot do what was asked ([`RsmediaError::Unsupported`]),
-    /// e.g. no usable hardware device, or a decoded frame in an unmodelled format.
+    /// e.g. an encoder this FFmpeg build was not compiled with, no usable hardware
+    /// device, or a decoded frame in an unmodelled format.
     /// Use this to skip or degrade gracefully instead of matching error strings.
     pub fn is_unsupported(&self) -> bool {
         matches!(self.root(), RsmediaError::Unsupported(_))
@@ -308,11 +328,6 @@ mod tests {
         assert_eq!(wrapped.to_string(), "outermost: outer: inner failure");
     }
 
-    /// 每个 `is_*` 谓词都要认出自己的变体，且**穿透 context 链**识别根因——
-    /// 新增变体时这张表会跟着漏掉，所以逐条对着变体列出来。
-    ///
-    /// 表内只列**有谓词**的变体；其余变体（`Other` / `External` / `Io`）没有谓词，
-    /// 需要时直接 `matches!(err.root(), ...)`。
     #[test]
     fn test_is_predicates_track_their_variants() {
         for (error, test) in [

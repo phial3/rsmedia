@@ -225,16 +225,16 @@ mod tests {
 
     #[test]
     fn avio_writing_test() {
-        std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
-        transcoding(c"assets/mp4.mp4", c"tests/output/avio_writing/mp4.mp4").unwrap();
+        std::fs::create_dir_all("output/avio_writing/").unwrap();
+        transcoding(c"assets/mp4.mp4", c"output/avio_writing/mp4.mp4").unwrap();
     }
 
     #[test]
     fn avio_clip_video_test() {
-        std::fs::create_dir_all("tests/output/avio_writing/").unwrap();
+        std::fs::create_dir_all("output/avio_writing/").unwrap();
         clip_video(
             c"assets/mp4.mp4",
-            c"tests/output/avio_writing/clip_video.mp4",
+            c"output/avio_writing/clip_video.mp4",
             0.0,
             1.0,
         )

@@ -1,15 +1,7 @@
 // Shared helpers for *integration* tests (`tests/*.rs`). This module is
 // intentionally independent of the library crate (`src/`): integration tests
 // `mod common;` and use `common::test_output_path(...)` / the frame generators.
-//
-// Note: library unit tests (`src/`) keep their own `test_support` module and do
-// not include this file, so there is no dependency between the two test suites.
 
-/// A per-test-crate temporary output root, created lazily and kept alive for the
-/// lifetime of the test binary. Using `tempfile` instead of a fixed `tests/output`
-/// directory isolates each integration-test crate (they run in separate processes,
-/// possibly in parallel) and guarantees the files are cleaned up on exit, so no
-/// crate can observe or clobber another crate's outputs.
 static OUTPUT_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
 
 fn output_root() -> &'static tempfile::TempDir {

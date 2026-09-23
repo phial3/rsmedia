@@ -698,6 +698,7 @@ impl EncoderBuilder {
                 )));
             }
         }
+
         let codec_name: String = match &self.codec_name {
             Some(codec_name) => codec_name.clone(),
             None => match media_type {
@@ -711,12 +712,10 @@ impl EncoderBuilder {
                 }
             },
         };
-        // `find_encoder_by_name` 不区分"名字拼错"与"该 FFmpeg 构建未编译此编码器"，
-        // 两者都是调用方给的**配置**在这台构建上没法满足 ⇒ `InvalidConfig`，
-        // 调用方换一个名字或换一个构建即可。
+
         let codec = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(&codec_name)?)
             .ok_or_else(|| {
-                RsmediaError::invalid_config(format!(
+                RsmediaError::unsupported(format!(
                     "encoder '{codec_name}' is not available in this FFmpeg build"
                 ))
             })?;
@@ -1905,8 +1904,7 @@ mod tests {
 
     /// 本构建是否提供默认视频编码器（`EncoderBuilder::VIDEO_CODEC_NAME`）。
     ///
-    /// 环境差异（构建未编入 libx264）应当跳过而不是失败，所以要**先探测可用性**：
-    /// 分类合并后"名字在本构建不存在"也是 `InvalidConfig`，无法与真正的配置错误区分。
+    /// 环境差异（构建未编入 libx264）应当跳过而不是失败，所以要**先探测可用性**
     fn default_video_encoder_available() -> bool {
         let name = std::ffi::CString::new(EncoderBuilder::VIDEO_CODEC_NAME)
             .expect("codec name is a NUL-free literal");
@@ -1983,10 +1981,8 @@ mod tests {
         Ok(())
     }
 
-    /// 编码器名在此 FFmpeg 构建中不存在时返回 `InvalidConfig`（而不是含糊的
-    /// `Other`）：名字来自调用方配置，换一个即可，且带 context 后仍能按变体识别。
     #[test]
-    fn test_missing_encoder_reports_invalid_config() {
+    fn test_missing_encoder_reports_unsupported() {
         let Err(err) = EncoderBuilder::new_video(64, 64)
             .with_codec_name("no_such_encoder".to_string())
             .build()
@@ -1994,9 +1990,10 @@ mod tests {
             panic!("unknown codec name must fail");
         };
         assert!(
-            err.is_invalid_config(),
-            "expected invalid configuration, got {err:?}"
+            err.is_unsupported(),
+            "expected an unsupported build capability, got {err:?}"
         );
+        assert!(!err.is_invalid_config(), "{err}");
         assert!(err.to_string().contains("no_such_encoder"), "{err}");
     }
 

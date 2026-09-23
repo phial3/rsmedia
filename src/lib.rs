@@ -22,6 +22,7 @@ pub mod pixel;
 pub mod resample;
 pub mod resize;
 pub mod scale;
+pub mod state;
 pub mod stream;
 pub mod strutils;
 pub mod subtitle;
@@ -52,11 +53,7 @@ pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
 pub use time::Time;
 
-pub(crate) mod state;
 pub(crate) const MAX_DRAIN_ITERATIONS: usize = 1_000;
-
-#[cfg(feature = "image")]
-pub use imgutils::thumbnail;
 
 /// re-exported under the name `ffmpeg`
 pub use rsmpeg as ffmpeg;

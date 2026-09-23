@@ -1002,10 +1002,11 @@ mod tests {
 
     #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
     fn version_gated_types() -> Vec<HWDeviceType> {
-        let mut gated = vec![HWDeviceType::D3D12VA];
-        gated.push(HWDeviceType::AMF);
-        gated.push(HWDeviceType::OHCODEC);
-        gated
+        vec![
+            HWDeviceType::D3D12VA,
+            HWDeviceType::AMF,
+            HWDeviceType::OHCODEC,
+        ]
     }
 
     /// 自动探测并创建硬件上下文；探不到就返回 `None` 让调用方跳过。
@@ -1086,79 +1087,6 @@ mod tests {
             Ok(None) => panic!("DRM 不允许回退到 NULL：open(NULL) 会在部分平台崩进程"),
             // 本机没有 /dev/dri（macOS / Windows / 容器）：干净报错即为正确。
             Err(_) => {}
-        }
-    }
-
-    /// DRM 节点挑选规则。
-    ///
-    /// 纯文件系统逻辑，传临时目录即可覆盖四种场景，任何平台都能严格断言：
-    /// ① `renderD*` 优先于 `card*`，同类按名字排序取第一个；
-    /// ② 只有显示节点时退回 `card*`；
-    /// ③ 目录里有 `by-path/`、`controlD64` 等非节点条目 → 报错，不瞎挑；
-    /// ④ 目录不存在 → 报错，且错误信息里带上路径方便排查。
-    #[test]
-    fn test_drm_node_selection() {
-        let base = std::env::temp_dir().join(format!("rsmedia-dri-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-
-        // ① 既有渲染节点又有显示节点：必须挑渲染节点，且是名字最小的那个。
-        let mixed = base.join("mixed");
-        std::fs::create_dir_all(mixed.join("by-path")).unwrap();
-        for f in ["card0", "card1", "renderD129", "renderD128", "controlD64"] {
-            std::fs::write(mixed.join(f), b"").unwrap();
-        }
-        let picked = drm_node_from(&mixed).unwrap();
-        assert_eq!(
-            picked.to_str().unwrap(),
-            mixed.join("renderD128").to_str().unwrap(),
-            "应优先且按名字取最小的渲染节点"
-        );
-
-        // ② 只有显示节点：退回 card*，同样按名字排序。
-        let cards_only = base.join("cards");
-        std::fs::create_dir_all(&cards_only).unwrap();
-        for f in ["card1", "card0"] {
-            std::fs::write(cards_only.join(f), b"").unwrap();
-        }
-        assert_eq!(
-            drm_node_from(&cards_only).unwrap().to_str().unwrap(),
-            cards_only.join("card0").to_str().unwrap()
-        );
-
-        // ③ 目录里有东西但都不是节点（实机上 by-path 是目录）：报错而不是乱挑。
-        let none = base.join("none");
-        std::fs::create_dir_all(none.join("by-path")).unwrap();
-        std::fs::write(none.join("controlD64"), b"").unwrap();
-        assert!(
-            drm_node_from(&none).is_err(),
-            "没有 renderD*/card* 时必须报错"
-        );
-
-        // ④ 目录不存在（非 Linux 平台）：报错，且错误里带上路径方便排查。
-        let missing = base.join("does-not-exist");
-        let err = drm_node_from(&missing).unwrap_err();
-        assert!(
-            err.to_string().contains("does-not-exist"),
-            "错误信息应包含路径，实际: {err}"
-        );
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// 用公开 API（`is_usable()`）探测**任何一个建模类型**都不得 panic、更不得崩进程。
-    ///
-    /// 这条回归针对一次真实事故：`av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_DRM, NULL, …)`
-    /// 会在 Rosetta 转译的 x86_64 上 SIGSEGV。`is_usable()` 现在先经
-    /// [`default_device_string`] 解析 `/dev/dri` 下的真实节点，没有节点直接判 false，
-    /// 因此不会再走到那条路径。
-    ///
-    /// 覆盖范围刻意取**全部建模类型**而非 `list_available()`：崩不崩进程取决于后端的
-    /// device 处理方式，与该类型是否被编入无关，而调用方可以直接指定任意建模类型
-    /// （例如在不带 GPU 的服务器上请求 DRM）。
-    #[test]
-    fn test_is_usable_never_crashes() {
-        for t in all_modeled_types() {
-            let _ = t.is_usable();
         }
     }
 

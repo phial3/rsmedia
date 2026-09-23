@@ -417,9 +417,7 @@ mod tests {
 
         // 3) Decode roundtrip: demux packets -> decode_subtitle -> rect payload
         let decoder = AVCodec::find_decoder(codec_id).ok_or_else(|| {
-            RsmediaError::invalid_config(
-                "the mov_text decoder is not available in this FFmpeg build",
-            )
+            RsmediaError::unsupported("decoder 'mov_text' is not available in this FFmpeg build")
         })?;
         let mut dctx = AVCodecContext::new(&decoder);
         dctx.open(None)?;
@@ -597,7 +595,7 @@ mod tests {
 
         // 3) Decode roundtrip: demux packets -> decode_subtitle -> rect payload
         let decoder = AVCodec::find_decoder(codec_id).ok_or_else(|| {
-            RsmediaError::invalid_config("the ass decoder is not available in this FFmpeg build")
+            RsmediaError::unsupported("decoder 'ass' is not available in this FFmpeg build")
         })?;
         let mut dctx = AVCodecContext::new(&decoder);
         dctx.open(None)?;
@@ -657,8 +655,8 @@ mod tests {
             Ok(_) => return Err(RsmediaError::msg("build should fail without header")),
         };
         // 默认字幕编码器 `subrip` 是 FFmpeg 内置的（不依赖外部库），理论上总在；
-        // 真缺席时跳过——先探测可用性，而不是靠错误变体判断（分类合并后它也是
-        // InvalidConfig，无法与"缺 header"区分）。
+        // 真缺席时跳过——先探测可用性，而不是靠错误变体判断（`Unsupported` 也包含
+        // 其它能力缺口，拿它当跳过标记会掩盖真正的问题）。
         use rsmpeg::avcodec::AVCodec;
         if AVCodec::find_encoder_by_name(c"subrip").is_none() {
             println!("SKIP: subrip is not in this FFmpeg build");

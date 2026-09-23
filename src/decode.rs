@@ -349,10 +349,6 @@ impl DecoderBuilder {
     }
 
     /// 校验像素格式能否以数据平面承载（非位流/调色板/硬件格式）。
-    ///
-    /// 报 `InvalidConfig`：格式是调用方通过 `with_pix_fmt` 显式指定的，与
-    /// 编码侧的约定一致（显式指定了本 crate 承载不了的格式 = 调用方的配置无效，
-    /// 而不是环境不支持）。
     fn ensure_pix_fmt_storable(fmt: PixelFormat) -> Result<()> {
         if !fmt.is_plane_storable() {
             return Err(RsmediaError::invalid_config(format!(
@@ -465,7 +461,11 @@ impl DecoderBuilder {
         // 看起来一模一样，实际解析到不同的变量。
         let codec_name = self.codec_name.as_deref().unwrap_or(&codec_name);
         let codec = AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name)?)
-            .context(format!("Failed to find decoder by name: '{codec_name}'"))?;
+            .ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "decoder '{codec_name}' is not available in this FFmpeg build"
+                ))
+            })?;
 
         let duration = Time::new(Some(input_stream.duration), input_stream.time_base);
         let nb_frames = input_stream.nb_frames;

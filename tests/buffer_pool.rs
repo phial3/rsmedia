@@ -51,8 +51,9 @@ fn make_source_frame(width: i32, height: i32, seed: u8) -> Result<AVFrame> {
 
 /// 本构建是否提供该编码器（FFmpeg 编译配置差异：缺失时跳过而不是失败）。
 ///
-/// 用**预先探测可用性**而不是拿库的错误变体当"跳过"标记：库已把"名字在本构建
-/// 不存在"并入 `InvalidConfig`，与真正的配置错误无法区分。
+/// 用**预先探测可用性**而不是拿库的错误变体当"跳过"标记：`Unsupported` 覆盖的
+/// 不止"缺这个编码器"（还有无可用设备、未建模格式等），拿它当跳过标记会把真正
+/// 的问题一起吞掉。
 fn encoder_available(name: &str) -> bool {
     std::ffi::CString::new(name)
         .ok()

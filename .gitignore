@@ -3,7 +3,6 @@
 /debug
 /target
 /output
-/tests/output
 /build
 **/*/target/
 

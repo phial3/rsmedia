@@ -623,9 +623,11 @@ pub fn get_pix_fmt_loss(
     // `dst_pix_fmt` 返回最大损失）"，负数来自 `get_pix_fmt_score` 的内部哨兵
     // （-1/-2 硬件格式、-3 深度查询失败、-4 描述符缺失），不是 `AVERROR(...)`——
     // 按返回码上报会渲染出 `AVERROR(-4): 'Interrupted system call'` 这种与事实
-    // 无关的文本（实测）。故按调用方入参问题上报，并点名两个格式。
+    // 无关的文本（实测）。负数意味着这对格式**没有可评分的描述**：那是本 crate
+    // 与 FFmpeg 的描述符都建模不了的能力缺口，调用方只能跳过该候选格式，因此报
+    // `Unsupported` 而不是 `InvalidConfig`（与 `frame.rs` 里"帧的格式未建模"同一分类）。
     if loss < 0 {
-        return Err(RsmediaError::invalid_config(format!(
+        return Err(RsmediaError::unsupported(format!(
             "cannot compute the loss of converting {src_pix_fmt:?} into {dst_pix_fmt:?} \
              (alpha: {has_alpha}): hardware or unmodelled formats have no scoreable \
              pixel-format description"
@@ -744,12 +746,13 @@ mod tests {
         // `av_get_pix_fmt_loss` 的返回值**不是错误码**（文档：损失标志组合），
         // 负数来自 `get_pix_fmt_score` 的内部哨兵；实测 FFmpeg 给 −4，
         // 而 `err2str` 会把它渲染成语义完全无关的 `AVERROR(-4): 'Interrupted
-        // system call'`。所以这里必须报 invalid_config，而不是 av_error。
+        // system call'`。所以这里必须报 `Unsupported`（能力缺口），而不是 av_error，
+        // 也不是 `InvalidConfig`：这对格式本来就无法评分，改调用也改不出描述符来。
         let loss = get_pix_fmt_loss(PixelFormat::YUV420P, PixelFormat::NONE, false)
             .expect_err("an unmodelled source format must fail");
         assert!(
-            loss.is_invalid_config(),
-            "an unscoreable pair is a caller-side argument problem: {loss:?}"
+            loss.is_unsupported(),
+            "an unscoreable pair is a capability gap, not a caller mistake: {loss:?}"
         );
         assert!(
             !loss.to_string().contains("Interrupted system call"),

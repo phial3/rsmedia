@@ -810,7 +810,7 @@ pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
 /// # Example
 ///
 /// ```rust,no_run
-/// # use rsmedia::thumbnail;
+/// # use rsmedia::imgutils::thumbnail;
 /// # use std::path::Path;
 /// let img = thumbnail(Path::new("assets/mp4.mp4"), None, (320, 240)).unwrap();
 /// println!("thumbnail: {}x{}", img.width(), img.height());

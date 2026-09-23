@@ -2143,17 +2143,40 @@ mod tests {
     }
 
     /// 单张图片读取：jpg 由 FFmpeg 自动探测（image2/mjpeg demuxer），应能
-    /// 解码出至少一帧且尺寸与源图一致。
+    /// 解码出**恰好一帧**，尺寸与非空白像素都对得上源图。
+    ///
+    /// 断言钉死真值（`assets/cat.jpg` 是 2000×1333）而不是只查 `> 0`：
+    /// 只查非零时，任何尺寸的错解码都能过，等于没断言。
     #[test]
     fn test_read_single_image() -> Result<()> {
         let demuxer = Demuxer::new("assets/cat.jpg")?;
         let decoded: Vec<_> = demuxer.filter_map(|res| res.ok()).collect();
-        assert!(
-            !decoded.is_empty(),
-            "expected at least one decoded frame from a single image"
+        assert_eq!(
+            decoded.len(),
+            1,
+            "a single image must decode to exactly one frame"
         );
+
         let (_, frame) = &decoded[0];
-        assert!(frame.width > 0 && frame.height > 0);
+        assert_eq!(
+            (frame.width, frame.height),
+            (2000, 1333),
+            "decoded geometry must match assets/cat.jpg"
+        );
+
+        // 布局无关：平面格式的第 0 个平面是亮度，packed 格式就是整块像素。
+        // `Demuxer` 给的是裸 `AVFrame`，第 0 个平面按"行宽 × 高度"取即可满足
+        // "非空白"这一个判据（不做逐像素语义断言）。
+        // SAFETY: `frame` 刚从解码器取出且未被 unref，`data[0]` 指向该平面
+        // `linesize[0] * height` 字节的有效缓冲，切片不越过这块缓冲。
+        let plane_len = frame.linesize[0] as usize * frame.height as usize;
+        let plane = unsafe { std::slice::from_raw_parts(frame.data[0], plane_len) };
+        let min = *plane.iter().min().expect("non-empty frame");
+        let max = *plane.iter().max().expect("non-empty frame");
+        assert!(
+            max - min > 32,
+            "the decoded image looks blank: {min}..{max}"
+        );
 
         Ok(())
     }

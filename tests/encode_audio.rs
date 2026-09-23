@@ -468,8 +468,9 @@ const COMMON_AUDIO_CONTAINERS: &[(&str, &str, i64)] = &[
 /// 返回 `Ok(false)` 表示本构建没有该编码器（如未编译 libmp3lame），调用方跳过该容器；
 /// 其余错误一律是真失败。
 fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64) -> Result<bool> {
-    // 编码器是否存在取决于 FFmpeg 编译配置，先探测再编码：不再借用库的错误变体
-    // 当"跳过"标记（"名字在本构建不存在"已归入 InvalidConfig，无法与真正的配置错误区分）。
+    // 编码器是否存在取决于 FFmpeg 编译配置，先探测再编码：不借用库的错误变体
+    // 当"跳过"标记（`Unsupported` 还包含无可用设备、未建模格式等其它能力缺口，
+    // 拿它当跳过标记会把真正的问题一起吞掉）。
     let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?) else {
         return Ok(false);
     };
