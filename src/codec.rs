@@ -13,13 +13,235 @@ use std::fmt;
 /// rsmpeg 的 `settable!` 字段表不含 `thread_count`，只能直接写字段；把这个
 /// unsafe 收敛在这里，`Encoder`/`Decoder` 都不再自己碰裸指针。
 pub(crate) fn set_thread_count(context: &mut AVCodecContext, thread_count: usize) {
+    // 超出 `i32` 可表示范围的输入没有合法语义（0 = 自动、负数无意义），此时回退到本机 CPU 数。
+    // 这里不引入"最大线程数"这类凭空写死的常量：线程数超过物理核心本就没有收益，可用核心数
+    // 是唯一有依据的取值。`num_cpus::get()` 返回本机核心数，必然落在 `i32`
+    // 范围内，`as i32` 不会截断。
+    let count = i32::try_from(thread_count).unwrap_or_else(|_| num_cpus::get() as i32);
     // SAFETY: `context` 由 `AVCodecContext::new` 分配、在借用期内一直有效；
-    // `thread_count` 是普通 `int` 字段，无别名与不变量要求。夹到 `i32` 范围内，
-    // 避免 `usize -> i32` 截断成负数（FFmpeg 里 0 = 自动，负数无意义）。
     unsafe {
-        (*context.as_mut_ptr()).thread_count = i32::try_from(thread_count).unwrap_or(i32::MAX);
+        (*context.as_mut_ptr()).thread_count = count;
     }
 }
+
+/// 设置 `AVCodecContext::thread_type`（多线程的并行方式，取值见 [`ThreadType`]）。
+///
+/// 与 [`set_thread_count`] 同因：`settable!` 字段表不含 `thread_type`。必须在
+/// `avcodec_open2` 之前写入才会生效（`avcodec_open2` 会按它选择线程实现）。
+/// `thread_type` 是 `FF_THREAD_*` 的位掩码（`FRAME | SLICE` 合法）。
+pub(crate) fn set_thread_type(context: &mut AVCodecContext, thread_type: i32) {
+    // SAFETY: 同 `set_thread_count`；`FF_THREAD_*` 各占一位，远在 `i32` 范围内。
+    unsafe {
+        (*context.as_mut_ptr()).thread_type = thread_type;
+    }
+}
+
+/// 设置 `AVCodecContext::flags2`（取值见 [`AVCodecFlag2`]）。
+///
+/// 与 [`set_thread_count`] 同因：`settable!` 只暴露了 `flags`，没有 `flags2`。
+/// 同样必须在 `avcodec_open2` 之前写入。`flags` 走 rsmpeg 的
+/// [`set_flags`](AVCodecContext::set_flags)，本函数只补它缺的那半边。
+pub(crate) fn set_flags2(context: &mut AVCodecContext, flags2: i32) {
+    // SAFETY: 同 `set_thread_count`；`AV_CODEC_FLAG2_*` 是 `int` 位集。
+    unsafe {
+        (*context.as_mut_ptr()).flags2 = flags2;
+    }
+}
+
+/// 生成 [`EncoderBuilder`](crate::encode::EncoderBuilder) 与
+/// [`DecoderBuilder`](crate::decode::DecoderBuilder) **共有**的那批 setter。
+///
+/// 两端共有的配置项（编解码器名与私有参数、滤镜、硬件加速及其帧池、线程与
+/// flags、缩放策略）在两个 builder 里**字段同名**，因此这份定义可以原样展开进
+/// 各自的 `impl` 块：公共选项的语义与文档只有这一处，改一次两端同时生效，也不会
+/// 出现"编码器加了 `with_flags2`、解码器忘了加"这类漂移。只属于一侧的选项
+/// （编码器的码率/画质/profile、解码器的输出格式/丢弃粒度等）留在各自文件里。
+///
+/// 新增公共选项的步骤：在这里加方法与文档 → 两个 builder 的结构体与 `Default`
+/// 各加一个同名字段 → 在各自的 `owned_option_keys()` 里决定是否需要独占该
+/// AVOption 键。
+macro_rules! impl_codec_builder_setters {
+    () => {
+        /// Set the codec name.
+        ///
+        /// 解码器：`None` = 按输入流自带的编解码器名（由容器决定）解码。
+        /// 编码器：`None` = 按媒体类型取默认编码器（`libx264` / `aac` / `subrip`）。
+        pub fn with_codec_name(mut self, codec_name: impl Into<Option<String>>) -> Self {
+            self.codec_name = codec_name.into();
+            self
+        }
+
+        /// Set the thread count.
+        ///
+        /// 未设置时取 `num_cpus::get()`；`with_options("threads", ..)` 与它互斥。
+        pub fn with_thread_count(mut self, thread_count: usize) -> Self {
+            self.thread_count = Some(thread_count);
+            self
+        }
+
+        /// Set `AVCodecContext.flags` (`AV_CODEC_FLAG_*`).
+        ///
+        /// 位集按 `impl Into<u32>` 给出（解码器的 `with_err_recognition` 也是这个形态）：
+        /// 单个标志（`AVCodecFlag::LOW_DELAY`）或 `|` 组合出的掩码
+        /// （`AVCodecFlag::CLOSED_GOP | AVCodecFlag::LOW_DELAY`）都能直接传——
+        /// `ffi_enum!` 的 `BitOr` 结果就是原始掩码，因为无字段枚举表示不了组合。
+        ///
+        /// 解码器未设置时取 `AVCodecFlag::LOW_DELAY`（rsmedia 的解码默认值）。
+        /// 编码器侧则是在上下文既有 flags 上按位合并：FFmpeg 的默认位（如
+        /// `CLOSED_GOP`）与 `with_global_header` 的 `GLOBAL_HEADER` 都保留，
+        /// 因此同时设置不构成配置冲突。
+        ///
+        /// # Example
+        ///
+        /// ```ignore
+        /// use rsmedia::codec::AVCodecFlag;
+        /// // Closed GOP + low latency, e.g. for a low-latency stream.
+        /// let builder = EncoderBuilder::new_video(640, 480)
+        ///     .with_flags(AVCodecFlag::CLOSED_GOP | AVCodecFlag::LOW_DELAY);
+        /// ```
+        pub fn with_flags(mut self, flags: impl Into<u32>) -> Self {
+            self.flags = Some(flags.into() as i32);
+            self
+        }
+
+        /// Set `AVCodecContext.flags2` (`AV_CODEC_FLAG2_*`).
+        ///
+        /// Same shape as [`Self::with_flags`]: a single flag or a `|` combination.
+        pub fn with_flags2(mut self, flags2: impl Into<u32>) -> Self {
+            self.flags2 = Some(flags2.into() as i32);
+            self
+        }
+
+        /// Set `AVCodecContext.thread_type` (`FF_THREAD_*`).
+        ///
+        /// Chooses the multithreading granularity: [`ThreadType::FRAME`](crate::ThreadType::FRAME)
+        /// (frame-level, best compression, more latency) or
+        /// [`ThreadType::SLICE`](crate::ThreadType::SLICE) (slice-level, lower
+        /// latency, needs codec support). Same shape as [`Self::with_flags`], so both
+        /// granularities can be requested: `ThreadType::FRAME | ThreadType::SLICE`.
+        /// Left unset, FFmpeg picks its default.
+        pub fn with_thread_type(mut self, thread_type: impl Into<u32>) -> Self {
+            self.thread_type = Some(thread_type.into() as i32);
+            self
+        }
+
+        /// Codec (private) options used for this stream.
+        ///
+        /// 只用于 builder 未建模的**编解码器私有参数**（编码器如 `preset`、`tune`、
+        /// `x264-params`；解码器如 `threads` 之外的各种解码开关）。builder 有
+        /// typed setter 的项若同时出现在这里，构建时报
+        /// [`RsmediaError::InvalidConfig`](crate::RsmediaError::InvalidConfig)：
+        /// 同一项有两个配置源时无法判断以谁为准，静默取其一正是要消除的陷阱。
+        ///
+        /// 公共项是 `threads`/`flags`/`flags2`/`thread_type`（对应
+        /// [`Self::with_thread_count`]/[`Self::with_flags`]/[`Self::with_flags2`]/
+        /// [`Self::with_thread_type`]）；编码器另有 `b`/`maxrate`/`bufsize`/`crf`/
+        /// `profile`/`level`/`g`/`bf`，解码器另有 `skip_frame`/`err_detect`。
+        pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+            self.codec_opts = options.into();
+            self
+        }
+
+        /// Set the filters applied to frames on their way to/from this codec.
+        ///
+        /// 解码器：作用于**解码后**的帧（缩放/叠加/去噪…），滤镜输出即
+        /// [`decode`](crate::Decoder::decode) 交付的帧。编码器：作用于**编码前**的帧。
+        pub fn with_filters(mut self, filters: impl Into<Option<Vec<Filter>>>) -> Self {
+            self.filters = filters.into();
+            self
+        }
+
+        /// Enable hardware acceleration with the specified device type.
+        ///
+        /// * `device_config` - Device to use for hardware acceleration.
+        pub fn with_hardware_device(mut self, device_config: Option<HWDeviceConfig>) -> Self {
+            self.hw_device_config = device_config;
+            self
+        }
+
+        /// 设置硬件帧池的预分配表面数（`AVHWFramesContext::initial_pool_size`）。
+        ///
+        /// 只在启用了硬件加速时有效。默认 `DEFAULT_HW_POOL_SIZE`（[`crate::hwaccel`]
+        /// 里的常量，20 张）对 1080p 是够用的启发值，但表面数是**预分配**的、直接
+        /// 决定显存占用：4K 一张 NV12 面约 12MB，20 张就是约 240MB。高分辨率、
+        /// 多路并发或显存紧张时按需调小；传 `0` 表示交给后端按需分配（FFmpeg 默认行为）。
+        ///
+        /// 解码器侧池子还要容纳 DPB（参考帧窗口），调到 1~2 张会限制参考帧复用、
+        /// 影响压缩效率，建议至少留够 `refs + 2`。
+        ///
+        /// ```no_run
+        /// # use rsmedia::encode::EncoderBuilder;
+        /// # use rsmedia::hwaccel::HWDeviceConfig;
+        /// # fn main() -> rsmedia::Result<()> {
+        /// let config = HWDeviceConfig::auto_platform()?;
+        /// let encoder = EncoderBuilder::new_video(3840, 2160)
+        ///     .with_hardware_device(Some(config))
+        ///     .with_hw_pool_size(4) // 4K 下只预占约 48MB 显存
+        ///     .build()?;
+        /// # drop(encoder);
+        /// # Ok(())
+        /// # }
+        /// ```
+        pub fn with_hw_pool_size(mut self, pool_size: u32) -> Self {
+            self.hw_pool_size = Some(pool_size);
+            self
+        }
+
+        /// Set the scaling algorithm used when converting frames to the target
+        /// pixel format (encoder: input frames -> the encoder's format; decoder:
+        /// decoded frames -> the output format, e.g. NV12 -> RGBA).
+        ///
+        /// The algorithm picks the scaling kernel and is **mutually exclusive** —
+        /// FFmpeg's header states *"Scaler selection options. Only one may be active
+        /// at a time."* Defaults to [`crate::scale::ScaleAlgorithm::BICUBIC`]; the
+        /// quality/behaviour bits are set separately with [`Self::with_scale_quality`].
+        pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
+            self.scale_algorithm = algorithm;
+            self
+        }
+
+        /// Set the scaling quality/behaviour bits used when converting frames to
+        /// the target pixel format.
+        ///
+        /// Unlike the algorithm (exactly one bit), the quality flags are a set, given as
+        /// `impl Into<u32>` like [`Self::with_flags`] — one bit
+        /// (`ScaleQuality::BITEXACT`), several combined with `|`
+        /// (`ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND`), or `0` for none.
+        /// Defaults to [`ScaleQuality::default_mask`].
+        pub fn with_scale_quality(mut self, quality: impl Into<u32>) -> Self {
+            self.scale_quality = quality.into();
+            self
+        }
+
+        /// Enable (`true`) or disable (`false`) pooled allocation of the scaler's
+        /// destination frames (see [`Scaler::with_buffer_pool`]).
+        ///
+        /// Off by default. With it on, frames this codec scales are allocated from an
+        /// internal `AVBufferPool` instead of being freshly allocated per frame, so a
+        /// steady stream of same-geometry conversions stops allocating after a couple
+        /// of frames; buffers are zero-filled before use, matching `alloc_buffer`.
+        pub fn with_scale_pool(mut self, enabled: bool) -> Self {
+            self.scale_pool = enabled;
+            self
+        }
+    };
+}
+pub(crate) use impl_codec_builder_setters;
+
+ffi_enum!(
+    /// 对应 FFmpeg `FF_THREAD_*`，即 `AVCodecContext.thread_type` 的位集。
+    ///
+    /// 选择多线程的并行粒度：`FRAME` 帧级并行（每个线程缓冲一帧，解码延迟增加
+    /// 一帧/线程）、`SLICE` 片级并行（延迟低，但需要编解码器支持切片）。两者
+    /// 可组合：`ThreadType::FRAME | ThreadType::SLICE`。
+    ///
+    /// 未显式设置时保持 FFmpeg 默认（`avcodec_open2` 自行选择），rsmedia 不干预。
+    #[allow(non_camel_case_types)]
+    ThreadType, u32 {
+        FRAME => ffi::FF_THREAD_FRAME;
+        SLICE => ffi::FF_THREAD_SLICE;
+    }
+);
 
 ffi_enum!(
     /// 对应 FFmpeg `AV_CODEC_FLAG_*`
@@ -408,20 +630,32 @@ impl FormatInfo {
     }
 
     fn new_info(
-        name: impl AsRef<CStr>,
-        long_name: impl AsRef<CStr>,
+        name: *const std::os::raw::c_char,
+        long_name: *const std::os::raw::c_char,
         extensions: *const std::os::raw::c_char,
     ) -> Self {
+        fn lossy(ptr: *const std::os::raw::c_char) -> String {
+            // SAFETY: 字段取自 FFmpeg 的**静态**格式表（`AVInputFormat` /
+            // `AVOutputFormat` 是静态对象，指针全程有效），非 NULL 时按约定
+            // 是 NUL 结尾字符串。
+            //
+            // 这里不能用 rsmpeg 的 `name()`/`long_name()`：它们直接
+            // `CStr::from_ptr`，而 `long_name` **允许为 NULL**——
+            // `NULL_IF_CONFIG_SMALL` 在 `CONFIG_SMALL` 构建下就是 NULL
+            // （实测本机构建的 `libcdio` 解复用器如此），解引用 NULL 是 UB
+            // （实测 SIGSEGV）。
+            if ptr.is_null() {
+                return String::new();
+            }
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        }
         Self {
-            name: name.as_ref().to_string_lossy().into_owned(),
-            long_name: long_name.as_ref().to_string_lossy().into_owned(),
+            name: lossy(name),
+            long_name: lossy(long_name),
             extensions: unsafe {
-                // SAFETY: `extensions` is the `extensions` field of an FFmpeg
-                // format descriptor taken from FFmpeg's **static** format table
-                // (`AVInputFormat` / `AVOutputFormat` are static objects that
-                // outlive the process), so the pointer stays valid; the field is
-                // either NULL or a NUL-terminated string, and the helper handles
-                // NULL without retaining the pointer.
+                // SAFETY: 同 `lossy`；helper 自己处理 NULL，也不保留指针。
                 strutils::c_char_to_str_list(extensions)
             },
         }
@@ -430,14 +664,14 @@ impl FormatInfo {
     /// All muxers (output container formats) in this FFmpeg build.
     pub fn muxers() -> Vec<Self> {
         rsmpeg::avformat::AVOutputFormat::iterate()
-            .map(|outfmt| Self::new_info(outfmt.name(), outfmt.long_name(), outfmt.extensions))
+            .map(|outfmt| Self::new_info(outfmt.name, outfmt.long_name, outfmt.extensions))
             .collect()
     }
 
     /// All demuxers (input container formats) in this FFmpeg build.
     pub fn demuxers() -> Vec<Self> {
         rsmpeg::avformat::AVInputFormat::iterate()
-            .map(|infmt| Self::new_info(infmt.name(), infmt.long_name(), infmt.extensions))
+            .map(|infmt| Self::new_info(infmt.name, infmt.long_name, infmt.extensions))
             .collect()
     }
 
@@ -627,6 +861,12 @@ mod tests {
 
     #[test]
     fn test_format_discovery() {
+        // 显式注册 libavdevice，让设备格式进入 `muxers()`/`demuxers()` 的迭代
+        // 范围：其中有 `long_name == NULL` 的项（`NULL_IF_CONFIG_SMALL` 在
+        // `CONFIG_SMALL` 构建下就是 NULL，实测本机构建的 `libcdio` 解复用器
+        // 如此）。不显式注册的话，这条判空路径要靠其它用例先调 `init()` 才会
+        // 被覆盖，且并行执行时表现为 SEGV 偶发——本用例把它变成确定性覆盖。
+        crate::init::init().expect("rsmedia init failed");
         let muxers = FormatInfo::muxers();
         let demuxers = FormatInfo::demuxers();
         assert!(!muxers.is_empty() && !demuxers.is_empty());

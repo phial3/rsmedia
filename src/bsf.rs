@@ -274,6 +274,55 @@ mod tests {
         Ok(())
     }
 
+    /// [`Muxer::add_copy_stream_with_bsf`] 是同一件事的一站式入口：调用方不持有
+    /// [`Bsf`]、不手工搬运 filter 的输出包，产物与上面的手工接线一致。
+    ///
+    /// 顺带覆盖两处只在库内路径上才会走到的逻辑：输出流 codecpar 取 `par_out()`、
+    /// `Muxer::finish` 自动冲刷 filter 里缓冲的尾部包。
+    #[test]
+    fn test_bsf_via_muxer_copy_stream() -> Result<()> {
+        let out = crate::test_support::test_output_path("bsf", "mp4_to_ts_via_muxer.ts");
+        crate::test_support::remove_test_output(&out);
+
+        let mut demuxer = Demuxer::new("assets/mp4.mp4")?;
+        let nb = demuxer.nb_streams();
+        let infos: Vec<_> = (0..nb).map(|i| demuxer.stream_info(i).unwrap()).collect();
+        let v_in = infos
+            .iter()
+            .position(|i| i.media_type == MediaType::VIDEO)
+            .expect("mp4 asset has a video stream");
+        let a_in = infos.iter().position(|i| i.media_type == MediaType::AUDIO);
+
+        let mut muxer = Muxer::new(&out)?;
+        let v_idx = muxer.add_copy_stream_with_bsf(&infos[v_in], "h264_mp4toannexb")?;
+        let a_idx = a_in.map(|i| muxer.add_copy_stream(&infos[i])).transpose()?;
+
+        let mut video_packets = 0usize;
+        while let Some((idx, mut pkt)) = demuxer.demux_packet()? {
+            if idx == v_in {
+                video_packets += 1;
+                muxer.mux_packet(&mut pkt, v_idx)?;
+            } else if Some(idx) == a_in {
+                muxer.mux_packet(&mut pkt, a_idx.expect("audio stream registered"))?;
+            }
+        }
+        muxer.finish()?;
+
+        // 读回 TS：视频流必须可解码（Annex B 的 SPS/PPS 内联是解码前提），
+        // 帧数与源视频包数一致。
+        let mut reader = StreamReader::new(&out)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        let mut frames = 0usize;
+        while decoder.decode_raw(&mut reader)?.is_some() {
+            frames += 1;
+        }
+        drop(reader);
+        assert_eq!(frames, video_packets, "TS 中解码出的帧数应与源视频包数一致");
+
+        crate::test_support::remove_test_output(&out);
+        Ok(())
+    }
+
     /// list() 应包含常用 filter。
     #[test]
     fn test_bsf_list_contains_common_filters() {

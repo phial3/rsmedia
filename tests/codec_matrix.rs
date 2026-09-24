@@ -243,7 +243,7 @@ fn matrix_video_mpeg4() -> anyhow::Result<()> {
 #[test]
 fn matrix_video_vp9() -> anyhow::Result<()> {
     let mut opts = Options::new();
-    opts.insert("cpu-used", "8").insert("row-mt", "1");
+    opts.set("cpu-used", "8").set("row-mt", "1");
     video_roundtrip(
         "vp9",
         "libvpx-vp9",

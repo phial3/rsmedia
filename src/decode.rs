@@ -1,4 +1,4 @@
-use crate::codec::AVCodecFlag;
+use crate::codec::{AVCodecFlag, impl_codec_builder_setters};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::fmt::FrameFormat;
@@ -59,7 +59,8 @@ ffi_enum!(
     /// [`EXPLODE`](Self::EXPLODE)，解码 API 会以 `Err` 报告而不是静默继续。
     ///
     /// 位可组合（`ErrRecognition::BUFFER | ErrRecognition::EXPLODE`，结果为原始
-    /// `i32` 掩码）；[`IGNORE_ERR`](Self::IGNORE_ERR) 与
+    /// `u32` 掩码，可直接传给 [`DecoderBuilder::with_err_recognition`]）；
+    /// [`IGNORE_ERR`](Self::IGNORE_ERR) 与
     /// [`EXPLODE`](Self::EXPLODE) 语义相反，FFmpeg 按位判断，同时置位时行为由
     /// FFmpeg 内部顺序决定，调用方不应同时给出。
     #[allow(non_camel_case_types)]
@@ -86,8 +87,13 @@ ffi_enum!(
 /// Builds a [`Decoder`].
 #[derive(Debug)]
 pub struct DecoderBuilder {
-    /// `None` = 未显式设置，构建时取 [`AVCodecFlag::LOW_DELAY`]。
-    flags: Option<AVCodecFlag>,
+    /// `None` = 未显式设置，构建时取 `AVCodecFlag::LOW_DELAY`。存的是合并好的
+    /// `AV_CODEC_FLAG_*` 掩码（`i32` 是 FFmpeg 的字段类型）。
+    flags: Option<i32>,
+    /// `AVCodecContext.flags2`（`AV_CODEC_FLAG2_*` 掩码）。`None` = FFmpeg 默认。
+    flags2: Option<i32>,
+    /// `AVCodecContext.thread_type`（`FF_THREAD_*` 掩码）。`None` = FFmpeg 默认。
+    thread_type: Option<i32>,
     /// `None` = 未显式设置，构建时取 [`num_cpus::get`]；`Some(n)` 表示调用方指定过
     /// —— 该"显式"信息被 [`Self::owned_option_keys`] 用来判定配置冲突。
     thread_count: Option<usize>,
@@ -96,10 +102,12 @@ pub struct DecoderBuilder {
     codec_opts: Option<Options>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
+    /// 硬件帧池的预分配表面数（`None` = [`crate::hwaccel::DEFAULT_HW_POOL_SIZE`]）。
+    hw_pool_size: Option<u32>,
     /// 缩放核选择（互斥，只取一个算法位）
     scale_algorithm: ScaleAlgorithm,
-    /// 缩放质量位（可多位，见 [`ScaleQuality`]）；构建 `Scaler` 时由 [`ScaleQuality::mask`] 合成为掩码
-    scale_quality: Vec<ScaleQuality>,
+    /// 缩放质量位掩码（可多位，见 [`ScaleQuality`]）。
+    scale_quality: u32,
     /// 是否用 `AVBufferPool` 池化缩放输出的帧缓冲（默认关闭）。
     scale_pool: bool,
     resize: Option<Resize>,
@@ -126,10 +134,13 @@ impl DecoderBuilder {
             codec_name: None,
             codec_opts: None,
             hw_device_config: None,
+            hw_pool_size: None,
             thread_count: None,
             flags: None,
+            flags2: None,
+            thread_type: None,
             scale_algorithm: ScaleAlgorithm::default(),
-            scale_quality: ScaleQuality::default_quality().to_vec(),
+            scale_quality: ScaleQuality::default_mask(),
             scale_pool: false,
             resize: None,
             pix_fmt: None,
@@ -139,90 +150,9 @@ impl DecoderBuilder {
         }
     }
 
-    /// Set decoding flags.
-    pub fn with_flags(mut self, flags: AVCodecFlag) -> Self {
-        self.flags = Some(flags);
-        self
-    }
-
-    /// Set the codec name to use for decoding.
-    /// If not set, the decoder will try to guess the codec based on the input.
-    pub fn with_codec_name(mut self, codec_name: impl Into<Option<String>>) -> Self {
-        self.codec_name = codec_name.into();
-        self
-    }
-
-    /// codec options to use for decoding.
-    ///
-    /// 只用于 builder 未建模的**编解码器私有参数**。builder 有 typed setter 的项
-    /// （`with_thread_count`、`with_flags`）若同时出现在这里，构建时报
-    /// [`RsmediaError::InvalidConfig`]：同一项有两个配置源时无法判断以谁为准。
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.codec_opts = options.into();
-        self
-    }
-
-    /// set the thread count.
-    ///
-    /// 与 `with_options("threads")` 互斥：两者同时指定会在构建时报错（同一项
-    /// 只能有一个配置源）。
-    pub fn with_thread_count(mut self, thread_count: usize) -> Self {
-        self.thread_count = Some(thread_count);
-        self
-    }
-
-    /// set the filters to apply to decoded frames.
-    pub fn with_filters(mut self, filters: impl Into<Option<Vec<Filter>>>) -> Self {
-        self.filters = filters.into();
-        self
-    }
-
-    /// Enable hardware acceleration with the specified device type.
-    ///
-    /// * `device_config` - Device to use for hardware acceleration.
-    pub fn with_hardware_device(mut self, device_config: Option<HWDeviceConfig>) -> Self {
-        self.hw_device_config = device_config;
-        self
-    }
-
-    /// Set the scaling algorithm used when converting decoded frames to the
-    /// output pixel format (and, with [`Self::with_resize`], to the output size).
-    ///
-    /// The algorithm picks the scaling kernel and is **mutually exclusive** —
-    /// FFmpeg's header states *"Scaler selection options. Only one may be active
-    /// at a time."* Defaults to [`ScaleAlgorithm::BICUBIC`]; use
-    /// [`ScaleAlgorithm::BILINEAR`] for output consistent with FFmpeg's command
-    /// line default, or [`ScaleAlgorithm::AREA`] when downscaling. The
-    /// quality/behaviour bits are set separately with [`Self::with_scale_quality`].
-    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
-        self.scale_algorithm = algorithm;
-        self
-    }
-
-    /// Set the scaling quality/behaviour bits used when converting decoded frames.
-    ///
-    /// Unlike the algorithm (exactly one bit), the quality flags are a set: pass the
-    /// bits themselves as a list — `[ScaleQuality::BITEXACT]`,
-    /// `[ScaleQuality::FULL_CHR_H_INT, ScaleQuality::ACCURATE_RND]`, … — and they are
-    /// combined into the mask handed to FFmpeg. Taking a list of [`ScaleQuality`]
-    /// values rather than a raw `u32` means an invalid flag cannot be passed.
-    /// Defaults to [`ScaleQuality::default_mask`].
-    pub fn with_scale_quality(mut self, quality: impl AsRef<[ScaleQuality]>) -> Self {
-        self.scale_quality = quality.as_ref().to_vec();
-        self
-    }
-
-    /// Enable (`true`) or disable (`false`) pooled allocation of the scaler's
-    /// destination frames (see [`Scaler::with_buffer_pool`]).
-    ///
-    /// Off by default. With it on, frames this decoder scales are allocated from an
-    /// internal `AVBufferPool` instead of being freshly allocated per frame, so a
-    /// steady stream of same-geometry conversions stops allocating after a couple
-    /// of frames; buffers are zero-filled before use, matching `alloc_buffer`.
-    pub fn with_scale_pool(mut self, enabled: bool) -> Self {
-        self.scale_pool = enabled;
-        self
-    }
+    // 与 EncoderBuilder 共有的那批 setter：定义与文档在 `codec.rs` 的宏里，
+    // 改一次两端同时生效（见 `impl_codec_builder_setters` 的说明）。
+    impl_codec_builder_setters!();
 
     /// Set the resize strategy applied to decoded video frames.
     ///
@@ -381,7 +311,13 @@ impl DecoderBuilder {
         }
 
         decoder.apply_codecpar(&input.codecpar())?;
-        decoder.set_flags(self.flags.unwrap_or(AVCodecFlag::LOW_DELAY) as i32);
+        decoder.set_flags(self.flags.unwrap_or(AVCodecFlag::LOW_DELAY.as_raw() as i32));
+        if let Some(flags2) = self.flags2 {
+            crate::codec::set_flags2(decoder, flags2);
+        }
+        if let Some(thread_type) = self.thread_type {
+            crate::codec::set_thread_type(decoder, thread_type);
+        }
         decoder.set_time_base(input.time_base);
         decoder.set_pkt_timebase(input.time_base);
         if let Some(framerate) = input.guess_framerate() {
@@ -412,11 +348,19 @@ impl DecoderBuilder {
     /// [`options::ensure_single_source`](crate::options)。
     fn owned_option_keys(&self) -> Vec<(&'static str, &'static str)> {
         let mut owned = Vec::new();
+        // 前四项是 `codec::impl_codec_builder_setters!` 生成的公共 setter 对应的键，
+        // 与编码器侧逐字相同；后面的键只属于解码器。
         if self.thread_count.is_some() {
             owned.push(("threads", "with_thread_count"));
         }
         if self.flags.is_some() {
             owned.push(("flags", "with_flags"));
+        }
+        if self.flags2.is_some() {
+            owned.push(("flags2", "with_flags2"));
+        }
+        if self.thread_type.is_some() {
+            owned.push(("thread_type", "with_thread_type"));
         }
         if self.skip_frame.is_some() {
             owned.push(("skip_frame", "with_skip_frame"));
@@ -523,7 +467,13 @@ impl DecoderBuilder {
                 HWContext::new(cfg)
                     .and_then(|ctx| {
                         // 注意：setup_decoder_frames 可能会改变 decode_ctx.pix_fmt
-                        ctx.setup_decoder_frames(&mut decode_ctx, init_width, init_height)?;
+                        ctx.setup_decoder_frames(
+                            &mut decode_ctx,
+                            init_width,
+                            init_height,
+                            self.hw_pool_size
+                                .unwrap_or(crate::hwaccel::DEFAULT_HW_POOL_SIZE),
+                        )?;
                         Ok(ctx)
                     })
                     .context("Hardware acceleration context initialization failed")
@@ -747,6 +697,39 @@ impl Decoder {
     #[inline(always)]
     pub fn height(&self) -> i32 {
         self.context.height
+    }
+
+    /// `AVCodecContext.flags` 掩码（`AV_CODEC_FLAG_*`，取值见 [`AVCodecFlag`]）。
+    ///
+    /// 读的是 `avcodec_open2` **之后**的实际值（未设置时即 rsmedia 的解码默认值
+    /// `LOW_DELAY`），编解码器自行调整过的位同样会反映出来。
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        self.context.flags as u32
+    }
+
+    /// `AVCodecContext.flags2` 掩码（`AV_CODEC_FLAG2_*`，取值见
+    /// [`AVCodecFlag2`](crate::codec::AVCodecFlag2)）。
+    #[inline]
+    pub fn flags2(&self) -> u32 {
+        self.context.flags2 as u32
+    }
+
+    /// `AVCodecContext.thread_type` 掩码（`FF_THREAD_*`，取值见
+    /// [`ThreadType`](crate::codec::ThreadType)）。
+    #[inline]
+    pub fn thread_type(&self) -> u32 {
+        self.context.thread_type as u32
+    }
+
+    /// `AVCodecContext.thread_count`（0 = 自动）。
+    ///
+    /// 读的是 `avcodec_open2` **之后**的实际值：帧级线程的编解码器会在
+    /// `thread_count == 0` 时把它改写成自动推导出的线程数（见 FFmpeg
+    /// `ff_frame_thread_init`），非 0 的调用方设置则原样保留。
+    #[inline]
+    pub fn thread_count(&self) -> i32 {
+        self.context.thread_count
     }
 
     /// The pixel format of the frames this decoder **yields**.
@@ -1308,9 +1291,9 @@ impl Decoder {
             // filter process
             match chain.graph.process_frame(Some(raw_frame))? {
                 Some(filtered_frame) => Ok(Some(filtered_frame)),
-                // `process_frame` 只在把图置为 `Drained`（还要更多输入）或
-                // `Flushed`（EOF）之后才返回 `None`，因此这里没有第三种情况：
-                // 返回 `None` 让外层循环继续驱动解码器，或就此收尾。
+                // `process_frame` 返回 `None` 有两种来源：图还需要更多输入（`EAGAIN`，状态
+                // 仍是 `Normal`——上一帧已被图吸收但还没攒够帧），或已经排空完毕
+                // （EOF）。两种都让外层循环继续驱动解码器，无需区分。
                 None => {
                     tracing::debug!(
                         "Filter graph produced no frame (drained: {}, flushed: {})",
@@ -1557,6 +1540,65 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// `with_flags`/`with_flags2`/`with_thread_type` 的 `impl Into<u32>` 参数落到
+    /// `AVCodecContext` 的对应字段（单个标志与 `|` 组合都原样保留），读数走
+    /// [`Decoder`] 的 getter（与外部调用方看到的一致）。
+    #[test]
+    fn test_builder_codec_flags_reach_decoder_context() -> Result<()> {
+        use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType};
+
+        let reader = StreamReader::new("assets/mp4.mp4")?;
+        let decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_flags(AVCodecFlag::OUTPUT_CORRUPT | AVCodecFlag::BITEXACT)
+            .with_flags2(AVCodecFlag2::FAST)
+            .with_thread_type(ThreadType::FRAME | ThreadType::SLICE)
+            .build_from_reader(&reader)?;
+
+        let want = AVCodecFlag::OUTPUT_CORRUPT.as_raw() | AVCodecFlag::BITEXACT.as_raw();
+        assert_eq!(
+            decoder.flags() & want,
+            want,
+            "combined flags must not be truncated to a single bit"
+        );
+        assert_eq!(decoder.flags2(), AVCodecFlag2::FAST.as_raw());
+        assert_eq!(
+            decoder.thread_type(),
+            ThreadType::FRAME.as_raw() | ThreadType::SLICE.as_raw()
+        );
+        assert_eq!(decoder.thread_count(), num_cpus::get() as i32);
+        Ok(())
+    }
+
+    /// 未设置 `with_flags` 时落到 rsmedia 的解码默认值 `LOW_DELAY`；显式设置
+    /// `thread_count` 时原样落入上下文（超出 `i32` 范围则回退到本机 CPU 数）。
+    #[test]
+    fn test_builder_codec_flags_default_and_thread_count() -> Result<()> {
+        use crate::codec::AVCodecFlag;
+
+        let reader = StreamReader::new("assets/mp4.mp4")?;
+        let default = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        assert_ne!(
+            default.flags() & AVCodecFlag::LOW_DELAY.as_raw(),
+            0,
+            "unset flags must fall back to the decoder default LOW_DELAY"
+        );
+
+        let explicit = DecoderBuilder::new(MediaType::VIDEO)
+            .with_thread_count(2)
+            .build_from_reader(&reader)?;
+        assert_eq!(explicit.thread_count(), 2);
+
+        let overflow = DecoderBuilder::new(MediaType::VIDEO)
+            .with_thread_count(usize::MAX)
+            .build_from_reader(&reader)?;
+        assert_eq!(
+            overflow.thread_count(),
+            default.thread_count(),
+            "an out-of-range thread_count must fall back to the CPU count"
+        );
         Ok(())
     }
 

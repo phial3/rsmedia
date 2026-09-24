@@ -1,3 +1,4 @@
+use crate::bsf::Bsf;
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
@@ -121,6 +122,9 @@ pub struct MuxerStream {
     /// 透传/remux 模式下源流的时间基，用于把 `mux_packet` 的 pts/dts
     /// 从源流时间基换算到输出流时间基。
     pub src_time_base: Option<ffi::AVRational>,
+    /// 透传流可选的 bitstream filter（见 [`Muxer::add_copy_stream_with_bsf`]）。
+    /// `None` = 原样搬运；有值时 `mux_packet` 与 `finish` 都先过它再写出。
+    pub bsf: Option<Bsf>,
 }
 
 impl MuxerStream {
@@ -133,11 +137,19 @@ impl MuxerStream {
             stream_info,
             stream_index,
             src_time_base: None,
+            bsf: None,
         }
     }
 
     /// 透传流：直接拷贝源的编解码参数，`src_time_base` 用于时间戳换算。
-    pub fn new_copy(stream_info: StreamInfo, src_time_base: ffi::AVRational) -> Self {
+    ///
+    /// `bsf` 是该流的可选 bitstream filter；构造输出流时其 codecpar 已按
+    /// `bsf.par_out()` 替换（见 [`Muxer::add_copy_stream_with_bsf`]）。
+    pub fn new_copy(
+        stream_info: StreamInfo,
+        src_time_base: ffi::AVRational,
+        bsf: Option<Bsf>,
+    ) -> Self {
         let media_type = stream_info.media_type;
         let stream_index = stream_info.index;
         Self {
@@ -146,13 +158,44 @@ impl MuxerStream {
             stream_info,
             stream_index,
             src_time_base: Some(src_time_base),
+            bsf,
         }
     }
 }
 
 impl Muxer<StreamWriter> {
     pub fn new(destination: impl Into<Location>) -> Result<Self> {
-        let writer = StreamWriter::new(destination)?;
+        Self::new_with_options(destination, None)
+    }
+
+    /// 打开输出并透传 **muxer 选项**（`movflags`、`frag_keyframe`、
+    /// `hls_time`、`rtsp_transport` 等）。
+    ///
+    /// 与 [`Muxer::new`] 的唯一差别是 options：这些是 muxer 私有选项，只在
+    /// `avformat_write_header` 被消费，构建期不传就再也没有机会设置（[`Muxer`]
+    /// 的 `set_metadata` / `set_interleaved` 等 setter 到不了这一层）。
+    ///
+    /// ```no_run
+    /// use rsmedia::mux::Muxer;
+    /// use rsmedia::options::Options;
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut opts = Options::new();
+    /// // MP4 落盘后把 moov 移到文件头，便于边下边播。
+    /// opts.set("movflags", "+faststart");
+    /// let mut muxer = Muxer::new_with_options("/tmp/out.mp4", opts)?;
+    /// # muxer.finish()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_with_options(
+        destination: impl Into<Location>,
+        options: impl Into<Option<Options>>,
+    ) -> Result<Self> {
+        let writer = crate::io::StreamWriterBuilder::new(destination)
+            .with_options(options)
+            .build()
+            .context("Failed to open output")?;
         Ok(Self::new_from_writer(writer))
     }
 
@@ -186,8 +229,8 @@ impl Muxer<StreamWriter> {
     ///
     /// # fn main() -> rsmedia::Result<()> {
     /// let mut opts = Options::new();
-    /// opts.insert("segment_time", "10");
-    /// opts.insert("reset_timestamps", "1");
+    /// opts.set("segment_time", "10");
+    /// opts.set("reset_timestamps", "1");
     /// let mut muxer = Muxer::new_segmented("/tmp/out_%03d.mp4", opts)?;
     ///
     /// let encoder = EncoderBuilder::new_video(640, 480).with_fps(25.0).build()?;
@@ -341,7 +384,61 @@ impl<W: Writer> Muxer<W> {
     ///
     /// 典型用法：`Demuxer::new_passthrough` 迭代的 packet（保留原流 index）
     /// 与 `Muxer::add_copy_stream` 输入的源流一一对应。
+    ///
+    /// 容器约定不一致的码流（MP4 的 avcC → TS 的 Annex B、TS 的 ADTS → MP4 的
+    /// raw AAC）必须先过 bitstream filter，见
+    /// [`Self::add_copy_stream_with_bsf`]。
     pub fn add_copy_stream(&mut self, src_info: &StreamInfo) -> Result<usize> {
+        self.add_copy_stream_inner(src_info, None)
+    }
+
+    /// 添加一个**带 bitstream filter 的透传流**。
+    ///
+    /// `bsf_name` 是 filter 名（如 `h264_mp4toannexb`、`hevc_mp4toannexb`、
+    /// `aac_adtstoasc`，完整列表见 [`Bsf::list`]）。与
+    /// [`Self::add_copy_stream`] 的差别只有一处，但正是 remux 最容易踩的坑：
+    ///
+    /// * 输出流的 codecpar 取 `bsf.par_out()`，而不是源流的 codecpar——例如
+    ///   avcC → Annex B 后 extradata 已被移除，照抄源 codecpar 会让目标容器头
+    ///   写错；
+    /// * [`Self::mux_packet`] 送入的包会先过 filter 再写出，[`Self::finish`]
+    ///   会自动冲刷 filter 里缓冲的尾部包。
+    ///
+    /// 因此调用方不需要自己持有 [`Bsf`]、也不需要手工把 `filter_packet` 的每个
+    /// 输出包再喂给 muxer（对比 [`bsf`](crate::bsf) 模块文档里的手工接线）。
+    ///
+    /// ```no_run
+    /// use rsmedia::mux::{Demuxer, Muxer};
+    /// use rsmedia::MediaType;
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut demuxer = Demuxer::new("in.mp4")?;
+    /// let mut muxer = Muxer::new("out.ts")?;
+    ///
+    /// // MP4（avcC）→ TS（Annex B）必须转换，否则 TS 里没有内联的 SPS/PPS。
+    /// let info = demuxer.stream_info(0)?;
+    /// let v_idx = muxer.add_copy_stream_with_bsf(&info, "h264_mp4toannexb")?;
+    ///
+    /// while let Some((_, mut pkt)) = demuxer.demux_packet()? {
+    ///     muxer.mux_packet(&mut pkt, v_idx)?;
+    /// }
+    /// muxer.finish()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn add_copy_stream_with_bsf(
+        &mut self,
+        src_info: &StreamInfo,
+        bsf_name: &str,
+    ) -> Result<usize> {
+        self.add_copy_stream_inner(src_info, Some(bsf_name))
+    }
+
+    fn add_copy_stream_inner(
+        &mut self,
+        src_info: &StreamInfo,
+        bsf_name: Option<&str>,
+    ) -> Result<usize> {
         // 与 `add_encoder` 同一守卫：header 写出后流数组已固定，再加流是未定义行为。
         if self.have_written_header {
             return Err(RsmediaError::invalid_config(
@@ -350,26 +447,34 @@ impl<W: Writer> Muxer<W> {
             ));
         }
         let src_time_base = src_info.time_base;
-        let stream_idx = self
-            .writer
-            .add_stream(src_info.codec_parameters.clone(), src_info.time_base)?;
+        // filter 必须在 `add_stream` 之前建好：输出流的 codecpar 要以
+        // `par_out()` 为准（见 `add_copy_stream_with_bsf`），而 par_out 只有在
+        // `init` 之后才有意义。
+        let (codecpar, bsf) = match bsf_name {
+            Some(name) => {
+                let bsf = Bsf::new(name, &src_info.codec_parameters, src_time_base)?;
+                (bsf.par_out(), Some(bsf))
+            }
+            None => (src_info.codec_parameters.clone(), None),
+        };
+        let stream_idx = self.writer.add_stream(codecpar, src_info.time_base)?;
         // 拷贝的 codec_parameters 携带源容器专属的 codec_tag（如 `mp4a`
         // /`avc1`）。跨容器 remux（mp4→mkv 等）时这些 tag 与目标 muxer 不
         // 兼容，清空后由目标 muxer 在 write_header 时自行指派正确 tag。
         // 与 ffmpeg remux 的 `codec_tag = 0` 语义一致。
         let stream = self.stream_ptr(stream_idx)?;
-        let codecpar = unsafe { (*stream).codecpar };
-        if codecpar.is_null() {
+        let raw_codecpar = unsafe { (*stream).codecpar };
+        if raw_codecpar.is_null() {
             return Err(RsmediaError::msg(format!(
                 "output stream {stream_idx} has no codec parameters"
             )));
         }
         unsafe {
-            (*codecpar).codec_tag = 0;
+            (*raw_codecpar).codec_tag = 0;
         }
         let stream_info = StreamInfo::from_writer(&self.writer, stream_idx)?;
         self.streams
-            .push(MuxerStream::new_copy(stream_info, src_time_base));
+            .push(MuxerStream::new_copy(stream_info, src_time_base, bsf));
         Ok(stream_idx)
     }
 
@@ -428,7 +533,7 @@ impl<W: Writer> Muxer<W> {
         if self.have_written_header {
             tracing::warn!("set_metadata after header write has no effect");
         }
-        self.metadata.insert(key.into(), value.into());
+        self.metadata.set(key.into(), value.into());
         Ok(self)
     }
 
@@ -460,8 +565,23 @@ impl<W: Writer> Muxer<W> {
         self.stream_metadata
             .entry(stream_index)
             .or_default()
-            .insert(key, value);
+            .set(key, value);
         Ok(self)
+    }
+
+    /// 已排入容器级元数据的全部条目（[`Self::set_metadata`] 的读取侧）。
+    ///
+    /// 读的是**待写入**的队列，不是文件里已有的内容——header 写出后
+    /// `set_metadata` 不再生效，因此这个视图与"文件里最终有什么"在
+    /// header 之前是一致的。
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// 已排入第 `stream_index` 条流的元数据（[`Self::set_stream_metadata`] 的
+    /// 读取侧）；该流没有排入任何条目时返回 `None`。
+    pub fn stream_metadata(&self, stream_index: usize) -> Option<&Metadata> {
+        self.stream_metadata.get(&stream_index)
     }
 
     /// Applies container-level and per-stream metadata to the raw format
@@ -650,7 +770,7 @@ impl<W: Writer> Muxer<W> {
                 // SAFETY: `(*chapter_ptr).metadata` starts out NULL and the chapter
                 // node is exclusively owned here (already inside an `unsafe` block).
                 Metadata::new()
-                    .insert("title", &chapter.title)
+                    .set("title", &chapter.title)
                     .write_into_raw_dict(&mut (*chapter_ptr).metadata);
             }
             chapter_nodes.push(chapter_ptr);
@@ -934,10 +1054,14 @@ impl<W: Writer> Muxer<W> {
     /// 容器，不解码、不重编码。pts/dts 从源流时间基（`add_copy_stream` 记录）
     /// 换算到输出流时间基。
     ///
+    /// 流带 bitstream filter 时（[`Self::add_copy_stream_with_bsf`]）包会先过
+    /// filter：一个输入包可能写出零个或多个输出包，调用方无需关心这个差异。
+    ///
     /// # Arguments
     ///
     /// * `packet`   - 来自 [`Demuxer::demux_packet`] 的原始包；其 `stream_index`
-    ///   会在写入前被改写为输出流 index。
+    ///   会在写入前被改写为输出流 index。流带 filter 时该包在调用后失效
+    ///   （所有权交给 filter），不要再用。
     /// * `stream_idx` - [`Self::add_copy_stream`] 返回的输出流 index。
     pub fn mux_packet(&mut self, packet: &mut AVPacket, stream_idx: usize) -> Result<W::Accum> {
         // 先确认这是透传流并取出源时间基（在 `begin_packet_write` 之前）：拿编码流调
@@ -949,6 +1073,39 @@ impl<W: Writer> Muxer<W> {
         })?;
         let mut collected = self.begin_packet_write()?;
 
+        // 带 filter 的流走独立通路：先整包过滤，再逐包写出（借用必须在写包前
+        // 结束，因为 `write_out_packet` 又要独占 `self`）。
+        if self.get_stream(stream_idx)?.bsf.is_some() {
+            let filtered = self
+                .get_stream_mut(stream_idx)?
+                .bsf
+                .as_mut()
+                .expect("checked above")
+                .filter_packet(packet)?;
+            for mut out in filtered {
+                let out = self.write_copy_packet(&mut out, stream_idx, src_time_base)?;
+                W::merge_out(&mut collected, out);
+            }
+            return Ok(collected);
+        }
+
+        // src_stream_time_base => out_stream_time_base（重复调用会重复换算，
+        // 因此只在我们自己保存的源时间基与输出时间基之间进行一次换算）
+        let out = self.write_copy_packet(packet, stream_idx, src_time_base)?;
+        W::merge_out(&mut collected, out);
+        Ok(collected)
+    }
+
+    /// 透传包写出的公共步骤：归一化时间戳 → 换算到输出流时间基 → 写出。
+    ///
+    /// 无 filter 与有 filter（每个 filter 输出包）两条路径共用，避免只在一处
+    /// 做归一化导致"带 filter 的流时间戳没被平移"。
+    fn write_copy_packet(
+        &mut self,
+        packet: &mut AVPacket,
+        stream_idx: usize,
+        src_time_base: ffi::AVRational,
+    ) -> Result<W::Out> {
         // 与 `mux` 一致：归一化在写包前应用（透传包的 pts/dts 在源流时间基里），
         // 基准与编码流共享同一物理时刻。
         let pts = self.normalize_ts(packet.pts, src_time_base);
@@ -959,12 +1116,7 @@ impl<W: Writer> Muxer<W> {
         if dts != packet.dts {
             packet.set_dts(dts);
         }
-
-        // src_stream_time_base => out_stream_time_base（重复调用会重复换算，
-        // 因此只在我们自己保存的源时间基与输出时间基之间进行一次换算）
-        let out = self.write_out_packet(packet, stream_idx, src_time_base)?;
-        W::merge_out(&mut collected, out);
-        Ok(collected)
+        self.write_out_packet(packet, stream_idx, src_time_base)
     }
 
     /// Signal to the muxer that writing has finished. This will cause a trailer to be written if
@@ -978,6 +1130,30 @@ impl<W: Writer> Muxer<W> {
 
         // flush 与 trailer 的输出同样要累积（缓冲型 Writer 的 `Out` 是增量字节）。
         let mut collected = W::Accum::default();
+
+        // 先冲刷透传流的 bitstream filter：filter 内部可能缓冲（如 `aac_adtstoasc`
+        // 需要看到足够数据才决定），不 flush 会丢掉尾部包。收集到局部 Vec 是因为
+        // 写包要独占 `self`，不能与 `self.streams` 的迭代借用共存。
+        let mut bsf_pending: Vec<(usize, ffi::AVRational, Vec<AVPacket>)> = Vec::new();
+        for mux_stream in self.streams.iter_mut() {
+            let Some(bsf) = mux_stream.bsf.as_mut() else {
+                continue;
+            };
+            let Some(src_time_base) = mux_stream.src_time_base else {
+                continue;
+            };
+            let packets = bsf.flush_packets()?;
+            if !packets.is_empty() {
+                bsf_pending.push((mux_stream.stream_index, src_time_base, packets));
+            }
+        }
+        for (stream_idx, src_time_base, packets) in bsf_pending {
+            for mut packet in packets {
+                let out = self.write_copy_packet(&mut packet, stream_idx, src_time_base)?;
+                W::merge_out(&mut collected, out);
+            }
+        }
+
         for mux_stream in self.streams.iter_mut() {
             // flush the encoder to ensure all packets are sent to the muxer.
             // 透传流没有编码器延迟缓冲，无需 flush。
@@ -1351,6 +1527,37 @@ impl<R: Reader> Demuxer<R> {
     /// 输入流总数。
     pub fn nb_streams(&self) -> usize {
         self.reader.input().nb_streams as usize
+    }
+
+    /// 读回**容器级**元数据（`title` / `artist` / `comment` / `encoder` …）。
+    ///
+    /// 这是 [`Muxer::set_metadata`] 的读取侧：remux 时把源容器的元数据原样搬到
+    /// 输出容器，靠它取源值。容器没有元数据时返回空 [`Metadata`]（不是错误）。
+    pub fn metadata(&self) -> Metadata {
+        let input = self.reader.input();
+        // SAFETY: `input.metadata` is the dictionary owned by the input context that
+        // `input` borrows; `from_raw_dict` copies the entries out, so the result does
+        // not outlive the borrow.
+        unsafe { Metadata::from_raw_dict(input.metadata) }
+    }
+
+    /// 读回第 `stream_index` 条流的元数据（`language` / `title` / `handler_name` …）。
+    ///
+    /// 这是 [`Muxer::set_stream_metadata`] 的读取侧。索引越界返回
+    /// [`RsmediaError::InvalidConfig`]（与 [`Self::stream_info`] 的越界行为一致，
+    /// 只是这里无法回退到实时读取——流不存在就是不存在）。
+    pub fn stream_metadata(&self, stream_index: usize) -> Result<Metadata> {
+        let input = self.reader.input();
+        let streams = input.streams();
+        let stream = streams.get(stream_index).ok_or_else(|| {
+            RsmediaError::invalid_config(format!(
+                "stream index {stream_index} out of range (nb_streams={})",
+                streams.len()
+            ))
+        })?;
+        // SAFETY: `stream.metadata` is that stream's own dictionary, owned by the
+        // input context; `from_raw_dict` copies the entries out.
+        Ok(unsafe { Metadata::from_raw_dict(stream.metadata) })
     }
 
     /// Whether this demuxer was built in passthrough (remux) mode.
@@ -1801,39 +2008,108 @@ mod tests {
         }
         muxer.finish()?;
 
-        // 回读验证：容器级 title/artist 与各流 language 标签
-        let reader = StreamReader::new(&output_path)?;
-        let input = reader.input();
+        // 回读验证：容器级 title/artist 与各流 language 标签。
+        // 用 `Demuxer::metadata`/`stream_metadata`（本库的读取侧入口），而不是
+        // 在这里自己碰 `AVFormatContext.metadata` 裸指针。
+        let demuxer = Demuxer::new(&output_path)?;
 
-        let get_str = |dict: *mut ffi::AVDictionary, key: &str| -> Option<String> {
-            // SAFETY: `dict` points at a live `AVDictionary` owned by the input
-            // format context / stream, which outlives this call.
-            unsafe { Metadata::from_raw_dict(dict) }
-                .get(key)
-                .map(String::from)
-        };
-
-        let title = get_str(input.metadata, "title");
         assert_eq!(
-            title.as_deref(),
+            demuxer.metadata().get("title"),
             Some("rsmedia metadata test"),
             "container title metadata mismatch"
         );
+        assert_eq!(demuxer.metadata().get("artist"), Some("rsmedia"));
 
-        let artist = get_str(input.metadata, "artist");
-        assert_eq!(artist.as_deref(), Some("rsmedia"));
+        assert_eq!(
+            demuxer.stream_metadata(video_index)?.get("language"),
+            Some("und")
+        );
+        assert_eq!(
+            demuxer.stream_metadata(audio_index)?.get("language"),
+            Some("chi")
+        );
+        // 越界索引必须报错，而不是返回空 metadata 假装成功。
+        assert!(demuxer.stream_metadata(99).is_err());
 
-        let streams = input.streams();
-        let raw_or_null = |d: Option<rsmpeg::avutil::AVDictionaryRef>| {
-            d.map(|d| d.as_ptr() as *mut _)
-                .unwrap_or(std::ptr::null_mut())
-        };
-        let video_lang = get_str(raw_or_null(streams[video_index].metadata()), "language");
-        assert_eq!(video_lang.as_deref(), Some("und"));
+        Ok(())
+    }
 
-        let audio_lang = get_str(raw_or_null(streams[audio_index].metadata()), "language");
-        assert_eq!(audio_lang.as_deref(), Some("chi"));
+    /// `Muxer::new_with_options` 把 muxer 私有选项送到 `avformat_write_header`：
+    /// `movflags=+faststart` 必须让 `moov` 排在 `mdat` 之前（mp4 的默认布局是
+    /// `mdat` 在前、`moov` 在尾，必须整段读完才能起播）。
+    #[test]
+    fn test_new_with_options_faststart_moves_moov_first() -> Result<()> {
+        let output_path = crate::test_support::test_output_path("mux", "test_faststart.mp4");
+        crate::test_support::remove_test_output(&output_path);
 
+        let (width, height) = (160, 120);
+        let encoder = Encoder::new_video(width, height)?;
+        let time_base = encoder.time_base();
+
+        let mut opts = Options::new();
+        opts.set("movflags", "+faststart");
+        let mut muxer = Muxer::new_with_options(&output_path, opts)?;
+        let index = muxer.add_encoder(encoder)?;
+        for i in 0..10i64 {
+            let mut frame = generate_video_frame(width, height, i);
+            frame.set_pts(i * time_base.den as i64);
+            frame.set_time_base(time_base);
+            muxer.mux(frame, index)?;
+        }
+        muxer.finish()?;
+
+        // 按 box 头逐层走一遍顶层盒子，取 moov/mdat 的**实际**次序（不靠字节里
+        // 搜 tag：压缩数据里也可能出现这些四字节序列）。
+        let bytes = std::fs::read(&output_path).context("read faststart output")?;
+        let mut order = Vec::new();
+        let mut offset = 0usize;
+        while offset + 8 <= bytes.len() {
+            let size = u32::from_be_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .expect("4-byte box size"),
+            ) as usize;
+            let kind = String::from_utf8_lossy(&bytes[offset + 4..offset + 8]).into_owned();
+            order.push(kind);
+            if size < 8 || offset + size > bytes.len() {
+                break;
+            }
+            offset += size;
+        }
+        let pos = |tag: &str| order.iter().position(|k| k == tag);
+        let moov = pos("moov").unwrap_or_else(|| panic!("no moov box in {order:?}"));
+        let mdat = pos("mdat").unwrap_or_else(|| panic!("no mdat box in {order:?}"));
+        assert!(
+            moov < mdat,
+            "faststart must move moov before mdat, got {order:?}"
+        );
+
+        crate::test_support::remove_test_output(&output_path);
+        Ok(())
+    }
+
+    /// metadata 的**写入侧 getter**：读的是待写入队列，且与 `set_*` 看到的一致。
+    #[test]
+    fn test_muxer_metadata_getters() -> Result<()> {
+        let mut muxer = Muxer::new(crate::test_support::test_output_path(
+            "mux",
+            "test_metadata_getters.mp4",
+        ))?;
+        assert!(muxer.metadata().is_empty());
+        assert!(muxer.stream_metadata(0).is_none());
+
+        muxer.set_metadata("title", "queued")?;
+        assert_eq!(muxer.metadata().get("title"), Some("queued"));
+
+        // 流级条目按流索引分桶；未设置过的流返回 None（而不是空表）。
+        let encoder = Encoder::new_video(64, 64)?;
+        let index = muxer.add_encoder(encoder)?;
+        assert!(muxer.stream_metadata(index).is_none());
+        muxer.set_stream_metadata(index, "language", "eng")?;
+        assert_eq!(
+            muxer.stream_metadata(index).and_then(|m| m.get("language")),
+            Some("eng")
+        );
         Ok(())
     }
 
@@ -2688,7 +2964,7 @@ mod tests {
                 let mut muxer = Muxer::new(&path)?;
                 muxer.set_normalize_timestamps(normalize);
                 let mut options = crate::Options::new();
-                options.insert("preset", "ultrafast");
+                options.set("preset", "ultrafast");
                 let encoder = EncoderBuilder::new_video(64, 64)
                     .with_fps(25.0)
                     .with_options(options)

@@ -931,9 +931,11 @@ mod video {
         let fps = 25.0;
 
         // (名称, Filter, 期望最小解码帧数, 期望尺寸(Some 则精确断言，None 则不断言))
-        // 注：尺寸改变类滤镜（`scale`/`crop`/`pad`/`rotate`/`transpose`）在编码管线中
-        // 存在已知崩溃（SIGSEGV），与滤镜本身无关，属编码-滤镜尺寸同步缺陷，已隔离到
-        // 专项调查，暂不纳入本列表阻塞其它滤镜测试。此处仅覆盖尺寸保持类滤镜。
+        //
+        // 尺寸改变类滤镜（`scale`/`crop`/`pad`/`rotate`/`transpose`）此前被误判为
+        // "编码管线中 SIGSEGV" 而排除。实际原因是编码器上下文尺寸需跟随滤镜输出
+        // 尺寸——`EncoderBuilder::build` 已做同步（`filter_graph.output_size()` →
+        // `encode_ctx.set_width/height`），故这些滤镜可正常跑通，现全部纳入。
         type FilterCase = (
             &'static str,
             rsmedia::filter::Filter,
@@ -1009,6 +1011,34 @@ mod video {
             (
                 "fade_out",
                 video::fade_out(n_frames as u32, 6),
+                n_frames,
+                Some((width, height)),
+            ),
+            // 尺寸改变类：编码器上下文尺寸会跟随滤镜输出（`rotate`/`transpose` 的
+            // 画布默认仍是输入尺寸，故方形输入下尺寸不变）。
+            (
+                "scale_down",
+                video::scale(32, 32, None),
+                n_frames,
+                Some((32, 32)),
+            ),
+            (
+                "scale_up",
+                video::scale(128, 128, None),
+                n_frames,
+                Some((128, 128)),
+            ),
+            ("crop", video::crop(0, 0, 32, 32), n_frames, Some((32, 32))),
+            (
+                "pad",
+                video::pad(96, 96, 0, 0, "black"),
+                n_frames,
+                Some((96, 96)),
+            ),
+            ("rotate", video::rotate(90), n_frames, Some((width, height))),
+            (
+                "transpose",
+                video::transpose(1),
                 n_frames,
                 Some((width, height)),
             ),
@@ -1280,8 +1310,8 @@ mod video {
         let dir = pattern.parent().expect("pattern has a parent dir");
 
         let mut options = Options::new();
-        options.insert("segment_time", "1");
-        options.insert("reset_timestamps", "1");
+        options.set("segment_time", "1");
+        options.set("reset_timestamps", "1");
         let mut muxer =
             rsmedia::mux::Muxer::new_segmented(pattern.to_string_lossy().to_string(), options)?;
         let encoder = EncoderBuilder::new_video(160, 120)

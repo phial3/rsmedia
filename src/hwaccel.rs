@@ -299,10 +299,36 @@ pub fn release_unused_hw_contexts() -> usize {
     removed
 }
 
+/// 硬件帧池的默认预分配表面数。
+///
+/// 这个数**直接决定显存占用**：1080p NV12 一张面约 3MB，4K 约 12MB，8K 约 50MB。
+/// 20 张对 1080p（约 60MB）是安全且够用的启发值（解码器 DPB + 滤镜缓冲 + 编码
+/// 上传面都从同一个池里取），但对 4K/8K 会白白占掉数百 MB 显存。
+///
+/// 需要按分辨率/内存预算调整时用
+/// [`EncoderBuilder::with_hw_pool_size`](crate::encode::EncoderBuilder::with_hw_pool_size)
+/// 或 [`DecoderBuilder::with_hw_pool_size`](crate::decode::DecoderBuilder::with_hw_pool_size)；
+/// 传 `0` 表示交给后端自己决定（FFmpeg 的默认行为：按需分配，不预占）。
+pub(crate) const DEFAULT_HW_POOL_SIZE: u32 = 20;
+
+/// 串行化所有触碰进程级 `HW_CTX_CACHE` 的测试。
+///
+/// 缓存是**进程级**静态，而 lib 测试在同一进程里并行跑：任何创建或持有
+/// [`HWContext`] 的测试（无论写在哪个模块）都必须先拿这把锁，否则
+/// [`release_unused_hw_contexts`] 那类按引用计数断言的测试会被别的测试正好持有的
+/// 上下文干扰（`strong_count > 1` → 该条目"仍在使用"，不会被释放）。
+#[cfg(test)]
+pub(crate) fn hw_cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static HW_CACHE_TEST_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
+    // 某个测试 panic 后锁会被标记为 poisoned；这里恢复内部值继续用（`into_inner`）——
+    // 被破坏的只是那个测试留下的状态，与本测试的断言无关，没必要让后续测试连锁失败。
+    HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A live hardware device context, plus the frame setup derived from it.
 ///
 /// Crate-internal: a caller configures [`HWDeviceConfig`] and hands it to
-/// [`EncoderBuilder::with_hw_device_config`](crate::encode::EncoderBuilder::with_hw_device_config)
+/// [`EncoderBuilder::with_hardware_device`](crate::encode::EncoderBuilder::with_hardware_device)
 /// or the decoder equivalent; the context itself is the plumbing between those
 /// builders and FFmpeg, never something a user holds.
 ///
@@ -398,13 +424,15 @@ impl HWContext {
     /// * `codec_ctx` - The decoder codec context to initialize
     /// * `width` - The width of the decoded frames
     /// * `height` - The height of the decoded frames
+    /// * `pool_size` - Preallocated surface count, see [`DEFAULT_HW_POOL_SIZE`]
     pub(crate) fn setup_decoder_frames(
         &self,
         codec_ctx: &mut AVCodecContext,
         width: i32,
         height: i32,
+        pool_size: u32,
     ) -> Result<()> {
-        let hw_frames_ctx = self.create_hw_frames_ctx(width, height)?;
+        let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
         codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
         codec_ctx.set_pix_fmt(self.get_format(true));
 
@@ -439,13 +467,15 @@ impl HWContext {
     /// * `codec_ctx` - The encoder codec context to initialize
     /// * `width` - The width of the frames to encode
     /// * `height` - The height of the frames to encode
+    /// * `pool_size` - Preallocated surface count, see [`DEFAULT_HW_POOL_SIZE`]
     pub(crate) fn setup_encoder_frames(
         &self,
         codec_ctx: &mut AVCodecContext,
         width: i32,
         height: i32,
+        pool_size: u32,
     ) -> Result<()> {
-        let hw_frames_ctx = self.create_hw_frames_ctx(width, height)?;
+        let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
         codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
         codec_ctx.set_pix_fmt(self.get_format(true));
 
@@ -456,22 +486,96 @@ impl HWContext {
     ///
     /// 仅共享访问 device_ctx：`hwframe_ctx_alloc` 内部只做 av_buffer_ref（原子），
     /// 每次调用都新建独立的 AVHWFramesContext，由调用方（codec_ctx）独占持有。
-    fn create_hw_frames_ctx(
+    pub(crate) fn create_hw_frames_ctx(
         &self,
         width: i32,
         height: i32,
+        pool_size: u32,
     ) -> Result<rsmpeg::avutil::AVHWFramesContext> {
         let mut hw_frames_ctx = self.device_ctx.hwframe_ctx_alloc();
         hw_frames_ctx.data().format = self.get_format(true);
         hw_frames_ctx.data().sw_format = self.get_format(false);
         hw_frames_ctx.data().width = width;
         hw_frames_ctx.data().height = height;
-        hw_frames_ctx.data().initial_pool_size = 20;
+        hw_frames_ctx.data().initial_pool_size = pool_size as i32;
 
         hw_frames_ctx
             .init()
             .context("Failed to initialize hardware frame context")?;
         Ok(hw_frames_ctx)
+    }
+
+    /// 把一帧硬件帧搬进 `codec_ctx` 自己的 frames context。
+    ///
+    /// 编码器的 frames context 是它自己那份（每个编解码器各建一个），上游交来的
+    /// 硬件帧却属于**别人的** frames context（解码器、另一台设备、或调用者自建）。
+    /// 两者直接混用不可靠：`av_hwframe_map` 才是 FFmpeg 认可的搬运方式，同设备
+    /// 且格式兼容时它只做一次 `av_buffer_ref`，**零拷贝**。
+    ///
+    /// 已经在同一 frames context 里的帧原样返回（`av_hwframe_map` 对同源同缓冲
+    /// 反而报 `EINVAL`）。
+    ///
+    /// 后端没实现 `map_to`/`map_from`（如 VideoToolbox）时 `av_hwframe_map` 返回
+    /// `AVERROR(ENOSYS)`——FFmpeg 文档称之为“以当前 hwframe 配置无法映射”，此时
+    /// 退回 [`Self::hw_download`] + [`Self::hw_upload`]（download → upload，两次
+    /// 全帧拷贝），结果帧一样落在 `codec_ctx` 自己的 frames context 里，只是不再
+    /// 零拷贝。
+    pub(crate) fn map_hw_frame(
+        &self,
+        codec_ctx: &mut AVCodecContext,
+        src: AVFrame,
+    ) -> Result<AVFrame> {
+        let dst_ref = unsafe { (*codec_ctx.as_ptr()).hw_frames_ctx };
+        if dst_ref.is_null() {
+            return Err(RsmediaError::invalid_config(
+                "Codec context has no hardware frames context to map into",
+            ));
+        }
+        // 比较的是 AVHWFramesContext 对象本身（`AVBufferRef::data`），不是 buffer_ref
+        // 结构体地址：`av_buffer_ref`/`av_hwframe_get_buffer` 每次都会新建一个
+        // AVBufferRef 指向同一对象，结构体地址几乎总是不等。
+        if !src.hw_frames_ctx.is_null() && unsafe { (*src.hw_frames_ctx).data == (*dst_ref).data } {
+            return Ok(src);
+        }
+
+        let mut dst = AVFrame::new();
+        let map_ret = unsafe {
+            let dst_ptr = dst.as_mut_ptr();
+            let src_ptr = src.as_ptr();
+            (*dst_ptr).format = (*src_ptr).format;
+            (*dst_ptr).width = (*src_ptr).width;
+            (*dst_ptr).height = (*src_ptr).height;
+            // av_buffer_ref：dst 持有独立引用，随 AVFrame 一起 unref，不影响 codec_ctx 那份。
+            (*dst_ptr).hw_frames_ctx = ffi::av_buffer_ref(dst_ref);
+            // flags 按 FFmpeg 文档传 0（当前未使用）。失败时 dst 由 Drop 负责
+            // unref 上面那个 buffer ref，无需手工清理。
+            ffi::av_hwframe_map(dst_ptr, src_ptr, 0)
+        };
+        if map_ret < 0 {
+            if map_ret != -(ffi::ENOSYS as i32) {
+                return Err(RsmediaError::av_error(map_ret).with_context(
+                    "Failed to map the hardware frame into this codec's frames context \
+                     (the two frames contexts must live on the same device and agree on \
+                     format and size)",
+                ));
+            }
+            // 该后端只能 transfer，不能 map：先下载到系统内存，再上传到编码器的
+            // frames context。`hw_download`/`hw_upload` 内部会搬运帧属性（含 pts）。
+            tracing::debug!(
+                "av_hwframe_map is not implemented for {:?}; falling back to download + upload",
+                self.config.device_type
+            );
+            let sw = self.hw_download(&src)?;
+            return self.hw_upload(codec_ctx, &sw);
+        }
+
+        tracing::debug!(
+            "Mapped HW frame into the codec frames context: {:?} {}x{}",
+            PixelFormat::from(dst.format),
+            dst.width,
+            dst.height
+        );
+        Ok(dst)
     }
 
     /// Download frame from hardware acceleration device to system memory.
@@ -727,7 +831,7 @@ impl HWDeviceType {
     /// 该设备类型在**本机**是否真的能用：实际建立一次设备上下文再释放。
     ///
     /// 与 [`Self::is_available`] 的区别见对方的文档。实现里也复用了
-    /// [`default_device_string`]，因此 DRM 会去 `/dev/dri` 找一个真实节点
+    /// `default_device_string`，因此 DRM 会去 `/dev/dri` 找一个真实节点
     /// （没有节点直接判为不可用），不会踩到 `open(NULL)` 那条路径 —— 那条路径在
     /// Rosetta 转译的 x86_64 上会 SIGSEGV，探测本身不能把调用方带走。
     ///
@@ -952,16 +1056,9 @@ unsafe extern "C" fn hwaccel_get_format(
 mod tests {
     use super::*;
 
-    /// 串行化所有触碰 `HW_CTX_CACHE` 的测试：缓存是进程级静态，lib 测试共享同
-    /// 一进程，并行运行会破坏彼此的计数断言。
-    static HW_CACHE_TEST_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
-
-    /// 取缓存测试锁。
-    ///
-    /// 某个测试 panic 后锁会被标记为 poisoned；这里恢复内部值继续用（`into_inner`）——
-    /// 被破坏的只是那个测试留下的状态，与本测试的断言无关，没必要让后续测试连锁失败。
+    /// 取缓存测试锁（定义见 [`hw_cache_test_lock`]，其它模块的硬件测试也用同一把）。
     fn cache_lock() -> std::sync::MutexGuard<'static, ()> {
-        HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        hw_cache_test_lock()
     }
 
     /// 本 crate 建模的**全部**硬件设备类型。
@@ -1294,6 +1391,103 @@ mod tests {
         assert_eq!(release_unused_hw_contexts(), 1);
         // 再次释放：缓存已空
         assert_eq!(release_unused_hw_contexts(), 0);
+    }
+
+    /// 帧池表面数**必须**是调用方要的那个值。
+    ///
+    /// `initial_pool_size` 是**预分配**的，直接决定显存占用（4K NV12 一张约 12MB），
+    /// 因此 `with_hw_pool_size` 的值不能在路上被默认值悄悄顶掉——`0` 也必须是 `0`
+    /// （表示"交给后端按需分配"），而不是被换成默认的 20。
+    #[test]
+    fn test_hw_frames_pool_size_reaches_context() {
+        let _guard = cache_lock();
+
+        let Some(ctx) = try_auto_hw_context() else {
+            return; // 无 GPU 环境跳过
+        };
+        for pool_size in [0u32, 1, 7, DEFAULT_HW_POOL_SIZE] {
+            let mut frames = ctx
+                .create_hw_frames_ctx(64, 64, pool_size)
+                .unwrap_or_else(|e| panic!("pool_size {pool_size} must be accepted: {e}"));
+            assert_eq!(
+                frames.data().initial_pool_size,
+                pool_size as i32,
+                "requested pool size {pool_size} must reach AVHWFramesContext"
+            );
+        }
+    }
+
+    /// `map_hw_frame` 的第一道闸门是"编码器上下文必须已经有自己的 frames context"。
+    ///
+    /// 没有就说明调用方把硬件帧塞给了软件编码路径——这是**配置错误**，不是环境差异，
+    /// 必须 fail-fast 报 `InvalidConfig`，而不是丢帧或崩在 FFmpeg 内部。
+    #[test]
+    fn test_map_hw_frame_without_frames_context_is_invalid_config() {
+        let _guard = cache_lock();
+
+        let Some(ctx) = try_auto_hw_context() else {
+            return; // 无 GPU 环境跳过
+        };
+        // 编解码器只用来提供一个"还没有 frames context"的上下文，因此只要求它在本
+        // 构建里存在（mpeg4 是内置编码器，不依赖外部库）。
+        let Some(codec) = AVCodec::find_encoder_by_name(c"mpeg4") else {
+            return; // 该 FFmpeg 构建没有 mpeg4 编码器
+        };
+        let mut codec_ctx = AVCodecContext::new(&codec);
+
+        let mut src = AVFrame::new();
+        src.set_width(64);
+        src.set_height(64);
+        src.set_format(ctx.get_format(true));
+
+        let err = ctx
+            .map_hw_frame(&mut codec_ctx, src)
+            .expect_err("a codec without hw frames context must reject hardware frames");
+        assert!(
+            err.is_invalid_config(),
+            "missing frames context must be InvalidConfig, got: {err}"
+        );
+    }
+
+    /// 帧已经在**编码器自己那份** frames context 里时必须原样返回。
+    ///
+    /// 这是零拷贝路径的兜底：`av_hwframe_map` 对同源同缓冲反而报 `EINVAL`（文档），
+    /// 后端不支持 map 时更会白白跑一遍 download + upload。真跑一遍并比对帧指针，
+    /// 保证这条捷径没有被误删。
+    #[test]
+    fn test_map_hw_frame_is_noop_for_frame_already_in_codec_context() {
+        let _guard = cache_lock();
+
+        let Some(ctx) = try_auto_hw_context() else {
+            return; // 无 GPU 环境跳过
+        };
+        let Some(codec) = AVCodec::find_encoder_by_name(c"mpeg4") else {
+            return;
+        };
+        let mut codec_ctx = AVCodecContext::new(&codec);
+        codec_ctx.set_hw_frames_ctx(
+            ctx.create_hw_frames_ctx(64, 64, 2)
+                .expect("frames context must be allocated"),
+        );
+
+        let mut src = AVFrame::new();
+        src.set_width(64);
+        src.set_height(64);
+        src.set_format(ctx.get_format(true));
+        codec_ctx
+            .hw_frames_ctx_mut()
+            .expect("frames context was just set")
+            .get_buffer(&mut src)
+            .expect("frame must be allocated from the codec's own frames context");
+        let src_ptr = src.as_ptr();
+
+        let mapped = ctx
+            .map_hw_frame(&mut codec_ctx, src)
+            .expect("a frame already in the codec frames context must be accepted");
+        assert!(
+            std::ptr::addr_eq(mapped.as_ptr(), src_ptr),
+            "a frame already in the codec frames context must be returned as-is"
+        );
     }
 
     /// `HWContext` 跨线程共享同一 `Arc` 不应触发数据竞争。

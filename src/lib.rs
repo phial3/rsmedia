@@ -29,7 +29,7 @@ pub mod subtitle;
 pub mod time;
 
 pub use bsf::Bsf;
-pub use codec::{CodecConfig, FormatInfo, Profile};
+pub use codec::{AVCodecFlag, AVCodecFlag2, CodecConfig, FormatInfo, Profile, ThreadType};
 pub use colors::Color;
 pub use decode::{Decoder, DecoderBuilder, ErrRecognition, SkipFrame};
 pub use encode::{Encoder, EncoderBuilder};
@@ -39,7 +39,7 @@ pub use fmt::{DataLayout, FrameFormat, SampleFormat};
 pub use frame::{ElementType, FrameData, FrameSideData, MediaFrame};
 pub use hwaccel::{HWDeviceConfig, HWDeviceType};
 pub use init::{AVLogFlag, AVLogLevel, init, init_with, init_with_level};
-pub use io::{AVSeekFlag, Reader, Seekable, Writer};
+pub use io::{AVSeekFlag, DynWriter, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
 pub use mux::{Chapter, Demuxer, Muxer};

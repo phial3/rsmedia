@@ -1,4 +1,4 @@
-use crate::codec::CodecConfig;
+use crate::codec::{AVCodecFlag, CodecConfig, impl_codec_builder_setters};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::fmt::FrameFormat;
@@ -53,6 +53,14 @@ pub struct EncoderBuilder {
     frame_rate: ffi::AVRational,
     /// config
     global_header: bool,
+    /// `AVCodecContext.flags`（`AV_CODEC_FLAG_*` 掩码，`i32` 是 FFmpeg 的字段类型）中由调用方显式设置的部分。
+    /// `None` = 不额外设置；`GLOBAL_HEADER` 由 [`Self::with_global_header`] 单独管理，
+    /// 两者在 `build()` 里按位合并（不同来源的位，不构成配置冲突）。
+    flags: Option<i32>,
+    /// `AVCodecContext.flags2`（`AV_CODEC_FLAG2_*` 掩码）。`None` = FFmpeg 默认。
+    flags2: Option<i32>,
+    /// `AVCodecContext.thread_type`（`FF_THREAD_*` 掩码）。`None` = FFmpeg 默认。
+    thread_type: Option<i32>,
     /// `None` = 未显式设置，构建时取 [`num_cpus::get`]；`Some(n)` 表示调用方
     /// 指定过 —— 该"显式"信息被 [`Self::owned_option_keys`] 用来判定配置冲突。
     thread_count: Option<usize>,
@@ -68,10 +76,12 @@ pub struct EncoderBuilder {
     subtitle_header: Option<String>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
+    /// 硬件帧池的预分配表面数（`None` = [`crate::hwaccel::DEFAULT_HW_POOL_SIZE`]）。
+    hw_pool_size: Option<u32>,
     /// 缩放核选择（互斥，只取一个算法位）
     scale_algorithm: ScaleAlgorithm,
-    /// 缩放质量位（可多位，见 [`ScaleQuality`]）；构建 `Scaler` 时由 [`ScaleQuality::mask`] 合成为掩码
-    scale_quality: Vec<ScaleQuality>,
+    /// 缩放质量位掩码（可多位，见 [`ScaleQuality`]）。
+    scale_quality: u32,
     /// 是否用 `AVBufferPool` 池化缩放输出的帧缓冲（默认关闭）。
     scale_pool: bool,
 }
@@ -189,19 +199,9 @@ impl EncoderBuilder {
         self
     }
 
-    /// Set the codec name.
-    /// video codec default is `libx264`
-    /// audio codec default is `aac`
-    pub fn with_codec_name(mut self, codec_name: impl Into<Option<String>>) -> Self {
-        self.codec_name = codec_name.into();
-        self
-    }
-
-    /// Set the thread count.
-    pub fn with_thread_count(mut self, thread_count: usize) -> Self {
-        self.thread_count = Some(thread_count);
-        self
-    }
+    // 与 DecoderBuilder 共有的那批 setter：定义与文档在 `codec.rs` 的宏里，
+    // 改一次两端同时生效（见 `impl_codec_builder_setters` 的说明）。
+    impl_codec_builder_setters!();
 
     /// Set the bit rate.
     ///
@@ -310,71 +310,6 @@ impl EncoderBuilder {
     /// supported list (preferring [`PixelFormat::YUV420P`]).
     pub fn with_pix_fmt(mut self, pixel_format: PixelFormat) -> Self {
         self.pixel_format = Some(pixel_format);
-        self
-    }
-
-    /// codec options used for encoder
-    ///
-    /// 只用于 builder 未建模的**编解码器私有参数**（如 `preset`、`tune`、
-    /// `x264-params`、`aac_coder`）。builder 有 typed setter 的项（`with_bit_rate`、
-    /// `with_quality`、`with_profile`、`with_level`、`with_gop_size`、
-    /// `with_max_b_frames`、`with_thread_count`）若同时出现在这里，[`Self::build`]
-    /// 报 [`RsmediaError::InvalidConfig`]：同一项有两个配置源时无法判断以谁为准，
-    /// 静默取其一正是要消除的陷阱。
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.codec_opts = options.into();
-        self
-    }
-
-    /// filters used for encoder
-    pub fn with_filters(mut self, filters: impl Into<Option<Vec<Filter>>>) -> Self {
-        self.filters = filters.into();
-        self
-    }
-
-    /// Enable hardware acceleration with the specified device type.
-    ///
-    /// * `device_config` - Device to use for hardware acceleration.
-    pub fn with_hardware_device(mut self, device_config: Option<HWDeviceConfig>) -> Self {
-        self.hw_device_config = device_config;
-        self
-    }
-
-    /// Set the scaling algorithm used when converting input frames to the
-    /// encoder's target pixel format (e.g. RGB24 -> YUV420P).
-    ///
-    /// The algorithm picks the scaling kernel and is **mutually exclusive** —
-    /// FFmpeg's header states *"Scaler selection options. Only one may be active
-    /// at a time."* Defaults to [`ScaleAlgorithm::BICUBIC`]; the quality/behaviour
-    /// bits are set separately with [`Self::with_scale_quality`].
-    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
-        self.scale_algorithm = algorithm;
-        self
-    }
-
-    /// Set the scaling quality/behaviour bits used when converting input frames
-    /// to the encoder's target pixel format.
-    ///
-    /// Unlike the algorithm (exactly one bit), the quality flags are a set: pass the
-    /// bits themselves as a list — `[ScaleQuality::BITEXACT]`,
-    /// `[ScaleQuality::FULL_CHR_H_INT, ScaleQuality::ACCURATE_RND]`, … — and they are
-    /// combined into the mask handed to FFmpeg. Taking a list of [`ScaleQuality`]
-    /// values rather than a raw `u32` means an invalid flag cannot be passed.
-    /// Defaults to [`ScaleQuality::default_mask`].
-    pub fn with_scale_quality(mut self, quality: impl AsRef<[ScaleQuality]>) -> Self {
-        self.scale_quality = quality.as_ref().to_vec();
-        self
-    }
-
-    /// Enable (`true`) or disable (`false`) pooled allocation of the scaler's
-    /// destination frames (see [`Scaler::with_buffer_pool`]).
-    ///
-    /// Off by default. With it on, frames this encoder scales are allocated from an
-    /// internal `AVBufferPool` instead of being freshly allocated per frame, so a
-    /// steady stream of same-geometry conversions stops allocating after a couple
-    /// of frames; buffers are zero-filled before use, matching `alloc_buffer`.
-    pub fn with_scale_pool(mut self, enabled: bool) -> Self {
-        self.scale_pool = enabled;
         self
     }
 
@@ -549,11 +484,28 @@ impl EncoderBuilder {
 
         // 参数集进 extradata（容器格式）还是随每个关键帧 in-band（裸流），
         // 由 `with_global_header` 决定，见该方法。
+        //
+        // 起手值必须是 `encoder.flags` 而不是 0：上下文创建时已带有 FFmpeg 的
+        // 默认位（实测 `AVCodecContext::new` 返回 `AV_CODEC_FLAG_CLOSED_GOP`，
+        // 与 FFmpeg CLI 默认一致——CLI 只有显式 `-flags 0` 才编出 open GOP 的
+        // 流）。从 0 重建会把这类默认位清掉，静默改变输出码流（closed GOP →
+        // open GOP），因此这里一律在既有位上合并。调用方 `with_flags` 与
+        // builder 自管的 `GLOBAL_HEADER` 各占不同位，同理按位合并（与
+        // `ensure_single_source` 要拦的"同一项两个配置源"无关）。
         let mut flags = encoder.flags;
+        if let Some(extra) = self.flags {
+            flags |= extra;
+        }
         if self.global_header {
-            flags |= ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+            flags |= AVCodecFlag::GLOBAL_HEADER.as_raw() as i32;
         }
         encoder.set_flags(flags);
+        if let Some(flags2) = self.flags2 {
+            crate::codec::set_flags2(encoder, flags2);
+        }
+        if let Some(thread_type) = self.thread_type {
+            crate::codec::set_thread_type(encoder, thread_type);
+        }
         crate::codec::set_thread_count(encoder, self.thread_count.unwrap_or_else(num_cpus::get));
 
         Ok(())
@@ -635,8 +587,16 @@ impl EncoderBuilder {
     /// 表里的键与 [`Self::with_options`] 文档中的 setter 列表一一对应。
     fn owned_option_keys(&self) -> Vec<(&'static str, &'static str)> {
         let mut owned = Vec::new();
-        if self.bit_rate.is_some() {
-            owned.push(("b", "with_bit_rate"));
+        // `threads`/`flags`/`flags2`/`thread_type` 四项与
+        // `codec::impl_codec_builder_setters!` 生成的公共 setter 一一对应，与解码器侧
+        // 逐字相同；本表其余键只属于编码器。
+        // `b` 有两条设置路径（`with_bit_rate` 与 `Quality::Bitrate`，后者优先，见
+        // `effective_bit_rate`）；`Quality::Bitrate(<=0)` 与 `effective_bit_rate` 一致
+        // 地算"未设置"，否则会把"非正 Bitrate 等于没设"的语义在冲突检查里判反。
+        let bit_rate_owned = self.bit_rate.is_some()
+            || matches!(self.quality, Some(Quality::Bitrate(bit_rate)) if bit_rate > 0);
+        if bit_rate_owned {
+            owned.push(("b", "with_bit_rate / with_quality(Quality::Bitrate)"));
         }
         if self.max_bit_rate.is_some() {
             owned.push(("maxrate", "with_max_bit_rate"));
@@ -661,6 +621,15 @@ impl EncoderBuilder {
         }
         if self.thread_count.is_some() {
             owned.push(("threads", "with_thread_count"));
+        }
+        if self.flags.is_some() {
+            owned.push(("flags", "with_flags"));
+        }
+        if self.flags2.is_some() {
+            owned.push(("flags2", "with_flags2"));
+        }
+        if self.thread_type.is_some() {
+            owned.push(("thread_type", "with_thread_type"));
         }
         owned
     }
@@ -874,7 +843,13 @@ impl EncoderBuilder {
                 HWContext::new(cfg)
                     .and_then(|ctx| {
                         // *注意*: setup_encoder_frames 会根据 HW 能力修改 encode_ctx.pix_fmt
-                        ctx.setup_encoder_frames(&mut encode_ctx, width, height)?;
+                        ctx.setup_encoder_frames(
+                            &mut encode_ctx,
+                            width,
+                            height,
+                            self.hw_pool_size
+                                .unwrap_or(crate::hwaccel::DEFAULT_HW_POOL_SIZE),
+                        )?;
                         Ok(ctx)
                     })
                     .context("Hardware acceleration context initialization failed")
@@ -886,14 +861,14 @@ impl EncoderBuilder {
         // `build` 开头由 `ensure_single_source` 拒绝，故这里不存在"谁覆盖谁"。
         let mut opts = Options::new();
         if use_crf && let Some(Quality::Crf(crf)) = self.quality {
-            opts.insert("crf", crf.to_string());
+            opts.set("crf", crf.to_string());
         }
         if media_type == MediaType::VIDEO {
             if let Some(profile) = self.profile {
-                opts.insert("profile", profile.as_option_str());
+                opts.set("profile", profile.as_option_str());
             }
             if let Some(level) = &self.level {
-                opts.insert("level", level);
+                opts.set("level", level);
             }
         }
         if let Some(user_opts) = self.codec_opts {
@@ -966,6 +941,9 @@ impl Default for EncoderBuilder {
             // common
             media_type: MediaType::VIDEO,
             thread_count: None,
+            flags: None,
+            flags2: None,
+            thread_type: None,
             codec_name: None,
             codec_opts: None,
             quality: None,
@@ -974,8 +952,9 @@ impl Default for EncoderBuilder {
             filters: None,
             subtitle_header: None,
             hw_device_config: None,
+            hw_pool_size: None,
             scale_algorithm: ScaleAlgorithm::default(),
-            scale_quality: ScaleQuality::default_quality().to_vec(),
+            scale_quality: ScaleQuality::default_mask(),
             scale_pool: false,
         }
     }
@@ -1224,6 +1203,15 @@ impl Encoder {
             // 滤镜图输入时间基为基准，而帧采样率会被滤镜输入转换、`rescale`、
             // `check_frame` 三处读取（见 `assign_pts_sample_rate`）。
             self.assign_pts_sample_rate(&mut frame);
+            // 硬件帧只能直接进编码器：软件滤镜图里没有 `hwdownload`，硬塞进去
+            // 会以 FFmpeg 的格式错误收场。要过滤镜就先自行下载到内存，或去掉滤镜。
+            if !frame.hw_frames_ctx.is_null() && self.filter_graph.is_some() {
+                return Err(RsmediaError::invalid_config(format!(
+                    "input frame is a hardware frame ({:?}) but this encoder has a software filter graph; \
+                     download the frame to system memory before encoding, or drop the filters",
+                    PixelFormat::from(frame.format)
+                )));
+            }
             // 正常编码帧：经过 filter（如有）
             // 滤镜 buffer/abuffer 源按"滤镜图输入格式"配置（声明优先，见
             // `Filter::with_input_format`；默认=编码器协商格式）。输入帧格式
@@ -1243,15 +1231,22 @@ impl Encoder {
             });
             // 先把帧转换到滤镜图输入格式（此转换需要 `&mut self` 以复用可变的
             // `scaler`/重采样上下文），转换完成后再借用 `filter_graph` 处理。
-            let converted = match graph_input_format {
-                FrameFormat::Pixel(dst) if frame.format != dst as i32 => {
-                    self.scaler
-                        .scale_frame(&frame, frame.width, frame.height, dst)?
+            //
+            // 硬件帧不进软件格式转换：swscale 处理不了 hw 帧，而 hw 帧也不能喂给
+            // 软件滤镜图（图里没有 `hwdownload`），故上面已拒绝"hw 帧 + 滤镜图"的
+            // 组合，这里只把它原样交给 `send_frame_post_filter` 做 frames context 映射。
+            let converted = if !frame.hw_frames_ctx.is_null() {
+                frame
+            } else {
+                match graph_input_format {
+                    FrameFormat::Pixel(dst) if frame.format != dst as i32 => self
+                        .scaler
+                        .scale_frame(&frame, frame.width, frame.height, dst)?,
+                    FrameFormat::Sample(dst) if frame.format != dst as i32 => self
+                        .filter_converter
+                        .convert(&frame, frame.ch_layout, dst as _, frame.sample_rate)?,
+                    _ => frame,
                 }
-                FrameFormat::Sample(dst) if frame.format != dst as i32 => self
-                    .filter_converter
-                    .convert(&frame, frame.ch_layout, dst as _, frame.sample_rate)?,
-                _ => frame,
             };
             if let Some(graph) = self.filter_graph.as_mut() {
                 match graph.process_frame(Some(converted))? {
@@ -1373,6 +1368,12 @@ impl Encoder {
                     .hw_upload(&mut self.context, &scaled_frame)
                     .context("Failed to upload frame to HW")?
             }
+            // 已是硬件帧，但属于**别的** frames context（解码器/另一台设备/调用方
+            // 自建）：映射进编码器自己那份，同设备时零拷贝。已经在编码器 frames
+            // context 里的帧由 `map_hw_frame` 原样返回。
+            Some(hw_ctx) if hw_ctx.is_hw_frame(&scaled_frame) => hw_ctx
+                .map_hw_frame(&mut self.context, scaled_frame)
+                .context("Failed to map the input hardware frame into the encoder")?,
             _ => scaled_frame, // 不需要上传或已经是 HW frame
         };
 
@@ -1522,6 +1523,29 @@ impl Encoder {
     fn rescale(&mut self, frame: AVFrame) -> Result<AVFrame> {
         let scaled_frame = match self.media_type {
             MediaType::VIDEO => {
+                // 已是硬件帧：swscale 处理不了 hw 帧，且软件编码器也吃不下它。
+                // 跨 frames context 的搬运（本编码器自己的那份）由
+                // `send_frame_post_filter` 用 `av_hwframe_map` 完成，这里原样透传。
+                if !frame.hw_frames_ctx.is_null() {
+                    let hw_ctx = self.hw_context.as_ref().ok_or_else(|| {
+                        RsmediaError::invalid_config(format!(
+                            "input frame is a hardware frame ({:?}) but this encoder has no hardware \
+                             device configured; enable hardware acceleration with \
+                             `with_hardware_device`, or download the frame to system memory first",
+                            PixelFormat::from(frame.format)
+                        ))
+                    })?;
+                    if !hw_ctx.is_hw_frame(&frame) {
+                        return Err(RsmediaError::invalid_config(format!(
+                            "input hardware frame format {:?} does not match this encoder's hardware \
+                             format {:?}; download the frame to system memory, or encode with the \
+                             same hardware backend",
+                            PixelFormat::from(frame.format),
+                            PixelFormat::from(hw_ctx.get_format(true))
+                        )));
+                    }
+                    return Ok(frame);
+                }
                 let target_sw_pix_fmt = if let Some(hw_ctx) = self.hw_context.as_ref() {
                     hw_ctx.get_format(false).into()
                 } else {
@@ -1587,6 +1611,22 @@ impl Encoder {
                     return Err(RsmediaError::unsupported(format!(
                         "this encoder cannot encode frames in pixel format {:?}",
                         frame.format
+                    )));
+                }
+                // 编码器上下文的尺寸是权威值（`build` 时若滤镜改了尺寸已同步到
+                // 上下文）。尺寸不符时 `avcodec_send_frame` 只在深处报一句
+                // "Frame parameters mismatch context ..." 的 EINVAL，这里提前失败
+                // 并说清该改哪一边。上下文尺寸为 0 表示未设置，交给编码器自行决定。
+                let (ctx_width, ctx_height) = (self.context.width, self.context.height);
+                if ctx_width > 0
+                    && ctx_height > 0
+                    && (frame.width != ctx_width || frame.height != ctx_height)
+                {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "frame size {}x{} does not match the encoder's {}x{}; \
+                         resize the frame before encoding, or configure the encoder \
+                         with the frame's size",
+                        frame.width, frame.height, ctx_width, ctx_height
                     )));
                 }
             }
@@ -1688,6 +1728,39 @@ impl Encoder {
     #[inline]
     pub fn codecpar(&self) -> AVCodecParameters {
         self.context.extract_codecpar()
+    }
+
+    /// `AVCodecContext.flags` 掩码（`AV_CODEC_FLAG_*`，取值见 [`AVCodecFlag`]）。
+    ///
+    /// 读的是 `avcodec_open2` **之后**的实际值，因此 `with_global_header(true)`
+    /// 并入的 `GLOBAL_HEADER` 位也在内；编解码器自行调整过的位同样会反映出来。
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        self.context.flags as u32
+    }
+
+    /// `AVCodecContext.flags2` 掩码（`AV_CODEC_FLAG2_*`，取值见
+    /// [`AVCodecFlag2`](crate::codec::AVCodecFlag2)）。
+    #[inline]
+    pub fn flags2(&self) -> u32 {
+        self.context.flags2 as u32
+    }
+
+    /// `AVCodecContext.thread_type` 掩码（`FF_THREAD_*`，取值见
+    /// [`ThreadType`](crate::codec::ThreadType)）。
+    #[inline]
+    pub fn thread_type(&self) -> u32 {
+        self.context.thread_type as u32
+    }
+
+    /// `AVCodecContext.thread_count`（0 = 自动）。
+    ///
+    /// 读的是 `avcodec_open2` **之后**的实际值：帧级线程的编解码器会在
+    /// `thread_count == 0` 时把它改写成自动推导出的线程数（见 FFmpeg
+    /// `ff_frame_thread_init`），非 0 的调用方设置则原样保留。
+    #[inline]
+    pub fn thread_count(&self) -> i32 {
+        self.context.thread_count
     }
 
     /// 单帧时长（编码器 time_base 单位），用于补全缺失的 packet duration。
@@ -1916,7 +1989,7 @@ mod tests {
     #[test]
     fn test_options_conflict_with_typed_setters() -> Result<()> {
         let mut opts = Options::new();
-        opts.insert("threads", "1");
+        opts.set("threads", "1");
 
         // 仅透传 `threads`：合法（builder 未用 typed setter 指定过线程数）。
         let builder = EncoderBuilder::new_video(64, 64)
@@ -1945,6 +2018,136 @@ mod tests {
         assert!(
             msg.contains("'threads'") && msg.contains("with_thread_count"),
             "message must name the key and its setter: {msg}"
+        );
+        Ok(())
+    }
+
+    /// `with_flags`/`with_flags2`/`with_thread_type` 的 `impl Into<u32>` 参数落到
+    /// `AVCodecContext` 的对应字段（单个标志与 `|` 组合都要原样保留）；
+    /// `with_flags` 与 builder 自管的 `GLOBAL_HEADER` 是不同位，按位合并而非互相覆盖。
+    #[test]
+    fn test_builder_codec_flags_reach_context() -> Result<()> {
+        use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType};
+
+        let encoder = EncoderBuilder::new_video(64, 64)
+            .with_flags(AVCodecFlag::CLOSED_GOP | AVCodecFlag::LOW_DELAY)
+            .with_flags2(AVCodecFlag2::FAST | AVCodecFlag2::CHUNKS)
+            .with_thread_type(ThreadType::SLICE)
+            .build()?;
+
+        let want = AVCodecFlag::CLOSED_GOP.as_raw() | AVCodecFlag::LOW_DELAY.as_raw();
+        assert_eq!(
+            encoder.flags() & want,
+            want,
+            "caller flags must survive the GLOBAL_HEADER merge"
+        );
+        assert_eq!(
+            encoder.flags2(),
+            AVCodecFlag2::FAST.as_raw() | AVCodecFlag2::CHUNKS.as_raw()
+        );
+        assert_eq!(encoder.thread_type(), ThreadType::SLICE.as_raw());
+
+        // 单个标志（不组合）同样可传，且不会带进别的位。
+        let single = EncoderBuilder::new_video(64, 64)
+            .with_flags2(AVCodecFlag2::FAST)
+            .build()?;
+        assert_eq!(single.flags2(), AVCodecFlag2::FAST.as_raw());
+
+        // 组合位（`FF_THREAD_FRAME | FF_THREAD_SLICE`）原样落到掩码。
+        let encoder = EncoderBuilder::new_video(64, 64)
+            .with_thread_type(ThreadType::FRAME | ThreadType::SLICE)
+            .build()?;
+        assert_eq!(
+            encoder.thread_type(),
+            ThreadType::FRAME.as_raw() | ThreadType::SLICE.as_raw()
+        );
+
+        // GLOBAL_HEADER 与调用方的 flags 是两个来源的不同位，必须同时存在。
+        let encoder = EncoderBuilder::new_video(64, 64)
+            .with_global_header(true)
+            .with_flags(AVCodecFlag::LOW_DELAY)
+            .build()?;
+        assert_ne!(encoder.flags() & AVCodecFlag::GLOBAL_HEADER.as_raw(), 0);
+        assert_ne!(encoder.flags() & AVCodecFlag::LOW_DELAY.as_raw(), 0);
+
+        // 调用方一个 flags 都不设时，上下文自带的默认位（FFmpeg 在
+        // `avcodec_alloc_context3` 里写入，实测含 `CLOSED_GOP`）必须原样保留：
+        // 把这些位从 0 重建会静默改变输出码流（closed GOP → open GOP），
+        // 而调用方并没有要求这个变化。对照值直接取自全新上下文的读数，不写死
+        // 具体位（默认位随 FFmpeg 版本变化）。
+        let codec = AVCodec::find_encoder_by_name(c"libx264")
+            .expect("libx264 is the default video encoder used by this test");
+        let defaults = AVCodecContext::new(&codec).flags as u32;
+        // 自检：下面那条断言只有在默认位非空时才有意义（6.1~9.0 实测都是
+        // `AV_CODEC_FLAG_CLOSED_GOP`）。若某个版本真把默认位清空了，这条会先
+        // 失败提醒，而不是让上面的断言悄悄变成恒真。
+        assert_ne!(defaults, 0, "no default flags to preserve on this FFmpeg");
+        let plain = EncoderBuilder::new_video(64, 64).build()?;
+        assert_eq!(
+            plain.flags() & defaults,
+            defaults,
+            "builder dropped FFmpeg's own default flags: got {:#x}, want at least {defaults:#x}",
+            plain.flags()
+        );
+        Ok(())
+    }
+
+    /// 显式 `thread_count` 原样落入上下文；超出 `i32` 范围（没有合法语义）时回退
+    /// 到本机 CPU 数，而不是某个凭空写死的"最大线程数"。
+    #[test]
+    fn test_builder_thread_count_beyond_i32_falls_back_to_cpu_count() -> Result<()> {
+        let explicit = EncoderBuilder::new_video(64, 64)
+            .with_thread_count(3)
+            .build()?;
+        assert_eq!(explicit.thread_count(), 3);
+
+        let cpu_count = num_cpus::get() as i32;
+        let default = EncoderBuilder::new_video(64, 64).build()?;
+        assert_eq!(default.thread_count(), cpu_count);
+
+        let overflow = EncoderBuilder::new_video(64, 64)
+            .with_thread_count(usize::MAX)
+            .build()?;
+        assert_eq!(
+            overflow.thread_count(),
+            cpu_count,
+            "an out-of-range thread_count must fall back to the CPU count"
+        );
+        Ok(())
+    }
+
+    /// `Quality::Bitrate` 也占 `b` 键：与 `with_options("b")` 同时出现必须报冲突；
+    /// 非正 Bitrate 与 `effective_bit_rate` 一致地算"未设置"，因此不算冲突。
+    #[test]
+    fn test_quality_bitrate_counts_as_owned_key() -> Result<()> {
+        let mut opts = Options::new();
+        opts.set("b", "500000");
+
+        let builder = EncoderBuilder::new_video(64, 64)
+            .with_codec_name(Some("libx264".to_string()))
+            .with_quality(Quality::Bitrate(2_000_000))
+            .with_options(Some(opts.clone()));
+        let err = builder
+            .build()
+            .err()
+            .expect("Quality::Bitrate + passthrough `b` must be rejected");
+        assert!(
+            matches!(err, RsmediaError::InvalidConfig(_)),
+            "expected InvalidConfig, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("'b'"),
+            "message must name the key: {err}"
+        );
+
+        // 非正 Bitrate 等于没设（见 `effective_bit_rate`），此时透传 `b` 合法。
+        let builder = EncoderBuilder::new_video(64, 64)
+            .with_codec_name(Some("libx264".to_string()))
+            .with_quality(Quality::Bitrate(0))
+            .with_options(Some(opts));
+        assert!(
+            builder.build().is_ok(),
+            "non-positive Bitrate means unset, passthrough `b` must stay legal"
         );
         Ok(())
     }
@@ -2135,6 +2338,16 @@ mod tests {
             "libx264 does not accept RGB24 frames"
         );
 
+        // 尺寸不符要在本地就被拦下：否则只有 `avcodec_send_frame` 深处一句
+        // "Frame parameters mismatch context" 的 EINVAL，看不出该改哪边。
+        frame.set_format(PixelFormat::YUV420P as i32);
+        frame.set_width(32);
+        let err = video
+            .check_frame(Some(&frame))
+            .expect_err("32x64 frame must not reach a 64x64 encoder");
+        assert!(err.is_invalid_config(), "{err}");
+        assert!(err.to_string().contains("32x64"), "{err}");
+
         let audio = EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP).build()?;
         audio.check_frame(None)?;
 
@@ -2302,6 +2515,108 @@ mod tests {
         Ok(())
     }
 
+    /// 自动探测硬件设备；探不到就返回 `None`（"本机此刻没有可用 GPU"不是测试失败）。
+    fn try_auto_hw_config() -> Option<HWDeviceConfig> {
+        match HWDeviceConfig::auto_platform() {
+            Ok(config) => Some(config),
+            Err(e) => {
+                println!("SKIP: no hardware acceleration device probed: {e}");
+                None
+            }
+        }
+    }
+
+    /// 某设备类型对应的 H.264 硬件编码器名（FFmpeg 的命名约定）。
+    ///
+    /// 只列出与**编码**设备一一对应的那些；纯解码后端（dxva2/d3d11va/vulkan/opencl）
+    /// 返回 `None`，测试据此跳过。
+    fn hw_encoder_for(device_type: crate::hwaccel::HWDeviceType) -> Option<&'static str> {
+        use crate::hwaccel::HWDeviceType as T;
+        match device_type {
+            T::VIDEOTOOLBOX => Some("h264_videotoolbox"),
+            T::CUDA => Some("h264_nvenc"),
+            T::VAAPI => Some("h264_vaapi"),
+            T::QSV => Some("h264_qsv"),
+            T::MEDIACODEC => Some("h264_mediacodec"),
+            _ => None,
+        }
+    }
+
+    /// 硬件帧输入：帧属于**别的** frames context（解码器 / 另一台设备 / 调用方自建）
+    /// 时，`rescale` 不许让 swscale 去碰它，`send_frame_post_filter` 必须把它搬进
+    /// 编码器自己那份 frames context（优先 `av_hwframe_map` 零拷贝，后端不支持
+    /// map 时退回 download + upload）。
+    ///
+    /// 断言分两层：搬运结果的 `hw_frames_ctx` 必须**就是**编码器上下文持有的那个
+    /// frames context；随后走完整 `encode_raw` 出包——FFmpeg 会拒绝 frames context
+    /// 与编码器不匹配的硬件帧，"能编码出包"因此反过来证明搬运确实发生了。
+    ///
+    /// 无 GPU / 无对应硬件编码器的环境跳过（先探测再跳过，不把环境差异当失败）。
+    #[test]
+    fn test_encode_raw_accepts_foreign_hw_frame() -> Result<()> {
+        // 本测试会创建并持有 `HWContext`（进程级缓存），必须与其它硬件测试串行，
+        // 否则会破坏按引用计数断言的缓存释放测试。
+        let _guard = crate::hwaccel::hw_cache_test_lock();
+
+        let Some(config) = try_auto_hw_config() else {
+            return Ok(());
+        };
+        let Some(codec_name) = hw_encoder_for(config.device_type) else {
+            println!(
+                "SKIP: {:?} has no matching hardware encoder",
+                config.device_type
+            );
+            return Ok(());
+        };
+        let codec_c = std::ffi::CString::new(codec_name).expect("codec name is NUL-free");
+        if AVCodec::find_encoder_by_name(&codec_c).is_none() {
+            println!("SKIP: {codec_name} is not in this FFmpeg build");
+            return Ok(());
+        }
+
+        let (width, height) = (64usize, 64usize);
+        let hw_ctx = HWContext::new(config.clone()).context("hardware device must open")?;
+
+        // 源帧来自**另一个** frames context（同一台设备）——正是解码器输出帧的样子。
+        let mut src_frames = hw_ctx.create_hw_frames_ctx(width as i32, height as i32, 2)?;
+
+        let mut encoder = EncoderBuilder::new_video(width, height)
+            .with_codec_name(codec_name.to_string())
+            .with_hardware_device(Some(config))
+            .with_hw_pool_size(2)
+            .build()?;
+
+        let mut packets = 0usize;
+        for index in 0..4i64 {
+            let mut src = AVFrame::new();
+            src.set_width(width as i32);
+            src.set_height(height as i32);
+            src.set_format(hw_ctx.get_format(true));
+            src_frames.get_buffer(&mut src)?;
+            src.set_pts(index);
+
+            // 映射进编码器自己的 frames context。
+            let mapped = hw_ctx.map_hw_frame(&mut encoder.context, src)?;
+            // 比对 AVHWFramesContext 对象本身（`AVBufferRef::data`）：map/upload 都会
+            // 新建一个 AVBufferRef 指向同一个 frames context，结构体地址并不可比。
+            let expected_data = {
+                let frames = encoder
+                    .context
+                    .hw_frames_ctx()
+                    .expect("encoder owns a frames context");
+                unsafe { (*frames.as_ptr()).data as usize }
+            };
+            assert!(
+                unsafe { (*mapped.hw_frames_ctx).data as usize } == expected_data,
+                "frame {index}: mapped frame must live in the encoder's frames context"
+            );
+
+            packets += encoder.encode_raw(mapped)?.len();
+        }
+        assert!(packets > 0, "hardware frames must produce packets");
+        Ok(())
+    }
+
     /// `with_fps` is fail-fast: a non-positive or non-finite rate is rejected by
     /// `build()` rather than silently falling back to the default 30 fps (which
     /// would produce a stream at the wrong speed, the hardest kind of bug to
@@ -2413,14 +2728,12 @@ mod tests {
     fn test_builder_scale_options_reach_the_scaler() -> Result<()> {
         use crate::scale::{ScaleAlgorithm, ScaleQuality};
 
-        // 多质量位（掩码）+ 非默认算法。
+        // 多质量位（`|` 组合）+ 非默认算法。
         let encoder = EncoderBuilder::new_video(320, 240)
             .with_scale_algorithm(ScaleAlgorithm::LANCZOS)
-            .with_scale_quality([
-                ScaleQuality::FULL_CHR_H_INT,
-                ScaleQuality::ACCURATE_RND,
-                ScaleQuality::BITEXACT,
-            ])
+            .with_scale_quality(
+                ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND | ScaleQuality::BITEXACT,
+            )
             .build()?;
         assert_eq!(encoder.scaler.algorithm(), ScaleAlgorithm::LANCZOS);
         assert_eq!(encoder.scaler.quality(), ScaleQuality::default_mask());
@@ -2434,11 +2747,15 @@ mod tests {
         assert_eq!(encoder.scaler.algorithm(), ScaleAlgorithm::default());
         assert_eq!(encoder.scaler.quality(), ScaleQuality::default_mask());
 
-        // 单个质量位（`Into<u32>`）。
+        // 单个质量位、以及裸掩码 `0`（= 无质量位）。
         let encoder = EncoderBuilder::new_video(320, 240)
-            .with_scale_quality([ScaleQuality::BITEXACT])
+            .with_scale_quality(ScaleQuality::BITEXACT)
             .build()?;
         assert_eq!(encoder.scaler.quality(), ScaleQuality::BITEXACT.as_raw());
+        let encoder = EncoderBuilder::new_video(320, 240)
+            .with_scale_quality(0u32)
+            .build()?;
+        assert_eq!(encoder.scaler.quality(), 0);
 
         // 池化开关进入 Scaler：默认关闭，with_scale_pool(true) 打开。
         assert!(!encoder.scaler.pool_enabled());

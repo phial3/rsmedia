@@ -945,8 +945,13 @@ pub mod video {
     /// 接进自定义的多输入图——线性滤镜链（`DecoderBuilder::with_filters` 等）
     /// 装不下它，会以「输入 pad 数不匹配」报错。
     /// * `x` / `y` - 叠加层在基底上的偏移（支持表达式，如 `"main_w-overlay_w-10"`）。
+    ///   表达式可含 `,`（如 `"if(eq(t,0),0,W-w)"`），会按滤镜语法转义，
+    ///   直接照写即可，无需自己加反斜杠。
     /// * `opacity` - 叠加层不透明度（0~1）。
     pub fn overlay(x: &str, y: &str, opacity: Option<f32>) -> Filter {
+        // x/y 是表达式，`,` 等字符会被滤镜语法解析吃掉（整条描述先按 `,` 拆分
+        // 滤镜），报出来的错与真实原因无关，因此与其它 `&str` 参数一致地转义。
+        let (x, y) = (escape_filter_option(x), escape_filter_option(y));
         let alpha = match opacity {
             Some(a) => format!(":alpha={a}"),
             None => String::new(),
@@ -960,7 +965,7 @@ pub mod video {
 
     /// 横向并排（hstack）：把多路视频并成一行。
     ///
-    /// 多输入滤镜，接线方式见 [`Self::overlay`]；要求各路**高度一致**，
+    /// 多输入滤镜，接线方式见 [`overlay`]；要求各路**高度一致**，
     /// 输出宽度为各路宽度之和（[`FilterGraphBuilder::hstack`] 会自动收口到声明的
     /// 输出尺寸）。
     pub fn hstack(inputs: u32) -> Filter {
@@ -1915,7 +1920,11 @@ impl FilterGraph {
         Ok(graph)
     }
 
-    /// 主输出（下标 0）是否已 drain（`av_buffersink_get_frame` 返回 `EAGAIN`）。
+    /// 主输出（下标 0）是否正在排空（EOF 已送出，图里还有缓冲帧要出）。
+    ///
+    /// 判据是"EOF 已送到每一路输入"，**不是** `av_buffersink_get_frame` 返回过
+    /// `EAGAIN`：流中段的 `EAGAIN`（还在等其它输入、滤镜缓冲未攒够）不改变状态，
+    /// 否则它在流中段就永久为真（契约见 `state::ProcessState`）。
     pub fn is_drained(&self) -> bool {
         self.is_drained_at(0)
     }
@@ -2272,8 +2281,9 @@ impl FilterGraph {
             .context("Error submitting the frame to the filter graph.")
     }
 
-    /// 从第 `output` 路输出取一帧：`Ok(Some)` 是产出帧，`Ok(None)` 表示暂时无帧
-    /// （图被 drain，该路状态置为 `Drained`）或已到流末尾（状态置为 `Flushed`）。
+    /// 从第 `output` 路输出取一帧：`Ok(Some)` 是产出帧，`Ok(None)` 表示这一刻没有帧
+    /// ——要么图还需要更多输入（`EAGAIN`，状态保持在 `Normal`），要么正在排空
+    /// （EOF 已送出，状态置为 `Drained`）或已到流末尾（状态置为 `Flushed`）。
     pub fn receive_frame_from(&mut self, output: usize) -> Result<Option<AVFrame>> {
         if output >= self.states.len() {
             return Err(RsmediaError::invalid_config(format!(
@@ -2292,8 +2302,18 @@ impl FilterGraph {
         match filter_result {
             Ok(frame) => Ok(Some(frame)),
             Err(rsmpeg::error::RsmpegError::BufferSinkDrainError) => {
-                tracing::debug!("filter graph: buffer sink drain error");
-                self.states[output] = ProcessState::Drained;
+                // `EAGAIN` 只说明**这一刻**没有帧：流中段同样会出现（帧同步类滤镜
+                // 还在等其它输入、滤镜自身的缓冲未攒够），并不等于已经在排空。
+                // 因此只有"EOF 已送到每一路输入"时才推进到 `Drained`——否则多输入图
+                // 里只喂了一路的一次 `EAGAIN` 就会让 `is_drained()` 在流中段永久为真
+                // （契约见 `state::ProcessState`）。
+                if self.eof_sent.iter().all(|sent| *sent) {
+                    self.states[output] = ProcessState::Drained;
+                }
+                tracing::debug!(
+                    "filter graph: output {output} has no frame available (EAGAIN, eof sent: {})",
+                    self.eof_sent.iter().all(|sent| *sent)
+                );
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::BufferSinkEofError) => {
@@ -2460,6 +2480,73 @@ impl FilterGraph {
     pub fn output_size_at(&mut self, output: usize) -> Option<(i32, i32)> {
         let sink = self.get_sink_context(output).ok()?;
         Some((sink.get_w(), sink.get_h()))
+    }
+
+    /// 运行时给图里的滤镜发一条命令（`avfilter_graph_send_command`）。
+    ///
+    /// 图一旦 `build()`，各滤镜的选项就被冻结了；要改一个参数，要么整张图重建
+    /// （断流重连，直播/交互场景不可接受），要么走这条路径。支持 `cmd` 的滤镜会
+    /// 在**处理下一帧时**应用新参数，因此适合调音量、转角度、改文字这类在线调整。
+    ///
+    /// - `target`  —— `"all"` 发给所有滤镜；否则按滤镜名（如 `"volume"`）或滤镜
+    ///   实例名匹配，命中多个就都发。
+    /// - `command` —— 命令名，只能是字母数字（FFmpeg 的硬性要求，见
+    ///   `ffmpeg -h filter=<name>` 的 "Commands" 段）。
+    /// - `arg`     —— 命令参数，语法由滤镜自己定义（如 `volume` 的 `"0.5"`）。
+    ///
+    /// 成功时返回滤镜写回的响应文本（多数滤镜不写，返回空串）。滤镜不认识该命令
+    /// 时 FFmpeg 报 `AVERROR(ENOSYS)`，此处映射为 [`RsmediaError::Unsupported`]；
+    /// 其余失败（target 不存在、参数被拒）保留原始 FFmpeg 错误码。
+    ///
+    /// # Errors
+    ///
+    /// 图尚未 `build()`、`target`/`command`/`arg` 含内部 NUL，或滤镜拒绝了这条
+    /// 命令。
+    pub fn send_command(&mut self, target: &str, command: &str, arg: &str) -> Result<String> {
+        if !self.is_initialized() {
+            return Err(RsmediaError::invalid_config(
+                "Filter graph not initialized; send_command needs a built graph",
+            ));
+        }
+
+        let target_c = strutils::str_to_cstring(target)?;
+        let command_c = strutils::str_to_cstring(command)?;
+        let arg_c = strutils::str_to_cstring(arg)?;
+
+        // FFmpeg 用 av_strlcpy 往 res 里写响应，保证 NUL 结尾；给足 256 字节。
+        // 元素类型跟随平台的 `c_char`（aarch64-linux 是 u8、macOS 与 x86_64 是 i8），
+        // 写死任一种都会在另一种平台上编译不过——binding 的签名就是 `c_char`。
+        let mut res = [0 as std::ffi::c_char; 256];
+        let ret = unsafe {
+            ffi::avfilter_graph_send_command(
+                self.graph.as_mut_ptr(),
+                target_c.as_ptr(),
+                command_c.as_ptr(),
+                arg_c.as_ptr(),
+                res.as_mut_ptr(),
+                res.len() as i32,
+                0,
+            )
+        };
+
+        if ret < 0 {
+            // FFmpeg 文档明确：命令不被支持时返回 AVERROR(ENOSYS)。
+            if ret == -(ffi::ENOSYS as i32) {
+                return Err(RsmediaError::unsupported(format!(
+                    "Filter {target:?} does not implement the command {command:?}; \
+                     see `ffmpeg -h filter=<name>` for the commands it accepts"
+                )));
+            }
+            return Err(RsmediaError::av_error(ret).with_context(format!(
+                "Failed to send command {command:?} to filter {target:?} \
+                 (unknown target, or the filter rejected the argument {arg:?})"
+            )));
+        }
+
+        // res 由 FFmpeg 用 av_strlcpy 写入，保证 NUL 结尾。
+        Ok(strutils::cstr_to_string_lossy(unsafe {
+            CStr::from_ptr(res.as_ptr())
+        }))
     }
 }
 
@@ -3806,6 +3893,11 @@ mod tests {
         frame
     }
 
+    /// 读 FLTP 帧第 `index` 个采样（单声道，取平面 0）。
+    fn fltp_sample_at(frame: &AVFrame, index: usize) -> f32 {
+        unsafe { *frame.data[0].cast::<f32>().add(index) }
+    }
+
     fn video_endpoint(width: i32, height: i32) -> VideoEndpoint {
         VideoEndpoint::new(
             width,
@@ -3932,6 +4024,89 @@ mod tests {
         Ok(())
     }
 
+    /// `overlay` 的 x/y 是表达式，可能含 `,`（如 `if(eq(a,b),c,d)`）。不转义时
+    /// 这个 `,` 会被图级解析当成滤镜分隔符，报出来的错与真实原因无关；转义后
+    /// 整图必须配置成功，且表达式仍按原意求值。
+    #[test]
+    fn test_overlay_expression_with_comma_is_escaped_and_runs() -> Result<()> {
+        // 基底高 4 → x 取 2，叠加层落在 (2,0)-(3,1)。
+        let expr = "if(eq(main_h,4),2,0)";
+
+        let spec = video::overlay(expr, "0", None).spec();
+        assert!(
+            spec.contains(r"\,"),
+            "comma must stay escaped for the graph-level parse: {spec}"
+        );
+
+        let mut graph = FilterGraphBuilder::overlay(
+            video_endpoint(4, 4),
+            video_endpoint(2, 2),
+            expr,
+            "0",
+            video_endpoint(4, 4),
+        )?;
+        graph.push_frame_to(0, Some(make_yuv420p_frame(4, 4, 0)))?;
+        graph.push_frame_to(1, Some(make_yuv420p_frame(2, 2, 255)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .expect("overlay emits a frame once both inputs have one");
+        for y in 0..4 {
+            for x in 0..4 {
+                let inside = (2..4).contains(&x) && (0..2).contains(&y);
+                assert_eq!(
+                    luma_at(&out, x, y),
+                    if inside { 255 } else { 0 },
+                    "overlay mismatch at ({x},{y}), spec: {spec}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `EAGAIN` 只是"这一刻没帧可取"，不等于已经在排空：`Drained` 的判据是
+    /// **EOF 已送到每一路输入**（见 `state::ProcessState`）。多输入图里只喂了
+    /// 一路时的 `EAGAIN` 若被记成 `Drained`，`is_drained()` 会在流中段永久为真。
+    #[test]
+    fn test_filter_graph_eagain_midstream_is_not_drained() -> Result<()> {
+        let mut graph = FilterGraphBuilder::overlay(
+            video_endpoint(4, 4),
+            video_endpoint(2, 2),
+            "2",
+            "2",
+            video_endpoint(4, 4),
+        )?;
+
+        // 只喂基底：overlay 还在等叠加层，取帧必得 EAGAIN，但这仍是流中段。
+        graph.push_frame_to(0, Some(make_yuv420p_frame(4, 4, 0)))?;
+        assert!(
+            graph.receive_frame_from(0)?.is_none(),
+            "overlay must wait for its second input"
+        );
+        assert!(
+            !graph.is_drained(),
+            "EAGAIN with input still to come is not draining: {graph:?}"
+        );
+        assert!(!graph.is_flushed());
+
+        // 补齐叠加层后必须能出帧——证明上一步只是"暂时没帧"，图仍能继续接收输入。
+        graph.push_frame_to(1, Some(make_yuv420p_frame(2, 2, 255)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .expect("overlay emits a frame once both inputs have one");
+        assert_eq!(luma_at(&out, 2, 2), 255);
+        assert!(!graph.is_drained(), "still mid-stream: {graph:?}");
+
+        // 推完 EOF 才真正进入排空，直至流末尾。
+        graph.push_frame_to(0, None)?;
+        graph.push_frame_to(1, None)?;
+        graph.drain_output(0)?;
+        assert!(
+            graph.is_flushed(),
+            "after EOF the graph must end up flushed: {graph:?}"
+        );
+        Ok(())
+    }
+
     /// `concat`：按输入顺序首尾相接——前两帧来自输入 0、后两帧来自输入 1。
     #[test]
     fn test_filter_graph_builder_concat_order() -> Result<()> {
@@ -3988,6 +4163,76 @@ mod tests {
             frames.iter().all(|frame| frame.sample_rate == 48000),
             "sample rate preserved"
         );
+        Ok(())
+    }
+
+    /// `send_command`：图一旦建成，滤镜选项就被冻结，运行时调参只能走命令通道。
+    ///
+    /// `volume` 的 `volume` 命令改的是增益表达式，而表达式要**逐帧求值**才会作用到
+    /// 后续帧（`eval=frame`）——默认 `eval=once` 只在初始化时算一次，改了表达式也
+    /// 不会重算。这里显式带上 `eval=frame`，用幅度 0.5 的帧验证 1.0 → 0.1 的衰减。
+    #[test]
+    fn test_filter_graph_send_command_changes_volume() -> Result<()> {
+        let endpoint = audio_endpoint(48000);
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("src", endpoint);
+        builder.add_node(FilterNode::new(Filter::new(
+            "volume",
+            MediaType::AUDIO,
+            "volume=1.0:eval=frame".to_string(),
+        )));
+        builder.add_output_tail(endpoint);
+        let mut graph = builder.build()?;
+
+        // 增益 1.0：输出与输入同幅。
+        graph.push_frame_to(0, Some(make_fltp_frame(48000, 512, 0.5)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .context("volume passes the first frame through")?;
+        let before = fltp_sample_at(&out, 0);
+        assert!(
+            (before - 0.5).abs() < 1e-3,
+            "gain 1.0 must leave the amplitude alone, got {before}"
+        );
+
+        // 运行时把增益改成 0.1，无需重建图。
+        let response = graph.send_command("volume", "volume", "0.1")?;
+        assert!(
+            response.is_empty(),
+            "volume writes no response, got {response:?}"
+        );
+
+        graph.push_frame_to(0, Some(make_fltp_frame(48000, 512, 0.5)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .context("volume passes the second frame through")?;
+        let after = fltp_sample_at(&out, 0);
+        assert!(
+            (after - 0.05).abs() < 1e-3,
+            "gain 0.1 must attenuate the amplitude to 0.05, got {after}"
+        );
+        Ok(())
+    }
+
+    /// `send_command` 遇到滤镜不认识的命令要报 `Unsupported`（FFmpeg 的 ENOSYS），
+    /// 而不是当作普通 FFmpeg 错误码糊过去——调用方可据此换滤镜或放弃该能力。
+    #[test]
+    fn test_filter_graph_send_command_unknown_command_is_unsupported() -> Result<()> {
+        let endpoint = audio_endpoint(48000);
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("src", endpoint);
+        builder.add_node(FilterNode::new(Filter::new(
+            "volume",
+            MediaType::AUDIO,
+            "volume=1.0:eval=frame".to_string(),
+        )));
+        builder.add_output_tail(endpoint);
+        let mut graph = builder.build()?;
+
+        let err = graph
+            .send_command("volume", "definitelynotacommand", "1")
+            .expect_err("volume does not implement this command");
+        assert!(err.is_unsupported(), "{err}");
         Ok(())
     }
 

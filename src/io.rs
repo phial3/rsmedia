@@ -1,5 +1,5 @@
 use crate::error::{Context, Result, RsmediaError};
-use crate::init::{AVLogFlag, AVLogLevel};
+use crate::init::AVLogLevel;
 use crate::location::Location;
 use crate::options::Options;
 use crate::stream::MediaType;
@@ -661,7 +661,7 @@ struct ReaderSpec<'a> {
 /// use rsmedia::io::StreamReaderBuilder;
 /// use rsmedia::Options;
 /// let mut options = Options::new();
-/// options.insert("rtsp_transport", "tcp");
+/// options.set("rtsp_transport", "tcp");
 ///
 /// let mut reader = StreamReaderBuilder::new("my_file.mp4")
 ///    .with_options(Some(options))
@@ -1047,6 +1047,10 @@ unsafe impl Send for IoReader {}
 /// 该 trait 是公开的扩展点：可以为任意目标（socket、channel、加密流等）
 /// 实现自定义 Writer。
 ///
+/// 本 trait 自身不是 object-safe：[`Out`](Self::Out)/[`Accum`](Self::Accum) 与
+/// 两个静态 `merge_*` 方法都需要具体类型才能解析。要在运行时擦除 writer 类型、
+/// 或异构持有（`Vec<...>` / `Box<...>`），用 [`DynWriter`] 包装。
+///
 /// 输出模型分两层：
 /// - [`Out`](Self::Out)：单次 `write_*` 调用产生的输出（如一个 [`Bytes`] 块）；
 /// - [`Accum`](Self::Accum)：跨多次调用累积输出的容器（如 `Vec<Bytes>`）。
@@ -1169,6 +1173,178 @@ pub trait Writer {
     ///
     /// Must accumulate, not overwrite — same rationale as [`Self::merge_out`].
     fn merge_accum(acc: &mut Self::Accum, other: Self::Accum);
+}
+
+////////////////////////////////////////
+// DynWriter（Writer 的对象安全适配层）
+////////////////////////////////////////
+
+/// [`Writer`] 的对象安全镜像。
+///
+/// 与 [`Writer`] 只差两处，都是为了 `dyn` 能成立：
+/// - 无关联类型：`Out`/`Accum` 固定为 `()`（每次调用直接写出，不产生增量字节）；
+/// - 无静态方法：`merge_out`/`merge_accum` 在 [`DynWriter`] 里是空操作——对
+///   `Out = ()` 的实现来说，"合并"本来就是"没有东西要合并"。
+///
+/// `Send` 是 supertrait：既与 [`IoWriterBuilder`] 对底层
+/// [`std::io::Write`](std::io::Write) 的要求一致，也让 [`DynWriter`] 自身是
+/// `Send`——它能随 [`Muxer`](crate::mux::Muxer) 一起移动到其他线程独占使用。
+trait WriterInner: Send {
+    fn write_header(&mut self) -> Result<()>;
+
+    fn is_header_written(&self) -> bool;
+
+    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()>;
+
+    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()>;
+
+    fn write_trailer(&mut self) -> Result<()>;
+
+    fn output(&self) -> &AVFormatContextOutput;
+
+    fn output_mut(&mut self) -> &mut AVFormatContextOutput;
+
+    fn add_stream(
+        &mut self,
+        codecpar: AVCodecParameters,
+        timebase: ffi::AVRational,
+    ) -> Result<usize>;
+
+    fn stream_time_base(&self, stream_index: usize) -> Result<ffi::AVRational>;
+}
+
+/// 所有"直接写出"的 [`Writer`]（`Out`/`Accum` 均为 `()`）都可被擦除。
+///
+/// 转发走 [`Writer`] 自身的默认实现（`add_stream`/`stream_time_base`），因此
+/// 自定义实现即使没覆盖过它们，行为也与用具体类型时一致——包括 header 写出后
+/// 拒绝 `add_stream` 的拦截。
+impl<W: Writer<Out = (), Accum = ()> + Send> WriterInner for W {
+    fn write_header(&mut self) -> Result<()> {
+        <W as Writer>::write_header(self)
+    }
+
+    fn is_header_written(&self) -> bool {
+        <W as Writer>::is_header_written(self)
+    }
+
+    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
+        <W as Writer>::write_frame(self, packet)
+    }
+
+    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()> {
+        <W as Writer>::write_interleaved(self, packet)
+    }
+
+    fn write_trailer(&mut self) -> Result<()> {
+        <W as Writer>::write_trailer(self)
+    }
+
+    fn output(&self) -> &AVFormatContextOutput {
+        <W as Writer>::output(self)
+    }
+
+    fn output_mut(&mut self) -> &mut AVFormatContextOutput {
+        <W as Writer>::output_mut(self)
+    }
+
+    fn add_stream(
+        &mut self,
+        codecpar: AVCodecParameters,
+        timebase: ffi::AVRational,
+    ) -> Result<usize> {
+        <W as Writer>::add_stream(self, codecpar, timebase)
+    }
+
+    fn stream_time_base(&self, stream_index: usize) -> Result<ffi::AVRational> {
+        <W as Writer>::stream_time_base(self, stream_index)
+    }
+}
+
+/// 把任意"直接写出"的 [`Writer`] 擦除成一个统一类型：运行时决定输出目标、
+/// 或把不同类型的 writer 放进同一个容器时用它。
+///
+/// 只接受 `Out`/`Accum` 均为 `()` 的实现——[`StreamWriter`]、[`IoWriter`] 以及
+/// 自定义的直接写出 writer。[`BufferWriter`] 不在此列：它的 `Out = Bytes` 是
+/// 每次调用**新增**的字节块，擦除掉就会静默丢数据，因此它保持具体类型使用
+/// （它自带 [`into_bytes`](BufferWriter::into_bytes) 取回完整容器）。
+///
+/// [`DynWriter`] 自己就是一个 [`Writer`]（`Out`/`Accum` = `()`），可直接交给
+/// 泛型 API：[`Muxer::new_from_writer`](crate::mux::Muxer::new_from_writer)、
+/// [`PcmSink`](crate::pcm::PcmSink)、[`copy_subtitle_stream`](crate::subtitle::copy_subtitle_stream) 等。
+///
+/// # Example
+///
+/// ```no_run
+/// use rsmedia::Writer;
+/// use rsmedia::io::{DynWriter, IoWriter};
+///
+/// // 两个不同类型的 writer 擦除进同一个容器，用同一段代码驱动。
+/// let mut writers: Vec<DynWriter> = vec![
+///     DynWriter::new(IoWriter::new("mpegts", Vec::new()).unwrap()),
+///     DynWriter::new(IoWriter::new("flv", std::io::sink()).unwrap()),
+/// ];
+/// for writer in &mut writers {
+///     writer.write_header().unwrap();
+///     writer.write_trailer().unwrap();
+/// }
+/// ```
+pub struct DynWriter(Box<dyn WriterInner>);
+
+impl DynWriter {
+    /// 装入一个"直接写出"的 writer。
+    ///
+    /// 需要跨线程移动时包装同样 `Send` 的实现即可——[`DynWriter`] 自身是 `Send`。
+    pub fn new<W: Writer<Out = (), Accum = ()> + Send + 'static>(writer: W) -> Self {
+        Self(Box::new(writer))
+    }
+}
+
+impl Writer for DynWriter {
+    type Out = ();
+    type Accum = ();
+
+    fn merge_out(_acc: &mut (), _out: ()) {}
+    fn merge_accum(_acc: &mut (), _other: ()) {}
+
+    fn write_header(&mut self) -> Result<()> {
+        self.0.write_header()
+    }
+
+    fn is_header_written(&self) -> bool {
+        self.0.is_header_written()
+    }
+
+    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
+        self.0.write_frame(packet)
+    }
+
+    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()> {
+        self.0.write_interleaved(packet)
+    }
+
+    fn write_trailer(&mut self) -> Result<()> {
+        self.0.write_trailer()
+    }
+
+    fn output(&self) -> &AVFormatContextOutput {
+        self.0.output()
+    }
+
+    fn output_mut(&mut self) -> &mut AVFormatContextOutput {
+        self.0.output_mut()
+    }
+
+    fn add_stream(
+        &mut self,
+        codecpar: AVCodecParameters,
+        timebase: ffi::AVRational,
+    ) -> Result<usize> {
+        self.0.add_stream(codecpar, timebase)
+    }
+
+    fn stream_time_base(&self, stream_index: usize) -> Result<ffi::AVRational> {
+        self.0.stream_time_base(stream_index)
+    }
 }
 
 /// 将 builder 阶段未消费的 options 在 `write_header` 时传给 muxer。
@@ -1389,7 +1565,7 @@ impl<'a> StreamWriterBuilder<'a> {
 /// use rsmedia::Options;
 ///
 /// let mut options = Options::new();
-/// options.insert("movflags", "frag_keyframe+empty_moov");
+/// options.set("movflags", "frag_keyframe+empty_moov");
 ///
 /// let mut writer = StreamWriterBuilder::new("my_file.mp4")
 ///     .with_options(Some(options))
@@ -1840,7 +2016,10 @@ unsafe impl<W: std::io::Write + Send + 'static> Send for IoWriter<W> {}
 /// `level` 也被记下来供回调自行过滤：FFmpeg 的 `av_log_set_level` 只作用于它
 /// 自带的默认回调，安装自定义回调后**所有**级别的消息都会送进回调，因此
 /// [`AVLogLevel::QUIET`] 必须由回调自己实现（见私有 `log_callback`）。
-pub fn init_logging(level: AVLogLevel, flag: AVLogFlag) {
+///
+/// `flag` 是 [`AVLogFlag`](crate::AVLogFlag) 位集，按 `impl Into<u32>` 给出（单个标志或 `|` 组合）。
+pub fn init_logging(level: AVLogLevel, flag: impl Into<u32>) {
+    let flag = flag.into();
     LOG_LEVEL.store(level as i32, Ordering::Relaxed);
     unsafe {
         ffi::av_log_set_callback(Some(log_callback));
@@ -2353,6 +2532,133 @@ mod tests {
         muxer.finish()?;
         let sink = muxer.into_writer().into_inner()?;
         assert!(!sink.is_empty(), "custom io writer produced no output");
+
+        Ok(())
+    }
+
+    /// `DynWriter` 擦除自定义 writer 后仍能当普通 `Writer` 交给 `Muxer`：
+    /// header / 包 / trailer 与默认的 `add_stream` 全部转发到位。
+    #[test]
+    fn test_dyn_writer_erases_a_custom_writer_for_the_muxer() -> Result<()> {
+        /// 自定义输出汇：统计收到的包与 trailer，其余交给内层 `IoWriter`。
+        ///
+        /// `DynWriter` 的转发 impl 让所有 `Out = ()` 的 writer 同时属于
+        /// `Writer`/`WriterInner` 两个 trait，本测试里统一显式写 `Writer::` 消歧。
+        struct CountingWriter {
+            inner: IoWriter<Vec<u8>>,
+            packets: Arc<AtomicUsize>,
+            trailers: Arc<AtomicUsize>,
+        }
+
+        impl Writer for CountingWriter {
+            type Out = ();
+            type Accum = ();
+
+            fn merge_out(_acc: &mut (), _out: ()) {}
+            fn merge_accum(_acc: &mut (), _other: ()) {}
+
+            fn write_header(&mut self) -> Result<()> {
+                Writer::write_header(&mut self.inner)
+            }
+
+            fn is_header_written(&self) -> bool {
+                Writer::is_header_written(&self.inner)
+            }
+
+            fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
+                self.packets.fetch_add(1, Ordering::Relaxed);
+                Writer::write_frame(&mut self.inner, packet)
+            }
+
+            fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()> {
+                self.packets.fetch_add(1, Ordering::Relaxed);
+                Writer::write_interleaved(&mut self.inner, packet)
+            }
+
+            fn write_trailer(&mut self) -> Result<()> {
+                self.trailers.fetch_add(1, Ordering::Relaxed);
+                Writer::write_trailer(&mut self.inner)
+            }
+
+            fn output(&self) -> &AVFormatContextOutput {
+                Writer::output(&self.inner)
+            }
+
+            fn output_mut(&mut self) -> &mut AVFormatContextOutput {
+                Writer::output_mut(&mut self.inner)
+            }
+        }
+
+        let packets = Arc::new(AtomicUsize::new(0));
+        let trailers = Arc::new(AtomicUsize::new(0));
+        let mut muxer = Muxer::new_from_writer(DynWriter::new(CountingWriter {
+            inner: IoWriter::new("mpegts", Vec::new())?,
+            packets: packets.clone(),
+            trailers: trailers.clone(),
+        }));
+
+        let encoder = EncoderBuilder::new_video(64, 48).build()?;
+        let tb = encoder.time_base();
+        let video_index = muxer.add_encoder(encoder)?;
+        for i in 0..4 {
+            let mut frame = generate_rgb_frame(64, 48, i);
+            frame.set_pts(i);
+            frame.set_time_base(tb);
+            muxer.mux(frame, video_index)?;
+        }
+        muxer.finish()?;
+
+        assert!(
+            packets.load(Ordering::Relaxed) > 0,
+            "the erased writer saw no packets"
+        );
+        assert_eq!(
+            trailers.load(Ordering::Relaxed),
+            1,
+            "trailer must be written exactly once"
+        );
+
+        Ok(())
+    }
+
+    /// `DynWriter` 可异构持有（不同类型擦除后放进同一容器统一驱动），
+    /// header 状态守卫继续生效，且它与 `Muxer<DynWriter>` 都是 `Send`。
+    #[test]
+    fn test_dyn_writer_holds_heterogeneous_writers() -> Result<()> {
+        fn assert_send<T: Send>() {}
+        assert_send::<DynWriter>();
+        assert_send::<Muxer<DynWriter>>();
+
+        let mut writers: Vec<DynWriter> = vec![
+            DynWriter::new(IoWriter::new("mpegts", Vec::new())?),
+            DynWriter::new(IoWriter::new("mpegts", std::io::sink())?),
+        ];
+        let encoder = EncoderBuilder::new_video(64, 48).build()?;
+
+        for writer in &mut writers {
+            Writer::add_stream(writer, encoder.codecpar(), encoder.time_base())?;
+            Writer::write_header(writer)?;
+            assert!(
+                Writer::is_header_written(writer),
+                "header state must be forwarded"
+            );
+
+            let err =
+                Writer::write_header(writer).expect_err("second write_header must be rejected");
+            assert!(
+                matches!(err, RsmediaError::InvalidConfig(_)),
+                "expected InvalidConfig, got {err:?}"
+            );
+
+            let err = Writer::add_stream(writer, encoder.codecpar(), encoder.time_base())
+                .expect_err("add_stream after header must be rejected");
+            assert!(
+                matches!(err, RsmediaError::InvalidConfig(_)),
+                "expected InvalidConfig, got {err:?}"
+            );
+
+            Writer::write_trailer(writer)?;
+        }
 
         Ok(())
     }

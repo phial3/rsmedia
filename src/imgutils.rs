@@ -159,7 +159,9 @@ pub fn copy_frame_to_buffer(frame: &AVFrame) -> Result<Vec<u8>> {
     // `check_image_size` above already rejected degenerate dimensions, so a
     // frame that reports a non-zero buffer size must copy at least one byte;
     // a zero here means the frame's format/size description contradicts its
-    // own buffer size (an internal inconsistency, not a caller mistake).
+    // own buffer size (an internal inconsistency, not a caller mistake) —
+    // hence `Other`: `is_invalid_config()` stays reserved for the caller's
+    // own inputs.
     if bytes == 0 {
         return Err(RsmediaError::msg(
             "frame reports a non-zero buffer size but copied no data",
@@ -244,7 +246,7 @@ fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
 
     // `comp` 是定长数组，越界索引会读到无关分量的 `step`。
     if plane_idx >= desc.nb_components as usize {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Invalid plane index {}: format {:?} has {} components",
             plane_idx, format, desc.nb_components
         )));
@@ -280,13 +282,13 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     // count planes of format
     let planes = frame_pixel_format(frame)?.count_planes()?;
     if plane_idx >= planes as usize {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Invalid plane index: {}, max planes: {}",
             plane_idx, planes
         )));
     }
     if frame.data[plane_idx].is_null() {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Null plane data pointer for plane {}",
             plane_idx
         )));
@@ -299,7 +301,7 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     // buffer and is only read below, before `frame` is released.
     let buf_ptr = unsafe { ffi::av_frame_get_plane_buffer(frame.as_ptr(), plane_idx as i32) };
     if buf_ptr.is_null() {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Null plane buffer pointer for plane {}",
             plane_idx
         )));
@@ -318,7 +320,7 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     // 退化尺寸的平面没有数据可读；`plane_geom` 之后这不该发生，故报错而不是
     // 让下面的偏移计算落到平面数据之外。
     if total_size == 0 {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Plane {} has no data at {}x{}",
             plane_idx, geom.width, geom.height
         )));
@@ -339,13 +341,13 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
         // 计算平面数据在缓冲区中的偏移量
         let data_offset = frame.data[plane_idx].offset_from(buf_data) as usize;
         if data_offset >= buf_size {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::invalid_config(format!(
                 "Invalid data offset for plane {}",
                 plane_idx
             )));
         }
         let data_offset = isize::try_from(data_offset).map_err(|_| {
-            RsmediaError::msg(format!(
+            RsmediaError::invalid_config(format!(
                 "Data offset of plane {} is out of range",
                 plane_idx
             ))
@@ -368,7 +370,7 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
                         .is_some_and(|end| end <= buf_size)
                 })
                 .ok_or_else(|| {
-                    RsmediaError::msg(format!(
+                    RsmediaError::invalid_config(format!(
                         "Plane {} row {} is outside the buffer",
                         plane_idx, y
                     ))
@@ -413,7 +415,7 @@ pub fn fill_plane_from_buffer(
         0,
     )?;
     if !frame.is_writable()? {
-        return Err(RsmediaError::msg("Frame is not writable"));
+        return Err(RsmediaError::invalid_config("Frame is not writable"));
     }
 
     // 获取平面数量并检查平面索引
@@ -421,14 +423,14 @@ pub fn fill_plane_from_buffer(
 
     // 检查平面索引
     if plane_idx >= planes as usize {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Invalid plane index: {plane_idx}, max planes: {planes}"
         )));
     }
 
     // 检查目标平面指针是否有效
     if frame.data[plane_idx].is_null() {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Null plane data pointer for plane {plane_idx}"
         )));
     }
@@ -442,7 +444,7 @@ pub fn fill_plane_from_buffer(
 
     // 验证行大小
     if src_linesize < byte_width {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Source linesize {} is less than required byte width {}",
             src_linesize, byte_width
         )));
@@ -450,7 +452,7 @@ pub fn fill_plane_from_buffer(
 
     // 验证 byte_width 是否满足 FFmpeg 的要求
     if byte_width > dst_linesize.unsigned_abs() as usize || byte_width > src_linesize {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "byte_width {} exceeds linesize limits (dst: {}, src: {})",
             byte_width, dst_linesize, src_linesize
         )));
@@ -459,7 +461,7 @@ pub fn fill_plane_from_buffer(
     // 计算所需的最小源数据大小（考虑行填充）
     let required_size = geom.height * src_linesize;
     if src.len() < required_size {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Incorrect source data size: got {}, need {}",
             src.len(),
             required_size
@@ -527,12 +529,12 @@ pub unsafe fn fill_plane_with<F>(
 pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()> {
     // 1. Basic validation
     if !frame.is_writable()? {
-        return Err(RsmediaError::msg("Frame is not writable"));
+        return Err(RsmediaError::invalid_config("Frame is not writable"));
     }
     if frame.data[0].is_null() {
         // This check implies the frame buffer hasn't been allocated properly
         // alloc_buffer should have been called before passing the frame here.
-        return Err(RsmediaError::msg(
+        return Err(RsmediaError::invalid_config(
             "Frame buffer is not allocated (frame.data is null)",
         ));
     }
@@ -542,7 +544,7 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
 
     // 3. Validate input buffer size
     if buffer.len() < expected_size {
-        return Err(RsmediaError::msg(format!(
+        return Err(RsmediaError::invalid_config(format!(
             "Input buffer size mismatch. Expected at least {} bytes, got {}",
             expected_size,
             buffer.len()
@@ -610,14 +612,11 @@ pub fn fill_frame_from_buffer(frame: &mut AVFrame, buffer: Vec<u8>) -> Result<()
 /// * `frame` - 目标 AVFrame（需已 alloc_buffer）
 pub fn fill_black(frame: &mut AVFrame) -> Result<()> {
     if frame.data[0].is_null() {
-        return Err(RsmediaError::msg(
+        return Err(RsmediaError::invalid_config(
             "Frame buffer is not allocated (frame.data is null)".to_string(),
         ));
     }
-    let mut dst_linesizes = [0isize; 8];
-    for i in 0..8 {
-        dst_linesizes[i] = frame.linesize[i] as isize;
-    }
+    let dst_linesizes: [isize; 8] = frame.linesize.map(|l| l as isize);
     // SAFETY: `data[0]` was checked non-null above, and `data`/`linesize` are the
     // frame's own arrays describing an allocation of its declared format and
     // dimensions; the caller passed the frame through `alloc_buffer`
@@ -656,14 +655,11 @@ pub fn fill_black(frame: &mut AVFrame) -> Result<()> {
 #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
 pub fn fill_color(frame: &mut AVFrame, r: u8, g: u8, b: u8, a: u8) -> Result<()> {
     if frame.data[0].is_null() {
-        return Err(RsmediaError::msg(
+        return Err(RsmediaError::invalid_config(
             "Frame buffer is not allocated (frame.data is null)".to_string(),
         ));
     }
-    let mut dst_lines = [0isize; 8];
-    for i in 0..8 {
-        dst_lines[i] = frame.linesize[i] as isize;
-    }
+    let dst_lines: [isize; 8] = frame.linesize.map(|l| l as isize);
     let color = [r as u32, g as u32, b as u32, a as u32];
     // SAFETY: as in `fill_black` — `data[0]` was checked non-null, and the frame's
     // own `data`/`linesize`/`format`/`width`/`height` describe an `alloc_buffer`'d
@@ -732,7 +728,7 @@ pub fn check_image_size(
 /// * `flags` - 传入 `ffi::AV_FRAME_CROP_UNALIGNED` 表示允许未对齐裁剪，否则按对齐约束
 pub fn apply_cropping(frame: &mut AVFrame, flags: i32) -> Result<()> {
     if frame.data[0].is_null() {
-        return Err(RsmediaError::msg(
+        return Err(RsmediaError::invalid_config(
             "Frame buffer is not allocated (frame.data is null)".to_string(),
         ));
     }
@@ -756,7 +752,7 @@ pub fn apply_cropping(frame: &mut AVFrame, flags: i32) -> Result<()> {
 pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
     let (width, height) = (frame.width as u32, frame.height as u32);
     if width == 0 || height == 0 {
-        return Err(RsmediaError::msg("Invalid frame dimensions"));
+        return Err(RsmediaError::invalid_config("Invalid frame dimensions"));
     }
 
     let build =
@@ -776,8 +772,9 @@ pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
     match pix_fmt {
         PixelFormat::RGB24 | PixelFormat::RGBA | PixelFormat::GRAY8 => {
             let buf = copy_frame_to_buffer(frame)?;
-            build(pix_fmt, buf)
-                .ok_or_else(|| RsmediaError::msg("Failed to build image from frame data"))
+            build(pix_fmt, buf).ok_or_else(|| {
+                RsmediaError::invalid_config("Failed to build image from frame data")
+            })
         }
         _ => {
             // 其他格式（YUV/BGR 族等）：swscale 统一转 RGB24
@@ -786,21 +783,23 @@ pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
             let buf = copy_frame_to_buffer(&rgb)?;
             image::RgbImage::from_raw(width, height, buf)
                 .map(image::DynamicImage::ImageRgb8)
-                .ok_or_else(|| RsmediaError::msg("Failed to build image from RGB24 data"))
+                .ok_or_else(|| {
+                    RsmediaError::invalid_config("Failed to build image from RGB24 data")
+                })
         }
     }
 }
 
 /// 一站式从输入获取一帧视频缩略图，返回 `image::DynamicImage`。
 ///
-/// 内部流程：构建视频解码器（RGB24 输出 + [`Resize::Fit`] 保持纵横比缩放）
+/// 内部流程：构建视频解码器（RGB24 输出 + [`Resize::Fit`](crate::Resize::Fit) 保持纵横比缩放）
 /// → seek 到目标时间 → 解码一帧原始 `AVFrame` → 转为
 /// [`image::DynamicImage`](crate::imgutils::to_dynamic_image)。
 /// 不依赖 `MediaFrame`，适合生成封面图 / 视频预览等场景。
 ///
 /// # Arguments
 ///
-/// * `source` - 输入（文件路径 / URL 等，见 [`Location`]）
+/// * `source` - 输入（文件路径 / URL 等，见 [`Location`](crate::Location)）
 /// * `timestamp_milliseconds` - 取帧时间点；`None` 时取**流中点**
 ///   （视频开头往往是黑帧/淡入，中点更容易取到有代表性的画面；
 ///   时长未知的流退化为取第一帧）
@@ -854,7 +853,7 @@ pub fn thumbnail(
         }
         decoder.decode_raw(&mut reader)?
     }
-    .ok_or_else(|| RsmediaError::msg("No video frame decoded for thumbnail"))?;
+    .ok_or_else(|| RsmediaError::invalid_config("No video frame decoded for thumbnail"))?;
 
     to_dynamic_image(&frame).context("Failed to convert AVFrame to image")
 }
@@ -1150,6 +1149,43 @@ mod tests {
         let too_few = fill_plane_sizes(yuv_fmt, vec![640, 320], 480)
             .expect_err("Should reject fewer linesizes than the format has planes");
         assert!(too_few.is_invalid_config(), "{too_few}");
+
+        Ok(())
+    }
+
+    /// 帧数据校验类失败必须统一报 [`RsmediaError::InvalidConfig`]（要改的是调用方
+    /// 自己的入参/帧状态），而不是无类型的 `Other`——否则 `is_invalid_config()`
+    /// 就失去了分类价值。覆盖：未分配缓冲区、平面索引越界、源行宽/大小不符。
+    #[test]
+    fn test_frame_data_validation_errors_are_invalid_config() -> Result<()> {
+        // 1. 缓冲区未分配（`data[0]` 为 null）：两个入口都要报 invalid_config
+        //    （`fill_black` 直接查 null，`fill_frame_from_buffer` 先查可写性）。
+        let mut unallocated = AVFrame::new();
+        unallocated.set_width(64);
+        unallocated.set_height(48);
+        unallocated.set_format(PixelFormat::RGB24.into());
+        let err = fill_black(&mut unallocated).expect_err("an unallocated frame must be rejected");
+        assert!(err.is_invalid_config(), "{err:?}");
+        let err = fill_frame_from_buffer(&mut unallocated, vec![0; 64 * 48 * 3])
+            .expect_err("an unallocated frame must be rejected");
+        assert!(err.is_invalid_config(), "{err:?}");
+
+        // 2. 平面索引越界（YUV420P 只有 3 个平面）
+        let frame = create_test_frame(64, 48, ffi::AV_PIX_FMT_YUV420P)?;
+        let err = get_plane_buffer(&frame, 3).expect_err("plane 3 must be rejected");
+        assert!(err.is_invalid_config(), "{err:?}");
+
+        // 3. 源行宽小于平面字节宽度
+        let mut frame = create_test_frame(64, 48, ffi::AV_PIX_FMT_YUV420P)?;
+        let err = fill_plane_from_buffer(&mut frame, 0, vec![0; 64 * 48], 8)
+            .expect_err("a source linesize below the plane width must be rejected");
+        assert!(err.is_invalid_config(), "{err:?}");
+
+        // 4. 源数据不足以覆盖平面（行宽合法，但总长度不够）
+        let mut frame = create_test_frame(64, 48, ffi::AV_PIX_FMT_YUV420P)?;
+        let err = fill_plane_from_buffer(&mut frame, 0, vec![0; 16], 64)
+            .expect_err("a source buffer smaller than the plane must be rejected");
+        assert!(err.is_invalid_config(), "{err:?}");
 
         Ok(())
     }

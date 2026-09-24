@@ -307,8 +307,8 @@ fn encode_to_size(frame: &MediaFrame<u8>, min_bytes: u64, max_bytes: u64) -> Res
 /// 低、体积越小），等价于 CLI 的 `-qmin/-qmax`。
 fn encode_jpeg(frame: &MediaFrame<u8>, qscale: u32) -> Result<Vec<u8>> {
     let mut options = Options::new();
-    options.insert("qmin", qscale.to_string());
-    options.insert("qmax", qscale.to_string());
+    options.set("qmin", qscale.to_string());
+    options.set("qmax", qscale.to_string());
 
     let encoder = EncoderBuilder::new_video(frame.width, frame.height)
         .with_codec_name("mjpeg".to_string())
