@@ -51,8 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono
 #pix = "1.0"
 #rgb = "0.8"
 #color = "0.3"
-ab_glyph = "0.2"
-imageproc = "0.27"
+fontdue = "0.9"
 #libblur = "0.24"
 #pic-scale = "0.7"
 #fast_image_resize = "6.0"
@@ -62,9 +61,6 @@ futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 ## sound & audio
 cpal = "0.18"
-wavers = "1.5"
-#rubato = "5.0"
-#dasp = { version = "0.11", features = ["all"] }
 rodio = { version = "0.22", features = ["symphonia-all", "tracing"] }
 
 [package.metadata.docs.rs]

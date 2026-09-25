@@ -98,7 +98,8 @@ fn main() {
     }
 
     let buf = std::fs::read("fonts/Arial.ttf").expect("Failed to read font file");
-    let font = ab_glyph::FontArc::try_from_vec(buf.to_owned()).unwrap();
+    let font = fontdue::Font::from_bytes(&buf[..], fontdue::FontSettings::default())
+        .expect("Failed to load font");
 
     for row in 0..rows {
         let name = if let Some((_, name)) = GRADIENTS.get(row) {
@@ -108,11 +109,12 @@ fn main() {
         } else {
             continue;
         };
-        imageproc::drawing::draw_text_mut(
+        // 文本盒左上角在 (10, row * grid + 10)，24px 字号的基线落在盒顶下方 24px 处。
+        draw_text(
             &mut imgbuf,
-            image::Rgb([100, 100, 100]),
+            [100, 100, 100],
             10,
-            (row * grid + 10) as i32,
+            (row * grid + 10) as i32 + 24,
             24.0,
             &font,
             name,
@@ -122,5 +124,44 @@ fn main() {
     if let Err(err) = imgbuf.save("colorous.png") {
         eprintln!("Error: {}", err);
         process::exit(1);
+    }
+}
+
+/// 用 fontdue 把 `text` 光栅化后叠加到图像上。
+///
+/// fontdue 的坐标系 y 轴向上，而图像 y 轴向下：基线 `baseline_y` 之上的
+/// `ymin + height` 才是字形位图的顶边；每个字形按 `advance_width` 向右前进。
+fn draw_text(
+    img: &mut ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    color: [u8; 3],
+    x: i32,
+    baseline_y: i32,
+    px: f32,
+    font: &fontdue::Font,
+    text: &str,
+) {
+    let mut pen_x = x as f32;
+    for ch in text.chars() {
+        let (metrics, bitmap) = font.rasterize(ch, px);
+        // 空字形（空格等）的 `width` 为 0、位图也为空，下面的循环体不会执行。
+        let left = pen_x as i32 + metrics.xmin;
+        let top = baseline_y - metrics.ymin - metrics.height as i32;
+        pen_x += metrics.advance_width;
+        for (i, coverage) in bitmap.iter().enumerate() {
+            if *coverage == 0 {
+                continue;
+            }
+            let dst_x = left + (i % metrics.width) as i32;
+            let dst_y = top + (i / metrics.width) as i32;
+            if dst_x < 0 || dst_y < 0 || dst_x >= img.width() as i32 || dst_y >= img.height() as i32
+            {
+                continue;
+            }
+            let alpha = *coverage as f32 / 255.0;
+            let dst = img.get_pixel_mut(dst_x as u32, dst_y as u32);
+            for (dst_c, &src_c) in dst.0.iter_mut().zip(color.iter()) {
+                *dst_c = (*dst_c as f32 * (1.0 - alpha) + src_c as f32 * alpha).round() as u8;
+            }
+        }
     }
 }

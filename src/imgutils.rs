@@ -872,7 +872,6 @@ mod tests {
     ) -> image::ImageBuffer<image::Rgb<u8>, Vec<u8>> {
         let mut img = image::ImageBuffer::new(width, height);
 
-        use ab_glyph::PxScale;
         use palette::IntoColor;
 
         // create a gradient color
@@ -894,22 +893,58 @@ mod tests {
             }
         }
 
-        let font = ab_glyph::FontArc::try_from_slice(include_bytes!("../fonts/Arial.ttf"))
+        let data: &[u8] = include_bytes!("../fonts/Arial.ttf");
+        let font = fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
             .map_err(|e| format!("Failed to load font: {}", e))
             .unwrap();
 
         // add text to the image
-        imageproc::drawing::draw_text_mut(
-            &mut img,
-            image::Rgb([255, 255, 255]),
-            10,
-            10,
-            PxScale::from(24.0),
-            &font,
-            text,
-        );
+        draw_text(&mut img, [255, 255, 255], 10, 34, 24.0, &font, text);
 
         img
+    }
+
+    /// 用 fontdue 把 `text` 光栅化后叠加到图像上。
+    ///
+    /// fontdue 的坐标系 y 轴向上，而图像 y 轴向下：基线 `baseline_y` 之上的
+    /// `ymin + height` 才是字形位图的顶边；每个字形按 `advance_width` 前进。
+    #[cfg(feature = "image")]
+    fn draw_text(
+        img: &mut image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+        color: [u8; 3],
+        x: i32,
+        baseline_y: i32,
+        px: f32,
+        font: &fontdue::Font,
+        text: &str,
+    ) {
+        let mut pen_x = x as f32;
+        for ch in text.chars() {
+            let (metrics, bitmap) = font.rasterize(ch, px);
+            // 空字形（空格等）的 `width` 为 0、位图也为空，下面的循环体不会执行。
+            let left = pen_x as i32 + metrics.xmin;
+            let top = baseline_y - metrics.ymin - metrics.height as i32;
+            pen_x += metrics.advance_width;
+            for (i, coverage) in bitmap.iter().enumerate() {
+                if *coverage == 0 {
+                    continue;
+                }
+                let dst_x = left + (i % metrics.width) as i32;
+                let dst_y = top + (i / metrics.width) as i32;
+                if dst_x < 0
+                    || dst_y < 0
+                    || dst_x >= img.width() as i32
+                    || dst_y >= img.height() as i32
+                {
+                    continue;
+                }
+                let alpha = *coverage as f32 / 255.0;
+                let dst = img.get_pixel_mut(dst_x as u32, dst_y as u32);
+                for (dst_c, &src_c) in dst.0.iter_mut().zip(color.iter()) {
+                    *dst_c = (*dst_c as f32 * (1.0 - alpha) + src_c as f32 * alpha).round() as u8;
+                }
+            }
+        }
     }
 
     #[test]
@@ -918,6 +953,14 @@ mod tests {
         let output_path = crate::test_support::test_output_path("imgutils", "image_with_text.png");
         let rgb = create_image_with_text(640, 480, "Hello, world!");
         rgb.save(output_path)?;
+
+        // 确认文字真的被光栅化上去了（否则字体加载/绘制静默失效也会"通过"）：
+        // 背景是 Hsl(l = 0.5) 的彩条，三通道同时接近 255 只可能来自白色文字。
+        let white = (10..310)
+            .flat_map(|x| (10..60).map(move |y| (x, y)))
+            .filter(|&(x, y)| rgb.get_pixel(x, y).0.iter().all(|&c| c >= 240))
+            .count();
+        assert!(white > 0, "no white text pixels found in the text area");
         Ok(())
     }
 
