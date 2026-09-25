@@ -1,4 +1,3 @@
-use crate::error::{Result, RsmediaError};
 use crate::strutils;
 
 use rsmpeg::avutil::{AVDictionary, AVDictionaryRef};
@@ -29,7 +28,7 @@ use std::ptr::NonNull;
 ///
 /// ```ignore
 /// let mut opts = Options::new();
-/// opts.insert("threads", "4");
+/// opts.set("threads", "4");
 /// opts.merge(Options::preset_h264()); // preset keys win
 /// ```
 #[derive(Clone, Default, Hash, PartialEq, Eq)]
@@ -48,9 +47,9 @@ impl Options {
         Self(BTreeMap::new())
     }
 
-    /// Inserts a key-value pair, replacing any existing entry (same
-    /// overwrite semantics as `av_dict_set` with flags 0).
-    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
+    /// Sets a key-value pair, replacing any existing entry (same overwrite
+    /// semantics as `av_dict_set` with flags 0).
+    pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
         self.0.insert(key.into(), value.into());
         self
     }
@@ -199,9 +198,9 @@ impl Options {
         let mut opts = Self::new();
         opts
             // These can't be too low because ffmpeg takes its sweet time
-            .insert("rtsp_transport", "tcp")
-            .insert("rw_timeout", "16000000")
-            .insert("stimeout", "16000000");
+            .set("rtsp_transport", "tcp")
+            .set("rw_timeout", "16000000")
+            .set("stimeout", "16000000");
         opts
     }
 
@@ -213,7 +212,7 @@ impl Options {
     /// Muxer output should be compatiable with MSE.
     pub fn preset_avformat_fragmented_mov() -> Self {
         let mut opts = Self::new();
-        opts.insert(
+        opts.set(
             "movflags",
             "faststart+frag_keyframe+frag_custom+empty_moov+omit_tfhd_offset",
         );
@@ -223,14 +222,14 @@ impl Options {
     /// Creates options for a FLV muxer.
     pub fn preset_avformat_flv() -> Self {
         let mut opts = Self::new();
-        opts.insert("flvflags", "no_duration_filesize")
-            .insert("fflags", "nobuffer+flush_packets")
+        opts.set("flvflags", "no_duration_filesize")
+            .set("fflags", "nobuffer+flush_packets")
             // 添加实时流标志
-            .insert("live", "1")
+            .set("live", "1")
             // 完全禁用元数据更新
-            .insert("write_metaf", "0")
+            .set("write_metaf", "0")
             // 设置较小的chunk大小以减少延迟
-            .insert("chunk_size", "4096");
+            .set("chunk_size", "4096");
         opts
     }
 
@@ -239,11 +238,11 @@ impl Options {
         let mut opts = Self::new();
         opts
             // ultrafast,superfast,veryfast,faster,fast,medium,slow,slower,veryslow,placebo
-            .insert("preset", "medium")
+            .set("preset", "medium")
             // baseline,main,high
-            .insert("profile", "high")
+            .set("profile", "high")
             // 场景切换敏感度
-            .insert("scenecut", "0");
+            .set("scenecut", "0");
         opts
     }
 
@@ -253,48 +252,48 @@ impl Options {
         let mut opts = Self::preset_h264();
         opts
             // baseline,main,high，低延迟用 main 而非 high
-            .insert("profile", "main")
+            .set("profile", "main")
             // film,animation,grain,stillimage,psnr,ssim,fastdecode,zerolatency
-            .insert("tune", "zerolatency")
+            .set("tune", "zerolatency")
             // 设置比特率控制,视频比特率
-            .insert("b", "3000k")
+            .set("b", "3000k")
             // 最大比特率
-            .insert("maxrate", "3500k")
+            .set("maxrate", "3500k")
             // 缓冲区大小
-            .insert("bufsize", "3000k")
+            .set("bufsize", "3000k")
             // 恒定质量因子
-            .insert("crf", "23")
+            .set("crf", "23")
             // 周期内部刷新替代关键帧
-            .insert("intra-refresh", "1")
+            .set("intra-refresh", "1")
             // 参考帧数量
-            .insert("refs", "3")
+            .set("refs", "3")
             // GOP=60（2秒@30fps）
-            .insert("g", "60")
+            .set("g", "60")
             // 禁用 B 帧
-            .insert("bf", "0")
+            .set("bf", "0")
             // 最小量化参数
-            .insert("qmin", "4")
+            .set("qmin", "4")
             // 最大量化参数
-            .insert("qmax", "51")
+            .set("qmax", "51")
             // 启用中等强度去块滤波
-            .insert("deblock", "1:1")
+            .set("deblock", "1:1")
             // 自适应量化模式
-            .insert("aq-mode", "2")
+            .set("aq-mode", "2")
             // 量化优化, 0: 禁用, 1: 仅用于最终编码, 2: 用于所有模式决策
-            .insert("trellis", "1")
-            .insert("threads", "auto")
+            .set("trellis", "1")
+            .set("threads", "auto")
             // 使用所有可用的分区模式
-            .insert("partitions", "all")
+            .set("partitions", "all")
             // 最小关键帧间隔
-            .insert("keyint_min", "30")
+            .set("keyint_min", "30")
             // 强制恒定帧率
-            .insert("force-cfr", "1")
+            .set("force-cfr", "1")
             // 启用切片线程
-            .insert("sliced_threads", "1")
+            .set("sliced_threads", "1")
             // 禁用前瞻同步
-            .insert("sync-lookahead", "0")
+            .set("sync-lookahead", "0")
             // 减少前瞻帧数
-            .insert("rc-lookahead", "10");
+            .set("rc-lookahead", "10");
         opts
     }
 
@@ -310,41 +309,41 @@ impl Options {
         let mut opts = Self::new();
         opts
             // p1-p7, default(p4), slow, medium, fast, hp, hq, bd, ll, llhq, llhp, lossless
-            .insert("preset", "p5")
+            .set("preset", "p5")
             // baseline, main, high, high444p, high10, high422
-            .insert("profile", "high")
+            .set("profile", "high")
             // ll, ull, lossless, film, animation, grain, fastdecode, zerolatency, hq
-            .insert("tune", "ll")
+            .set("tune", "ll")
             // 设置比特率 4Mbps
-            .insert("b", "4000k")
-            .insert("maxrate", "5000k")
-            .insert("bufsize", "8000k")
+            .set("b", "4000k")
+            .set("maxrate", "5000k")
+            .set("bufsize", "8000k")
             // constqp, ll_2pass_size, ll_2pass_quality
             // vbr, vbr_hq, vbr_minqp, vbr_2pass
             // cbr, cbr_hq, cbr_ld_hq
-            .insert("rc", "cbr")
+            .set("rc", "cbr")
             // 量化参数
-            .insert("qmin", "10")
-            .insert("qmax", "18")
+            .set("qmin", "10")
+            .set("qmax", "18")
             // 启用自适应量化
-            .insert("spatial-aq", "1")
-            .insert("temporal-aq", "1")
-            .insert("aq-strength", "8")
+            .set("spatial-aq", "1")
+            .set("temporal-aq", "1")
+            .set("aq-strength", "8")
             // GOP设置，较小的GOP有利于快速恢复和低延迟
-            .insert("g", "30")
+            .set("g", "30")
             // 禁用B帧以，避免出现画面闪烁
-            .insert("bf", "0")
-            .insert("b_ref_mode", "middle")
+            .set("bf", "0")
+            .set("b_ref_mode", "middle")
             // 启用场景切换检测，允许在场景变化时插入I帧
-            .insert("no-scenecut", "0")
+            .set("no-scenecut", "0")
             // 低延时
-            .insert("delay", "0")
-            .insert("zerolatency", "1")
+            .set("delay", "0")
+            .set("zerolatency", "1")
             // NVENC特有的参数
             // 增加表面缓冲区数量
-            .insert("surfaces", "32")
+            .set("surfaces", "32")
             // 加权预测，改善低光照
-            .insert("weighted_pred", "1");
+            .set("weighted_pred", "1");
         opts
     }
 }
@@ -402,38 +401,6 @@ impl std::fmt::Display for Options {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, f)
     }
-}
-
-/// 单一配置源检查：builder 的 typed setter 与 [`Options`] 透传不得同时配置同一项。
-///
-/// builder 把"有 setter 的设置项"（码率、质量、profile、线程数……）视作自己独占的
-/// 键；[`Options`] 只承载 builder 未建模的私有参数。同一项若同时出现在两处，以谁为准
-/// 只能靠隐含的先后顺序，是个静默陷阱，因此这里直接报
-/// [`RsmediaError::InvalidConfig`]，并在消息里指出该用哪个 setter。
-///
-/// `owned` 是 `(AVOption key, 对应的 builder setter)` 列表，**只包含调用方显式设置过
-/// 的项**：默认值不算配置冲突（否则"用透传设 `threads`"这种合法用法会被误伤）。
-pub(crate) fn ensure_single_source(
-    passthrough: Option<&Options>,
-    owned: &[(&str, &str)],
-) -> Result<()> {
-    let Some(passthrough) = passthrough else {
-        return Ok(());
-    };
-    let conflicts: Vec<String> = owned
-        .iter()
-        .filter(|(key, _)| passthrough.contains_key(key))
-        .map(|(key, setter)| format!("'{key}' (also set by {setter})"))
-        .collect();
-    if conflicts.is_empty() {
-        return Ok(());
-    }
-    Err(RsmediaError::invalid_config(format!(
-        "options conflict with builder setters: {}; configure each setting in exactly one \
-         place — builder setters for what they model, `with_options` only for codec-private \
-         parameters without a setter",
-        conflicts.join(", ")
-    )))
 }
 
 /// Video encoders whose FFmpeg wrapper exposes a `crf` private option.
@@ -518,14 +485,14 @@ mod tests {
         let mut opts = Options::new();
         assert!(opts.is_empty());
 
-        opts.insert("threads", "4").insert("preset", "fast");
+        opts.set("threads", "4").set("preset", "fast");
         assert_eq!(opts.len(), 2);
         assert_eq!(opts.get("threads"), Some("4"));
         assert_eq!(opts.get("missing"), None);
         assert!(opts.contains_key("preset"));
 
         // overwrite semantics
-        opts.insert("threads", "8");
+        opts.set("threads", "8");
         assert_eq!(opts.get("threads"), Some("8"));
 
         assert_eq!(opts.remove("preset"), Some("fast".to_string()));
@@ -536,10 +503,10 @@ mod tests {
     #[test]
     fn test_options_merge_other_wins() {
         let mut base = Options::new();
-        base.insert("preset", "medium").insert("crf", "23");
+        base.set("preset", "medium").set("crf", "23");
 
         let mut overlay = Options::new();
-        overlay.insert("crf", "18").insert("tune", "film");
+        overlay.set("crf", "18").set("tune", "film");
 
         base.merge(overlay);
         assert_eq!(base.get("preset"), Some("medium"));
@@ -557,7 +524,7 @@ mod tests {
     #[test]
     fn test_options_dict_roundtrip() {
         let mut opts = Options::new();
-        opts.insert("crf", "23").insert("profile", "high");
+        opts.set("crf", "23").set("profile", "high");
 
         let dict = opts.to_dict().expect("non-empty must materialize");
         let back = Options::from_dict(&dict);
@@ -610,7 +577,7 @@ mod tests {
     #[test]
     fn test_options_write_into_raw_dict_roundtrip() {
         let mut opts = Options::new();
-        opts.insert("title", "hello").insert("artist", "rsmedia");
+        opts.set("title", "hello").set("artist", "rsmedia");
 
         let mut dest: *mut ffi::AVDictionary = std::ptr::null_mut();
         // SAFETY: `dest` 为 NULL，函数按"空槽位"处理。
@@ -643,29 +610,6 @@ mod tests {
         // SAFETY: `dest` 指向刚转移的合法字典。
         unsafe { Options::new().write_into_raw_dict(&mut dest) };
         assert!(dest.is_null());
-    }
-
-    #[test]
-    fn test_ensure_single_source() {
-        let mut passthrough = Options::new();
-        passthrough.insert("threads", "4");
-
-        // 没有透传选项 → 无冲突
-        assert!(ensure_single_source(None, &[("threads", "with_thread_count")]).is_ok());
-        // 透传的键与 setter 无关 → 无冲突
-        assert!(ensure_single_source(Some(&passthrough), &[("b", "with_bit_rate")]).is_ok());
-        // 未显式设置过的 setter 不在表里 → "用透传设 threads" 合法
-        assert!(ensure_single_source(Some(&passthrough), &[]).is_ok());
-
-        // 同一项两个来源 → InvalidConfig，消息指出键与对应 setter
-        let err = ensure_single_source(Some(&passthrough), &[("threads", "with_thread_count")])
-            .expect_err("conflicting key must be rejected");
-        assert!(matches!(err, RsmediaError::InvalidConfig(_)), "got {err:?}");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("'threads'") && msg.contains("with_thread_count"),
-            "message must name the key and its setter: {msg}"
-        );
     }
 
     #[test]

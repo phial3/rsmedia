@@ -42,6 +42,7 @@ ffi_enum!(
     /// but the enum still implements `BitOr`/`Into<u32>` so it can be combined
     /// with non-algorithm quality flags (`SWS_FULL_CHR_H_INT`, `SWS_ACCURATE_RND`,
     /// `SWS_BITEXACT`, …) before handing the assembled mask to FFI.
+    #[derive(Default)]
     #[allow(non_camel_case_types)]
     ScaleAlgorithm, u32 {
         /// fast bilinear filtering
@@ -49,6 +50,7 @@ ffi_enum!(
         /// bilinear filtering
         BILINEAR => ffi::SWS_BILINEAR;
         /// 2-tap cubic B-spline
+        #[default]
         BICUBIC => ffi::SWS_BICUBIC;
         /// experimental
         X => ffi::SWS_X;
@@ -68,13 +70,6 @@ ffi_enum!(
         SPLINE => ffi::SWS_SPLINE;
     }
 );
-
-#[allow(clippy::derivable_impls)]
-impl Default for ScaleAlgorithm {
-    fn default() -> Self {
-        Self::BICUBIC
-    }
-}
 
 ffi_enum!(
     /// Video scaler quality / behaviour flags (SWS_* non-algorithm bits, 1 << 11 .. 1 << 20).
@@ -117,44 +112,21 @@ ffi_enum!(
 );
 
 impl ScaleQuality {
-    /// Combine a set of quality bits into the mask handed to FFmpeg.
-    ///
-    /// This is the sanctioned way to spell a quality set: every element is a real
-    /// [`ScaleQuality`] variant, so an invalid flag cannot be expressed (an empty list
-    /// means "no quality bits").
+    /// The default quality mask: full chroma upsampling when upscaling to RGB plus
+    /// platform-independent bit-exact output. The header notes that `ACCURATE_RND` and
+    /// `BITEXACT` are meant to be set together.
     ///
     /// ```
     /// use rsmedia::ScaleQuality;
     ///
-    /// let mask = ScaleQuality::mask([ScaleQuality::ACCURATE_RND, ScaleQuality::BITEXACT]);
-    /// assert_eq!(
-    ///     mask,
-    ///     ScaleQuality::ACCURATE_RND.as_raw() | ScaleQuality::BITEXACT.as_raw()
-    /// );
-    /// // Slices and vectors work too.
-    /// assert_eq!(
-    ///     ScaleQuality::mask(&[ScaleQuality::BITEXACT]),
-    ///     ScaleQuality::BITEXACT.as_raw()
-    /// );
+    /// let mask = ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND | ScaleQuality::BITEXACT;
+    /// assert_eq!(mask, ScaleQuality::default_mask());
+    /// // A single flag converts on its own, and the mask is what `Scaler` takes.
+    /// let one: u32 = ScaleQuality::BITEXACT.into();
+    /// assert_eq!(one, ScaleQuality::BITEXACT.as_raw());
     /// ```
-    pub fn mask(bits: impl AsRef<[ScaleQuality]>) -> u32 {
-        bits.as_ref()
-            .iter()
-            .fold(0, |mask, bit| mask | bit.as_raw())
-    }
-
-    /// The default quality bits, in the list form the scaler takes: full chroma
-    /// upsampling when upscaling to RGB plus platform-independent bit-exact output.
-    /// The header notes that `ACCURATE_RND` and `BITEXACT` are meant to be set together.
-    pub fn default_quality() -> [ScaleQuality; 3] {
-        [Self::FULL_CHR_H_INT, Self::ACCURATE_RND, Self::BITEXACT]
-    }
-
-    /// [`ScaleQuality::default_quality`] as a raw mask
-    /// (`FULL_CHR_H_INT | ACCURATE_RND | BITEXACT`) — the baseline that
-    /// [`Scaler::new`] uses and [`ScaleQuality::default_mask`] appends.
     pub fn default_mask() -> u32 {
-        Self::mask(Self::default_quality())
+        Self::FULL_CHR_H_INT | Self::ACCURATE_RND | Self::BITEXACT
     }
 }
 
@@ -498,14 +470,15 @@ impl Scaler {
     /// ([`ScaleAlgorithm::default`], BICUBIC) and the FFmpeg-recommended quality mask
     /// ([`ScaleQuality::default_mask`]).
     pub fn new() -> Self {
-        Self::new_with_options(ScaleAlgorithm::default(), ScaleQuality::default_quality())
+        Self::new_with_options(ScaleAlgorithm::default(), ScaleQuality::default_mask())
     }
 
     /// Create a scaler with an explicit kernel and quality bits.
     ///
-    /// `quality` is the set of quality/behaviour bits to apply, given as a list of
-    /// [`ScaleQuality`] values — one bit, several, or an empty list for none. Every
-    /// element is a real variant, so no invalid flag can be passed.
+    /// `quality` is the quality/behaviour bit mask, given as `impl Into<u32>` like the
+    /// builders' `with_flags`: one bit (`ScaleQuality::BITEXACT`), several combined with
+    /// `|` (the result is the raw `u32` mask, per this crate's flag-set convention), or
+    /// `0` for none.
     ///
     /// ```
     /// use rsmedia::{ScaleAlgorithm, ScaleQuality, Scaler};
@@ -513,18 +486,15 @@ impl Scaler {
     /// // One algorithm bit (mutually exclusive) plus a set of quality bits.
     /// let scaler = Scaler::new_with_options(
     ///     ScaleAlgorithm::LANCZOS,
-    ///     [ScaleQuality::FULL_CHR_H_INT, ScaleQuality::ACCURATE_RND, ScaleQuality::BITEXACT],
+    ///     ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND | ScaleQuality::BITEXACT,
     /// );
     /// assert_eq!(scaler.algorithm(), ScaleAlgorithm::LANCZOS);
     /// assert_eq!(scaler.quality(), ScaleQuality::default_mask());
     /// ```
-    pub fn new_with_options(
-        algorithm: ScaleAlgorithm,
-        quality: impl AsRef<[ScaleQuality]>,
-    ) -> Self {
+    pub fn new_with_options(algorithm: ScaleAlgorithm, quality: impl Into<u32>) -> Self {
         Self {
             algorithm,
-            quality: ScaleQuality::mask(quality),
+            quality: quality.into(),
             bound: None,
             pool_enabled: false,
         }
@@ -680,8 +650,10 @@ impl Scaler {
                 )
             };
             if ret < 0 {
-                return Err(RsmediaError::msg(format!(
-                    "Failed to call sws_scale_frame, ret: {ret}"
+                return Err(RsmediaError::av_error(ret).with_context(format!(
+                    "Failed to scale {}x{} {src_pix_fmt:?} into {}x{} {dst_pix_fmt:?} \
+                     (sws_scale_frame)",
+                    src_frame.width, src_frame.height, dst_frame.width, dst_frame.height
                 )));
             }
         }
@@ -828,8 +800,9 @@ fn alloc_pooled_frame(
         )
     };
     if ret < 0 {
-        return Err(RsmediaError::msg(format!(
-            "av_image_fill_arrays failed for {fmt:?} {width}x{height}, ret: {ret}"
+        return Err(RsmediaError::av_error(ret).with_context(format!(
+            "Failed to lay out a pooled {fmt:?} frame {width}x{height} \
+             (av_image_fill_arrays)"
         )));
     }
 
@@ -887,8 +860,9 @@ unsafe fn zero_frame_padding(
     // Safety: 本地数组 + 调用方已校验的格式/尺寸。
     let ret = unsafe { ffi::av_image_fill_linesizes(visible.as_mut_ptr(), fmt.into(), width) };
     if ret < 0 {
-        return Err(RsmediaError::msg(format!(
-            "av_image_fill_linesizes failed for {fmt:?} width {width}, ret: {ret}"
+        return Err(RsmediaError::av_error(ret).with_context(format!(
+            "Failed to get the visible line sizes of {fmt:?} at width {width} \
+             (av_image_fill_linesizes)"
         )));
     }
     let visible_isize: [isize; 8] = visible.map(|bytes| bytes as isize);
@@ -903,16 +877,21 @@ unsafe fn zero_frame_padding(
         )
     };
     if ret < 0 {
-        return Err(RsmediaError::msg(format!(
-            "av_image_fill_plane_sizes failed for {fmt:?} height {height}, ret: {ret}"
+        return Err(RsmediaError::av_error(ret).with_context(format!(
+            "Failed to get the plane sizes of {fmt:?} at height {height} \
+             (av_image_fill_plane_sizes)"
         )));
     }
     // Safety: 纯查询，参数为已校验的像素格式。
     let planes = unsafe { ffi::av_pix_fmt_count_planes(fmt.into()) };
-    if planes <= 0 {
-        return Err(RsmediaError::msg(format!(
-            "cannot count the planes of {fmt:?}, av_pix_fmt_count_planes returned {planes}"
-        )));
+    if planes < 0 {
+        return Err(RsmediaError::av_error(planes)
+            .with_context(format!("Failed to count the planes of {fmt:?}")));
+    }
+    // 计数为 0 的格式没有可清空的 padding，但也没有平面可遍历；
+    // 上层只对已知有数据的格式调用本函数，走到这里说明格式假设不成立。
+    if planes == 0 {
+        return Err(RsmediaError::msg(format!("{fmt:?} reports no planes")));
     }
 
     // Safety: 下面所有写入都限制在 [buf_start, buf_start + buf_size) 内——各平面的可见区
@@ -1308,17 +1287,13 @@ mod tests {
         Ok(())
     }
 
-    /// 质量位是**集合**：`Scaler` 接收若干具名位并合成掩码（算法位仍只能有一个）。
+    /// 质量位是**集合**：`Scaler` 接收具名位（单个或用 `|` 组合的掩码；算法位仍只能有一个）。
     #[test]
     fn test_scaler_quality_mask_accepts_multiple_bits() -> Result<()> {
         // 多个质量位 = FFmpeg 建议的基线。
         let scaler = Scaler::new_with_options(
             ScaleAlgorithm::LANCZOS,
-            [
-                ScaleQuality::FULL_CHR_H_INT,
-                ScaleQuality::ACCURATE_RND,
-                ScaleQuality::BITEXACT,
-            ],
+            ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND | ScaleQuality::BITEXACT,
         );
         assert_eq!(scaler.algorithm(), ScaleAlgorithm::LANCZOS);
         assert_eq!(scaler.quality(), ScaleQuality::default_mask());
@@ -1327,13 +1302,13 @@ mod tests {
             (ScaleAlgorithm::LANCZOS.as_raw() | ScaleQuality::default_mask()),
         );
 
-        // 单个位、切片、空集合（= 无质量位）。
-        let single = Scaler::new_with_options(ScaleAlgorithm::AREA, [ScaleQuality::BITEXACT]);
+        // 单个位、裸掩码、空（= 无质量位）。
+        let single = Scaler::new_with_options(ScaleAlgorithm::AREA, ScaleQuality::BITEXACT);
         assert_eq!(single.quality(), ScaleQuality::BITEXACT.as_raw());
-        let slice = ScaleQuality::default_quality();
-        let from_slice = Scaler::new_with_options(ScaleAlgorithm::BICUBLIN, &slice[..1]);
-        assert_eq!(from_slice.quality(), ScaleQuality::FULL_CHR_H_INT.as_raw());
-        let none = Scaler::new_with_options(ScaleAlgorithm::POINT, []);
+        let raw =
+            Scaler::new_with_options(ScaleAlgorithm::BICUBLIN, ScaleQuality::BITEXACT.as_raw());
+        assert_eq!(raw.quality(), ScaleQuality::BITEXACT.as_raw());
+        let none = Scaler::new_with_options(ScaleAlgorithm::POINT, 0u32);
         assert_eq!(none.quality(), 0);
 
         // 默认构造 = 默认算法 + 默认质量掩码。
@@ -1358,7 +1333,7 @@ mod tests {
     fn test_scaler_rebinds_when_geometry_changes() -> Result<()> {
         let mut scaler = Scaler::new_with_options(
             ScaleAlgorithm::BILINEAR,
-            [ScaleQuality::ACCURATE_RND, ScaleQuality::BITEXACT],
+            ScaleQuality::ACCURATE_RND | ScaleQuality::BITEXACT,
         );
 
         // 首帧：绑定上下文。

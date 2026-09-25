@@ -53,12 +53,6 @@ fn skip_if_filter_unavailable(filter: &Filter, path: &Path) -> bool {
     true
 }
 
-/// 编码器因 FFmpeg 构建配置缺失（如 libmp3lame/libtheora/libx265）时跳过：
-/// 匹配类型化 [`RsmediaError::CodecNotFound`] 变体。
-fn is_encoder_unavailable(e: &RsmediaError) -> bool {
-    e.is_codec_not_found()
-}
-
 /// 汇总容器遍历测试结果：任何非跳过失败都断言失败；至少一个容器成功，
 /// 防止环境异常时测试空壳通过。
 fn assert_container_results(
@@ -78,7 +72,7 @@ fn assert_container_results(
 }
 
 /// 生成一帧纯色（RGB24）测试视频帧，颜色随相位 `p` 在彩虹色相上变化。
-fn rainbow_video_frame(w: usize, h: usize, p: f32) -> MediaFrame<u8> {
+fn rainbow_video_frame(w: u32, h: u32, p: f32) -> MediaFrame<u8> {
     use rsmedia::colors;
     let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
     let mut frame = MediaFrame::<u8>::new_video_frame(w, h, PixelFormat::RGB24).unwrap();
@@ -86,6 +80,8 @@ fn rainbow_video_frame(w: usize, h: usize, p: f32) -> MediaFrame<u8> {
         .data
         .as_packed_mut()
         .expect("RGB24 frames are interleaved");
+    let w = w as usize;
+    let h = h as usize;
     for y in 0..h {
         for x in 0..w {
             samples[[y, x, 0]] = rgb[0];
@@ -256,16 +252,18 @@ mod video {
     ];
 
     /// 对指定视频容器执行「编码 10 秒视频 → flush」完整流程。
-    fn encode_video_for_container(spec: &VideoContainerSpec, fps: f64) -> Result<()> {
+    ///
+    /// 返回 `Ok(false)` 表示本构建没有该编码器，调用方跳过该容器。
+    fn encode_video_for_container(spec: &VideoContainerSpec, fps: f64) -> Result<bool> {
         use rsmedia::filter;
         use rsmedia::time::Time;
 
         let codec_name = spec.codec.unwrap_or("libx264");
-        // 编码器存在性取决于 FFmpeg 构建配置（如 libtheora/libx265），缺失时跳过
+        // 编码器存在性取决于 FFmpeg 构建配置（如 libtheora/libx265），缺失时跳过：
+        // 先探测可用性，而不是拿库的错误变体当"跳过"标记（`Unsupported` 还包括
+        // 无可用设备、未建模格式等，拿它当跳过标记会吞掉真正的问题）。
         if AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?).is_none() {
-            return Err(RsmediaError::codec_not_found(format!(
-                "encoder {codec_name} not available in this FFmpeg build"
-            )));
+            return Ok(false);
         }
         let codec_name = strutils::str_to_cstring(codec_name)?;
         let codec_config = CodecConfig::new_with_name(&codec_name)?;
@@ -290,7 +288,7 @@ mod video {
         // 按容器规格创建编码器（fps 必须传入编码器，保证 time_base = 1/fps，
         // 否则编码器运行在默认 30fps，与帧 pts 的 25fps 语义不一致，
         // 会导致 flv 等严格 muxer 报 "Invalid pts <= last"）
-        let mut builder = EncoderBuilder::new_video(width as usize, height as usize)
+        let mut builder = EncoderBuilder::new_video(width, height)
             .with_codec_name(codec_name.to_str()?.to_string())
             .with_fps(fps as f32)
             .with_filters(filters);
@@ -329,8 +327,7 @@ mod video {
         let n_frames = (VIDEO_DURATION_SECS * fps).round() as usize;
         let n_frames = n_frames.max(1);
         for i in 0..n_frames {
-            let mut frame =
-                rainbow_video_frame(width as usize, height as usize, i as f32 / n_frames as f32);
+            let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
             frame.set_pts(
                 position
                     .aligned_with_rational(encoder_time_base)
@@ -349,7 +346,7 @@ mod video {
         // flush encoder
         muxer.finish().unwrap();
 
-        Ok(())
+        Ok(true)
     }
 
     /// 遍历视频容器映射表逐一编码。
@@ -365,12 +362,15 @@ mod video {
         for spec in VIDEO_CONTAINERS {
             println!("Testing format: {}...", spec.container);
             match encode_video_for_container(spec, fps) {
-                Ok(()) => {
+                Ok(true) => {
                     println!("Testing format: {} passed.", spec.container);
                     passed.push(spec.container);
                 }
-                Err(e) if is_encoder_unavailable(&e) => {
-                    println!("SKIP {}: {e:#}", spec.container);
+                Ok(false) => {
+                    println!(
+                        "SKIP {}: encoder is not in this FFmpeg build",
+                        spec.container
+                    );
                     skipped.push(spec.container);
                 }
                 Err(e) => failed.push((spec.container, format!("{e:#}"))),
@@ -386,8 +386,8 @@ mod video {
     fn test_encode_decode_roundtrip() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64usize;
-        let height = 64usize;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 10;
         let fps = 25.0;
 
@@ -434,8 +434,8 @@ mod video {
     fn test_quality_crf_roundtrip() -> Result<()> {
         use rsmedia::DecoderBuilder;
 
-        let width = 64usize;
-        let height = 64usize;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 10;
         let fps = 25.0;
 
@@ -478,8 +478,8 @@ mod video {
     fn test_negotiate_pixel_format_mjpeg() -> Result<()> {
         use rsmedia::DecoderBuilder;
 
-        let width = 64usize;
-        let height = 64usize;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 5;
 
         // 未显式指定 pix_fmt：协商为 mjpeg 支持列表中的格式
@@ -527,8 +527,8 @@ mod video {
     /// 容器元数据（avcC/SPS）应回报 profile=High(100)、level=4.1(41)。
     #[test]
     fn test_profile_level_applied() -> Result<()> {
-        let width = 64usize;
-        let height = 64usize;
+        let width = 64u32;
+        let height = 64u32;
         let fps = 25.0;
 
         let path = common::test_output_path("encode", "rsmedia_profile.mp4");
@@ -569,8 +569,8 @@ mod video {
     fn test_encode_delayed_filter_roundtrip() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64usize;
-        let height = 64usize;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 30;
         let fps = 30.0;
 
@@ -620,8 +620,8 @@ mod video {
     fn test_write_frame_auto_pts() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64usize;
-        let height = 64usize;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 8;
         let fps: f64 = 30.0;
 
@@ -685,8 +685,8 @@ mod video {
     fn test_video_pts_fully_automatic() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64usize;
-        let height = 64usize;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 8usize;
         let fps: f64 = 30.0;
 
@@ -804,7 +804,7 @@ mod video {
             ("libx264", true), // 支持延迟滤镜插值
             ("mpeg4", false),  // 简单编码器，检验无延迟路径
         ];
-        let srces: &[(usize, usize)] = &[(64, 64), (96, 48)];
+        let srces: &[(u32, u32)] = &[(64, 64), (96, 48)];
         let resizes: &[Option<Resize>] = &[
             None,                          // 不缩放，期望原尺寸
             Some(Resize::Exact(32, 32)),   // 精确尺寸
@@ -824,8 +824,8 @@ mod video {
                         // 期望尺寸：resize 实际输出的尺寸（按宽高比计算），None 则为原尺寸
                         let (ew, eh) = match resize {
                             Some(r) => {
-                                let (dw, dh) = r.compute_for((w as u32, h as u32)).unwrap();
-                                (dw as usize, dh as usize)
+                                let (dw, dh) = r.compute_for((w, h)).unwrap();
+                                (dw, dh)
                             }
                             None => (w, h),
                         };
@@ -926,20 +926,22 @@ mod video {
         use rsmedia::filter::video;
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64usize;
-        let height = 64usize;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 6;
         let fps = 25.0;
 
         // (名称, Filter, 期望最小解码帧数, 期望尺寸(Some 则精确断言，None 则不断言))
-        // 注：尺寸改变类滤镜（`scale`/`crop`/`pad`/`rotate`/`transpose`）在编码管线中
-        // 存在已知崩溃（SIGSEGV），与滤镜本身无关，属编码-滤镜尺寸同步缺陷，已隔离到
-        // 专项调查，暂不纳入本列表阻塞其它滤镜测试。此处仅覆盖尺寸保持类滤镜。
+        //
+        // 尺寸改变类滤镜（`scale`/`crop`/`pad`/`rotate`/`transpose`）此前被误判为
+        // "编码管线中 SIGSEGV" 而排除。实际原因是编码器上下文尺寸需跟随滤镜输出
+        // 尺寸——`EncoderBuilder::build` 已做同步（`filter_graph.output_size()` →
+        // `encode_ctx.set_width/height`），故这些滤镜可正常跑通，现全部纳入。
         type FilterCase = (
             &'static str,
             rsmedia::filter::Filter,
             usize,
-            Option<(usize, usize)>,
+            Option<(u32, u32)>,
         );
         let cases: Vec<FilterCase> = vec![
             // 尺寸保持类
@@ -1010,6 +1012,34 @@ mod video {
             (
                 "fade_out",
                 video::fade_out(n_frames as u32, 6),
+                n_frames,
+                Some((width, height)),
+            ),
+            // 尺寸改变类：编码器上下文尺寸会跟随滤镜输出（`rotate`/`transpose` 的
+            // 画布默认仍是输入尺寸，故方形输入下尺寸不变）。
+            (
+                "scale_down",
+                video::scale(32, 32, None),
+                n_frames,
+                Some((32, 32)),
+            ),
+            (
+                "scale_up",
+                video::scale(128, 128, None),
+                n_frames,
+                Some((128, 128)),
+            ),
+            ("crop", video::crop(0, 0, 32, 32), n_frames, Some((32, 32))),
+            (
+                "pad",
+                video::pad(96, 96, 0, 0, "black"),
+                n_frames,
+                Some((96, 96)),
+            ),
+            ("rotate", video::rotate(90), n_frames, Some((width, height))),
+            (
+                "transpose",
+                video::transpose(1),
                 n_frames,
                 Some((width, height)),
             ),
@@ -1091,13 +1121,15 @@ mod video {
     /// 噪声内容**不可压缩**：编码器无法靠"画面简单"省下码率，因此目标码率与
     /// `maxrate` 都会成为真实约束——这正是验证码率控制生效所需的内容，
     /// 用渐变/纯色画面会让码率上限完全看不出来。
-    fn noise_video_frame(w: usize, h: usize, seed: u32) -> MediaFrame<u8> {
+    fn noise_video_frame(w: u32, h: u32, seed: u32) -> MediaFrame<u8> {
         let mut frame = MediaFrame::<u8>::new_video_frame(w, h, PixelFormat::RGB24)
             .expect("RGB24 frame allocation");
         let samples = frame
             .data
             .as_packed_mut()
             .expect("RGB24 frames are interleaved");
+        let w = w as usize;
+        let h = h as usize;
         // 线性同余发生器：无需引入随机数依赖，且同样的 seed 得到同样的画面。
         let mut state = seed | 1;
         for y in 0..h {
@@ -1115,8 +1147,8 @@ mod video {
     fn encode_noise_sequence(
         builder: EncoderBuilder,
         path: &Path,
-        width: usize,
-        height: usize,
+        width: u32,
+        height: u32,
         n_frames: i64,
     ) -> Result<u64> {
         let encoder = builder.build()?;
@@ -1153,12 +1185,13 @@ mod video {
     /// 限流不能以损坏流为代价。
     #[test]
     fn test_vbv_rate_control_caps_bitrate() -> Result<()> {
-        let width = 320usize;
-        let height = 240usize;
+        let width = 320u32;
+        let height = 240u32;
         let fps = 25.0;
         let n_frames = 40i64;
         let bit_rate = 800_000;
         let max_bit_rate = 200_000;
+        let buffer_size = 1024;
 
         let baseline_path = common::test_output_path("encode", "rsmedia_vbv_baseline.mp4");
         let capped_path = common::test_output_path("encode", "rsmedia_vbv_capped.mp4");
@@ -1175,7 +1208,7 @@ mod video {
         let capped = encode_noise_sequence(
             base_builder()
                 .with_max_bit_rate(max_bit_rate)
-                .with_buffer_size(max_bit_rate),
+                .with_buffer_size(buffer_size),
             &capped_path,
             width,
             height,
@@ -1213,8 +1246,8 @@ mod video {
     /// YUV420P，因此这条用例同时覆盖「标记经 scaler 转换后仍保留」。
     #[test]
     fn test_force_key_frame() -> Result<()> {
-        let width = 64usize;
-        let height = 64usize;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 20usize;
         let forced_index = 10usize;
         let path = common::test_output_path("encode", "rsmedia_force_key_frame.mp4");
@@ -1281,8 +1314,8 @@ mod video {
         let dir = pattern.parent().expect("pattern has a parent dir");
 
         let mut options = Options::new();
-        options.insert("segment_time", "1");
-        options.insert("reset_timestamps", "1");
+        options.set("segment_time", "1");
+        options.set("reset_timestamps", "1");
         let mut muxer =
             rsmedia::mux::Muxer::new_segmented(pattern.to_string_lossy().to_string(), options)?;
         let encoder = EncoderBuilder::new_video(160, 120)
@@ -1397,16 +1430,18 @@ mod audio {
 
     /// 对指定音频容器执行「编码 5 秒正弦波 → 解码校验」完整流程：
     /// 验证音频 time_base = 1/sample_rate、解码采样率/声道数不变、采样量不丢失。
-    fn encode_audio_for_container(spec: &AudioContainerSpec) -> Result<()> {
+    /// 对指定音频容器执行「编码 1 秒音频 → flush → 解码回读」完整流程。
+    ///
+    /// 返回 `Ok(false)` 表示本构建没有该编码器，调用方跳过该容器。
+    fn encode_audio_for_container(spec: &AudioContainerSpec) -> Result<bool> {
         use rsmedia::{DecoderBuilder, MediaType};
 
         let codec_name = spec.codec.unwrap_or("aac");
-        // 编码器存在性取决于 FFmpeg 构建配置（如 libmp3lame/libopus），缺失时跳过
+        // 编码器存在性取决于 FFmpeg 构建配置（如 libmp3lame/libopus），缺失时跳过：
+        // 先探测可用性，而不是拿库的错误变体当"跳过"标记。
         let Some(codec) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec_name)?)
         else {
-            return Err(RsmediaError::codec_not_found(format!(
-                "encoder {codec_name} not available in this FFmpeg build"
-            )));
+            return Ok(false);
         };
         let config = CodecConfig::from_codec(codec);
 
@@ -1558,7 +1593,7 @@ mod audio {
         );
 
         common::remove_test_output(&path);
-        Ok(())
+        Ok(true)
     }
 
     /// 遍历音频容器映射表逐一编码。
@@ -1726,12 +1761,16 @@ mod audio {
                 spec.channels
             );
             match encode_audio_for_container(spec) {
-                Ok(()) => {
+                Ok(true) => {
                     println!("Testing audio container: {} passed.", spec.container);
                     passed.push(spec.container);
                 }
-                Err(e) if is_encoder_unavailable(&e) => {
-                    println!("SKIP {}: {e:#}", spec.container);
+                Ok(false) => {
+                    println!(
+                        "SKIP {}: encoder {} is not in this FFmpeg build",
+                        spec.container,
+                        spec.codec.unwrap_or("aac")
+                    );
                     skipped.push(spec.container);
                 }
                 Err(e) => failed.push((spec.container, format!("{e:#}"))),

@@ -19,8 +19,8 @@ use rsmedia::{DecoderBuilder, EncoderBuilder, MediaType, Options, Quality};
 use std::ffi::CString;
 use std::time::Instant;
 
-const WIDTH: usize = 96;
-const HEIGHT: usize = 64;
+const WIDTH: u32 = 96;
+const HEIGHT: u32 = 64;
 const FRAMES: usize = 10;
 const FPS: f32 = 25.0;
 const SAMPLE_RATE: u32 = 44_100;
@@ -243,7 +243,7 @@ fn matrix_video_mpeg4() -> anyhow::Result<()> {
 #[test]
 fn matrix_video_vp9() -> anyhow::Result<()> {
     let mut opts = Options::new();
-    opts.insert("cpu-used", "8").insert("row-mt", "1");
+    opts.set("cpu-used", "8").set("row-mt", "1");
     video_roundtrip(
         "vp9",
         "libvpx-vp9",

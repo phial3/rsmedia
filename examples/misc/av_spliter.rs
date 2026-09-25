@@ -59,7 +59,6 @@ fn av_spliter(file_path: &CStr, out_video: &str, out_audio: &CStr) -> Result<()>
                     }
                     Err(RsmpegError::BitstreamDrainError)
                     | Err(RsmpegError::BitstreamFlushedError) => {
-                        println!("av_spliter Bitstream drained or flushed.");
                         break;
                     }
                     Err(e) => anyhow::bail!(e),
@@ -84,11 +83,11 @@ mod tests {
 
     #[test]
     fn test_av_spliter() {
-        std::fs::create_dir_all("tests/output/av_spliter").unwrap();
+        std::fs::create_dir_all("output/av_spliter").unwrap();
         av_spliter(
             c"assets/mp4.mp4",
-            "tests/output/av_spliter/out_video.h264",
-            c"tests/output/av_spliter/out_audio.aac",
+            "output/av_spliter/out_video.h264",
+            c"output/av_spliter/out_audio.aac",
         )
         .unwrap();
     }

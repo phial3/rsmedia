@@ -73,8 +73,11 @@ pub fn init_with_level(level: AVLogLevel) -> Result<()> {
 /// Initialize with full control over level and flags; the environment is not
 /// consulted. Idempotent — the first call wins.
 ///
+/// 位集按 `impl Into<u32>` 给出：单个标志（[`AVLogFlag::SKIP_REPEATED`]）或用 `|`
+/// 组合出的掩码（`AVLogFlag::SKIP_REPEATED | AVLogFlag::PRINT_LEVEL`）都能直接传。
+///
 /// Also registers all libavdevice devices (see the [module docs](self)).
-pub fn init_with(level: AVLogLevel, flag: AVLogFlag) -> Result<()> {
+pub fn init_with(level: AVLogLevel, flag: impl Into<u32>) -> Result<()> {
     INIT.get_or_try_init(|| {
         // 1. Register all libavdevice devices.
         //    The call itself is idempotent and thread-safe on the FFmpeg side
@@ -84,7 +87,7 @@ pub fn init_with(level: AVLogLevel, flag: AVLogFlag) -> Result<()> {
         unsafe { ffi::avdevice_register_all() };
 
         // 2. Redirect logging to the Rust logging facade.
-        init_logging(level, flag);
+        init_logging(level, flag.into());
         Ok::<(), RsmediaError>(())
     })?;
 

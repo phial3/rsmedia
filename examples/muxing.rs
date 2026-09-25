@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
         let info = &in_stream.stream_info;
 
         let encoder = if info.media_type == MediaType::VIDEO {
-            EncoderBuilder::new_video(info.width as usize, info.height as usize)
+            EncoderBuilder::new_video(info.width as u32, info.height as u32)
                 .with_codec_name("libx264".to_string())
                 .with_bit_rate(info.bit_rate)
                 .with_pix_fmt(info.format.into_pixel().unwrap_or(PixelFormat::YUV420P))

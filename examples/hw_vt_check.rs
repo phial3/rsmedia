@@ -5,13 +5,15 @@ use rsmedia::{
 };
 use std::path::PathBuf;
 
-fn rainbow_frame(width: usize, height: usize, p: f32) -> MediaFrame<u8> {
+fn rainbow_frame(width: u32, height: u32, p: f32) -> MediaFrame<u8> {
     let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
     let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24).unwrap();
     let samples = frame
         .data
         .as_packed_mut()
         .expect("RGB24 frames are interleaved");
+    let width = width as usize;
+    let height = height as usize;
     for y in 0..height {
         for x in 0..width {
             samples[[y, x, 0]] = rgb[0];
@@ -23,7 +25,7 @@ fn rainbow_frame(width: usize, height: usize, p: f32) -> MediaFrame<u8> {
 }
 
 fn check(codec: &'static str, ext: &str) -> anyhow::Result<()> {
-    let (w, h, n) = (320usize, 240usize, 60usize);
+    let (w, h, n) = (320u32, 240u32, 60u32);
     let path = PathBuf::from(format!("/tmp/hw_vt_{codec}.{ext}"));
     let _ = std::fs::remove_file(&path);
 

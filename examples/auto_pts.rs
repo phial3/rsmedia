@@ -14,8 +14,8 @@ use rsmedia::frame::MediaFrame;
 use rsmedia::mux::Muxer;
 use rsmedia::{EncoderBuilder, PixelFormat, SampleFormat};
 
-const WIDTH: usize = 320;
-const HEIGHT: usize = 240;
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 240;
 const FPS: f32 = 30.0;
 const VIDEO_FRAMES: usize = 90; // 3 s
 
@@ -87,8 +87,8 @@ fn rainbow_frame(p: f32) -> MediaFrame<u8> {
         .data
         .as_packed_mut()
         .expect("RGB24 frames are interleaved");
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
+    for y in 0..HEIGHT as usize {
+        for x in 0..WIDTH as usize {
             samples[[y, x, 0]] = rgb[0];
             samples[[y, x, 1]] = rgb[1];
             samples[[y, x, 2]] = rgb[2];

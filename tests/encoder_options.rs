@@ -10,10 +10,11 @@ mod common;
 use anyhow::Result;
 use common::{gradient_video_frame, remove_test_output, test_output_path};
 use rsmedia::{DecoderBuilder, EncoderBuilder, MediaType, Muxer, PixelFormat, StreamReader};
+use rsmpeg::avcodec::AVCodec;
 use rsmpeg::ffi;
 
-const WIDTH: usize = 64;
-const HEIGHT: usize = 64;
+const WIDTH: u32 = 64;
+const HEIGHT: u32 = 64;
 const FPS: f32 = 25.0;
 const FRAMES: i64 = 24;
 
@@ -29,6 +30,14 @@ fn picture_types(
 ) -> Result<Option<Vec<ffi::AVPictureType>>> {
     let path = test_output_path("encoder_options", file);
 
+    // 编码器存在性取决于 FFmpeg 编译配置：先探测可用性（`Ok(None)` = 跳过），
+    // 而不是拿库的错误变体当"跳过"标记——`Unsupported` 覆盖的不止"缺这个编码器"
+    // （还有无可用设备、未建模格式等），拿它当跳过标记会把真正的问题一起吞掉。
+    if AVCodec::find_encoder_by_name(c"libx264").is_none() {
+        println!("SKIP: libx264 is not available in this build");
+        return Ok(None);
+    }
+
     let mut builder = EncoderBuilder::new_video(WIDTH, HEIGHT)
         .with_fps(FPS)
         .with_pix_fmt(PixelFormat::YUV420P);
@@ -38,14 +47,9 @@ fn picture_types(
     if let Some(max_b_frames) = max_b_frames {
         builder = builder.with_max_b_frames(max_b_frames);
     }
-    let encoder = match builder.with_codec_name(Some("libx264".to_string())).build() {
-        Ok(encoder) => encoder,
-        Err(e) if e.is_codec_not_found() => {
-            println!("SKIP: libx264 is not available in this build ({e})");
-            return Ok(None);
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let encoder = builder
+        .with_codec_name(Some("libx264".to_string()))
+        .build()?;
 
     let mut muxer = Muxer::new(&path)?;
     let index = muxer.add_encoder(encoder)?;

@@ -35,7 +35,7 @@ use common::{
 
 /// One iteration: a complete 3-stream MP4 (2 s video + ~3 s audio + 30
 /// subtitle cues), every encoder using `enc_threads` threads.
-fn encode_container(path: &Path, enc_threads: usize) -> Result<()> {
+fn encode_container(path: &Path, enc_threads: u32) -> Result<()> {
     let mut v_enc = EncoderBuilder::new_video(WIDTH, HEIGHT)
         .with_fps(FPS)
         .with_thread_count(enc_threads)
@@ -160,8 +160,8 @@ fn rainbow_frame(p: f32) -> MediaFrame<u8> {
         .data
         .as_packed_mut()
         .expect("RGB24 frames are interleaved");
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
+    for y in 0..HEIGHT as usize {
+        for x in 0..WIDTH as usize {
             samples[[y, x, 0]] = rgb[0];
             samples[[y, x, 1]] = rgb[1];
             samples[[y, x, 2]] = rgb[2];
@@ -190,7 +190,7 @@ fn sine_audio_frame(nb_samples: u32) -> MediaFrame<f32> {
 
 fn bench_container(c: &mut Criterion) {
     init().expect("rsmedia init failed");
-    let cores = cores();
+    let cores = cores() as u32;
     let dir = bench_dir();
     let path: PathBuf = dir.join("container_bench.mp4");
 

@@ -107,10 +107,10 @@ impl HWDeviceConfig {
     /// 按当前平台自动选择最佳可用的硬件加速配置。
     ///
     /// 依 [`HWDeviceType::platform_preference`] 的平台优先级依次**真实探测**
-    /// （会为每个候选建立一次设备，见 [`HWDeviceType::is_usable`]），返回第一个
-    /// 在本机能真正建起来的配置；一个都建不起来（无 GPU / 无驱动 / 无 FFmpeg
-    /// 支持编译）时返回错误，**不会**回退到随机设备 —— 需要软件路径时由调用方
-    /// 显式省略 hw 配置。
+    /// （会为每个候选建立设备并试分配表面，见 [`HWDeviceType::is_available`] 与
+    /// [`ProbeDepth::SurfaceAlloc`]），返回第一个在本机能真正干活的配置；一个都
+    /// 通不过（无 GPU / 无驱动 / 无 FFmpeg 支持编译）时返回错误，**不会**回退到
+    /// 随机设备 —— 需要软件路径时由调用方显式省略 hw 配置。
     ///
     /// 返回值可以直接交给 `with_hardware_device`，不会再出现"拿到的配置要到
     /// 建编解码器时才失败"的两段式错误。
@@ -231,6 +231,18 @@ static HW_CTX_CACHE: Lazy<DashMap<HWDeviceConfig, Arc<HWContext>>> = Lazy::new(D
 /// 全部在使用中时可超额容纳（等待 [`release_unused_hw_contexts`] 后续清理）。
 const HW_CTX_CACHE_MAX_ENTRIES: usize = 8;
 
+/// 硬件帧池的默认预分配表面数。
+///
+/// 这个数**直接决定显存占用**：1080p NV12 一张面约 3MB，4K 约 12MB，8K 约 50MB。
+/// 20 张对 1080p（约 60MB）是安全且够用的启发值（解码器 DPB + 滤镜缓冲 + 编码
+/// 上传面都从同一个池里取），但对 4K/8K 会白白占掉数百 MB 显存。
+///
+/// 需要按分辨率/内存预算调整时用
+/// [`EncoderBuilder::with_hw_pool_size`](crate::encode::EncoderBuilder::with_hw_pool_size)
+/// 或 [`DecoderBuilder::with_hw_pool_size`](crate::decode::DecoderBuilder::with_hw_pool_size)；
+/// 传 `0` 表示交给后端自己决定（FFmpeg 的默认行为：按需分配，不预占）。
+pub(crate) const DEFAULT_HW_POOL_SIZE: u32 = 20;
+
 /// 无锁地收集缓存中**当前未被使用**（引用计数为 1，仅缓存自身持有）的条目键。
 fn unused_hw_ctx_configs() -> Vec<HWDeviceConfig> {
     HW_CTX_CACHE
@@ -302,7 +314,7 @@ pub fn release_unused_hw_contexts() -> usize {
 /// A live hardware device context, plus the frame setup derived from it.
 ///
 /// Crate-internal: a caller configures [`HWDeviceConfig`] and hands it to
-/// [`EncoderBuilder::with_hw_device_config`](crate::encode::EncoderBuilder::with_hw_device_config)
+/// [`EncoderBuilder::with_hardware_device`](crate::encode::EncoderBuilder::with_hardware_device)
 /// or the decoder equivalent; the context itself is the plumbing between those
 /// builders and FFmpeg, never something a user holds.
 ///
@@ -398,16 +410,25 @@ impl HWContext {
     /// * `codec_ctx` - The decoder codec context to initialize
     /// * `width` - The width of the decoded frames
     /// * `height` - The height of the decoded frames
+    /// * `pool_size` - Preallocated surface count, see [`DEFAULT_HW_POOL_SIZE`]
     pub(crate) fn setup_decoder_frames(
         &self,
         codec_ctx: &mut AVCodecContext,
         width: i32,
         height: i32,
+        pool_size: u32,
     ) -> Result<()> {
-        let hw_frames_ctx = self.create_hw_frames_ctx(width, height)?;
+        let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
         codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
         codec_ctx.set_pix_fmt(self.get_format(true));
 
+        // SAFETY: rsmpeg's wrap types do not implement `DerefMut`, so field writes
+        // must go through `UnsafeDerefMut::deref_mut`; this access is exclusive —
+        // `codec_ctx` is a `&mut` borrow held for the whole block, so no other
+        // reference to the context exists. `get_format` is set to an `extern "C"`
+        // function whose signature is exactly `AVCodecContext.get_format` (so the
+        // ABI matches and FFmpeg may call it), and `sw_pix_fmt` is the software
+        // format that same callback falls back to.
         unsafe {
             let ctx_mut_ptr = codec_ctx.deref_mut();
             ctx_mut_ptr.get_format = Some(hwaccel_get_format);
@@ -432,13 +453,15 @@ impl HWContext {
     /// * `codec_ctx` - The encoder codec context to initialize
     /// * `width` - The width of the frames to encode
     /// * `height` - The height of the frames to encode
+    /// * `pool_size` - Preallocated surface count, see [`DEFAULT_HW_POOL_SIZE`]
     pub(crate) fn setup_encoder_frames(
         &self,
         codec_ctx: &mut AVCodecContext,
         width: i32,
         height: i32,
+        pool_size: u32,
     ) -> Result<()> {
-        let hw_frames_ctx = self.create_hw_frames_ctx(width, height)?;
+        let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
         codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
         codec_ctx.set_pix_fmt(self.get_format(true));
 
@@ -449,22 +472,96 @@ impl HWContext {
     ///
     /// 仅共享访问 device_ctx：`hwframe_ctx_alloc` 内部只做 av_buffer_ref（原子），
     /// 每次调用都新建独立的 AVHWFramesContext，由调用方（codec_ctx）独占持有。
-    fn create_hw_frames_ctx(
+    pub(crate) fn create_hw_frames_ctx(
         &self,
         width: i32,
         height: i32,
+        pool_size: u32,
     ) -> Result<rsmpeg::avutil::AVHWFramesContext> {
         let mut hw_frames_ctx = self.device_ctx.hwframe_ctx_alloc();
         hw_frames_ctx.data().format = self.get_format(true);
         hw_frames_ctx.data().sw_format = self.get_format(false);
         hw_frames_ctx.data().width = width;
         hw_frames_ctx.data().height = height;
-        hw_frames_ctx.data().initial_pool_size = 20;
+        hw_frames_ctx.data().initial_pool_size = pool_size as i32;
 
         hw_frames_ctx
             .init()
             .context("Failed to initialize hardware frame context")?;
         Ok(hw_frames_ctx)
+    }
+
+    /// 把一帧硬件帧搬进 `codec_ctx` 自己的 frames context。
+    ///
+    /// 编码器的 frames context 是它自己那份（每个编解码器各建一个），上游交来的
+    /// 硬件帧却属于**别人的** frames context（解码器、另一台设备、或调用者自建）。
+    /// 两者直接混用不可靠：`av_hwframe_map` 才是 FFmpeg 认可的搬运方式，同设备
+    /// 且格式兼容时它只做一次 `av_buffer_ref`，**零拷贝**。
+    ///
+    /// 已经在同一 frames context 里的帧原样返回（`av_hwframe_map` 对同源同缓冲
+    /// 反而报 `EINVAL`）。
+    ///
+    /// 后端没实现 `map_to`/`map_from`（如 VideoToolbox）时 `av_hwframe_map` 返回
+    /// `AVERROR(ENOSYS)`——FFmpeg 文档称之为“以当前 hwframe 配置无法映射”，此时
+    /// 退回 [`Self::hw_download`] + [`Self::hw_upload`]（download → upload，两次
+    /// 全帧拷贝），结果帧一样落在 `codec_ctx` 自己的 frames context 里，只是不再
+    /// 零拷贝。
+    pub(crate) fn map_hw_frame(
+        &self,
+        codec_ctx: &mut AVCodecContext,
+        src: AVFrame,
+    ) -> Result<AVFrame> {
+        let dst_ref = unsafe { (*codec_ctx.as_ptr()).hw_frames_ctx };
+        if dst_ref.is_null() {
+            return Err(RsmediaError::invalid_config(
+                "Codec context has no hardware frames context to map into",
+            ));
+        }
+        // 比较的是 AVHWFramesContext 对象本身（`AVBufferRef::data`），不是 buffer_ref
+        // 结构体地址：`av_buffer_ref`/`av_hwframe_get_buffer` 每次都会新建一个
+        // AVBufferRef 指向同一对象，结构体地址几乎总是不等。
+        if !src.hw_frames_ctx.is_null() && unsafe { (*src.hw_frames_ctx).data == (*dst_ref).data } {
+            return Ok(src);
+        }
+
+        let mut dst = AVFrame::new();
+        let map_ret = unsafe {
+            let dst_ptr = dst.as_mut_ptr();
+            let src_ptr = src.as_ptr();
+            (*dst_ptr).format = (*src_ptr).format;
+            (*dst_ptr).width = (*src_ptr).width;
+            (*dst_ptr).height = (*src_ptr).height;
+            // av_buffer_ref：dst 持有独立引用，随 AVFrame 一起 unref，不影响 codec_ctx 那份。
+            (*dst_ptr).hw_frames_ctx = ffi::av_buffer_ref(dst_ref);
+            // flags 按 FFmpeg 文档传 0（当前未使用）。失败时 dst 由 Drop 负责
+            // unref 上面那个 buffer ref，无需手工清理。
+            ffi::av_hwframe_map(dst_ptr, src_ptr, 0)
+        };
+        if map_ret < 0 {
+            if map_ret != -(ffi::ENOSYS as i32) {
+                return Err(RsmediaError::av_error(map_ret).with_context(
+                    "Failed to map the hardware frame into this codec's frames context \
+                     (the two frames contexts must live on the same device and agree on \
+                     format and size)",
+                ));
+            }
+            // 该后端只能 transfer，不能 map：先下载到系统内存，再上传到编码器的
+            // frames context。`hw_download`/`hw_upload` 内部会搬运帧属性（含 pts）。
+            tracing::debug!(
+                "av_hwframe_map is not implemented for {:?}; falling back to download + upload",
+                self.config.device_type
+            );
+            let sw = self.hw_download(&src)?;
+            return self.hw_upload(codec_ctx, &sw);
+        }
+
+        tracing::debug!(
+            "Mapped HW frame into the codec frames context: {:?} {}x{}",
+            PixelFormat::from(dst.format),
+            dst.width,
+            dst.height
+        );
+        Ok(dst)
     }
 
     /// Download frame from hardware acceleration device to system memory.
@@ -702,35 +799,76 @@ ffi_enum_wrap_from!(
     }
 );
 
-impl HWDeviceType {
-    /// 该设备类型是否被**当前的 FFmpeg 构建**编入。
+/// 硬件设备的探测深度（由浅到深，开销与副作用递增；浅层不通过则深层必不通过）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeDepth {
+    /// 只查该类型是否被**当前 FFmpeg 构建**编入（`av_hwdevice_iterate_types`）。
     ///
-    /// 判据是 `av_hwdevice_iterate_types`，也就是说它回答的是"构建期支持哪些
-    /// 设备类型"，**不是**"本机能不能真的用起来"。两者在有 GPU 的机器上通常一致，
-    /// 但在 CI / 虚拟机 / 无显卡驱动的机器上差距很大：实测一台无 GPU 的 Ubuntu 上
-    /// [`Self::list_available`] 报出 6 种类型，真正能建立设备的只有 1 种。
+    /// 纯枚举、无副作用、开销可忽略。回答的是"构建期支持什么"，**不是**
+    /// "本机能不能真的用起来"——两者在有 GPU 的机器上通常一致，但在 CI /
+    /// 虚拟机 / 无显卡驱动的机器上差距很大（实测一台无 GPU 的 Ubuntu 上枚举出
+    /// 6 种类型，真正能建设备的只有 1 种）。
+    CompiledIn,
+    /// 在 [`Self::CompiledIn`] 之上，实际建立一次设备上下文（`av_hwdevice_ctx_create`）
+    /// 再释放，回答"设备在本机能不能打开"。
     ///
-    /// 需要"能不能真的用"时请用 [`Self::is_usable`]；需要"帮我挑一个能用的"时
-    /// 用 [`Self::auto_platform_config`]。本方法保留廉价语义（纯枚举、无副作用），
-    /// 适合做能力展示或快速筛选。
-    pub fn is_available(self) -> bool {
-        Self::list_available().contains(&self)
-    }
+    /// 会真的打开 GPU 设备（`/dev/dri`、Vulkan loader、CUDA 驱动等），毫秒级开销。
+    /// DRM 经内部的默认设备串解析拿到真实节点（没有节点直接判否），不会踩到
+    /// `open(NULL)`——那条路径在 Rosetta 转译的 x86_64 上会 SIGSEGV。
+    DeviceOpen,
+    /// 在 [`Self::DeviceOpen`] 之上，再初始化一个最小（64×64、池大小 1）的
+    /// `AVHWFramesContext`，回答"设备能不能真正分配硬件表面"。
+    ///
+    /// 这是最强的一层：设备对象能创建不代表能干活。无 GPU 的 Windows runner 上
+    /// DXVA2 的 D3D9 device manager 能正常建立，但表面分配被 Microsoft Basic
+    /// Render Driver 拒成 `AVERROR_UNKNOWN`——只有这一层能把它挡掉。
+    /// 自动选择（[`HWDeviceType::auto_platform_config`]）用的就是这一层，保证
+    /// 返回的配置不会到建编解码器 / 帧池时才失败。
+    SurfaceAlloc,
+}
 
-    /// 该设备类型在**本机**是否真的能用：实际建立一次设备上下文再释放。
+impl HWDeviceType {
+    /// 按给定 [`ProbeDepth`] 判断该设备类型在**本机**是否可用。
     ///
-    /// 与 [`Self::is_available`] 的区别见对方的文档。实现里也复用了
-    /// [`default_device_string`]，因此 DRM 会去 `/dev/dri` 找一个真实节点
-    /// （没有节点直接判为不可用），不会踩到 `open(NULL)` 那条路径 —— 那条路径在
-    /// Rosetta 转译的 x86_64 上会 SIGSEGV，探测本身不能把调用方带走。
+    /// 探测逐级进行：构建枚举 → 建立设备上下文 → 试分配硬件表面，任一层失败立即
+    /// 返回 `false`，因此深层通过必然意味着所有浅层通过（单调性由测试钉住）。
     ///
-    /// **有副作用与开销**：会真的打开 GPU 设备（`/dev/dri`、Vulkan loader、
-    /// CUDA 驱动等），单次调用开销在毫秒级。不要放进热路径。
-    pub fn is_usable(self) -> bool {
+    /// [`ProbeDepth::DeviceOpen`] 与 [`ProbeDepth::SurfaceAlloc`] **有副作用与开销**
+    /// （真的打开 GPU / 分配表面，毫秒级），不要放进热路径；只做快速能力展示时用
+    /// [`ProbeDepth::CompiledIn`]，需要"帮我挑一个真能用的"时用
+    /// [`Self::auto_platform_config`]。
+    pub fn is_available(self, depth: ProbeDepth) -> bool {
+        // 第一层：构建枚举（廉价、无副作用）。
+        if !Self::list_available().contains(&self) {
+            return false;
+        }
+        if depth == ProbeDepth::CompiledIn {
+            return true;
+        }
+
+        // 第二层：真正建立设备上下文。DRM 在此之前先经 default_device_string
+        // 拿到真实节点，避免 open(NULL) 在 Rosetta x86_64 上崩进程。
         let Ok(device) = default_device_string(self) else {
             return false;
         };
-        AVHWDeviceContext::create(self.into(), device.as_deref(), None, 0).is_ok()
+        let Ok(hw_device_ctx) = AVHWDeviceContext::create(self.into(), device.as_deref(), None, 0)
+        else {
+            return false;
+        };
+        if depth == ProbeDepth::DeviceOpen {
+            return true;
+        }
+
+        // 第三层：设备能建不代表能干活——用与 HWContext::create_hw_frames_ctx
+        // 完全相同的参数（默认 hw/sw 格式）初始化一个单表面帧池，能 init 成功
+        // 才说明这台设备真的具备编解码所需的表面能力。
+        let mut hw_frames_ctx = hw_device_ctx.hwframe_ctx_alloc();
+        hw_frames_ctx.data().format = self.default_hw_pixel_format().into();
+        hw_frames_ctx.data().sw_format = self.default_sw_pixel_format().into();
+        hw_frames_ctx.data().width = 64;
+        hw_frames_ctx.data().height = 64;
+        hw_frames_ctx.data().initial_pool_size = 1;
+        hw_frames_ctx.init().is_ok()
     }
 
     /// 当前平台的硬件加速优先级（从高到低）。
@@ -780,12 +918,13 @@ impl HWDeviceType {
                 std::env::consts::OS
             )));
         }
-        // 逐个候选**真实探测**（会建立一次设备），避免只用首个候选的枚举结果去
-        // 匹配其它候选；更重要的是：枚举只说明"构建编入了"，无 GPU 的机器上
-        // 建不起来的设备也会被枚举到，只查枚举就会返回一个注定失败的配置。
+        // 逐个候选按最深层探测（建设备 + 试分配一个硬件表面）。只查枚举不够：
+        // 枚举只说明"构建编入了"；只建设备也不够——无 GPU 的 Windows 上 DXVA2
+        // 的设备管理器能建立，表面却分配不了。探到 `SurfaceAlloc` 才能保证返回的
+        // 配置交给 with_hardware_device 后不会在建编解码器 / 帧池时才失败。
         let device = preference
             .iter()
-            .find(|ty| ty.is_usable())
+            .find(|ty| ty.is_available(ProbeDepth::SurfaceAlloc))
             .copied()
             .ok_or_else(|| {
                 RsmediaError::unsupported(format!(
@@ -925,8 +1064,8 @@ unsafe extern "C" fn hwaccel_get_format(
 ///
 /// - **A 设备串解析与 DRM 安全** —— `default_device_string` / `drm_node_from`，
 ///   以及"用公开 API 探测任何设备类型都不许崩进程"这条底线。
-/// - **B 能力查询契约** —— `is_usable` / `is_available` / `list_available` 之间的
-///   不变量。
+/// - **B 能力查询契约** —— `is_available` 的三个 [`ProbeDepth`] 层级与
+///   `list_available` 之间的不变量。
 /// - **C 平台策略与自动选择** —— `platform_preference` / `auto_platform[_with]` /
 ///   `HWDeviceConfig::amf`。
 /// - **D 枚举映射** —— `HWDeviceType` ↔ `ffi::AVHWDeviceType`。
@@ -945,16 +1084,10 @@ unsafe extern "C" fn hwaccel_get_format(
 mod tests {
     use super::*;
 
-    /// 串行化所有触碰 `HW_CTX_CACHE` 的测试：缓存是进程级静态，lib 测试共享同
-    /// 一进程，并行运行会破坏彼此的计数断言。
-    static HW_CACHE_TEST_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
-
-    /// 取缓存测试锁。
-    ///
-    /// 某个测试 panic 后锁会被标记为 poisoned；这里恢复内部值继续用（`into_inner`）——
-    /// 被破坏的只是那个测试留下的状态，与本测试的断言无关，没必要让后续测试连锁失败。
+    /// 取缓存测试锁（定义见 [`crate::test_support::hw_cache_test_lock`]，其它模块的
+    /// 硬件测试也用同一把）。
     fn cache_lock() -> std::sync::MutexGuard<'static, ()> {
-        HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_support::hw_cache_test_lock()
     }
 
     /// 本 crate 建模的**全部**硬件设备类型。
@@ -995,16 +1128,17 @@ mod tests {
 
     #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
     fn version_gated_types() -> Vec<HWDeviceType> {
-        let mut gated = vec![HWDeviceType::D3D12VA];
-        gated.push(HWDeviceType::AMF);
-        gated.push(HWDeviceType::OHCODEC);
-        gated
+        vec![
+            HWDeviceType::D3D12VA,
+            HWDeviceType::AMF,
+            HWDeviceType::OHCODEC,
+        ]
     }
 
     /// 自动探测并创建硬件上下文；探不到就返回 `None` 让调用方跳过。
     ///
-    /// `auto_platform()` 本身已经是**真探测**（内部走 [`HWDeviceType::is_usable`]，
-    /// 会为每个候选真正建立一次设备），所以走到这里仍失败通常只剩竞态或驱动状态
+    /// `auto_platform()` 本身已经是**最深层真探测**（`is_available(SurfaceAlloc)`，
+    /// 会为每个候选建设备并试分配表面），所以走到这里仍失败通常只剩竞态或驱动状态
     /// 变化之类的边缘原因 —— 无论是哪种，结论都是"本机此刻没有可用 GPU"，
     /// 打印原因并跳过，**不要**当成测试失败。
     fn try_auto_hw_context() -> Option<Arc<HWContext>> {
@@ -1082,97 +1216,34 @@ mod tests {
         }
     }
 
-    /// DRM 节点挑选规则。
-    ///
-    /// 纯文件系统逻辑，传临时目录即可覆盖四种场景，任何平台都能严格断言：
-    /// ① `renderD*` 优先于 `card*`，同类按名字排序取第一个；
-    /// ② 只有显示节点时退回 `card*`；
-    /// ③ 目录里有 `by-path/`、`controlD64` 等非节点条目 → 报错，不瞎挑；
-    /// ④ 目录不存在 → 报错，且错误信息里带上路径方便排查。
-    #[test]
-    fn test_drm_node_selection() {
-        let base = std::env::temp_dir().join(format!("rsmedia-dri-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-
-        // ① 既有渲染节点又有显示节点：必须挑渲染节点，且是名字最小的那个。
-        let mixed = base.join("mixed");
-        std::fs::create_dir_all(mixed.join("by-path")).unwrap();
-        for f in ["card0", "card1", "renderD129", "renderD128", "controlD64"] {
-            std::fs::write(mixed.join(f), b"").unwrap();
-        }
-        let picked = drm_node_from(&mixed).unwrap();
-        assert_eq!(
-            picked.to_str().unwrap(),
-            mixed.join("renderD128").to_str().unwrap(),
-            "应优先且按名字取最小的渲染节点"
-        );
-
-        // ② 只有显示节点：退回 card*，同样按名字排序。
-        let cards_only = base.join("cards");
-        std::fs::create_dir_all(&cards_only).unwrap();
-        for f in ["card1", "card0"] {
-            std::fs::write(cards_only.join(f), b"").unwrap();
-        }
-        assert_eq!(
-            drm_node_from(&cards_only).unwrap().to_str().unwrap(),
-            cards_only.join("card0").to_str().unwrap()
-        );
-
-        // ③ 目录里有东西但都不是节点（实机上 by-path 是目录）：报错而不是乱挑。
-        let none = base.join("none");
-        std::fs::create_dir_all(none.join("by-path")).unwrap();
-        std::fs::write(none.join("controlD64"), b"").unwrap();
-        assert!(
-            drm_node_from(&none).is_err(),
-            "没有 renderD*/card* 时必须报错"
-        );
-
-        // ④ 目录不存在（非 Linux 平台）：报错，且错误里带上路径方便排查。
-        let missing = base.join("does-not-exist");
-        let err = drm_node_from(&missing).unwrap_err();
-        assert!(
-            err.to_string().contains("does-not-exist"),
-            "错误信息应包含路径，实际: {err}"
-        );
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// 用公开 API（`is_usable()`）探测**任何一个建模类型**都不得 panic、更不得崩进程。
-    ///
-    /// 这条回归针对一次真实事故：`av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_DRM, NULL, …)`
-    /// 会在 Rosetta 转译的 x86_64 上 SIGSEGV。`is_usable()` 现在先经
-    /// [`default_device_string`] 解析 `/dev/dri` 下的真实节点，没有节点直接判 false，
-    /// 因此不会再走到那条路径。
-    ///
-    /// 覆盖范围刻意取**全部建模类型**而非 `list_available()`：崩不崩进程取决于后端的
-    /// device 处理方式，与该类型是否被编入无关，而调用方可以直接指定任意建模类型
-    /// （例如在不带 GPU 的服务器上请求 DRM）。
-    #[test]
-    fn test_is_usable_never_crashes() {
-        for t in all_modeled_types() {
-            let _ = t.is_usable();
-        }
-    }
-
     // ======================================================================
     // B 组 · 能力查询契约
     // ======================================================================
 
-    /// `is_usable()` 只能比 `is_available()` 更严格：能用的一定是构建里编入的。
+    /// `is_available()` 的深度必须单调：深层通过 ⇒ 所有浅层都通过。
     ///
-    /// 反过来不成立 —— 编入 ≠ 本机能用（无 GPU 机器上实测枚举出 6 种、真能建起来的
-    /// 只有 1 种），这正是 [`HWDeviceType::is_usable`] 存在的理由。
+    /// 编入 ≠ 设备能打开 ≠ 表面能分配（无 GPU 机器上实测枚举出 6 种、真能建起来的
+    /// 只有 1 种；无 GPU 的 Windows runner 上 DXVA2 设备可建、表面分配失败），三层
+    /// 各有存在的理由，但顺序绝不能倒挂。
     #[test]
-    fn test_is_usable_implies_is_available() {
+    fn test_is_available_depth_is_monotonic() {
         for t in HWDeviceType::list_available() {
-            if t.is_usable() {
-                assert!(t.is_available(), "{t:?} 报告可用却不在 list_available() 里");
+            if t.is_available(ProbeDepth::SurfaceAlloc) {
+                assert!(
+                    t.is_available(ProbeDepth::DeviceOpen),
+                    "{t:?} 能分配表面却报告设备打不开"
+                );
+            }
+            if t.is_available(ProbeDepth::DeviceOpen) {
+                assert!(
+                    t.is_available(ProbeDepth::CompiledIn),
+                    "{t:?} 设备可建却不在 list_available() 里"
+                );
             }
         }
     }
 
-    /// `list_available()` / `is_available()` 的契约。
+    /// `list_available()` / `is_available(CompiledIn)` 的契约。
     ///
     /// 三条断言各管一件事：
     ///
@@ -1182,8 +1253,8 @@ mod tests {
     ///    这里会失败。（当前 FFmpeg 枚举出的类型都在建模集合内，所以它今天是空跑通过。）
     /// ② 报出的类型必须都在本 crate 的建模集合内（即实现里 `from_ffi_checked` 的
     ///    跳过契约：FFmpeg 报出未建模的类型时丢掉，而不是 panic 或降级）。
-    /// ③ `is_available()` 与 `list_available()` 结果一致（同一定义的两种形式，钉住
-    ///    的是契约：若有人把 `is_available` 换成另一种探测方式，这里会失败）。
+    /// ③ `is_available(CompiledIn)` 与 `list_available()` 结果一致（同一定义的两种
+    ///    形式，钉住的是契约：若有人把最浅层探测换成另一种判据，这里会失败）。
     #[test]
     fn test_list_available_contract() {
         let listed = HWDeviceType::list_available();
@@ -1203,9 +1274,9 @@ mod tests {
 
         for t in &modeled {
             assert_eq!(
-                t.is_available(),
+                t.is_available(ProbeDepth::CompiledIn),
                 listed.contains(t),
-                "{t:?} 的 is_available() 与 list_available() 结果不一致"
+                "{t:?} 的 is_available(CompiledIn) 与 list_available() 结果不一致"
             );
         }
     }
@@ -1258,17 +1329,17 @@ mod tests {
         }
     }
 
-    /// `auto_platform_config()` 一旦返回 `Ok`，那个设备就必须是本机**真能建起来**的。
+    /// `auto_platform_config()` 一旦返回 `Ok`，那个设备在本机就必须**能真正分配表面**。
     ///
-    /// 这是"返回的配置可以直接用"这条承诺的检查点（用 `is_usable()` 反查），
-    /// 杜绝"拿到的配置要到开编解码器时才失败"的两段式错误。
+    /// 这是"返回的配置可以直接用"这条承诺的检查点（用 `is_available(SurfaceAlloc)`
+    /// 反查），杜绝"拿到的配置要到开编解码器 / 建帧池时才失败"的两段式错误。
     /// 无 GPU 的机器上返回 `Err` 是正确结果，故那时不检查。
     #[test]
     fn test_auto_platform_config_returns_usable_device() {
         if let Ok(config) = HWDeviceType::auto_platform_config(None) {
             assert!(
-                config.device_type.is_usable(),
-                "auto_platform_config 返回了建不起来的设备: {config:?}"
+                config.device_type.is_available(ProbeDepth::SurfaceAlloc),
+                "auto_platform_config 返回了不能分配表面的设备: {config:?}"
             );
         }
     }
@@ -1359,6 +1430,133 @@ mod tests {
         assert_eq!(release_unused_hw_contexts(), 1);
         // 再次释放：缓存已空
         assert_eq!(release_unused_hw_contexts(), 0);
+    }
+
+    /// 帧池表面数**必须**是调用方要的那个值。
+    ///
+    /// `initial_pool_size` 是**预分配**的，直接决定显存占用（4K NV12 一张约 12MB），
+    /// 因此 `with_hw_pool_size` 的值不能在路上被默认值悄悄顶掉——`0` 也必须是 `0`
+    /// （表示"交给后端按需分配"），而不是被换成默认的 20。
+    ///
+    /// 两个平台例外，均属后端/环境的真实约束，不是透传逻辑被破坏：
+    /// - **D3D11VA 硬拒 `0`**：其 `frames_init` 在 `ArraySize == 0` 时无条件返回
+    ///   `ENOMEM`（`av_realloc_f(NULL, 0, …)` 得 NULL，FFmpeg 6.1–9.0 源码一致），
+    ///   D3D11VA 的池必须为正数；该类型不参与 `0` 的用例。
+    /// - **无表面能力的环境**（无 GPU 的 Windows runner 上的 DXVA2：设备可建，
+    ///   `CreateSurface` 被 Microsoft Basic Render Driver 拒成 `AVERROR_UNKNOWN`）：
+    ///   正数池建不了，按环境跳过；但 `0` 不预分配表面，在同一环境仍可验证。
+    #[test]
+    fn test_hw_frames_pool_size_reaches_context() {
+        let _guard = cache_lock();
+
+        let Some(ctx) = try_auto_hw_context() else {
+            return; // 无 GPU 环境跳过
+        };
+        let can_allocate = ctx
+            .config
+            .device_type
+            .is_available(ProbeDepth::SurfaceAlloc);
+        for pool_size in [0u32, 1, 7, DEFAULT_HW_POOL_SIZE] {
+            let is_d3d11_zero = pool_size == 0 && ctx.config.device_type == HWDeviceType::D3D11VA;
+            match ctx.create_hw_frames_ctx(64, 64, pool_size) {
+                Ok(mut frames) => assert_eq!(
+                    frames.data().initial_pool_size,
+                    pool_size as i32,
+                    "requested pool size {pool_size} must reach AVHWFramesContext"
+                ),
+                // D3D11VA 的 frames_init 对 0 无条件 ENOMEM：后端硬约束，非透传缺陷。
+                Err(_) if is_d3d11_zero => {}
+                // 环境连正数表面都分配不了：正数池与（可能同样受影响的）0 池按环境跳过。
+                Err(e) if !can_allocate => {
+                    println!(
+                        "skip pool_size {pool_size}: environment cannot allocate surfaces: {e}"
+                    );
+                }
+                Err(e) => panic!("pool_size {pool_size} must be accepted: {e}"),
+            }
+        }
+    }
+
+    /// `map_hw_frame` 的第一道闸门是"编码器上下文必须已经有自己的 frames context"。
+    ///
+    /// 没有就说明调用方把硬件帧塞给了软件编码路径——这是**配置错误**，不是环境差异，
+    /// 必须 fail-fast 报 `InvalidConfig`，而不是丢帧或崩在 FFmpeg 内部。
+    #[test]
+    fn test_map_hw_frame_without_frames_context_is_invalid_config() {
+        let _guard = cache_lock();
+
+        let Some(ctx) = try_auto_hw_context() else {
+            return; // 无 GPU 环境跳过
+        };
+        // 编解码器只用来提供一个"还没有 frames context"的上下文，因此只要求它在本
+        // 构建里存在（mpeg4 是内置编码器，不依赖外部库）。
+        let Some(codec) = AVCodec::find_encoder_by_name(c"mpeg4") else {
+            return; // 该 FFmpeg 构建没有 mpeg4 编码器
+        };
+        let mut codec_ctx = AVCodecContext::new(&codec);
+
+        let mut src = AVFrame::new();
+        src.set_width(64);
+        src.set_height(64);
+        src.set_format(ctx.get_format(true));
+
+        let err = ctx
+            .map_hw_frame(&mut codec_ctx, src)
+            .expect_err("a codec without hw frames context must reject hardware frames");
+        assert!(
+            err.is_invalid_config(),
+            "missing frames context must be InvalidConfig, got: {err}"
+        );
+    }
+
+    /// 帧已经在**编码器自己那份** frames context 里时必须原样返回。
+    ///
+    /// 这是零拷贝路径的兜底：`av_hwframe_map` 对同源同缓冲反而报 `EINVAL`（文档），
+    /// 后端不支持 map 时更会白白跑一遍 download + upload。真跑一遍并比对帧指针，
+    /// 保证这条捷径没有被误删。
+    #[test]
+    fn test_map_hw_frame_is_noop_for_frame_already_in_codec_context() {
+        let _guard = cache_lock();
+
+        let Some(ctx) = try_auto_hw_context() else {
+            return; // 无 GPU 环境跳过
+        };
+        // 本用例必须真的从帧池 `get_buffer` 出一个表面；无 GPU 环境（如 runner 上的
+        // DXVA2：设备可建、CreateSurface 被拒）整条零拷贝捷径无从验证，按环境跳过。
+        if !ctx
+            .config
+            .device_type
+            .is_available(ProbeDepth::SurfaceAlloc)
+        {
+            return;
+        }
+        let Some(codec) = AVCodec::find_encoder_by_name(c"mpeg4") else {
+            return;
+        };
+        let mut codec_ctx = AVCodecContext::new(&codec);
+        codec_ctx.set_hw_frames_ctx(
+            ctx.create_hw_frames_ctx(64, 64, 2)
+                .expect("frames context must be allocated"),
+        );
+
+        let mut src = AVFrame::new();
+        src.set_width(64);
+        src.set_height(64);
+        src.set_format(ctx.get_format(true));
+        codec_ctx
+            .hw_frames_ctx_mut()
+            .expect("frames context was just set")
+            .get_buffer(&mut src)
+            .expect("frame must be allocated from the codec's own frames context");
+        let src_ptr = src.as_ptr();
+
+        let mapped = ctx
+            .map_hw_frame(&mut codec_ctx, src)
+            .expect("a frame already in the codec frames context must be accepted");
+        assert!(
+            std::ptr::addr_eq(mapped.as_ptr(), src_ptr),
+            "a frame already in the codec frames context must be returned as-is"
+        );
     }
 
     /// `HWContext` 跨线程共享同一 `Arc` 不应触发数据竞争。

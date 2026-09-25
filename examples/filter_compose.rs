@@ -23,8 +23,8 @@ use rsmedia::filter::{AudioEndpoint, FilterGraphBuilder, VideoEndpoint};
 use rsmedia::{EncoderBuilder, MediaFrame, Muxer, PixelFormat, SampleFormat};
 
 /// 合成用的单路画面尺寸：每一路输入都是 160x120（YUV420P 要求宽高为偶数）。
-const W: usize = 160;
-const H: usize = 120;
+const W: u32 = 160;
+const H: u32 = 120;
 /// 帧率，同时也是视频端点的时间基（1/25）。
 const FPS: i32 = 25;
 /// 输入音频：48kHz 单声道，每帧 1024 个采样点。
@@ -129,8 +129,8 @@ fn compose_vstack() -> Result<()> {
         .data
         .as_planes()
         .context("YUV420P frames are planar")?;
-    let top = planes[0][[H / 2, W / 2]];
-    let bottom = planes[0][[H + H / 2, W / 2]];
+    let top = planes[0][[H as usize / 2, W as usize / 2]];
+    let bottom = planes[0][[(H + H / 2) as usize, W as usize / 2]];
     anyhow::ensure!(
         top == 30 && bottom == 220,
         "vstack mismatch: top half = {top}, bottom half = {bottom}"
@@ -143,7 +143,7 @@ fn compose_vstack() -> Result<()> {
 fn compose_overlay() -> Result<()> {
     println!("== 3) overlay：小图叠到大图上（画中画 / 水印）==");
 
-    let (overlay_w, overlay_h) = (40usize, 30usize);
+    let (overlay_w, overlay_h) = (40u32, 30u32);
     let (x, y) = (100usize, 20usize);
     let mut graph = FilterGraphBuilder::overlay(
         video_endpoint(W, H),
@@ -168,7 +168,7 @@ fn compose_overlay() -> Result<()> {
         .as_planes()
         .context("YUV420P frames are planar")?;
 
-    let inside = planes[0][[y + overlay_h / 2, x + overlay_w / 2]];
+    let inside = planes[0][[y + overlay_h as usize / 2, x + overlay_w as usize / 2]];
     let outside = planes[0][[y / 2, x / 2]];
     anyhow::ensure!(
         inside == 240 && outside == 20,
@@ -265,7 +265,7 @@ fn compose_amix() -> Result<()> {
 }
 
 /// 这一批场景统一的视频端点：YUV420P、25fps、时间基 1/25。
-fn video_endpoint(width: usize, height: usize) -> VideoEndpoint {
+fn video_endpoint(width: u32, height: u32) -> VideoEndpoint {
     VideoEndpoint::new(
         width as i32,
         height as i32,
@@ -289,7 +289,7 @@ fn audio_endpoint() -> AudioEndpoint {
 }
 
 /// 生成一张 YUV420P 纯色帧：亮度面全填 `luma`，两个色度面填中性 128。
-fn solid_frame(width: usize, height: usize, luma: u8, pts: i64) -> Result<MediaFrame<u8>> {
+fn solid_frame(width: u32, height: u32, luma: u8, pts: i64) -> Result<MediaFrame<u8>> {
     let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::YUV420P)?;
     {
         let planes = frame
@@ -327,9 +327,10 @@ fn verify_split(frame: &MediaFrame<u8>, left: u8, right: u8) -> Result<()> {
         .data
         .as_planes()
         .context("YUV420P frames are planar")?;
-    let width = frame.width;
+    let width = frame.width as usize;
+    let height = frame.height as usize;
     for (x, expected) in [(10usize, left), (width - 10, right)] {
-        for y in [10usize, frame.height / 2, frame.height - 10] {
+        for y in [10usize, height / 2, height - 10] {
             let got = planes[0][[y, x]];
             anyhow::ensure!(
                 got == expected,
@@ -346,5 +347,5 @@ fn center_luma(frame: &MediaFrame<u8>) -> Result<u8> {
         .data
         .as_planes()
         .context("YUV420P frames are planar")?;
-    Ok(planes[0][[frame.height / 2, frame.width / 2]])
+    Ok(planes[0][[frame.height as usize / 2, frame.width as usize / 2]])
 }
