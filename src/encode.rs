@@ -2420,8 +2420,10 @@ mod tests {
     /// map 时退回 download + upload）。
     ///
     /// 断言分两层：搬运结果的 `hw_frames_ctx` 必须**就是**编码器上下文持有的那个
-    /// frames context；随后走完整 `encode_raw` 出包——FFmpeg 会拒绝 frames context
-    /// 与编码器不匹配的硬件帧，"能编码出包"因此反过来证明搬运确实发生了。
+    /// frames context；随后送 EOS 排空编码器并逐包计数——FFmpeg 会拒绝 frames
+    /// context 与编码器不匹配的硬件帧，"能编码出包"因此反过来证明搬运确实发生了。
+    /// 出包断言必须在 draining 后做：硬件编码器带 `AV_CODEC_CAP_DELAY`，EOS 前
+    /// 可以合法地零输出（包在内部异步管线里），flush 前计数不稳定且与版本/负载有关。
     ///
     /// 无 GPU / 无对应硬件编码器的环境跳过（先探测再跳过，不把环境差异当失败）。
     #[test]
@@ -2458,8 +2460,9 @@ mod tests {
             .with_hw_pool_size(2)
             .build()?;
 
+        let frame_count: i64 = 4;
         let mut packets = 0usize;
-        for index in 0..4i64 {
+        for index in 0..frame_count {
             let mut src = AVFrame::new();
             src.set_width(width as i32);
             src.set_height(height as i32);
@@ -2485,7 +2488,34 @@ mod tests {
 
             packets += encoder.encode_raw(mapped)?.len();
         }
-        assert!(packets > 0, "hardware frames must produce packets");
+
+        // VideoToolbox 等硬件编码器带 `AV_CODEC_CAP_DELAY`：send/receive API 允许
+        // 编码器在 EOS 前合法地零输出（包压在内部异步管线里），所以不能在 flush 前
+        // 断言出包。送 NULL 进入 draining，把编码器排空后再断言"每帧一包"。
+        encoder.send_frame_to_encoder(None)?;
+        let mut eagain = 0;
+        while !encoder.is_flushed() {
+            match encoder.receive_packet()? {
+                Some(pkt) => {
+                    packets += 1;
+                    eagain = 0;
+                    drop(pkt);
+                }
+                None => {
+                    // 与 `flush()` 同一防御：正常 draining 不会持续 EAGAIN，
+                    // 持续不推进说明编码器异常，避免死循环。
+                    eagain += 1;
+                    assert!(
+                        eagain < crate::MAX_DRAIN_ITERATIONS,
+                        "hardware encoder did not reach EOF after draining"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            packets, frame_count as usize,
+            "hardware frames must produce one packet per frame after flush"
+        );
         Ok(())
     }
 
