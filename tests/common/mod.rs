@@ -44,7 +44,7 @@ pub fn remove_test_output(path: &std::path::Path) {
 /// gradients plus a phase-shifted blue channel, so round-trips exercise every
 /// plane.
 #[allow(dead_code)]
-pub fn gradient_video_frame(width: usize, height: usize, phase: f32) -> rsmedia::MediaFrame<u8> {
+pub fn gradient_video_frame(width: u32, height: u32, phase: f32) -> rsmedia::MediaFrame<u8> {
     let mut frame =
         rsmedia::MediaFrame::<u8>::new_video_frame(width, height, rsmedia::PixelFormat::RGB24)
             .expect("video frame allocation");
@@ -52,6 +52,8 @@ pub fn gradient_video_frame(width: usize, height: usize, phase: f32) -> rsmedia:
         .data
         .as_packed_mut()
         .expect("RGB24 frames are interleaved");
+    let width = width as usize;
+    let height = height as usize;
     for y in 0..height {
         for x in 0..width {
             samples[[y, x, 0]] = ((x as f32 / width as f32) * 255.0) as u8;

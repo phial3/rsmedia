@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
         .build()
         .expect("failed to create stream writer");
 
-    let mut encoder = EncoderBuilder::new_video(width as usize, height as usize)
+    let mut encoder = EncoderBuilder::new_video(width, height)
         // encoder with CUDA acceleration
         .with_hardware_device(Some(HWDeviceConfig::auto_platform()?))
         // libx264, libx265, h264_nvenc, h264_vaapi
@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     let mut lost = 0usize;
     for i in 0..256 {
         // 每一帧对应彩虹色轮上的一个相位，逐帧渐变，生成平滑动画。
-        let frame = rainbow_frame(width as usize, height as usize, i as f32 / 256.0);
+        let frame = rainbow_frame(width, height, i as f32 / 256.0);
         // 编码后立即交给 StreamWriter 写盘：先完成 `encode()`，再把每次返回的
         // packet 写到容器，这样不丢包。
         let packets = encoder.encode(frame)?; // 编码：由 Encoder 产出 packet
@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rainbow_frame(width: usize, height: usize, p: f32) -> MediaFrame<u8> {
+fn rainbow_frame(width: u32, height: u32, p: f32) -> MediaFrame<u8> {
     // This is what generated the rainbow effect!
     // We loop through the HSV color spectrum and convert to RGB.
     let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
@@ -110,6 +110,8 @@ fn rainbow_frame(width: usize, height: usize, p: f32) -> MediaFrame<u8> {
         .data
         .as_packed_mut()
         .expect("RGB24 frames are interleaved");
+    let width = width as usize;
+    let height = height as usize;
     for y in 0..height {
         for x in 0..width {
             samples[[y, x, 0]] = rgb[0];

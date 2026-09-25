@@ -144,7 +144,7 @@ fn encode_video_container(container_type: &str, codec_name: &str) -> Result<bool
 
     let output_path = test_output_path("encode_video", &format!("test.{container_type}"));
 
-    let encoder = EncoderBuilder::new_video(WIDTH, HEIGHT)
+    let encoder = EncoderBuilder::new_video(WIDTH as u32, HEIGHT as u32)
         .with_fps(25.0)
         .with_codec_name(codec_name.to_string())
         .build()?;

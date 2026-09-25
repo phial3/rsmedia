@@ -12,12 +12,13 @@ use std::fmt;
 ///
 /// rsmpeg 的 `settable!` 字段表不含 `thread_count`，只能直接写字段；把这个
 /// unsafe 收敛在这里，`Encoder`/`Decoder` 都不再自己碰裸指针。
-pub(crate) fn set_thread_count(context: &mut AVCodecContext, thread_count: usize) {
-    // 超出 `i32` 可表示范围的输入没有合法语义（0 = 自动、负数无意义），此时回退到本机 CPU 数。
-    // 这里不引入"最大线程数"这类凭空写死的常量：线程数超过物理核心本就没有收益，可用核心数
-    // 是唯一有依据的取值。`num_cpus::get()` 返回本机核心数，必然落在 `i32`
-    // 范围内，`as i32` 不会截断。
-    let count = i32::try_from(thread_count).unwrap_or_else(|_| num_cpus::get() as i32);
+///
+/// 只写正值：`0` 表示交给 codec 自行推导（FFmpeg 的默认语义），负数没有合法含义
+/// （只可能来自窄化转换的溢出），两者都不写字段、保持调用前的状态。
+pub(crate) fn set_thread_count(context: &mut AVCodecContext, count: i32) {
+    if count <= 0 {
+        return;
+    }
     // SAFETY: `context` 由 `AVCodecContext::new` 分配、在借用期内一直有效；
     unsafe {
         (*context.as_mut_ptr()).thread_count = count;
@@ -75,7 +76,7 @@ macro_rules! impl_codec_builder_setters {
         ///
         /// 未设置时取 `num_cpus::get()`；同名 AVOption 若经 `with_options` 透传，
         /// 以透传值为准（见 [`Self::with_options`]）。
-        pub fn with_thread_count(mut self, thread_count: usize) -> Self {
+        pub fn with_thread_count(mut self, thread_count: u32) -> Self {
             self.thread_count = Some(thread_count);
             self
         }

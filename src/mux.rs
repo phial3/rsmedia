@@ -659,8 +659,8 @@ impl<W: Writer> Muxer<W> {
     ///
     /// Returns the output stream index of the cover stream.
     pub fn add_cover_art(&mut self, cover_frame: AVFrame) -> Result<usize> {
-        let width = cover_frame.width as usize;
-        let height = cover_frame.height as usize;
+        let width = cover_frame.width as u32;
+        let height = cover_frame.height as u32;
         let encoder = EncoderBuilder::new_video(width, height)
             .with_codec_name("mjpeg".to_string())
             .build()?;
@@ -1742,7 +1742,7 @@ mod tests {
     use std::path::Path;
 
     /// 生成YUV420P格式的视频帧,彩色渐变测试图
-    fn generate_video_frame(width: usize, height: usize, frame_index: i64) -> AVFrame {
+    fn generate_video_frame(width: u32, height: u32, frame_index: i64) -> AVFrame {
         let mut frame = AVFrame::new();
         frame.set_width(width as i32);
         frame.set_height(height as i32);
@@ -1767,7 +1767,7 @@ mod tests {
         // 填充Y平面 (亮度)
         for y in 0..height {
             for x in 0..width {
-                let index = y * y_linesize as usize + x;
+                let index = y as usize * y_linesize as usize + x as usize;
                 let gradient = (x as f32 / width as f32 * 255.0) as u8;
                 unsafe {
                     *y_plane.add(index) = gradient;
@@ -1778,7 +1778,7 @@ mod tests {
         // 填充U平面 (蓝色分量)
         for y in 0..(height / 2) {
             for x in 0..(width / 2) {
-                let index = y * u_linesize as usize + x;
+                let index = y as usize * u_linesize as usize + x as usize;
                 let u_value = ((time_factor * 128.0) as u8).wrapping_add(128);
                 unsafe {
                     *u_plane.add(index) = u_value;
@@ -1789,7 +1789,7 @@ mod tests {
         // 填充V平面 (红色分量)
         for y in 0..(height / 2) {
             for x in 0..(width / 2) {
-                let index = y * v_linesize as usize + x;
+                let index = y as usize * v_linesize as usize + x as usize;
                 let v_value = (((1.0 - time_factor) * 128.0) as u8).wrapping_add(128);
                 unsafe {
                     *v_plane.add(index) = v_value;
@@ -2169,8 +2169,8 @@ mod tests {
     #[test]
     fn test_multiple_streams() -> Result<()> {
         // 视频参数
-        pub const VIDEO_WIDTH: usize = 640;
-        pub const VIDEO_HEIGHT: usize = 360;
+        pub const VIDEO_WIDTH: u32 = 640;
+        pub const VIDEO_HEIGHT: u32 = 360;
         pub const VIDEO_FPS: f32 = 30f32;
         pub const VIDEO_DURATION_SEC: u32 = 3;
 
@@ -2591,7 +2591,7 @@ mod tests {
         let output_path = crate::test_support::test_output_path("mux", "test_gif_palette.gif");
         crate::test_support::remove_test_output(&output_path);
 
-        let (width, height) = (96usize, 64usize);
+        let (width, height) = (96, 64);
         let in_fps = 30.0f32;
         let out_fps = 10.0f32;
 
@@ -2631,8 +2631,8 @@ mod tests {
             frames.len()
         );
         let (_, frame) = &frames[0];
-        assert_eq!(frame.width as usize, width);
-        assert_eq!(frame.height as usize, height);
+        assert_eq!(frame.width as u32, width);
+        assert_eq!(frame.height as u32, height);
 
         let frame_count = frames.len() as f64;
 
@@ -2684,7 +2684,7 @@ mod tests {
         let linesize = cover.linesize[0];
         for y in 0..height {
             for x in 0..width {
-                let index = y * linesize as usize + x * 3;
+                let index = y as usize * linesize as usize + x as usize * 3;
                 unsafe {
                     *rgb.add(index) = (x * 255 / width) as u8;
                     *rgb.add(index + 1) = (y * 255 / height) as u8;

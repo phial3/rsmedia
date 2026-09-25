@@ -231,6 +231,18 @@ static HW_CTX_CACHE: Lazy<DashMap<HWDeviceConfig, Arc<HWContext>>> = Lazy::new(D
 /// 全部在使用中时可超额容纳（等待 [`release_unused_hw_contexts`] 后续清理）。
 const HW_CTX_CACHE_MAX_ENTRIES: usize = 8;
 
+/// 硬件帧池的默认预分配表面数。
+///
+/// 这个数**直接决定显存占用**：1080p NV12 一张面约 3MB，4K 约 12MB，8K 约 50MB。
+/// 20 张对 1080p（约 60MB）是安全且够用的启发值（解码器 DPB + 滤镜缓冲 + 编码
+/// 上传面都从同一个池里取），但对 4K/8K 会白白占掉数百 MB 显存。
+///
+/// 需要按分辨率/内存预算调整时用
+/// [`EncoderBuilder::with_hw_pool_size`](crate::encode::EncoderBuilder::with_hw_pool_size)
+/// 或 [`DecoderBuilder::with_hw_pool_size`](crate::decode::DecoderBuilder::with_hw_pool_size)；
+/// 传 `0` 表示交给后端自己决定（FFmpeg 的默认行为：按需分配，不预占）。
+pub(crate) const DEFAULT_HW_POOL_SIZE: u32 = 20;
+
 /// 无锁地收集缓存中**当前未被使用**（引用计数为 1，仅缓存自身持有）的条目键。
 fn unused_hw_ctx_configs() -> Vec<HWDeviceConfig> {
     HW_CTX_CACHE
@@ -297,32 +309,6 @@ pub fn release_unused_hw_contexts() -> usize {
         tracing::debug!("Released {removed} unused hardware device context(s).");
     }
     removed
-}
-
-/// 硬件帧池的默认预分配表面数。
-///
-/// 这个数**直接决定显存占用**：1080p NV12 一张面约 3MB，4K 约 12MB，8K 约 50MB。
-/// 20 张对 1080p（约 60MB）是安全且够用的启发值（解码器 DPB + 滤镜缓冲 + 编码
-/// 上传面都从同一个池里取），但对 4K/8K 会白白占掉数百 MB 显存。
-///
-/// 需要按分辨率/内存预算调整时用
-/// [`EncoderBuilder::with_hw_pool_size`](crate::encode::EncoderBuilder::with_hw_pool_size)
-/// 或 [`DecoderBuilder::with_hw_pool_size`](crate::decode::DecoderBuilder::with_hw_pool_size)；
-/// 传 `0` 表示交给后端自己决定（FFmpeg 的默认行为：按需分配，不预占）。
-pub(crate) const DEFAULT_HW_POOL_SIZE: u32 = 20;
-
-/// 串行化所有触碰进程级 `HW_CTX_CACHE` 的测试。
-///
-/// 缓存是**进程级**静态，而 lib 测试在同一进程里并行跑：任何创建或持有
-/// [`HWContext`] 的测试（无论写在哪个模块）都必须先拿这把锁，否则
-/// [`release_unused_hw_contexts`] 那类按引用计数断言的测试会被别的测试正好持有的
-/// 上下文干扰（`strong_count > 1` → 该条目"仍在使用"，不会被释放）。
-#[cfg(test)]
-pub(crate) fn hw_cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static HW_CACHE_TEST_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
-    // 某个测试 panic 后锁会被标记为 poisoned；这里恢复内部值继续用（`into_inner`）——
-    // 被破坏的只是那个测试留下的状态，与本测试的断言无关，没必要让后续测试连锁失败。
-    HW_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A live hardware device context, plus the frame setup derived from it.
@@ -1056,9 +1042,10 @@ unsafe extern "C" fn hwaccel_get_format(
 mod tests {
     use super::*;
 
-    /// 取缓存测试锁（定义见 [`hw_cache_test_lock`]，其它模块的硬件测试也用同一把）。
+    /// 取缓存测试锁（定义见 [`crate::test_support::hw_cache_test_lock`]，其它模块的
+    /// 硬件测试也用同一把）。
     fn cache_lock() -> std::sync::MutexGuard<'static, ()> {
-        hw_cache_test_lock()
+        crate::test_support::hw_cache_test_lock()
     }
 
     /// 本 crate 建模的**全部**硬件设备类型。

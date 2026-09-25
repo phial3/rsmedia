@@ -95,7 +95,7 @@ pub struct DecoderBuilder {
     /// `AVCodecContext.thread_type`（`FF_THREAD_*` 掩码）。`None` = FFmpeg 默认。
     thread_type: Option<i32>,
     /// `None` = 未显式设置，构建时取 [`num_cpus::get`]。
-    thread_count: Option<usize>,
+    thread_count: Option<u32>,
     media_type: MediaType,
     codec_name: Option<String>,
     codec_opts: Option<Options>,
@@ -323,7 +323,12 @@ impl DecoderBuilder {
             decoder.set_framerate(framerate);
         }
 
-        crate::codec::set_thread_count(decoder, self.thread_count.unwrap_or_else(num_cpus::get));
+        // 未显式设置时取本机 CPU 数；显式值超出 `i32` 范围（如 `u32::MAX`）会
+        // 下溢成负数，被 `set_thread_count` 忽略，从而保持 FFmpeg 默认线程数。
+        crate::codec::set_thread_count(
+            decoder,
+            self.thread_count.unwrap_or_else(|| num_cpus::get() as u32) as i32,
+        );
 
         // 稳定性策略：rsmpeg 未生成 skip_frame / err_recognition 访问器，直接写字段
         // （encode.rs 写 rc_max_rate 同例）。两项都必须在 `avcodec_open2` 之前生效，
@@ -1540,7 +1545,8 @@ mod tests {
     }
 
     /// 未设置 `with_flags` 时落到 rsmedia 的解码默认值 `LOW_DELAY`；显式设置
-    /// `thread_count` 时原样落入上下文（超出 `i32` 范围则回退到本机 CPU 数）。
+    /// `thread_count` 时原样落入上下文（超出 `i32` 范围的值被忽略，上下文保持
+    /// `0`，`avcodec_open2` 会把它定成解码器的默认 `1`）。
     #[test]
     fn test_builder_codec_flags_default_and_thread_count() -> Result<()> {
         use crate::codec::AVCodecFlag;
@@ -1559,12 +1565,12 @@ mod tests {
         assert_eq!(explicit.thread_count(), 2);
 
         let overflow = DecoderBuilder::new(MediaType::VIDEO)
-            .with_thread_count(usize::MAX)
+            .with_thread_count(u32::MAX)
             .build_from_reader(&reader)?;
         assert_eq!(
             overflow.thread_count(),
-            default.thread_count(),
-            "an out-of-range thread_count must fall back to the CPU count"
+            1,
+            "an out-of-range thread_count must fall back to the default count"
         );
         Ok(())
     }

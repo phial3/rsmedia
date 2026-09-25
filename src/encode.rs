@@ -26,10 +26,10 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct EncoderBuilder {
     /// Video
-    /// 最近一次 [`Self::with_fps`] 传入的原值，仅供 `build()` 校验（见该方法）。
-    requested_fps: Option<f32>,
-    width: usize,
-    height: usize,
+    /// 最近一次 [`Self::with_fps`] 传入的原值，仅供 `build()` 校验
+    req_fps: Option<f32>,
+    width: u32,
+    height: u32,
     /// `None` = 未显式指定，`build()` 时按编码器支持列表自动协商。
     pixel_format: Option<PixelFormat>,
     /// Audio
@@ -44,11 +44,10 @@ pub struct EncoderBuilder {
     /// 瞬时码率上限（`AVCodecContext.rc_max_rate`，ffmpeg CLI 的 `-maxrate`）。
     max_bit_rate: Option<i64>,
     /// VBV 缓冲大小（`AVCodecContext.rc_buffer_size`，ffmpeg CLI 的 `-bufsize`）。
-    buffer_size: Option<i64>,
+    buffer_size: Option<i32>,
     /// 关键帧间隔；`None` = 不设置，沿用编解码器自身默认值。
     gop_size: Option<i32>,
-    /// B 帧上限；`None` = 不设置，沿用编解码器自身默认值（FFmpeg 的 `bf` 默认
-    /// -1，libx264 为 3）。
+    /// B 帧上限；`None` = 不设置，沿用编解码器自身默认值（默认 -1，libx264 为 3）。
     max_b_frames: Option<i32>,
     frame_rate: ffi::AVRational,
     /// config
@@ -62,7 +61,7 @@ pub struct EncoderBuilder {
     /// `AVCodecContext.thread_type`（`FF_THREAD_*` 掩码）。`None` = FFmpeg 默认。
     thread_type: Option<i32>,
     /// `None` = 未显式设置，构建时取 [`num_cpus::get`]。
-    thread_count: Option<usize>,
+    thread_count: Option<u32>,
     media_type: MediaType,
     codec_name: Option<String>,
     codec_opts: Option<Options>,
@@ -131,7 +130,7 @@ impl EncoderBuilder {
     ///
     /// * `width` - The width of the video stream.
     /// * `height` - The height of the video stream.
-    pub fn new_video(width: usize, height: usize) -> Self {
+    pub fn new_video(width: u32, height: u32) -> Self {
         Self::default().with_width(width).with_height(height)
     }
 
@@ -187,13 +186,13 @@ impl EncoderBuilder {
     }
 
     /// Set the width of the video stream.
-    pub fn with_width(mut self, width: usize) -> Self {
+    pub fn with_width(mut self, width: u32) -> Self {
         self.width = width;
         self
     }
 
     /// Set the height of the video stream.
-    pub fn with_height(mut self, height: usize) -> Self {
+    pub fn with_height(mut self, height: u32) -> Self {
         self.height = height;
         self
     }
@@ -218,7 +217,7 @@ impl EncoderBuilder {
     /// 一起设置、并令 `max_bit_rate == bit_rate` 时即为 CBR（恒定码率）——推流场景
     /// 常用它避免突发码率把上行打满。
     ///
-    /// 必须为正；≤ 0 时 [`Self::build`] 报 [`RsmediaError::InvalidConfig`]。
+    /// 必须为正；非正值视为未设置，不写入 `rc_max_rate`（`0` 即"不限瞬时码率"）。
     pub fn with_max_bit_rate(mut self, max_bit_rate: i64) -> Self {
         self.max_bit_rate = Some(max_bit_rate);
         self
@@ -231,8 +230,8 @@ impl EncoderBuilder {
     /// [`Self::with_max_bit_rate`] 配套使用，否则编码器只看到一个巨大的缓冲，
     /// 起不到限流作用。
     ///
-    /// 必须为正；≤ 0 时 [`Self::build`] 报 [`RsmediaError::InvalidConfig`]。
-    pub fn with_buffer_size(mut self, buffer_size: i64) -> Self {
+    /// 必须为正；非正值视为未设置，不写入 `rc_buffer_size`。
+    pub fn with_buffer_size(mut self, buffer_size: i32) -> Self {
         self.buffer_size = Some(buffer_size);
         self
     }
@@ -277,7 +276,7 @@ impl EncoderBuilder {
     /// 非正或非有限的 `fps` 会在 [`Self::build`] 时报错（fail fast），而不是静默
     /// 退回默认帧率——那会产出"帧率与预期不符"这类最难排查的结果。
     pub fn with_fps(mut self, fps: f32) -> Self {
-        self.requested_fps = Some(fps);
+        self.req_fps = Some(fps);
         if fps > 0.0 && fps.is_finite() {
             self.frame_rate = avutil::av_d2q(fps as f64, Self::FPS_MAX);
         }
@@ -469,15 +468,15 @@ impl EncoderBuilder {
         // （普通整型，无所有权/无缓冲）——与 `crate::codec::set_thread_count` 同法。
         unsafe {
             let raw = encoder.as_mut_ptr();
-            if let Some(max_bit_rate) = self.max_bit_rate {
+            if let Some(max_bit_rate) = self.max_bit_rate
+                && max_bit_rate.is_positive()
+            {
                 (*raw).rc_max_rate = max_bit_rate;
             }
-            if let Some(buffer_size) = self.buffer_size {
-                (*raw).rc_buffer_size = i32::try_from(buffer_size).map_err(|_| {
-                    RsmediaError::invalid_config(format!(
-                        "buffer_size {buffer_size} exceeds the i32 range of AVCodecContext.rc_buffer_size"
-                    ))
-                })?;
+            if let Some(buffer_size) = self.buffer_size
+                && buffer_size.is_positive()
+            {
+                (*raw).rc_buffer_size = buffer_size;
             }
         }
 
@@ -504,7 +503,12 @@ impl EncoderBuilder {
         if let Some(thread_type) = self.thread_type {
             crate::codec::set_thread_type(encoder, thread_type);
         }
-        crate::codec::set_thread_count(encoder, self.thread_count.unwrap_or_else(num_cpus::get));
+        // 未显式设置时取本机 CPU 数；显式值超出 `i32` 范围（如 `u32::MAX`）会
+        // 下溢成负数，被 `set_thread_count` 忽略，从而保持 FFmpeg 默认线程数。
+        crate::codec::set_thread_count(
+            encoder,
+            self.thread_count.unwrap_or_else(|| num_cpus::get() as u32) as i32,
+        );
 
         Ok(())
     }
@@ -589,24 +593,12 @@ impl EncoderBuilder {
     /// * `settings` - Encoder settings to use.
     pub fn build(self) -> Result<Encoder> {
         let media_type = self.media_type;
-        if let Some(fps) = self.requested_fps
+        if let Some(fps) = self.req_fps
             && !(fps > 0.0 && fps.is_finite())
         {
             return Err(RsmediaError::invalid_config(format!(
                 "fps must be a positive, finite number, got {fps}"
             )));
-        }
-        for (value, setter) in [
-            (self.max_bit_rate, "max_bit_rate"),
-            (self.buffer_size, "buffer_size"),
-        ] {
-            if let Some(value) = value
-                && value <= 0
-            {
-                return Err(RsmediaError::invalid_config(format!(
-                    "{setter} must be positive, got {value}"
-                )));
-            }
         }
 
         let codec_name: String = match &self.codec_name {
@@ -883,7 +875,7 @@ impl Default for EncoderBuilder {
             max_bit_rate: None,
             buffer_size: None,
             frame_rate: time::new_rational(Self::FRAME_RATE, 1),
-            requested_fps: None,
+            req_fps: None,
             gop_size: None,
             max_b_frames: None,
             global_header: true,
@@ -989,7 +981,7 @@ impl Encoder {
     ///
     /// note: default video codec is `libx264`
     #[inline]
-    pub fn new_video(width: usize, height: usize) -> Result<Encoder> {
+    pub fn new_video(width: u32, height: u32) -> Result<Encoder> {
         EncoderBuilder::new_video(width, height).build()
     }
 
@@ -1712,8 +1704,8 @@ impl Encoder {
     /// `thread_count == 0` 时把它改写成自动推导出的线程数（见 FFmpeg
     /// `ff_frame_thread_init`），非 0 的调用方设置则原样保留。
     #[inline]
-    pub fn thread_count(&self) -> i32 {
-        self.context.thread_count
+    pub fn thread_count(&self) -> u32 {
+        self.context.thread_count as u32
     }
 
     /// 单帧时长（编码器 time_base 单位），用于补全缺失的 packet duration。
@@ -2007,26 +1999,27 @@ mod tests {
         Ok(())
     }
 
-    /// 显式 `thread_count` 原样落入上下文；超出 `i32` 范围（没有合法语义）时回退
-    /// 到本机 CPU 数，而不是某个凭空写死的"最大线程数"。
+    /// 未设置时落到本机 CPU 数；显式设置时原样落入上下文；超出 `i32` 范围的值
+    /// 被 [`crate::codec::set_thread_count`] 忽略（负数是窄化溢出的产物，没有合法
+    /// 语义），上下文保持 FFmpeg 默认的 `0` = 由编码器自行推导。
     #[test]
-    fn test_builder_thread_count_beyond_i32_falls_back_to_cpu_count() -> Result<()> {
+    fn test_builder_thread_count_beyond_i32_is_ignored() -> Result<()> {
         let explicit = EncoderBuilder::new_video(64, 64)
             .with_thread_count(3)
             .build()?;
         assert_eq!(explicit.thread_count(), 3);
 
-        let cpu_count = num_cpus::get() as i32;
+        let cpu_count = num_cpus::get() as u32;
         let default = EncoderBuilder::new_video(64, 64).build()?;
         assert_eq!(default.thread_count(), cpu_count);
 
         let overflow = EncoderBuilder::new_video(64, 64)
-            .with_thread_count(usize::MAX)
+            .with_thread_count(u32::MAX)
             .build()?;
         assert_eq!(
             overflow.thread_count(),
-            cpu_count,
-            "an out-of-range thread_count must fall back to the CPU count"
+            0,
+            "an out-of-range thread_count must be ignored, leaving FFmpeg's default"
         );
         Ok(())
     }
@@ -2435,7 +2428,7 @@ mod tests {
     fn test_encode_raw_accepts_foreign_hw_frame() -> Result<()> {
         // 本测试会创建并持有 `HWContext`（进程级缓存），必须与其它硬件测试串行，
         // 否则会破坏按引用计数断言的缓存释放测试。
-        let _guard = crate::hwaccel::hw_cache_test_lock();
+        let _guard = crate::test_support::hw_cache_test_lock();
 
         let Some(config) = try_auto_hw_config() else {
             return Ok(());
@@ -2453,7 +2446,7 @@ mod tests {
             return Ok(());
         }
 
-        let (width, height) = (64usize, 64usize);
+        let (width, height) = (64u32, 64u32);
         let hw_ctx = HWContext::new(config.clone()).context("hardware device must open")?;
 
         // 源帧来自**另一个** frames context（同一台设备）——正是解码器输出帧的样子。

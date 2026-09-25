@@ -2210,7 +2210,7 @@ mod tests {
     }
 
     /// 生成 RGB24 渐变测试帧（image2 序列写入用）。
-    fn generate_rgb_frame(width: usize, height: usize, index: i64) -> AVFrame {
+    fn generate_rgb_frame(width: u32, height: u32, index: i64) -> AVFrame {
         let mut frame = AVFrame::new();
         frame.set_width(width as i32);
         frame.set_height(height as i32);
@@ -2218,10 +2218,10 @@ mod tests {
         frame.alloc_buffer().expect("alloc rgb frame buffer");
 
         let plane = frame.data_mut()[0];
-        let linesize = frame.linesize[0];
+        let linesize = frame.linesize[0] as usize;
         for y in 0..height {
             for x in 0..width {
-                let i = y * linesize as usize + x * 3;
+                let i = y as usize * linesize + x as usize * 3;
                 unsafe {
                     *plane.add(i) = (x * 255 / width) as u8;
                     *plane.add(i + 1) = (y * 255 / height) as u8;

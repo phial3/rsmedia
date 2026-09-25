@@ -13,8 +13,8 @@ use rsmedia::{DecoderBuilder, EncoderBuilder, MediaType, Muxer, PixelFormat, Str
 use rsmpeg::avcodec::AVCodec;
 use rsmpeg::ffi;
 
-const WIDTH: usize = 64;
-const HEIGHT: usize = 64;
+const WIDTH: u32 = 64;
+const HEIGHT: u32 = 64;
 const FPS: f32 = 25.0;
 const FRAMES: i64 = 24;
 

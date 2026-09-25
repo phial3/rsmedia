@@ -32,8 +32,8 @@ use rsmedia::{
 };
 
 /// 合成模式源图尺寸：故意用非 295:413 比例的底图，验证裁剪。
-const SRC_W: usize = 600;
-const SRC_H: usize = 800;
+const SRC_W: u32 = 600;
+const SRC_H: u32 = 800;
 /// 合成图的蓝底颜色
 const SYNTH_BG_RGB: (u8, u8, u8) = (215, 139, 67);
 
@@ -123,8 +123,8 @@ fn synthetic_id_photo() -> MediaFrame<u8> {
         MediaFrame::<u8>::new_video_frame(SRC_W, SRC_H, PixelFormat::RGB24).expect("rgb frame");
     {
         let samples = frame.data.as_packed_mut().expect("RGB24 is interleaved");
-        for y in 0..SRC_H {
-            for x in 0..SRC_W {
+        for y in 0..SRC_H as usize {
+            for x in 0..SRC_W as usize {
                 // 头：以 (300, 300) 为心、半径 120 的圆；肩：y>480 的梯形。
                 let head = ((x as i32 - 300).pow(2) + (y as i32 - 300).pow(2)) < 120 * 120;
                 let shoulder = y > 480 && (x as i32 - 300).abs() * 2 < (y - 480) as i32 * 3 + 200;
@@ -183,8 +183,8 @@ fn swap_background(
     let mut bg = MediaFrame::<u8>::new_video_frame(photo.width, photo.height, PixelFormat::RGB24)?;
     {
         let samples = bg.data.as_packed_mut().context("RGB24 is interleaved")?;
-        for y in 0..bg.height {
-            for x in 0..bg.width {
+        for y in 0..bg.height as usize {
+            for x in 0..bg.width as usize {
                 samples[[y, x, 0]] = new_bg.0;
                 samples[[y, x, 1]] = new_bg.1;
                 samples[[y, x, 2]] = new_bg.2;
@@ -214,14 +214,14 @@ fn crop_scale(
     let (w, h) = (photo.width, photo.height);
     // 居中裁剪框：源更宽则裁宽，更高则裁高。
     let (cw, ch) = if (w as f64 / h as f64) > target_ratio {
-        ((h as f64 * target_ratio) as u32, h as u32)
+        ((h as f64 * target_ratio) as u32, h)
     } else {
-        (w as u32, (w as f64 / target_ratio) as u32)
+        (w, (w as f64 / target_ratio) as u32)
     };
-    let cw = cw.min(w as u32);
-    let ch = ch.min(h as u32);
-    let cx = ((w - cw as usize) / 2) as i32;
-    let cy = ((h - ch as usize) / 2) as i32;
+    let cw = cw.min(w);
+    let ch = ch.min(h);
+    let cx = ((w - cw) / 2) as i32;
+    let cy = ((h - ch) / 2) as i32;
 
     let endpoint = rgb_endpoint(w as i32, h as i32);
     let out_endpoint = rgb_endpoint(tw as i32, th as i32);
@@ -346,7 +346,7 @@ fn rgb_endpoint(width: i32, height: i32) -> VideoEndpoint {
 /// 校验合成模式的结果：尺寸正确；开了换底则再校验新底色生效且人像未被盖住。
 fn verify(frame: &MediaFrame<u8>, tw: usize, th: usize, swapped: bool) -> Result<()> {
     anyhow::ensure!(
-        (frame.width, frame.height) == (tw, th),
+        (frame.width, frame.height) == (tw as u32, th as u32),
         "unexpected size {}x{}",
         frame.width,
         frame.height

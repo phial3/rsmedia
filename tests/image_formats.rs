@@ -36,8 +36,8 @@ use rsmedia::{DecoderBuilder, EncoderBuilder, MediaType, Muxer, Reader, Result, 
 use rsmpeg::avcodec::AVCodec;
 use rsmpeg::ffi;
 
-const WIDTH: usize = 320;
-const HEIGHT: usize = 240;
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 240;
 const FPS: f32 = 25.0;
 
 /// One row: an extension a caller would use, plus the encoder FFmpeg lists for
@@ -275,12 +275,8 @@ mod reference_decoding {
 
     /// A gradient plain enough for any of the formats above to store.
     fn reference_image() -> RgbImage {
-        RgbImage::from_fn(WIDTH as u32, HEIGHT as u32, |x, y| {
-            image::Rgb([
-                (x * 255 / WIDTH as u32) as u8,
-                (y * 255 / HEIGHT as u32) as u8,
-                0x40,
-            ])
+        RgbImage::from_fn(WIDTH, HEIGHT, |x, y| {
+            image::Rgb([(x * 255 / WIDTH) as u8, (y * 255 / HEIGHT) as u8, 0x40])
         })
     }
 

@@ -427,10 +427,12 @@ impl PixelFormat {
     /// `None` means the format cannot be expressed as whole sample arrays at
     /// this size: bitstream, paletted and hardware formats (whose components are
     /// not whole samples), or a zero dimension.
-    pub fn data_layout(self, width: usize, height: usize) -> Option<DataLayout> {
+    pub fn data_layout(self, width: u32, height: u32) -> Option<DataLayout> {
         if width == 0 || height == 0 {
             return None;
         }
+        // 布局本身用 `ndarray` 的维度表示，几何运算一律按 `usize` 做。
+        let (width, height) = (width as usize, height as usize);
         let desc = AVPixFmtDescriptorRef::get(self.into())?;
         if has_no_sample_planes(&desc) {
             return None;
