@@ -1117,6 +1117,25 @@ mod tests {
         }
     }
 
+    /// 该环境能否在该设备上**真正分配硬件表面**（比设备可建更强的探针）。
+    ///
+    /// 设备创建成功不等于能干活：无 GPU 的 Windows runner 上 DXVA2 的 D3D9
+    /// device manager 能正常建立，但 `frames_init` 预分配 decode render-target
+    /// 表面时被 Microsoft Basic Render Driver 拒成 `AVERROR_UNKNOWN`。
+    /// 需要表面的测试用本探针区分"环境不具备"（打印原因并跳过）与真实回归
+    /// （在有 GPU 的 macOS/Linux CI 上照样 panic）。
+    fn can_allocate_surfaces(ctx: &HWContext) -> bool {
+        match ctx.create_hw_frames_ctx(64, 64, 1) {
+            Ok(_) => true,
+            Err(e) => {
+                println!(
+                    "skip: hardware device opens but cannot allocate surfaces on this machine: {e}"
+                );
+                false
+            }
+        }
+    }
+
     // ======================================================================
     // A 组 · 设备串解析与 DRM 安全
     // ======================================================================
@@ -1385,6 +1404,14 @@ mod tests {
     /// `initial_pool_size` 是**预分配**的，直接决定显存占用（4K NV12 一张约 12MB），
     /// 因此 `with_hw_pool_size` 的值不能在路上被默认值悄悄顶掉——`0` 也必须是 `0`
     /// （表示"交给后端按需分配"），而不是被换成默认的 20。
+    ///
+    /// 两个平台例外，均属后端/环境的真实约束，不是透传逻辑被破坏：
+    /// - **D3D11VA 硬拒 `0`**：其 `frames_init` 在 `ArraySize == 0` 时无条件返回
+    ///   `ENOMEM`（`av_realloc_f(NULL, 0, …)` 得 NULL，FFmpeg 6.1–9.0 源码一致），
+    ///   D3D11VA 的池必须为正数；该类型不参与 `0` 的用例。
+    /// - **无表面能力的环境**（无 GPU 的 Windows runner 上的 DXVA2：设备可建，
+    ///   `CreateSurface` 被 Microsoft Basic Render Driver 拒成 `AVERROR_UNKNOWN`）：
+    ///   正数池建不了，按环境跳过；但 `0` 不预分配表面，在同一环境仍可验证。
     #[test]
     fn test_hw_frames_pool_size_reaches_context() {
         let _guard = cache_lock();
@@ -1392,15 +1419,25 @@ mod tests {
         let Some(ctx) = try_auto_hw_context() else {
             return; // 无 GPU 环境跳过
         };
+        let can_allocate = can_allocate_surfaces(&ctx);
         for pool_size in [0u32, 1, 7, DEFAULT_HW_POOL_SIZE] {
-            let mut frames = ctx
-                .create_hw_frames_ctx(64, 64, pool_size)
-                .unwrap_or_else(|e| panic!("pool_size {pool_size} must be accepted: {e}"));
-            assert_eq!(
-                frames.data().initial_pool_size,
-                pool_size as i32,
-                "requested pool size {pool_size} must reach AVHWFramesContext"
-            );
+            let is_d3d11_zero = pool_size == 0 && ctx.config.device_type == HWDeviceType::D3D11VA;
+            match ctx.create_hw_frames_ctx(64, 64, pool_size) {
+                Ok(mut frames) => assert_eq!(
+                    frames.data().initial_pool_size,
+                    pool_size as i32,
+                    "requested pool size {pool_size} must reach AVHWFramesContext"
+                ),
+                // D3D11VA 的 frames_init 对 0 无条件 ENOMEM：后端硬约束，非透传缺陷。
+                Err(_) if is_d3d11_zero => {}
+                // 环境连正数表面都分配不了：正数池与（可能同样受影响的）0 池按环境跳过。
+                Err(e) if !can_allocate => {
+                    println!(
+                        "skip pool_size {pool_size}: environment cannot allocate surfaces: {e}"
+                    );
+                }
+                Err(e) => panic!("pool_size {pool_size} must be accepted: {e}"),
+            }
         }
     }
 
@@ -1448,6 +1485,11 @@ mod tests {
         let Some(ctx) = try_auto_hw_context() else {
             return; // 无 GPU 环境跳过
         };
+        // 本用例必须真的从帧池 `get_buffer` 出一个表面；无 GPU 环境（如 runner 上的
+        // DXVA2：设备可建、CreateSurface 被拒）整条零拷贝捷径无从验证，按环境跳过。
+        if !can_allocate_surfaces(&ctx) {
+            return;
+        }
         let Some(codec) = AVCodec::find_encoder_by_name(c"mpeg4") else {
             return;
         };
