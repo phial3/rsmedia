@@ -107,10 +107,10 @@ impl HWDeviceConfig {
     /// 按当前平台自动选择最佳可用的硬件加速配置。
     ///
     /// 依 [`HWDeviceType::platform_preference`] 的平台优先级依次**真实探测**
-    /// （会为每个候选建立一次设备，见 [`HWDeviceType::is_usable`]），返回第一个
-    /// 在本机能真正建起来的配置；一个都建不起来（无 GPU / 无驱动 / 无 FFmpeg
-    /// 支持编译）时返回错误，**不会**回退到随机设备 —— 需要软件路径时由调用方
-    /// 显式省略 hw 配置。
+    /// （会为每个候选建立设备并试分配表面，见 [`HWDeviceType::is_available`] 与
+    /// [`ProbeDepth::SurfaceAlloc`]），返回第一个在本机能真正干活的配置；一个都
+    /// 通不过（无 GPU / 无驱动 / 无 FFmpeg 支持编译）时返回错误，**不会**回退到
+    /// 随机设备 —— 需要软件路径时由调用方显式省略 hw 配置。
     ///
     /// 返回值可以直接交给 `with_hardware_device`，不会再出现"拿到的配置要到
     /// 建编解码器时才失败"的两段式错误。
@@ -799,35 +799,76 @@ ffi_enum_wrap_from!(
     }
 );
 
-impl HWDeviceType {
-    /// 该设备类型是否被**当前的 FFmpeg 构建**编入。
+/// 硬件设备的探测深度（由浅到深，开销与副作用递增；浅层不通过则深层必不通过）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeDepth {
+    /// 只查该类型是否被**当前 FFmpeg 构建**编入（`av_hwdevice_iterate_types`）。
     ///
-    /// 判据是 `av_hwdevice_iterate_types`，也就是说它回答的是"构建期支持哪些
-    /// 设备类型"，**不是**"本机能不能真的用起来"。两者在有 GPU 的机器上通常一致，
-    /// 但在 CI / 虚拟机 / 无显卡驱动的机器上差距很大：实测一台无 GPU 的 Ubuntu 上
-    /// [`Self::list_available`] 报出 6 种类型，真正能建立设备的只有 1 种。
+    /// 纯枚举、无副作用、开销可忽略。回答的是"构建期支持什么"，**不是**
+    /// "本机能不能真的用起来"——两者在有 GPU 的机器上通常一致，但在 CI /
+    /// 虚拟机 / 无显卡驱动的机器上差距很大（实测一台无 GPU 的 Ubuntu 上枚举出
+    /// 6 种类型，真正能建设备的只有 1 种）。
+    CompiledIn,
+    /// 在 [`Self::CompiledIn`] 之上，实际建立一次设备上下文（`av_hwdevice_ctx_create`）
+    /// 再释放，回答"设备在本机能不能打开"。
     ///
-    /// 需要"能不能真的用"时请用 [`Self::is_usable`]；需要"帮我挑一个能用的"时
-    /// 用 [`Self::auto_platform_config`]。本方法保留廉价语义（纯枚举、无副作用），
-    /// 适合做能力展示或快速筛选。
-    pub fn is_available(self) -> bool {
-        Self::list_available().contains(&self)
-    }
+    /// 会真的打开 GPU 设备（`/dev/dri`、Vulkan loader、CUDA 驱动等），毫秒级开销。
+    /// DRM 经内部的默认设备串解析拿到真实节点（没有节点直接判否），不会踩到
+    /// `open(NULL)`——那条路径在 Rosetta 转译的 x86_64 上会 SIGSEGV。
+    DeviceOpen,
+    /// 在 [`Self::DeviceOpen`] 之上，再初始化一个最小（64×64、池大小 1）的
+    /// `AVHWFramesContext`，回答"设备能不能真正分配硬件表面"。
+    ///
+    /// 这是最强的一层：设备对象能创建不代表能干活。无 GPU 的 Windows runner 上
+    /// DXVA2 的 D3D9 device manager 能正常建立，但表面分配被 Microsoft Basic
+    /// Render Driver 拒成 `AVERROR_UNKNOWN`——只有这一层能把它挡掉。
+    /// 自动选择（[`HWDeviceType::auto_platform_config`]）用的就是这一层，保证
+    /// 返回的配置不会到建编解码器 / 帧池时才失败。
+    SurfaceAlloc,
+}
 
-    /// 该设备类型在**本机**是否真的能用：实际建立一次设备上下文再释放。
+impl HWDeviceType {
+    /// 按给定 [`ProbeDepth`] 判断该设备类型在**本机**是否可用。
     ///
-    /// 与 [`Self::is_available`] 的区别见对方的文档。实现里也复用了
-    /// `default_device_string`，因此 DRM 会去 `/dev/dri` 找一个真实节点
-    /// （没有节点直接判为不可用），不会踩到 `open(NULL)` 那条路径 —— 那条路径在
-    /// Rosetta 转译的 x86_64 上会 SIGSEGV，探测本身不能把调用方带走。
+    /// 探测逐级进行：构建枚举 → 建立设备上下文 → 试分配硬件表面，任一层失败立即
+    /// 返回 `false`，因此深层通过必然意味着所有浅层通过（单调性由测试钉住）。
     ///
-    /// **有副作用与开销**：会真的打开 GPU 设备（`/dev/dri`、Vulkan loader、
-    /// CUDA 驱动等），单次调用开销在毫秒级。不要放进热路径。
-    pub fn is_usable(self) -> bool {
+    /// [`ProbeDepth::DeviceOpen`] 与 [`ProbeDepth::SurfaceAlloc`] **有副作用与开销**
+    /// （真的打开 GPU / 分配表面，毫秒级），不要放进热路径；只做快速能力展示时用
+    /// [`ProbeDepth::CompiledIn`]，需要"帮我挑一个真能用的"时用
+    /// [`Self::auto_platform_config`]。
+    pub fn is_available(self, depth: ProbeDepth) -> bool {
+        // 第一层：构建枚举（廉价、无副作用）。
+        if !Self::list_available().contains(&self) {
+            return false;
+        }
+        if depth == ProbeDepth::CompiledIn {
+            return true;
+        }
+
+        // 第二层：真正建立设备上下文。DRM 在此之前先经 default_device_string
+        // 拿到真实节点，避免 open(NULL) 在 Rosetta x86_64 上崩进程。
         let Ok(device) = default_device_string(self) else {
             return false;
         };
-        AVHWDeviceContext::create(self.into(), device.as_deref(), None, 0).is_ok()
+        let Ok(hw_device_ctx) = AVHWDeviceContext::create(self.into(), device.as_deref(), None, 0)
+        else {
+            return false;
+        };
+        if depth == ProbeDepth::DeviceOpen {
+            return true;
+        }
+
+        // 第三层：设备能建不代表能干活——用与 HWContext::create_hw_frames_ctx
+        // 完全相同的参数（默认 hw/sw 格式）初始化一个单表面帧池，能 init 成功
+        // 才说明这台设备真的具备编解码所需的表面能力。
+        let mut hw_frames_ctx = hw_device_ctx.hwframe_ctx_alloc();
+        hw_frames_ctx.data().format = self.default_hw_pixel_format().into();
+        hw_frames_ctx.data().sw_format = self.default_sw_pixel_format().into();
+        hw_frames_ctx.data().width = 64;
+        hw_frames_ctx.data().height = 64;
+        hw_frames_ctx.data().initial_pool_size = 1;
+        hw_frames_ctx.init().is_ok()
     }
 
     /// 当前平台的硬件加速优先级（从高到低）。
@@ -877,12 +918,13 @@ impl HWDeviceType {
                 std::env::consts::OS
             )));
         }
-        // 逐个候选**真实探测**（会建立一次设备），避免只用首个候选的枚举结果去
-        // 匹配其它候选；更重要的是：枚举只说明"构建编入了"，无 GPU 的机器上
-        // 建不起来的设备也会被枚举到，只查枚举就会返回一个注定失败的配置。
+        // 逐个候选按最深层探测（建设备 + 试分配一个硬件表面）。只查枚举不够：
+        // 枚举只说明"构建编入了"；只建设备也不够——无 GPU 的 Windows 上 DXVA2
+        // 的设备管理器能建立，表面却分配不了。探到 `SurfaceAlloc` 才能保证返回的
+        // 配置交给 with_hardware_device 后不会在建编解码器 / 帧池时才失败。
         let device = preference
             .iter()
-            .find(|ty| ty.is_usable())
+            .find(|ty| ty.is_available(ProbeDepth::SurfaceAlloc))
             .copied()
             .ok_or_else(|| {
                 RsmediaError::unsupported(format!(
@@ -1022,8 +1064,8 @@ unsafe extern "C" fn hwaccel_get_format(
 ///
 /// - **A 设备串解析与 DRM 安全** —— `default_device_string` / `drm_node_from`，
 ///   以及"用公开 API 探测任何设备类型都不许崩进程"这条底线。
-/// - **B 能力查询契约** —— `is_usable` / `is_available` / `list_available` 之间的
-///   不变量。
+/// - **B 能力查询契约** —— `is_available` 的三个 [`ProbeDepth`] 层级与
+///   `list_available` 之间的不变量。
 /// - **C 平台策略与自动选择** —— `platform_preference` / `auto_platform[_with]` /
 ///   `HWDeviceConfig::amf`。
 /// - **D 枚举映射** —— `HWDeviceType` ↔ `ffi::AVHWDeviceType`。
@@ -1095,8 +1137,8 @@ mod tests {
 
     /// 自动探测并创建硬件上下文；探不到就返回 `None` 让调用方跳过。
     ///
-    /// `auto_platform()` 本身已经是**真探测**（内部走 [`HWDeviceType::is_usable`]，
-    /// 会为每个候选真正建立一次设备），所以走到这里仍失败通常只剩竞态或驱动状态
+    /// `auto_platform()` 本身已经是**最深层真探测**（`is_available(SurfaceAlloc)`，
+    /// 会为每个候选建设备并试分配表面），所以走到这里仍失败通常只剩竞态或驱动状态
     /// 变化之类的边缘原因 —— 无论是哪种，结论都是"本机此刻没有可用 GPU"，
     /// 打印原因并跳过，**不要**当成测试失败。
     fn try_auto_hw_context() -> Option<Arc<HWContext>> {
@@ -1113,25 +1155,6 @@ mod tests {
             Err(e) => {
                 println!("skip: hardware device not usable on this machine: {e}");
                 None
-            }
-        }
-    }
-
-    /// 该环境能否在该设备上**真正分配硬件表面**（比设备可建更强的探针）。
-    ///
-    /// 设备创建成功不等于能干活：无 GPU 的 Windows runner 上 DXVA2 的 D3D9
-    /// device manager 能正常建立，但 `frames_init` 预分配 decode render-target
-    /// 表面时被 Microsoft Basic Render Driver 拒成 `AVERROR_UNKNOWN`。
-    /// 需要表面的测试用本探针区分"环境不具备"（打印原因并跳过）与真实回归
-    /// （在有 GPU 的 macOS/Linux CI 上照样 panic）。
-    fn can_allocate_surfaces(ctx: &HWContext) -> bool {
-        match ctx.create_hw_frames_ctx(64, 64, 1) {
-            Ok(_) => true,
-            Err(e) => {
-                println!(
-                    "skip: hardware device opens but cannot allocate surfaces on this machine: {e}"
-                );
-                false
             }
         }
     }
@@ -1197,20 +1220,30 @@ mod tests {
     // B 组 · 能力查询契约
     // ======================================================================
 
-    /// `is_usable()` 只能比 `is_available()` 更严格：能用的一定是构建里编入的。
+    /// `is_available()` 的深度必须单调：深层通过 ⇒ 所有浅层都通过。
     ///
-    /// 反过来不成立 —— 编入 ≠ 本机能用（无 GPU 机器上实测枚举出 6 种、真能建起来的
-    /// 只有 1 种），这正是 [`HWDeviceType::is_usable`] 存在的理由。
+    /// 编入 ≠ 设备能打开 ≠ 表面能分配（无 GPU 机器上实测枚举出 6 种、真能建起来的
+    /// 只有 1 种；无 GPU 的 Windows runner 上 DXVA2 设备可建、表面分配失败），三层
+    /// 各有存在的理由，但顺序绝不能倒挂。
     #[test]
-    fn test_is_usable_implies_is_available() {
+    fn test_is_available_depth_is_monotonic() {
         for t in HWDeviceType::list_available() {
-            if t.is_usable() {
-                assert!(t.is_available(), "{t:?} 报告可用却不在 list_available() 里");
+            if t.is_available(ProbeDepth::SurfaceAlloc) {
+                assert!(
+                    t.is_available(ProbeDepth::DeviceOpen),
+                    "{t:?} 能分配表面却报告设备打不开"
+                );
+            }
+            if t.is_available(ProbeDepth::DeviceOpen) {
+                assert!(
+                    t.is_available(ProbeDepth::CompiledIn),
+                    "{t:?} 设备可建却不在 list_available() 里"
+                );
             }
         }
     }
 
-    /// `list_available()` / `is_available()` 的契约。
+    /// `list_available()` / `is_available(CompiledIn)` 的契约。
     ///
     /// 三条断言各管一件事：
     ///
@@ -1220,8 +1253,8 @@ mod tests {
     ///    这里会失败。（当前 FFmpeg 枚举出的类型都在建模集合内，所以它今天是空跑通过。）
     /// ② 报出的类型必须都在本 crate 的建模集合内（即实现里 `from_ffi_checked` 的
     ///    跳过契约：FFmpeg 报出未建模的类型时丢掉，而不是 panic 或降级）。
-    /// ③ `is_available()` 与 `list_available()` 结果一致（同一定义的两种形式，钉住
-    ///    的是契约：若有人把 `is_available` 换成另一种探测方式，这里会失败）。
+    /// ③ `is_available(CompiledIn)` 与 `list_available()` 结果一致（同一定义的两种
+    ///    形式，钉住的是契约：若有人把最浅层探测换成另一种判据，这里会失败）。
     #[test]
     fn test_list_available_contract() {
         let listed = HWDeviceType::list_available();
@@ -1241,9 +1274,9 @@ mod tests {
 
         for t in &modeled {
             assert_eq!(
-                t.is_available(),
+                t.is_available(ProbeDepth::CompiledIn),
                 listed.contains(t),
-                "{t:?} 的 is_available() 与 list_available() 结果不一致"
+                "{t:?} 的 is_available(CompiledIn) 与 list_available() 结果不一致"
             );
         }
     }
@@ -1296,17 +1329,17 @@ mod tests {
         }
     }
 
-    /// `auto_platform_config()` 一旦返回 `Ok`，那个设备就必须是本机**真能建起来**的。
+    /// `auto_platform_config()` 一旦返回 `Ok`，那个设备在本机就必须**能真正分配表面**。
     ///
-    /// 这是"返回的配置可以直接用"这条承诺的检查点（用 `is_usable()` 反查），
-    /// 杜绝"拿到的配置要到开编解码器时才失败"的两段式错误。
+    /// 这是"返回的配置可以直接用"这条承诺的检查点（用 `is_available(SurfaceAlloc)`
+    /// 反查），杜绝"拿到的配置要到开编解码器 / 建帧池时才失败"的两段式错误。
     /// 无 GPU 的机器上返回 `Err` 是正确结果，故那时不检查。
     #[test]
     fn test_auto_platform_config_returns_usable_device() {
         if let Ok(config) = HWDeviceType::auto_platform_config(None) {
             assert!(
-                config.device_type.is_usable(),
-                "auto_platform_config 返回了建不起来的设备: {config:?}"
+                config.device_type.is_available(ProbeDepth::SurfaceAlloc),
+                "auto_platform_config 返回了不能分配表面的设备: {config:?}"
             );
         }
     }
@@ -1419,7 +1452,10 @@ mod tests {
         let Some(ctx) = try_auto_hw_context() else {
             return; // 无 GPU 环境跳过
         };
-        let can_allocate = can_allocate_surfaces(&ctx);
+        let can_allocate = ctx
+            .config
+            .device_type
+            .is_available(ProbeDepth::SurfaceAlloc);
         for pool_size in [0u32, 1, 7, DEFAULT_HW_POOL_SIZE] {
             let is_d3d11_zero = pool_size == 0 && ctx.config.device_type == HWDeviceType::D3D11VA;
             match ctx.create_hw_frames_ctx(64, 64, pool_size) {
@@ -1487,7 +1523,11 @@ mod tests {
         };
         // 本用例必须真的从帧池 `get_buffer` 出一个表面；无 GPU 环境（如 runner 上的
         // DXVA2：设备可建、CreateSurface 被拒）整条零拷贝捷径无从验证，按环境跳过。
-        if !can_allocate_surfaces(&ctx) {
+        if !ctx
+            .config
+            .device_type
+            .is_available(ProbeDepth::SurfaceAlloc)
+        {
             return;
         }
         let Some(codec) = AVCodec::find_encoder_by_name(c"mpeg4") else {

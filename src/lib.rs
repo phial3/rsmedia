@@ -37,7 +37,7 @@ pub use error::{Result, RsmediaError};
 pub use filter::{Filter, FilterGraph, FilterGraphBuilder, FilterNode};
 pub use fmt::{DataLayout, FrameFormat, SampleFormat};
 pub use frame::{ElementType, FrameData, FrameSideData, MediaFrame};
-pub use hwaccel::{HWDeviceConfig, HWDeviceType};
+pub use hwaccel::{HWDeviceConfig, HWDeviceType, ProbeDepth};
 pub use init::{AVLogFlag, AVLogLevel, init, init_with, init_with_level};
 pub use io::{AVSeekFlag, DynWriter, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
