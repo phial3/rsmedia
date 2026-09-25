@@ -94,8 +94,7 @@ pub struct DecoderBuilder {
     flags2: Option<i32>,
     /// `AVCodecContext.thread_type`（`FF_THREAD_*` 掩码）。`None` = FFmpeg 默认。
     thread_type: Option<i32>,
-    /// `None` = 未显式设置，构建时取 [`num_cpus::get`]；`Some(n)` 表示调用方指定过
-    /// —— 该"显式"信息被 [`Self::owned_option_keys`] 用来判定配置冲突。
+    /// `None` = 未显式设置，构建时取 [`num_cpus::get`]。
     thread_count: Option<usize>,
     media_type: MediaType,
     codec_name: Option<String>,
@@ -342,36 +341,6 @@ impl DecoderBuilder {
         Ok(())
     }
 
-    /// 解码器 AVOption 里由 builder typed setter 独占的键，`(option key, setter)`。
-    ///
-    /// 只列出**调用方显式设置过**的项（默认值不算配置过），规则见
-    /// [`options::ensure_single_source`](crate::options)。
-    fn owned_option_keys(&self) -> Vec<(&'static str, &'static str)> {
-        let mut owned = Vec::new();
-        // 前四项是 `codec::impl_codec_builder_setters!` 生成的公共 setter 对应的键，
-        // 与编码器侧逐字相同；后面的键只属于解码器。
-        if self.thread_count.is_some() {
-            owned.push(("threads", "with_thread_count"));
-        }
-        if self.flags.is_some() {
-            owned.push(("flags", "with_flags"));
-        }
-        if self.flags2.is_some() {
-            owned.push(("flags2", "with_flags2"));
-        }
-        if self.thread_type.is_some() {
-            owned.push(("thread_type", "with_thread_type"));
-        }
-        if self.skip_frame.is_some() {
-            owned.push(("skip_frame", "with_skip_frame"));
-        }
-        if self.err_recognition.is_some() {
-            // AVOption 名是 `err_detect`（`err_recognition` 字段的选项拼写）。
-            owned.push(("err_detect", "with_err_recognition"));
-        }
-        owned
-    }
-
     /// 构建一个**裸** [`Decoder`]（不持有 reader）。
     ///
     /// 适合需要精细控制 reader 生命周期的高级场景：这里只为**探测流信息**临时
@@ -388,8 +357,6 @@ impl DecoderBuilder {
     /// reader，且不支持 seek。
     pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
-        // 单一配置源：typed setter 与 `with_options` 不得同时配置同一项。
-        crate::options::ensure_single_source(self.codec_opts.as_ref(), &self.owned_option_keys())?;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
         let input_stream =
             reader

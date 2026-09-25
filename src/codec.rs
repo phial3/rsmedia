@@ -58,8 +58,8 @@ pub(crate) fn set_flags2(context: &mut AVCodecContext, flags2: i32) {
 /// （编码器的码率/画质/profile、解码器的输出格式/丢弃粒度等）留在各自文件里。
 ///
 /// 新增公共选项的步骤：在这里加方法与文档 → 两个 builder 的结构体与 `Default`
-/// 各加一个同名字段 → 在各自的 `owned_option_keys()` 里决定是否需要独占该
-/// AVOption 键。
+/// 各加一个同名字段 → 若该 setter 对应的 AVOption 键可能与 `with_options` 透传的键
+/// 重名，在 `with_options` 的文档里补上这个键（重名时以透传为准，见该方法文档）。
 macro_rules! impl_codec_builder_setters {
     () => {
         /// Set the codec name.
@@ -73,7 +73,8 @@ macro_rules! impl_codec_builder_setters {
 
         /// Set the thread count.
         ///
-        /// 未设置时取 `num_cpus::get()`；`with_options("threads", ..)` 与它互斥。
+        /// 未设置时取 `num_cpus::get()`；同名 AVOption 若经 `with_options` 透传，
+        /// 以透传值为准（见 [`Self::with_options`]）。
         pub fn with_thread_count(mut self, thread_count: usize) -> Self {
             self.thread_count = Some(thread_count);
             self
@@ -89,7 +90,7 @@ macro_rules! impl_codec_builder_setters {
         /// 解码器未设置时取 `AVCodecFlag::LOW_DELAY`（rsmedia 的解码默认值）。
         /// 编码器侧则是在上下文既有 flags 上按位合并：FFmpeg 的默认位（如
         /// `CLOSED_GOP`）与 `with_global_header` 的 `GLOBAL_HEADER` 都保留，
-        /// 因此同时设置不构成配置冲突。
+        /// 因此同时设置不会互相覆盖。
         ///
         /// # Example
         ///
@@ -128,12 +129,14 @@ macro_rules! impl_codec_builder_setters {
         /// Codec (private) options used for this stream.
         ///
         /// 只用于 builder 未建模的**编解码器私有参数**（编码器如 `preset`、`tune`、
-        /// `x264-params`；解码器如 `threads` 之外的各种解码开关）。builder 有
-        /// typed setter 的项若同时出现在这里，构建时报
-        /// [`RsmediaError::InvalidConfig`](crate::RsmediaError::InvalidConfig)：
-        /// 同一项有两个配置源时无法判断以谁为准，静默取其一正是要消除的陷阱。
+        /// `x264-params`；解码器如 `threads` 之外的各种解码开关）。
         ///
-        /// 公共项是 `threads`/`flags`/`flags2`/`thread_type`（对应
+        /// 同一个 AVOption 若同时由 typed setter 与这里给出，**以这里为准**：typed
+        /// setter 写的是 `AVCodecContext` 字段，而 `avcodec_open2` 在处理完字段之后
+        /// 才应用本字典，同名的键因此覆盖 setter（写进同一个字典的 `crf`/`profile`/
+        /// `level` 也是本字典后合并）。想让 setter 生效，就不要把同名键放进这里。
+        ///
+        /// 与 typed setter 同名的键：`threads`/`flags`/`flags2`/`thread_type`（对应
         /// [`Self::with_thread_count`]/[`Self::with_flags`]/[`Self::with_flags2`]/
         /// [`Self::with_thread_type`]）；编码器另有 `b`/`maxrate`/`bufsize`/`crf`/
         /// `profile`/`level`/`g`/`bf`，解码器另有 `skip_frame`/`err_detect`。

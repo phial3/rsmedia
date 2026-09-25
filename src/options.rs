@@ -1,4 +1,3 @@
-use crate::error::{Result, RsmediaError};
 use crate::strutils;
 
 use rsmpeg::avutil::{AVDictionary, AVDictionaryRef};
@@ -404,38 +403,6 @@ impl std::fmt::Display for Options {
     }
 }
 
-/// 单一配置源检查：builder 的 typed setter 与 [`Options`] 透传不得同时配置同一项。
-///
-/// builder 把"有 setter 的设置项"（码率、质量、profile、线程数……）视作自己独占的
-/// 键；[`Options`] 只承载 builder 未建模的私有参数。同一项若同时出现在两处，以谁为准
-/// 只能靠隐含的先后顺序，是个静默陷阱，因此这里直接报
-/// [`RsmediaError::InvalidConfig`]，并在消息里指出该用哪个 setter。
-///
-/// `owned` 是 `(AVOption key, 对应的 builder setter)` 列表，**只包含调用方显式设置过
-/// 的项**：默认值不算配置冲突（否则"用透传设 `threads`"这种合法用法会被误伤）。
-pub(crate) fn ensure_single_source(
-    passthrough: Option<&Options>,
-    owned: &[(&str, &str)],
-) -> Result<()> {
-    let Some(passthrough) = passthrough else {
-        return Ok(());
-    };
-    let conflicts: Vec<String> = owned
-        .iter()
-        .filter(|(key, _)| passthrough.contains_key(key))
-        .map(|(key, setter)| format!("'{key}' (also set by {setter})"))
-        .collect();
-    if conflicts.is_empty() {
-        return Ok(());
-    }
-    Err(RsmediaError::invalid_config(format!(
-        "options conflict with builder setters: {}; configure each setting in exactly one \
-         place — builder setters for what they model, `with_options` only for codec-private \
-         parameters without a setter",
-        conflicts.join(", ")
-    )))
-}
-
 /// Video encoders whose FFmpeg wrapper exposes a `crf` private option.
 ///
 /// Single source of truth: used by [`EncoderBuilder::with_quality`](crate::EncoderBuilder::with_quality) /
@@ -643,29 +610,6 @@ mod tests {
         // SAFETY: `dest` 指向刚转移的合法字典。
         unsafe { Options::new().write_into_raw_dict(&mut dest) };
         assert!(dest.is_null());
-    }
-
-    #[test]
-    fn test_ensure_single_source() {
-        let mut passthrough = Options::new();
-        passthrough.set("threads", "4");
-
-        // 没有透传选项 → 无冲突
-        assert!(ensure_single_source(None, &[("threads", "with_thread_count")]).is_ok());
-        // 透传的键与 setter 无关 → 无冲突
-        assert!(ensure_single_source(Some(&passthrough), &[("b", "with_bit_rate")]).is_ok());
-        // 未显式设置过的 setter 不在表里 → "用透传设 threads" 合法
-        assert!(ensure_single_source(Some(&passthrough), &[]).is_ok());
-
-        // 同一项两个来源 → InvalidConfig，消息指出键与对应 setter
-        let err = ensure_single_source(Some(&passthrough), &[("threads", "with_thread_count")])
-            .expect_err("conflicting key must be rejected");
-        assert!(matches!(err, RsmediaError::InvalidConfig(_)), "got {err:?}");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("'threads'") && msg.contains("with_thread_count"),
-            "message must name the key and its setter: {msg}"
-        );
     }
 
     #[test]

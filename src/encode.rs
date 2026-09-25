@@ -5,7 +5,7 @@ use crate::fmt::FrameFormat;
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
-use crate::options::{self, CRF_CAPABLE_CODECS, Options, Quality, VideoProfile};
+use crate::options::{CRF_CAPABLE_CODECS, Options, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
 use crate::resample;
 use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
@@ -55,14 +55,13 @@ pub struct EncoderBuilder {
     global_header: bool,
     /// `AVCodecContext.flags`（`AV_CODEC_FLAG_*` 掩码，`i32` 是 FFmpeg 的字段类型）中由调用方显式设置的部分。
     /// `None` = 不额外设置；`GLOBAL_HEADER` 由 [`Self::with_global_header`] 单独管理，
-    /// 两者在 `build()` 里按位合并（不同来源的位，不构成配置冲突）。
+    /// 两者在 `build()` 里按位合并（不同来源的位，不会互相覆盖）。
     flags: Option<i32>,
     /// `AVCodecContext.flags2`（`AV_CODEC_FLAG2_*` 掩码）。`None` = FFmpeg 默认。
     flags2: Option<i32>,
     /// `AVCodecContext.thread_type`（`FF_THREAD_*` 掩码）。`None` = FFmpeg 默认。
     thread_type: Option<i32>,
-    /// `None` = 未显式设置，构建时取 [`num_cpus::get`]；`Some(n)` 表示调用方
-    /// 指定过 —— 该"显式"信息被 [`Self::owned_option_keys`] 用来判定配置冲突。
+    /// `None` = 未显式设置，构建时取 [`num_cpus::get`]。
     thread_count: Option<usize>,
     media_type: MediaType,
     codec_name: Option<String>,
@@ -490,8 +489,7 @@ impl EncoderBuilder {
         // 与 FFmpeg CLI 默认一致——CLI 只有显式 `-flags 0` 才编出 open GOP 的
         // 流）。从 0 重建会把这类默认位清掉，静默改变输出码流（closed GOP →
         // open GOP），因此这里一律在既有位上合并。调用方 `with_flags` 与
-        // builder 自管的 `GLOBAL_HEADER` 各占不同位，同理按位合并（与
-        // `ensure_single_source` 要拦的"同一项两个配置源"无关）。
+        // builder 自管的 `GLOBAL_HEADER` 各占不同位，同理按位合并。
         let mut flags = encoder.flags;
         if let Some(extra) = self.flags {
             flags |= extra;
@@ -580,60 +578,6 @@ impl EncoderBuilder {
         }
     }
 
-    /// 编码器 AVOption 里由 builder typed setter 独占的键，`(option key, setter)`。
-    ///
-    /// 只列出**调用方显式设置过**的项：默认值不算"配置过"（例如未调用
-    /// `with_thread_count` 时，用 `with_options("threads")` 单线程编码依然合法）。
-    /// 表里的键与 [`Self::with_options`] 文档中的 setter 列表一一对应。
-    fn owned_option_keys(&self) -> Vec<(&'static str, &'static str)> {
-        let mut owned = Vec::new();
-        // `threads`/`flags`/`flags2`/`thread_type` 四项与
-        // `codec::impl_codec_builder_setters!` 生成的公共 setter 一一对应，与解码器侧
-        // 逐字相同；本表其余键只属于编码器。
-        // `b` 有两条设置路径（`with_bit_rate` 与 `Quality::Bitrate`，后者优先，见
-        // `effective_bit_rate`）；`Quality::Bitrate(<=0)` 与 `effective_bit_rate` 一致
-        // 地算"未设置"，否则会把"非正 Bitrate 等于没设"的语义在冲突检查里判反。
-        let bit_rate_owned = self.bit_rate.is_some()
-            || matches!(self.quality, Some(Quality::Bitrate(bit_rate)) if bit_rate > 0);
-        if bit_rate_owned {
-            owned.push(("b", "with_bit_rate / with_quality(Quality::Bitrate)"));
-        }
-        if self.max_bit_rate.is_some() {
-            owned.push(("maxrate", "with_max_bit_rate"));
-        }
-        if self.buffer_size.is_some() {
-            owned.push(("bufsize", "with_buffer_size"));
-        }
-        if matches!(self.quality, Some(Quality::Crf(_))) {
-            owned.push(("crf", "with_quality(Quality::Crf)"));
-        }
-        if self.profile.is_some() {
-            owned.push(("profile", "with_profile"));
-        }
-        if self.level.is_some() {
-            owned.push(("level", "with_level"));
-        }
-        if self.gop_size.is_some() {
-            owned.push(("g", "with_gop_size"));
-        }
-        if self.max_b_frames.is_some() {
-            owned.push(("bf", "with_max_b_frames"));
-        }
-        if self.thread_count.is_some() {
-            owned.push(("threads", "with_thread_count"));
-        }
-        if self.flags.is_some() {
-            owned.push(("flags", "with_flags"));
-        }
-        if self.flags2.is_some() {
-            owned.push(("flags2", "with_flags2"));
-        }
-        if self.thread_type.is_some() {
-            owned.push(("thread_type", "with_thread_type"));
-        }
-        owned
-    }
-
     /// Build an [`Encoder`].
     ///
     /// Create an encoder from a [`StreamWriter`](crate::io::StreamWriter).
@@ -645,9 +589,6 @@ impl EncoderBuilder {
     /// * `settings` - Encoder settings to use.
     pub fn build(self) -> Result<Encoder> {
         let media_type = self.media_type;
-        // 单一配置源：typed setter 与 `with_options` 不得同时配置同一项（见
-        // `options::ensure_single_source`），在任何实际工作之前先拦下这类误配置。
-        options::ensure_single_source(self.codec_opts.as_ref(), &self.owned_option_keys())?;
         if let Some(fps) = self.requested_fps
             && !(fps > 0.0 && fps.is_finite())
         {
@@ -857,8 +798,9 @@ impl EncoderBuilder {
             .transpose()?;
 
         // 打开编码器前的私有选项：quality/profile/level 写成 AVOption；用户
-        // codec_opts 只补充 builder 未建模的键 —— 与上面这些键重叠的情况已在
-        // `build` 开头由 `ensure_single_source` 拒绝，故这里不存在"谁覆盖谁"。
+        // codec_opts 只用于补充 builder 未建模的键 —— 同一个键两边都给时以用户透传为准
+        // （typed setter 写的是 `AVCodecContext` 字段，`avcodec_open2` 在字段写入之后
+        // 才应用这个字典，见 `EncoderBuilder::with_options` 文档）。
         let mut opts = Options::new();
         if use_crf && let Some(Quality::Crf(crf)) = self.quality {
             opts.set("crf", crf.to_string());
@@ -872,6 +814,17 @@ impl EncoderBuilder {
             }
         }
         if let Some(user_opts) = self.codec_opts {
+            // 这里能直接看出重叠的只有刚写进 `opts` 的 `crf`/`profile`/`level`；其余
+            // typed setter 直接写上下文字段，是否被字典覆盖只有 `avcodec_open2` 内部
+            // 知道，无法在此检测，故在 `with_options` 文档里声明规则。
+            for (key, _) in user_opts.iter() {
+                if opts.contains_key(key) {
+                    tracing::warn!(
+                        "codec option '{key}' from with_options overrides the builder setting \
+                         for the same AVOption"
+                    );
+                }
+            }
             opts.merge(user_opts);
         }
 
@@ -1984,44 +1937,6 @@ mod tests {
         AVCodec::find_encoder_by_name(&name).is_some()
     }
 
-    /// 单一配置源：typed setter 与 `with_options` 同时指定同一项时 `build` 报错；
-    /// 只由其中一方指定（含"仅用透传设 `threads`"）则正常构建。
-    #[test]
-    fn test_options_conflict_with_typed_setters() -> Result<()> {
-        let mut opts = Options::new();
-        opts.set("threads", "1");
-
-        // 仅透传 `threads`：合法（builder 未用 typed setter 指定过线程数）。
-        let builder = EncoderBuilder::new_video(64, 64)
-            .with_codec_name(Some("libx264".to_string()))
-            .with_options(Some(opts.clone()))
-            .with_bit_rate(500_000);
-        assert!(
-            builder.build().is_ok(),
-            "passthrough-only `threads` must stay legal"
-        );
-
-        // setter + 透传同一项：必须报 InvalidConfig（消息指出键与 setter）。
-        let builder = EncoderBuilder::new_video(64, 64)
-            .with_codec_name(Some("libx264".to_string()))
-            .with_thread_count(1)
-            .with_options(Some(opts));
-        let err = builder
-            .build()
-            .err()
-            .expect("threads set twice must be rejected");
-        assert!(
-            matches!(err, RsmediaError::InvalidConfig(_)),
-            "expected InvalidConfig, got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("'threads'") && msg.contains("with_thread_count"),
-            "message must name the key and its setter: {msg}"
-        );
-        Ok(())
-    }
-
     /// `with_flags`/`with_flags2`/`with_thread_type` 的 `impl Into<u32>` 参数落到
     /// `AVCodecContext` 的对应字段（单个标志与 `|` 组合都要原样保留）；
     /// `with_flags` 与 builder 自管的 `GLOBAL_HEADER` 是不同位，按位合并而非互相覆盖。
@@ -2112,42 +2027,6 @@ mod tests {
             overflow.thread_count(),
             cpu_count,
             "an out-of-range thread_count must fall back to the CPU count"
-        );
-        Ok(())
-    }
-
-    /// `Quality::Bitrate` 也占 `b` 键：与 `with_options("b")` 同时出现必须报冲突；
-    /// 非正 Bitrate 与 `effective_bit_rate` 一致地算"未设置"，因此不算冲突。
-    #[test]
-    fn test_quality_bitrate_counts_as_owned_key() -> Result<()> {
-        let mut opts = Options::new();
-        opts.set("b", "500000");
-
-        let builder = EncoderBuilder::new_video(64, 64)
-            .with_codec_name(Some("libx264".to_string()))
-            .with_quality(Quality::Bitrate(2_000_000))
-            .with_options(Some(opts.clone()));
-        let err = builder
-            .build()
-            .err()
-            .expect("Quality::Bitrate + passthrough `b` must be rejected");
-        assert!(
-            matches!(err, RsmediaError::InvalidConfig(_)),
-            "expected InvalidConfig, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("'b'"),
-            "message must name the key: {err}"
-        );
-
-        // 非正 Bitrate 等于没设（见 `effective_bit_rate`），此时透传 `b` 合法。
-        let builder = EncoderBuilder::new_video(64, 64)
-            .with_codec_name(Some("libx264".to_string()))
-            .with_quality(Quality::Bitrate(0))
-            .with_options(Some(opts));
-        assert!(
-            builder.build().is_ok(),
-            "non-positive Bitrate means unset, passthrough `b` must stay legal"
         );
         Ok(())
     }

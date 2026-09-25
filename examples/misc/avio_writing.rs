@@ -23,7 +23,6 @@ pub fn encode_write_frame(
         let mut packet = match encode_context.receive_packet() {
             Ok(packet) => packet,
             Err(RsmpegError::EncoderDrainError) | Err(RsmpegError::EncoderFlushedError) => {
-                println!("encode_write_frame Bitstream drained or flushed.");
                 break;
             }
             Err(e) => bail!(e),

@@ -59,7 +59,6 @@ fn av_spliter(file_path: &CStr, out_video: &str, out_audio: &CStr) -> Result<()>
                     }
                     Err(RsmpegError::BitstreamDrainError)
                     | Err(RsmpegError::BitstreamFlushedError) => {
-                        println!("av_spliter Bitstream drained or flushed.");
                         break;
                     }
                     Err(e) => anyhow::bail!(e),
