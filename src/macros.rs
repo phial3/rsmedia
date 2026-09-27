@@ -16,17 +16,21 @@
 //! | test one bit in a set | no | no | yes ([`FlagSet::contains`](crate::FlagSet::contains), or `set & Enum::A`) |
 //! | fallback for an unlisted value | panics; every table fails fast (the expression form is still supported but unused) | n/a | n/a |
 //!
-//! In practice the split is mostly by kind: the `ffi_enum!` call sites are bit sets
-//! (`AVCodecFlag`, `AVCodecFlag2`, `AVFormatFlag`, `AVPixFmtFlag`, `AVSeekFlag`) and the
-//! `ffi_enum_wrap_from!` call sites are IDs (`PixelFormat`, `SampleFormat`, `MediaType`,
-//! `HWDeviceType`, plus the swscale value sets in `scale.rs`: `SwsDither`, `AlphaBlend`,
-//! `ScalerFlags`, `Intent`, `Backend`).
+//! In practice the split is mostly by kind.
 //!
-//! One table is an ID **and** sits with bit sets: `ScaleAlgorithm` (`scale.rs`) is a mutually
-//! exclusive choice ("only one may be active at a time" per FFmpeg's header) whose members are
-//! `SWS_*` bits — it is therefore an `ffi_enum!` bit-set table even though callers pick one
-//! value, and combining two of its bits is a caller error FFmpeg rejects rather than something
-//! the type prevents.
+//! The `ffi_enum!` call sites are bit sets — `AVCodecFlag` / `AVCodecFlag2` / `ThreadType`
+//! (`codec.rs`), `AVFormatFlag` (`fmt.rs`), `AVPixFmtFlag` (`pixel.rs`), `AVSeekFlag`
+//! (`io.rs`), `ErrRecognition` (`decode.rs`), `ScaleQuality` (`scale.rs`), `AVLogFlag`
+//! (`init.rs`) — plus two tables that are really IDs: `ScaleAlgorithm` (`scale.rs`, a
+//! mutually exclusive choice — "only one may be active at a time" per FFmpeg's header —
+//! whose members are `SWS_*` bits) and `AVLogLevel` (`init.rs`, an ordered level, not a
+//! mask). Neither of those two can reject a combination at the type level, so combining
+//! their values is a caller error FFmpeg rejects rather than something the type prevents.
+//!
+//! The `ffi_enum_wrap_from!` call sites are IDs: `PixelFormat` (`pixel.rs`), `SampleFormat`
+//! (`fmt.rs`), `MediaType` (`stream.rs`), `HWDeviceType` (`hwaccel.rs`), `SkipFrame`
+//! (`decode.rs`), plus the swscale value sets in `scale.rs`: `SwsDither`, `SwsAlphaBlend`,
+//! `SwsScaler`, `SwsIntent`, `SwsBackend`.
 //!
 //! `ffi_enum_wrap!` currently has no user — see the note on the macro itself for why the need
 //! for it disappeared.

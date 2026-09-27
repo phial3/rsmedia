@@ -190,10 +190,11 @@ impl Options {
 
     /// Creates options such that ffmpeg will prefer TCP transport when reading RTSP stream (over
     /// the default UDP format). It also adds some options to reduce the socket and I/O timeouts to
-    /// 4 seconds.
+    /// 16 seconds.
     ///
     /// This sets the `rtsp_transport` to `tcp` in ffmpeg options,
-    /// it also sets `rw_timeout` and `stimeout` to lower (more sane) values.
+    /// it also sets `rw_timeout` and `stimeout` to lower (more sane) values. Both are protocol
+    /// options carrying **microseconds**, so the value below is 16 s, not 16.
     pub fn preset_avformat_rtsp_transport_tcp() -> Self {
         let mut opts = Self::new();
         opts
@@ -220,14 +221,17 @@ impl Options {
     }
 
     /// Creates options for a FLV muxer.
+    ///
+    /// Every key below is one FFmpeg actually reads: `live` and `write_metaf` are **not** AVOptions
+    /// of the FLV muxer (nor of `AVFormatContext`), so setting them silently did nothing — "no
+    /// metadata" is a `flvflags` value, not a separate key.
     pub fn preset_avformat_flv() -> Self {
         let mut opts = Self::new();
-        opts.set("flvflags", "no_duration_filesize")
+        opts
+            // 实时流：不写 duration/filesize 占位、不写 metadata（两者都是 `flvflags`
+            // 的取值，不是独立选项）
+            .set("flvflags", "no_duration_filesize+no_metadata")
             .set("fflags", "nobuffer+flush_packets")
-            // 添加实时流标志
-            .set("live", "1")
-            // 完全禁用元数据更新
-            .set("write_metaf", "0")
             // 设置较小的chunk大小以减少延迟
             .set("chunk_size", "4096");
         opts

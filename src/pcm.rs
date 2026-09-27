@@ -88,8 +88,9 @@ const MAX_CHUNK_SAMPLES: usize = 4096;
 /// Streaming PCM → [`Encoder`](crate::encode::Encoder) → [`Muxer`] 桥接器。
 ///
 /// 持有 [`Muxer`] 的所有权；`write_*` 按 cpal 回调粒度投递交错 PCM，
-/// `finish` 冲刷编码器并写 trailer。忘记 `finish` 时 `Drop` 仍会经
-/// [`Muxer::finish`] 自动收尾，保证输出文件完整性。
+/// `finish` 冲刷编码器并写 trailer。忘记 `finish` 时 `Drop` 仍会经 `Muxer`
+/// 自己的 `Drop` 收尾（flush 编码器 + 写 trailer），输出容器不会损坏；
+/// 但重采样器内部的延迟样本不会被排出、错误也感知不到，详见 [`Self::finish`]。
 ///
 /// 内部持有一个**持久** [`Resampler`]（首次写入时按实际输入格式惰性创建）：
 /// 输入块先转成编码器的采样格式/采样率/声道数，再按实际输出样本数累计
@@ -185,8 +186,9 @@ impl<W: Writer> PcmSink<W> {
 
     /// 冲刷重采样器尾样、编码器剩余样本并写 trailer，消费 sink。
     ///
-    /// 未调用时 `Drop` 会自动执行相同收尾（经 [`Muxer::finish`]），
-    /// 但无法感知错误，且 Drop 路径不会冲刷重采样器尾样 —— 显式调用推荐。
+    /// 未调用时 `Drop` 只做 `Muxer` 的那部分收尾（flush 编码器 + 写 trailer）：
+    /// 容器仍然完整可读，但**不会**冲刷重采样器尾样（最后几十毫秒会丢），错误也
+    /// 无法感知。因此显式调用 `finish` 是推荐做法。
     pub fn finish(mut self) -> Result<W::Accum> {
         self.drain_resampler()?;
         self.muxer.finish()

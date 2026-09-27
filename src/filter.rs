@@ -91,7 +91,7 @@ impl Filter {
 /// let node = filter::FilterNode::new(filter::video::scale(1280, 720, None));
 ///
 /// // 多输入节点：显式指定两路来源（图输入标签或前序节点的输出标签）
-/// let node = filter::FilterNode::new(filter::video::overlay("10", "10", None))
+/// let node = filter::FilterNode::new(filter::video::overlay("10", "10"))
 ///     .with_inputs(["base", "logo"])
 ///     .with_label("composed");
 ///
@@ -107,8 +107,10 @@ pub struct FilterNode {
     /// 各路输入分别接到哪个上游标签，顺序即滤镜的输入 pad 顺序。
     /// 空 = 自动接线（接在链尾；链首接图的首个输入）。
     inputs: Vec<String>,
-    /// 各输出 pad 的标签，顺序即滤镜的输出 pad 顺序；空 = 由构建器自动分配
-    /// （仅对**恰好一个**输出 pad 的滤镜成立，多输出滤镜必须显式标注）。
+    /// 各输出 pad 的标签，顺序即滤镜的输出 pad 顺序；空 = 由构建器自动分配一个
+    /// `n{序号}`（自动分配**只给一个**标签：单输出 pad 的滤镜正好够用；多输出滤镜
+    /// 不标注的话，静态 pad 会在建图时因个数不符报 `InvalidConfig`，而动态 pad 的
+    /// `split`/`asplit` 会安静地只生成 1 路输出）。
     outputs: Vec<String>,
 }
 
@@ -125,8 +127,10 @@ impl FilterNode {
     /// 绑定本节点的输入到指定的上游标签，顺序即滤镜的输入 pad 顺序。
     ///
     /// 上游可以是图输入（[`FilterGraphBuilder::add_input_with`] 声明的标签）或前序
-    /// 节点的输出（[`FilterNode::with_label`]）。多输入滤镜必须逐个指全；只给部分
-    /// 标签会在建图时报 [`RsmediaError::InvalidConfig`]，不会静默接错。
+    /// 节点的输出（[`FilterNode::with_label`]）。**静态**输入 pad 的滤镜必须逐个指全：
+    /// 只给部分标签会在建图时报 [`RsmediaError::InvalidConfig`]，不会静默接错。
+    /// 动态输入 pad 的滤镜（`hstack`/`amix`/`concat`…）不校验个数，路数是否与滤镜
+    /// 自己的 `inputs=` / `n=` 选项一致由 FFmpeg 在 `config()` 阶段核对。
     pub fn with_inputs<I, S>(mut self, inputs: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -138,9 +142,10 @@ impl FilterNode {
 
     /// 给本节点的输出打标签，供下游节点或图输出引用。
     ///
-    /// 标签是滤镜图内的接线标识，只能包含 ASCII 字母、数字与下划线；不设置时由
-    /// 构建器自动分配（因此不写标签的节点无法被 [`FilterGraphBuilder::add_output`]
-    /// 直接引用）。
+    /// 标签是滤镜图内的接线标识，只能包含 ASCII 字母、数字与下划线。不设置时
+    /// [`FilterGraphBuilder::build`] 会按节点序号自动分配 `n0`、`n1`…，所以即便
+    /// 不写标签也能被 [`FilterGraphBuilder::add_output`] 引用（写 `n0` 即可），只是
+    /// 这种标签会随节点增删而移位；要稳定引用就显式写一个。
     ///
     /// 这是单输出滤镜的简写；多输出 pad 的滤镜（`split` / `asplit`）请改用
     /// [`with_outputs`](Self::with_outputs) 逐个 pad 标注，否则未被标注的 pad
@@ -153,9 +158,10 @@ impl FilterNode {
     /// 逐个输出 pad 绑定标签，顺序即滤镜的输出 pad 顺序。
     ///
     /// 用于多输出 pad 的滤镜（`split` / `asplit`）把一路输入复制成多路：每个标签
-    /// 各接一条下游链路或声明为一个图输出。标签个数必须与滤镜的输出 pad 数一致
-    /// （多输出滤镜的动态 pad 数由这里的标签个数决定），否则 [`FilterGraphBuilder::build`]
-    /// 报 [`RsmediaError::InvalidConfig`]。
+    /// 各接一条下游链路或声明为一个图输出。标签个数必须与滤镜的输出 pad 数一致，
+    /// 否则 [`FilterGraphBuilder::build`] 报 [`RsmediaError::InvalidConfig`]；
+    /// **动态**输出 pad 的滤镜（`split`/`asplit`，即带 `AVFILTER_FLAG_DYNAMIC_OUTPUTS`
+    /// 的那些）不参与这个校验——它们的 pad 数正是由这里的标签个数决定的。
     ///
     /// ```no_run
     /// # use rsmedia::filter::{self, FilterGraphBuilder, FilterNode, VideoEndpoint};
@@ -264,9 +270,14 @@ fn escape_filter_str(input: &str) -> String {
         // Pointer that will receive the escaped string
         let mut escaped_ptr = std::ptr::null_mut();
 
-        // FFmpeg `av_escape` function flags:
-        // AV_ESCAPE_MODE_BACKSLASH (0) - escape with backslashes
-        // AV_ESCAPE_FLAG_STRICT (1) - be strict about escaping
+        // FFmpeg `av_escape` 的实参：
+        // * `AV_ESCAPE_MODE_AUTO` (0) —— 目前就是 `AV_ESCAPE_MODE_BACKSLASH`：
+        //   `av_bprint_escape` 里写着 `mode = AV_ESCAPE_MODE_BACKSLASH; /* TODO:
+        //   implement a heuristic */`，所以别指望 AUTO 会"挑"一种模式。
+        // * `AV_ESCAPE_FLAG_WHITESPACE` (1 << 0 = 1) —— 连空白字符一起转义。
+        //   （`AV_ESCAPE_FLAG_STRICT` 是 1 << 1 = **2**，不是 1。）
+        // 不带 `STRICT` 时 `av_bprint_escape` 还会额外转义 `'` 与 `\`，
+        // 以及**首尾位置**的空白字符。
         let result = ffi::av_escape(
             &mut escaped_ptr,
             c_input.as_ptr(),
@@ -972,8 +983,9 @@ pub mod video {
 
     /// 视频降噪（hqdn3d），减少亮度/色度噪声。
     ///
-    /// * `luma` - 亮度空间降噪强度（0-4，默认 4）。
-    /// * `chroma` - 色度空间降噪强度（0-3，默认 3）。
+    /// * `luma` - 亮度空间降噪强度（`luma_spatial`，FFmpeg: 0~DBL_MAX，默认 0；
+    ///   常用 4）。
+    /// * `chroma` - 色度空间降噪强度（`chroma_spatial`，同上，常用 3）。
     ///
     /// `hqdn3d.luma_spatial` / `chroma_spatial` 在 FFmpeg 里是 `<double>`，因此这里
     /// 收 `f64`：包一层 `f32` 会比 FFmpeg 实际接受的域更窄。
@@ -1009,10 +1021,13 @@ pub mod video {
     ///
     /// * `luma_strength` - 亮度平滑强度（-1~1）。**正值 = 平滑/磨皮**，
     ///   负值 = 锐化；证件照建议 `0.05~0.2`。
-    /// * `luma_radius` - 平滑半径（0.1~5），越大越柔和，证件照建议 `3` 左右。
+    /// * `luma_radius` - 平滑半径（0.1~5，默认 1），越大越柔和，证件照建议 `3` 左右。
     ///
-    /// 色度通道默认与亮度同参数（`chroma_mode=me`）；如需单独控制请用
-    /// [`Filter::new`] 逃生舱传完整 spec。
+    /// 色度/alpha 无需单独设置：FFmpeg 的 `smartblur` **没有** `chroma_mode` 这类选项，
+    /// 而是在 `init` 里把低于合法下限的 `chroma_radius` / `chroma_strength` /
+    /// `chroma_threshold`（默认值 `-0.9` / `-2` / `-31`，即各自下限减一）直接替换成
+    /// 对应的 luma 值——所以不显式指定时色度就是跟随亮度。若要让色度与亮度不同，
+    /// 请用 [`Filter::new`] 逃生舱传完整 spec。
     pub fn smartblur(luma_strength: impl Into<f64>, luma_radius: impl Into<f64>) -> Filter {
         Filter::new(
             "smartblur",
@@ -1047,7 +1062,8 @@ pub mod video {
     }
 
     /// 鲜艳度调节（画质增强）。
-    /// `vibrance` 为鲜艳度（-1.0 ~ 1.0，0 表示不变），对应 FFmpeg `vibrance=intensity`。
+    /// `vibrance` 为鲜艳度（FFmpeg: -2.0 ~ 2.0，默认 0 表示不变），对应
+    /// `vibrance=intensity`。
     pub fn vibrance(vibrance: impl Into<f64>) -> Filter {
         Filter::new(
             "vibrance",
@@ -1096,21 +1112,17 @@ pub mod video {
     /// * `x` / `y` - 叠加层在基底上的偏移（支持表达式，如 `"main_w-overlay_w-10"`）。
     ///   表达式可含 `,`（如 `"if(eq(t,0),0,W-w)"`），会按滤镜语法转义，
     ///   直接照写即可，无需自己加反斜杠。
-    /// * `opacity` - 叠加层不透明度（0~1）。
-    pub fn overlay(x: &str, y: &str, opacity: impl Into<Option<f32>>) -> Filter {
-        let opacity: Option<f32> = opacity.into();
+    ///
+    /// ⚠️ 这里**没有**不透明度参数：`overlay` 的 `alpha` 是"alpha 格式"枚举
+    /// （`auto` / `straight` / `premultiplied`，取值 0~2），不是不透明度 ——
+    /// 把 0~1 的透明度写进 `alpha=` 会被 FFmpeg 静默取整成一个格式档位。
+    /// 要给叠加层做半透明，先用 [`FilterGraphBuilder`] 在该路上接一个
+    /// `colorchannelmixer=aa=<0~1>`（或 `format=rgba` + `colorchannelmixer`）。
+    pub fn overlay(x: &str, y: &str) -> Filter {
         // x/y 是表达式，`,` 等字符会被滤镜语法解析吃掉（整条描述先按 `,` 拆分
         // 滤镜），报出来的错与真实原因无关，因此与其它 `&str` 参数一致地转义。
         let (x, y) = (escape_filter_option(x), escape_filter_option(y));
-        let alpha = match opacity {
-            Some(a) => format!(":alpha={a}"),
-            None => String::new(),
-        };
-        Filter::new(
-            "overlay",
-            MediaType::VIDEO,
-            format!("overlay=x={x}:y={y}{alpha}"),
-        )
+        Filter::new("overlay", MediaType::VIDEO, format!("overlay=x={x}:y={y}"))
     }
 
     /// 横向并排（hstack）：把多路视频并成一行。
@@ -1154,14 +1166,17 @@ pub mod video {
     /// **多输出**滤镜：用 [`FilterNode::with_outputs`] 给每个输出 pad 标名，每个名字
     /// 各接一条下游链路——同一个标签被两处消费会被建图期拒绝，正是提示在这里插一个
     /// `split`。复制的是同一份像素（后续各链路互不影响）。
-    /// `outputs` 必须 ≥ 2（FFmpeg 的 `split` 族下限）。
+    ///
+    /// `outputs` 取值范围是 FFmpeg 的 `split.outputs`：**1~INT_MAX**，默认 2。
+    /// 传 `1` 是合法的（等价于直连，只是多一层拷贝）。本函数**不校验**该值，
+    /// 传 `0` 或超过 `INT_MAX` 的数会原样写进 spec，由建图时的 FFmpeg 报错。
     pub fn split(outputs: u32) -> Filter {
         Filter::new("split", MediaType::VIDEO, format!("split={outputs}"))
     }
 
     /// 色度键抠像（chromakey），将指定颜色转为透明。
     /// * `color` - 要抠掉的颜色，如 `"green@0.5"`。
-    /// * `similarity` - 颜色相似度阈值（0~0.01，越大越宽松）。
+    /// * `similarity` - 颜色相似度阈值（FFmpeg: 1e-05~1，默认 0.01，越大越宽松）。
     /// * `blend` - 混合比例（0~1）。
     pub fn chromakey(color: &str, similarity: impl Into<f64>, blend: impl Into<f64>) -> Filter {
         let color = escape_filter_option(color);
@@ -1208,7 +1223,8 @@ pub mod video {
     }
 
     /// 逐行/隔行转换（bwdif）去隔行，现代去隔行替代方案。
-    /// `mode`: `send_frame`(默认) / `send_field` / `send_frame_nospatial`。
+    /// `mode`: `send_frame` / `send_field`(默认)。FFmpeg 的 `bwdif` 只有这两档
+    /// （取值 0~1），没有 `send_frame_nospatial`。
     pub fn bwdif(mode: &str) -> Filter {
         let mode = escape_filter_option(mode);
         Filter::new("bwdif", MediaType::VIDEO, format!("bwdif=mode={mode}"))
@@ -1299,9 +1315,12 @@ pub mod video {
     /// 相纸排 8 张一寸"即此滤镜。
     ///
     /// * `cols` / `rows` - 网格行列数（总格数 = cols*rows，输入帧数不足时
-    ///   最后一格用 `padding` 色填充）。
-    /// * `padding` - 格子间距像素（0~100）。
-    /// * `color` - 背景/填充颜色，如 `"white"`。
+    ///   未填满的格子用 `color` 填充）。
+    /// * `padding` - **内边框厚度**（每格四周各加这么多像素），FFmpeg 取值
+    ///   0~1024（默认 0）；它不是"格与格之间的间距"。整图外边框另有 `margin`，
+    ///   本函数不暴露。
+    /// * `color` - 未使用区域的颜色（"set the color of the unused area"，
+    ///   默认 `black`）：既填未填满的格子，也填 `padding` 留出的内边框，如 `"white"`。
     ///
     /// 注意：tile 是**攒帧**滤镜——每 cols*rows 帧吐 1 帧，EOF 时输出残余格。
     pub fn tile(cols: u32, rows: u32, padding: u32, color: &str) -> Filter {
@@ -1353,7 +1372,7 @@ pub mod audio {
     }
 
     /// 把通道数解析为 FFmpeg 通道布局描述；失败时回退到数字通道数，避免 panic。
-    /// 滤镜图源/汇（`FilterGraph::setup_audio_filters`）也复用同一逻辑。
+    /// 音频端点建图（[`FilterGraph::create_audio_source`]）也复用同一逻辑。
     pub(super) fn audio_channel_desc(nb_channels: i32) -> String {
         AVChannelLayout::from_nb_channels(nb_channels)
             .describe()
@@ -1537,9 +1556,14 @@ pub mod audio {
     /// 创建高级FFT降噪过滤器
     /// Applies FFT noise reduction (advanced).
     ///
-    /// * `noise_reduction`: Noise reduction in dB（`afftdn.nr`，`<float>`）。
-    /// * `noise_floor`: Noise floor in dB（`afftdn.nf`，`<float>`）。
-    /// * `noise_type`: `'w'`/`'v'`/`'p'`/`'c'`/`'s'`，默认 `'w'`。
+    /// * `noise_reduction`: Noise reduction in dB（`afftdn.nr`，`<float>`，
+    ///   FFmpeg 取值 0.01~97，默认 12）。
+    /// * `noise_floor`: Noise floor in dB（`afftdn.nf`，`<float>`，
+    ///   FFmpeg 取值 -80~-20，默认 -50）。
+    /// * `noise_type`: `afftdn.nt`，`'w'`（white，默认）/ `'v'`（vinyl）/ `'s'`（shellac）/
+    ///   `'c'`（custom）。FFmpeg 只认这四个枚举值（0~3），本函数**不做校验**：
+    ///   传别的值（例如 `'p'`）会原样写进 spec，最终在建图时报错。
+    ///   `'c'` 还要配合 `band_noise` 才有意义，本函数不暴露该选项。
     /// * `track_residual`: `afftdn.tr`，FFmpeg 声明为 **`<boolean>`**：跟踪残余噪声
     ///   （`track_residual`），不是"时间平滑系数"。
     ///
@@ -1571,8 +1595,12 @@ pub mod audio {
     /// 创建自适应非局部均值降噪过滤器
     /// Applies Non-Local Means de-noising (anlmdn).
     /// `strength`: Denoising strength (0 to inf, default 1e-05).
-    /// `patch_size`: Patch size (default 7).
-    /// `search_range`: Research range (default 15).
+    /// `patch_size`: Patch **duration** (FFmpeg's `p`, `<duration>`, default 0.002 = 2 ms).
+    /// `search_range`: Research **duration** (FFmpeg's `r`, `<duration>`, default 0.006 = 6 ms).
+    ///
+    /// `p` / `r` are `<duration>` options, not sample counts — FFmpeg rejects anything outside
+    /// `[0.001, 0.1]` / `[0.002, 0.3]`, so they are typed [`Duration`] here (like `afade` and
+    /// `trim`) rather than `i32`.
     ///
     /// # Known upstream issue (FFmpeg <= 9.0)
     ///
@@ -1584,21 +1612,21 @@ pub mod audio {
     /// 的整数倍，或改用 `Filter::fft_denoise` / `Filter::denoise`。
     pub fn anlm_denoise(
         strength: impl Into<Option<f64>>,
-        patch_size: impl Into<Option<i32>>,
-        search_range: impl Into<Option<i32>>,
+        patch_size: impl Into<Option<Duration>>,
+        search_range: impl Into<Option<Duration>>,
     ) -> Filter {
         let strength: Option<f64> = strength.into();
-        let patch_size: Option<i32> = patch_size.into();
-        let search_range: Option<i32> = search_range.into();
+        let patch_size: Option<Duration> = patch_size.into();
+        let search_range: Option<Duration> = search_range.into();
         let mut params = Vec::new();
         if let Some(s) = strength {
             params.push(format!("s={s}"));
         }
         if let Some(p) = patch_size {
-            params.push(format!("p={p}"));
+            params.push(format!("p={}", duration_literal(p)));
         }
         if let Some(r) = search_range {
-            params.push(format!("r={r}"));
+            params.push(format!("r={}", duration_literal(r)));
         }
         let spec = if params.is_empty() {
             "anlmdn".to_string()
@@ -1683,7 +1711,10 @@ pub mod audio {
     ///
     /// **多输出**滤镜：用 [`FilterNode::with_outputs`] 给每个输出 pad 标名，每个名字
     /// 各接一条下游链路（同一个标签接两处会被建图期拒绝）。
-    /// `outputs` 必须 ≥ 2（FFmpeg 的 `split` 族下限）。
+    ///
+    /// `outputs` 取值范围是 FFmpeg 的 `(a)split.outputs`：**1~INT_MAX**，默认 2。
+    /// 传 `1` 是合法的（等价于直连）。本函数**不校验**该值，`0` 或超过 `INT_MAX`
+    /// 的数会原样写进 spec，由建图时的 FFmpeg 报错。
     pub fn asplit(outputs: u32) -> Filter {
         Filter::new("asplit", MediaType::AUDIO, format!("asplit={outputs}"))
     }
@@ -2098,8 +2129,10 @@ const SINGLE_OUTPUT_LABEL: &str = "out";
 ///
 /// rsmpeg 只提供单节点构造，而 `avfilter_graph_parse_ptr` 要的是链表，节点顺序
 /// 无关紧要（配对按名字，见 [`FilterGraph::setup_endpoints`]），名字才是关键。
-/// 链表所有权交给 FFmpeg（`parse_ptr` 成功时会释放整条链），因此除头节点外的节点
-/// 必须 `mem::forget`，否则 rsmpeg 的 `Drop` 会二次释放。
+///
+/// 除头节点外的节点必须 `mem::forget`：rsmpeg 的 `Drop` 调的是
+/// `avfilter_inout_free`，它会顺着 `next` 释放**整条链**。因此只保留头节点的所有权
+/// 即可覆盖全部节点；若其余节点留在 `Vec` 里被逐个析构，就是把同一批节点重复释放。
 fn chain_inouts(mut nodes: Vec<AVFilterInOut>) -> Option<AVFilterInOut> {
     if nodes.is_empty() {
         return None;
@@ -2225,11 +2258,15 @@ impl FilterGraph {
 
     /// 建一张已初始化的滤镜图（`new` + [`init`](Self::init) 的合并入口）。
     ///
-    /// 解码与编码两条流水线都用它建图，转义、媒体类型校验、滤镜可用性校验
+    /// 解码与编码两条流水线都用它建图，媒体类型校验、滤镜可用性校验
     /// （本构建没编入该滤镜 → [`Unsupported`](crate::RsmediaError::Unsupported)，
     /// 媒体类型不符 → [`InvalidConfig`](crate::RsmediaError::InvalidConfig)）
     /// 因此只有 [`init`](Self::init) 一处实现——调用方不需要在门外再抄一遍这些
     /// 检查，两份检查只会随 FFmpeg 版本漂移。
+    ///
+    /// **转义不在这一层**：滤镜描述里的特殊字符在构造 `Filter` 时（各便捷构造函数
+    /// 内部走 `escape_filter_option`）就已经转义好了，`init` 只负责把 spec 用 `,`
+    /// 拼成线性链。
     pub(crate) fn build(params: &FilterParams, filters: &[Filter]) -> Result<FilterGraph> {
         let mut graph = Self::new();
         graph
@@ -2567,12 +2604,15 @@ impl FilterGraph {
                 )
             })?;
 
-        // 返回值实测是入参指针的原样回显（成功路径上 FFmpeg 既不改写、也不接管所有权，
-        // 节点仍归调用方），因此这里原样释放我们自己的链表即可——`parse_ptr` 已对入参
-        // `into_raw()`，释放由这对返回值唯一完成，不会重复释放。
+        // 返回值是**配对后剩余**的节点链表，不是入参指针的原样回显：
+        // `avfilter_graph_parse_ptr` 会把按名字配上的那些节点自己 `av_free` 掉
+        // （节点由 `avfilter_inout_alloc` 分配，由 FFmpeg 释放才是对称的），
+        // 没配上名字的节点才留在这对返回值里。全部配对成功时两个返回值都是 `None`；
+        // 非空则意味着有端点没接上（名字写错正是这种情形），后续 `config()` 会以
+        // "pad not connected" 失败。
         //
-        // 注意：**不要**用这个返回值判断"有没有多余的开放端点"，它恒为传入值；
-        // 端点数量不匹配会由 FFmpeg 自身在 `config()` 时报错（pad 未连接）。
+        // rsmpeg 侧在成功路径上对传入的链表做了 `into_raw()`（不析构），仅失败路径才
+        // 析构，所以这里只释放这对返回值即可，不会重复释放。
         drop(rest_inputs);
         drop(rest_outputs);
 
@@ -3032,9 +3072,11 @@ impl FilterGraphBuilder {
 
     /// 追加一个滤镜节点。
     ///
-    /// 节点的接线为空（[`FilterNode::new`]）时自动接链尾：第一个节点接图输入 `in0`，
-    /// 其余接上一个节点的输出。多输入滤镜必须用 [`FilterNode::with_inputs`] 显式
-    /// 接线，否则建图时以「接线数与 pad 数不符」报错。
+    /// 节点的接线为空（[`FilterNode::new`]）时自动接链尾：第一个节点接**第一路**
+    /// 图输入（用 [`Self::add_input`] 声明时它的标签是 `in0`；用
+    /// [`Self::add_input_with`] 时就是给定的那个标签），其余接上一个节点的**末位**
+    /// 输出 pad。多输入滤镜必须用 [`FilterNode::with_inputs`] 显式接线，否则建图时
+    /// 以「接线数与 pad 数不符」报错。
     pub fn add_node(&mut self, node: impl Into<FilterNode>) -> &mut Self {
         self.nodes.push(node.into());
         self
@@ -3056,8 +3098,9 @@ impl FilterGraphBuilder {
         self
     }
 
-    /// 组装并协商整张图：校验接线、生成带标签的滤镜图描述、按标签建
-    /// `buffer`/`abuffersink` 端点，最后由 `avfilter_graph_config` 完成格式协商。
+    /// 组装并协商整张图：校验接线与标签、生成带标签的滤镜图描述、按标签建
+    /// `buffer`/`abuffer` 源与 `buffersink`/`abuffersink` 汇，最后由
+    /// `avfilter_graph_config` 完成格式协商。
     ///
     /// 校验都在触碰 FFmpeg 之前完成，接线错误报的是 [`RsmediaError::InvalidConfig`]，
     /// 而不是一句难以定位的 FFmpeg 解析错误。
@@ -3372,7 +3415,7 @@ impl FilterGraphBuilder {
         builder.add_input_with("base", base);
         builder.add_input_with("over", over);
         builder.add_node(
-            FilterNode::new(video::overlay(x, y, None))
+            FilterNode::new(video::overlay(x, y))
                 .with_inputs(["base", "over"])
                 .with_label("overlay"),
         );
@@ -3618,11 +3661,9 @@ mod tests {
                 .spec()
                 .contains("flags=neighbor")
         );
-        assert!(
-            video::overlay("0", "0", 0.5f32)
-                .spec()
-                .contains("alpha=0.5")
-        );
+        // `overlay` 不再接受"不透明度"：`alpha` 是 0~2 的格式枚举，不是透明度，
+        // 所以这个位置改用 `curves` 之类的占位断言没有意义 —— 直接断言 x/y 转义。
+        assert_eq!(video::overlay("0", "0").spec(), "overlay=x=0:y=0");
         assert!(
             video::gif_palette(10.0, "bayer")
                 .spec()
@@ -3649,12 +3690,21 @@ mod tests {
                 .spec()
                 .contains("nt=v")
         );
-        assert!(audio::anlm_denoise(0.001, 7, 15).spec().contains("p=7"));
+        // `p` / `r` 是 `<duration>`（秒），不是样本数：2 ms / 6 ms
+        assert!(
+            audio::anlm_denoise(
+                0.001,
+                Duration::from_micros(2000),
+                Duration::from_micros(6000)
+            )
+            .spec()
+            .contains("p=0.002")
+        );
         assert!(video::zoompan("1.5", "0", "0", 25).spec().contains("d=25"));
 
         // 不传值仍然可用
         assert!(video::scale(64, 64, None).spec().contains("flags=bicubic"));
-        assert_eq!(video::overlay("0", "0", None).spec(), "overlay=x=0:y=0");
+        assert_eq!(video::overlay("0", "0").spec(), "overlay=x=0:y=0");
         assert_eq!(video::lutyuv(None, None, None).spec(), "lutyuv");
         assert_eq!(audio::anlm_denoise(None, None, None).spec(), "anlmdn");
     }
@@ -4490,7 +4540,7 @@ mod tests {
         // 基底高 4 → x 取 2，叠加层落在 (2,0)-(3,1)。
         let expr = "if(eq(main_h,4),2,0)";
 
-        let spec = video::overlay(expr, "0", None).spec();
+        let spec = video::overlay(expr, "0").spec();
         assert!(
             spec.contains(r"\,"),
             "comma must stay escaped for the graph-level parse: {spec}"
@@ -5005,7 +5055,7 @@ mod tests {
         // 双输入滤镜塞进线性链：接线数（1）≠ pad 数（2）。
         let mut builder = FilterGraphBuilder::new();
         builder.add_input(video);
-        builder.add_node(FilterNode::new(video::overlay("0", "0", None)));
+        builder.add_node(FilterNode::new(video::overlay("0", "0")));
         builder.add_output_tail(video);
         let err = builder.build().unwrap_err();
         assert!(err.is_invalid_config(), "{err}");

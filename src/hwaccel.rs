@@ -77,9 +77,11 @@ impl HWDeviceConfig {
 
     /// build CUDA HWDeviceConfig
     ///
-    /// `device_id` 为 GPU 编号字符串（如 `"0"`、`"1"`），与其他设备构造器
-    /// 的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。也可以直接传
-    /// 一个 `&str`；`None` 表示让后端自选默认设备。
+    /// `device_id` 为 GPU 编号字符串（如 `Some("0".to_string())`），与其他设备
+    /// 构造器的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。
+    /// 该参数是 `impl Into<Option<String>>`，因此 `None` 表示让后端自选默认设备
+    /// （CUDA 即 0 号卡），但要传值必须给 **`String`** —— `&str` 不会自动转换，
+    /// 需 `.to_string()`。
     pub fn cuda(device_id: impl Into<Option<String>>) -> Self {
         Self::default_for(HWDeviceType::CUDA, device_id.into())
     }
@@ -103,9 +105,14 @@ impl HWDeviceConfig {
 
     /// build AMD AMF HWDeviceConfig（Windows 平台，基于 D3D11 设备）。
     ///
-    /// FFmpeg 的 AMF 编码器（`h264_amf`/`hevc_amf`/`av1_amf`）没有独立的
-    /// hw_context 类型，挂在 `AV_HWDEVICE_TYPE_D3D11VA` 下：软件帧（NV12）
-    /// 先上传到 D3D11 surface，再由 AMF 编码。
+    /// 落在 [`HWDeviceType::D3D11VA`] 上：AMF 编码器
+    /// （`h264_amf`/`hevc_amf`/`av1_amf`）的 `pix_fmts` 同时列了
+    /// `AV_PIX_FMT_D3D11` 与 `AV_PIX_FMT_AMF_SURFACE`，所以把软件帧（NV12）先
+    /// 上传成 D3D11 surface 再交给 AMF 编码是可行的。
+    ///
+    /// 注意 FFmpeg 8 起 AMF 也有**独立**的设备类型 [`HWDeviceType::AMF`]
+    /// （本 crate 仅在 `ffmpeg8`/`ffmpeg9` feature 下建模它）；要直接用那条路径，
+    /// 请用 [`Self::new`] 自行指定 `HWDeviceType::AMF` + `PixelFormat::AMF_SURFACE`。
     #[cfg(target_os = "windows")]
     pub fn amf(device_id: impl Into<Option<String>>) -> Self {
         Self::default_for(HWDeviceType::D3D11VA, device_id.into())
@@ -407,7 +414,11 @@ impl HWContext {
     /// Besides creating and attaching the `AVHWFramesContext`, this also:
     /// - installs the `hwaccel_get_format` callback so the decoder picks the
     ///   hardware surface format during `avcodec_open2`;
-    /// - sets `sw_pix_fmt` to the configured software format;
+    /// - sets `sw_pix_fmt` to the configured software format — note that FFmpeg's
+    ///   `ff_get_format` (run during `avcodec_open2`, i.e. *after* this call)
+    ///   overwrites it with the last entry of the codec's own `pix_fmts` list
+    ///   whenever that entry is not a hardware format, so this write only
+    ///   survives for codecs whose candidate list ends in a hardware format;
     /// - holds an independent reference (`av_buffer_ref`) to the hardware
     ///   device context, so the decoder owns its own ref and unrefs it on
     ///   close — no manual teardown needed in `Decoder::Drop`.
@@ -434,8 +445,8 @@ impl HWContext {
         // `codec_ctx` is a `&mut` borrow held for the whole block, so no other
         // reference to the context exists. `get_format` is set to an `extern "C"`
         // function whose signature is exactly `AVCodecContext.get_format` (so the
-        // ABI matches and FFmpeg may call it), and `sw_pix_fmt` is the software
-        // format that same callback falls back to.
+        // ABI matches and FFmpeg may call it), and `sw_pix_fmt` is a plain
+        // enum write of this device type's software format.
         unsafe {
             let ctx_mut_ptr = codec_ctx.deref_mut();
             ctx_mut_ptr.get_format = Some(hwaccel_get_format);
@@ -881,10 +892,13 @@ impl HWDeviceType {
     /// 当前平台的硬件加速优先级（从高到低）。
     ///
     /// 排序依据与 FFmpeg CLI / 主流转码器的默认习惯一致：
-    /// - macOS: VideoToolbox（Apple Silicon/Intel 均原生支持）
-    /// - Windows: D3D11VA（承载 AMD AMF 及通用 D3D11 hwaccel）> QSV > CUDA > Vulkan
-    /// - Linux: VAAPI（Intel/AMD 开箱即用）> CUDA > Vulkan
-    /// - Android: MediaCodec
+    /// - macOS: VideoToolbox > Vulkan
+    /// - Windows: D3D11VA（承载 AMD AMF 及通用 D3D11 hwaccel）> QSV > CUDA >
+    ///   Vulkan > DXVA2（末位是旧 API 兜底）
+    /// - Linux: VAAPI（Intel/AMD 开箱即用）> CUDA > Vulkan > VDPAU > OpenCL > DRM
+    ///   （后三者是 NVIDIA 老卡 / 通用 GPU / 无 X 的 DRM 渲染节点兜底）
+    /// - Android: MediaCodec（只有这一项）
+    /// - 其它平台：空列表（`auto_platform*` 随即报错）
     pub fn platform_preference() -> Vec<HWDeviceType> {
         match std::env::consts::OS {
             "macos" => vec![HWDeviceType::VIDEOTOOLBOX, HWDeviceType::VULKAN],

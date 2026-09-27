@@ -538,16 +538,22 @@ pub struct FrameSideData {
 ///
 /// # Field coverage
 ///
-/// Every value-carrying field of `AVFrame` is mirrored here, so
+/// Every value-carrying field of `AVFrame` is mirrored here **except `ch_layout`**, so
 /// [`from_avframe`](MediaFrame::from_avframe) and [`to_avframe`](MediaFrame::to_avframe)
 /// form a lossless round trip for the modelled fields.
 ///
-/// The `AVFrame` fields that are *not* mirrored are the ones that cannot be carried as
-/// values: `data` / `linesize` / `extended_data` are what [`data`](Self::data) packs
-/// into planes, `buf` / `extended_buf` / `nb_extended_buf` / `opaque` /
-/// `opaque_ref` / `private_ref` are ownership handles, and `hw_frames_ctx` describes a
-/// hardware frame pool that has no meaning once the samples are copied into host
-/// memory. They are intentionally excluded rather than missing.
+/// The one lossy field is the audio channel **layout**: only its channel count is
+/// carried ([`nb_channels`](Self::nb_channels)), and `to_avframe` rebuilds the layout
+/// as `AVChannelLayout::from_nb_channels(..)`. A `FL+FC` frame therefore comes back as
+/// `stereo` — same count, different layout/order. Anything that depends on which
+/// channels these are (not merely how many) has to be handled on the `AVFrame` itself.
+///
+/// The other `AVFrame` fields that are *not* mirrored are the ones that cannot be
+/// carried as values: `data` / `linesize` / `extended_data` are what
+/// [`data`](Self::data) packs into planes, `buf` / `extended_buf` / `nb_extended_buf`
+/// / `opaque` / `opaque_ref` / `private_ref` are ownership handles, and `hw_frames_ctx`
+/// describes a hardware frame pool that has no meaning once the samples are copied into
+/// host memory. They are intentionally excluded rather than missing.
 ///
 /// # Parameters
 ///

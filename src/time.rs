@@ -68,9 +68,12 @@ impl Rational {
     /// representation as a pair of `i32`:
     ///
     /// * `den == 0` — `x / 0` is not a number;
-    /// * the normalised numerator or denominator would not fit in `i32`, which
-    ///   can only happen for `den == i32::MIN`, or for `num == i32::MIN` with
-    ///   `den == -1` (whose normalised form is `2^31 / 1`).
+    /// * the **reduced** numerator or denominator still does not fit in `i32`.
+    ///   Reduction happens *before* the range check, so this is narrower than it
+    ///   looks: it needs `den == i32::MIN` (whose absolute value is `2^31`) with a
+    ///   `num` that does not share enough factors to shrink it — `0 / i32::MIN`
+    ///   and `i32::MIN / i32::MIN` both reduce into range and are accepted — or
+    ///   `num == i32::MIN` with `den == -1`, whose normalised form is `2^31 / 1`.
     ///
     /// # Examples
     ///
@@ -399,14 +402,19 @@ impl Time {
 
     /// Whether the [`Time`] carries a usable value at all.
     ///
-    /// Both "no time" spellings report `false`: no value whatsoever (`None`), and
-    /// the `AV_NOPTS_VALUE` sentinel FFmpeg writes when a stream simply has no
-    /// timestamp. This is the predicate to branch on before converting to seconds
-    /// — converting a NOPTS would yield ≈ -9.2e13 seconds.
-    /// [`Self::into_value`], the seconds conversions and the comparisons all
-    /// agree with it.
+    /// Three "no time" spellings report `false`: no value whatsoever (`None`); the
+    /// `AV_NOPTS_VALUE` sentinel FFmpeg writes when a stream simply has no
+    /// timestamp; and a **zero time base** ([`Rational::ZERO`], what FFmpeg's own
+    /// `0/0` folds to), which leaves a raw value nobody can interpret —
+    /// [`Self::as_secs_f64`], [`std::fmt::Display`] and the comparisons all treat
+    /// it as "nothing", so this predicate has to as well.
+    ///
+    /// This is the predicate to branch on before converting to seconds — converting
+    /// a NOPTS would yield ≈ -9.2e12 seconds.
+    /// [`Self::into_value`], the seconds conversions and the comparisons all agree
+    /// with it (every one of them funnels through the same private helper).
     pub fn has_value(&self) -> bool {
-        self.value().is_some()
+        self.instant().is_some()
     }
 
     /// The raw value, with the `AV_NOPTS_VALUE` sentinel filtered out.
@@ -489,8 +497,8 @@ impl Time {
     /// Get number of seconds as floating point value.
     ///
     /// Returns `0.0` when there is no usable value ([`Self::has_value`] is
-    /// `false`) or the time base is zero, which also keeps the result finite — a
-    /// NOPTS would otherwise turn into ≈ -9.2e13 seconds.
+    /// `false`, which covers a zero time base too), which also keeps the result
+    /// finite — a NOPTS would otherwise turn into ≈ -9.2e12 seconds.
     pub fn as_secs_f64(&self) -> f64 {
         self.seconds_or_none().unwrap_or(0.0)
     }
@@ -498,12 +506,13 @@ impl Time {
     /// Convert to underlying time to `i64` (the number of time units).
     ///
     /// Returns `None` when there is no usable value — including the
-    /// `AV_NOPTS_VALUE` sentinel — so it agrees with [`Self::has_value`].
+    /// `AV_NOPTS_VALUE` sentinel **and a zero time base** (a raw count nobody can
+    /// interpret) — so it agrees with [`Self::has_value`].
     ///
     /// Assumes that the caller knows the time base and applies it correctly when doing arithmetic
     /// operations on the time value.
     pub fn into_value(self) -> Option<i64> {
-        self.value()
+        self.instant().map(|(time, _, _)| time)
     }
 
     /// Align the timestamp along another `time_base`.
@@ -545,9 +554,11 @@ pub const TIME_BASE: Rational = Rational::unit(1_000_000);
 
 /// Rescale a timestamp between two time bases.
 ///
-/// Implemented for every integer type, so a pts value can be rescaled in place:
-/// `pts.rescale(from, to)`. Both time bases are [`Rational`], like every other
-/// rational in this crate.
+/// Implemented for every integer type that converts into `i64`
+/// (`impl<T: Into<i64> + Clone>`), so a pts value can be rescaled in place:
+/// `pts.rescale(from, to)`. That covers `i8`…`i64` and `u8`…`u32`, but **not**
+/// `u64` / `usize` / `u128` / `i128` — cast those to `i64` first. Both time
+/// bases are [`Rational`], like every other rational in this crate.
 pub trait Rescale {
     fn rescale<S, D>(&self, source: S, destination: D) -> i64
     where
@@ -982,6 +993,29 @@ mod tests {
             Some(std::cmp::Ordering::Less)
         );
         assert!(earlier < later_other_base);
+    }
+
+    /// "无值"的三种写法必须口径一致：零时间基（FFmpeg 自己的 `0/0`）与
+    /// `None` / `AV_NOPTS_VALUE` 一样没有可用值 —— `has_value`、`into_value`、
+    /// 秒换算、`Display` 与比较全部以 [`Time::instant`] 为准。
+    #[test]
+    fn test_zero_time_base_is_no_value() {
+        let zero_base = Time::new(Some(5), Rational::ZERO);
+
+        assert!(
+            !zero_base.has_value(),
+            "a zero time base leaves nothing to interpret"
+        );
+        assert_eq!(zero_base.into_value(), None);
+        assert_eq!(zero_base.as_secs_f64(), 0.0);
+        assert_eq!(zero_base.to_string(), "none");
+        // 因此它与"完全没有值"是同一个时刻（排序上并列最前）
+        assert_eq!(zero_base, Time::new(None, TIME_BASE));
+
+        // 契约的另一半：正常时间基下 0 也是有值（0 秒），与"无值"不同。
+        let zero = Time::new(Some(0), TIME_BASE);
+        assert!(zero.has_value());
+        assert_ne!(zero, Time::new(None, TIME_BASE));
     }
 
     /// 比较必须是**精确**的：同一时刻的两条不同计算路径在 `f64` 下可能相差 1 ulp，

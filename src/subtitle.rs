@@ -2,8 +2,8 @@
 //!
 //! Subtitle encoding is provided by the generic [`crate::encode::Encoder`]
 //! (see [`EncoderBuilder::new_subtitle`](crate::encode::EncoderBuilder::new_subtitle)),
-//! which uses the standard `avcodec_open2` + `avcodec_encode_subtitle` path
-//! with an auto-generated ASS script header. This module provides:
+//! which uses the standard `avcodec_open2` + `avcodec_encode_subtitle` path.
+//! This module provides:
 //!
 //! * [`copy_subtitle_stream`] — passthrough: copy subtitle packets from a
 //!   reader to a writer without decode/encode (same codec, e.g. subrip→subrip).
@@ -14,8 +14,11 @@
 //!
 //! Subtitle encoders (mov_text, subrip) require `subtitle_header` (an ASS
 //! `[Script Info]`/`[V4+ Styles]` header) to be set before `avcodec_open2`,
-//! otherwise init fails with `AVERROR_INVALIDDATA`. The generic encoder
-//! generates a default header automatically.
+//! otherwise init fails with `AVERROR_INVALIDDATA`. **The header is not
+//! generated for you**: `EncoderBuilder::build` rejects a subtitle encoder
+//! that has no header — supply one with
+//! [`EncoderBuilder::with_subtitle_header`](crate::encode::EncoderBuilder::with_subtitle_header)
+//! (in a transcode pipeline, forward the header the subtitle decoder produced).
 //!
 //! FFmpeg Documentation: <https://ffmpeg.org/doxygen/trunk/group__lavc__subtitle.html>
 
@@ -156,7 +159,9 @@ impl SubtitleSegment {
     /// 与 [`crate::encode::Encoder::encode_subtitle_segment`] 对称：编码时把
     /// 纯文本放进 Dialogue 行第 10 字段，此处逆变换还原。
     ///
-    /// 返回 [`None`] 表示该 subtitle 无文本 rect（如位图字幕或空段落）。
+    /// 返回 [`None`] 有三种情形：`num_rects == 0`（空段落）、所有 rect 都不是文本
+    /// 类型（如 `SUBTITLE_BITMAP` 位图字幕）、以及 `pts` 为 `AV_NOPTS_VALUE`
+    /// （没有可用的时间信息，宁可丢掉也不要产出荒谬的时间戳）。
     pub fn from_avsubtitle(subtitle: &AVSubtitle) -> Option<Self> {
         if subtitle.num_rects() == 0 {
             return None;

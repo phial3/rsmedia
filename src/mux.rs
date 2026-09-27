@@ -853,7 +853,8 @@ impl<W: Writer> Muxer<W> {
     ///
     /// header 一旦写出，后续所有 `mux`/`mux_packet` 直接写包；本函数在首个
     /// 包之前被主动调用，避免每个包路径各自重复 header 逻辑。
-    /// 返回 header 写入产生的输出（已写过则返回 `None`），由调用方并入自己的
+    /// 返回 header 写入产生的输出（**已写过则返回空累加值** `W::Accum::default()`
+    /// ——返回类型是 `Result<W::Accum>`，没有 `None`），由调用方并入自己的
     /// 结果一起返回。缓冲型 [`Writer`] 的 `Out` 是**增量**字节，**不能在这里
     /// 丢掉**：`write_header` 已经把它们从 writer 的内部累积里取走，丢弃就意味着
     /// header 那些字节永远不会到达调用方（`BufferWriter` 用户会拿到缺头的容器）。

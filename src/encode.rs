@@ -58,9 +58,11 @@ pub struct EncoderBuilder {
     max_bit_rate: Option<i64>,
     /// VBV 缓冲大小（`AVCodecContext.rc_buffer_size`，ffmpeg CLI 的 `-bufsize`）。
     buffer_size: Option<i32>,
-    /// 关键帧间隔；`None` = 不设置，沿用编解码器自身默认值。
+    /// 关键帧间隔；`None` = 不设置，沿用编码器自身的默认值（通用 12，libx264 为
+    /// `-1` = 交给 x264，见 [`Self::with_gop_size`]）。
     gop_size: Option<i32>,
-    /// B 帧上限；`None` = 不设置，沿用编解码器自身默认值（默认 -1，libx264 为 3）。
+    /// B 帧上限；`None` = 不设置，沿用编码器自身的默认值（通用 0，libx264 为 `-1`
+    /// = 交给 x264，`medium` preset 下是 3，见 [`Self::with_max_b_frames`]）。
     max_b_frames: Option<i32>,
     frame_rate: Rational,
     /// config
@@ -255,14 +257,17 @@ impl EncoderBuilder {
         self
     }
 
-    /// Set the rate control strategy (video encoders only; ignored for audio).
+    /// Set the rate control strategy.
     ///
-    /// * [`Quality::Crf`] — quality-targeted encoding. Applied via the codec's
-    ///   `crf` private option for the encoders in [`CRF_CAPABLE_CODECS`]; other
-    ///   codecs fall back to [`Self::with_bit_rate`] with a warning and the
-    ///   stream bit rate is left untouched.
-    /// * [`Quality::Bitrate`] — explicit target bit rate, overriding
-    ///   [`Self::with_bit_rate`].
+    /// * [`Quality::Bitrate`] — explicit target bit rate in bits/s, overriding
+    ///   [`Self::with_bit_rate`]. **Not** video-only: it is written to
+    ///   `AVCodecContext::bit_rate` for audio encoders as well. A non-positive
+    ///   value counts as "unset" and the media-type default is used instead.
+    /// * [`Quality::Crf`] — quality-targeted encoding, **video only**. Applied via
+    ///   the codec's `crf` private option for the encoders in [`CRF_CAPABLE_CODECS`];
+    ///   any other codec — and every audio codec — falls back to bit-rate control
+    ///   (whatever [`Self::with_bit_rate`] or the media-type default yields) with
+    ///   a warning, leaving the stream bit rate untouched.
     pub fn with_quality(mut self, quality: Quality) -> Self {
         self.quality = Some(quality);
         self
@@ -344,8 +349,13 @@ impl EncoderBuilder {
 
     /// Set the GOP size (keyframe interval, in frames).
     ///
-    /// 未设置时沿用编解码器自身的默认值（FFmpeg 的 `g` 选项，通常为 12）。
-    /// 注意 `0` 会被 libx264 解释为**全 I 帧**（每个关键帧间隔为 1），除非
+    /// 未设置时不覆盖 `AVCodecContext::gop_size`，落到哪个值由**编码器**决定：
+    /// `avcodec_alloc_context3` 先套 FFmpeg 的通用默认值 12（`g` 选项），随后编码器
+    /// 自带的 `FFCodec.defaults` 会覆盖它 —— libx264 把 `g` 置为 `-1`，而它只在
+    /// `gop_size >= 0` 时才去覆盖 x264 的设定，于是 x264 沿用自己的 `keyint`
+    /// （默认 250）；native 编码器（mpeg4 等）则沿用 12。
+    ///
+    /// 注意 `0` 会被 libx264 解释为**全 I 帧**（`i_keyint_max` 取 1），除非
     /// 明确想要全帧内编码，否则不要传 0。
     pub fn with_gop_size(mut self, gop_size: i32) -> Self {
         self.gop_size = Some(gop_size);
@@ -354,8 +364,14 @@ impl EncoderBuilder {
 
     /// Set the maximum number of B-frames.
     ///
-    /// 未设置时沿用编解码器自身默认值（FFmpeg 的 `bf` 选项默认 -1 = 交给编码器，
-    /// libx264 为 3）。注意 `0` 会**显式禁用** B 帧，而不是"交给编码器"。
+    /// 未设置时不覆盖 `AVCodecContext::max_b_frames`，默认值同样是**按编码器**的：
+    /// FFmpeg 通用默认值是 `0`（`bf` 选项），而 libx264 通过 `FFCodec.defaults`
+    /// 把它改成 `-1`；libx264 只在 `max_b_frames >= 0` 时才覆盖 x264 的设定，于是
+    /// x264 沿用 preset 自带的值（`medium` 下 `bframes=3`）。
+    ///
+    /// 注意 `0` 会**显式禁用** B 帧，而不是"交给编码器"；负值在 native 编码器
+    /// （mpegvideo 系）上直接是 `AVERROR(EINVAL)`（"max b frames must be 0 or
+    /// positive"），只有 libx264 这类把它当"未设置"的编码器才接受。
     pub fn with_max_b_frames(mut self, max_b_frames: i32) -> Self {
         self.max_b_frames = Some(max_b_frames);
         self
@@ -488,13 +504,14 @@ impl EncoderBuilder {
             if !use_crf {
                 encoder.set_bit_rate(self.effective_bit_rate());
             }
-            // gop_size 未设置时不覆盖：`avcodec_alloc_context3` 已应用 FFmpeg 的
-            // 默认值（`g` 选项，通常为 12）；显式设 0 反而会被 libx264 解释为全 I 帧。
+            // gop_size 未设置时不覆盖：值由 `avcodec_alloc_context3` + 编码器自己的
+            // `FFCodec.defaults` 共同决定（通用 12，libx264 是 -1 = 交给 x264）。
+            // 显式设 0 反而会被 libx264 解释为全 I 帧。
             if let Some(gop_size) = self.gop_size {
                 encoder.set_gop_size(gop_size);
             }
-            // B 帧上限未设置时不覆盖：avcodec 的 `bf` 默认 -1 = 交给编码器决定
-            // （libx264 为 3）；显式设 0 会禁用 B 帧，与 ffmpeg CLI 默认输出不一致。
+            // B 帧上限未设置时不覆盖：通用默认 0，libx264 由 `FFCodec.defaults`
+            // 改成 -1 = 交给 x264（medium preset 下 3）；显式设 0 会禁用 B 帧。
             if let Some(max_b_frames) = self.max_b_frames {
                 encoder.set_max_b_frames(max_b_frames);
             }
@@ -603,13 +620,19 @@ impl EncoderBuilder {
 
     /// 解析编码目标像素格式（P0-2 自动格式协商）。
     ///
-    /// * 显式指定（[`Self::with_pix_fmt`]]）：软件路径立即校验编码器
+    /// * 显式指定（[`Self::with_pix_fmt`]）：软件路径立即校验编码器
     ///   是否支持，不支持时 `build()` 报错（fail fast）；硬件路径跳过校验
     ///   （`setup_encoder_frames` 会按 HW 要求重设 pix_fmt，HW 私有格式不在
     ///   软件支持列表内）。
-    /// * 未指定：优先 [`PixelFormat::YUV420P`]（兼容性最好）；编码器不支持
-    ///   时（如 mjpeg 仅接受 YUVJ 系）取支持列表首个格式；列表为 `None`
-    ///   （FFmpeg 未限制）或查询失败时仍回退 YUV420P。
+    /// * 未指定：取编码器支持列表
+    ///   （[`CodecConfig::supported_pixel_formats`](crate::CodecConfig::supported_pixel_formats)）
+    ///   的**第一个**。FFmpeg 的 `AVCodec::pix_fmts` 就是按编码器偏好顺序书写的，
+    ///   首个即编码器自己最想要的格式——常见编码器（libx264、libvpx、libx265…）
+    ///   首个正好是 [`PixelFormat::YUV420P`]，而 mjpeg 是
+    ///   [`PixelFormat::YUVJ420P`]、png 是 [`PixelFormat::RGB24`]。比在这里硬编码
+    ///   一个"通用首选"更贴近编码器意图。
+    ///   列表为 `None`（FFmpeg 未声明限制）或查询失败时回退
+    ///   [`PixelFormat::YUV420P`]。
     fn resolve_pixel_format(&self, config: &CodecConfig, codec_name: &str) -> Result<PixelFormat> {
         match self.pixel_format {
             Some(fmt) => {
@@ -1173,7 +1196,6 @@ impl Encoder {
         Ok(packets)
     }
 
-    /// ASS 时间格式 `H:MM:SS.cc`（厘秒精度）。
     /// 编码一条字幕段落（仅字幕编码器）。
     ///
     /// 字幕编码走 rsmpeg 的 [`AVCodecContext::encode_subtitle`]（同步 API，无
@@ -1329,7 +1351,8 @@ impl Encoder {
     /// **采样率**：音频帧的 0 表示"调用方没有声明"，而不是"0 Hz"——音频编码器的目标
     /// 采样率在 [`EncoderBuilder::new_audio`] 时就必须给定并写入 `AVCodecContext`
     /// （见 [`effective_time_base`](Self::effective_time_base)），是唯一权威值，故以它
-    /// 补齐。**只有 0 会被替换**：非 0 一律视为调用方声明的真实源率，与编码器不同时
+    /// 补齐。**只有非正值（`<= 0`，含负数的脏值）会被替换**：正数一律视为调用方
+    /// 声明的真实源率，与编码器不同时
     /// 照常重采样（这是"任意采样率输入"功能的依据）。这一步必须在下游三处消费者之前
     /// 完成——滤镜输入格式转换（`resample::convert_frame` 把帧率当**源率**）、
     /// [`rescale`](Self::rescale) 的重采样判断、[`check_frame`](Self::check_frame) 的

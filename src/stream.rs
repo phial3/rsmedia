@@ -219,11 +219,14 @@ impl StreamInfo {
         // 真正解码时，`PixelFormat::data_layout` 会再给出明确错误。
         let format = if codec_type.is_video() {
             let pix_fmt = PixelFormat::from_ffi_checked(codecpar.format).unwrap_or_else(|| {
+                // `PixelFormat::from` 对未收录值是 **panic**，而这个分支恰好只在
+                // "未收录"时执行 —— 用它取名字会把"降级并告警"变成崩溃。
+                // `name_of` 走 `av_get_pix_fmt_name`，任何值都拿得到可读文本。
                 tracing::warn!(
                     "Stream {} has an unsupported pixel format {} ({}); reporting it as unknown",
                     stream.index,
                     codecpar.format,
-                    PixelFormat::from(codecpar.format).get_pix_fmt_name()
+                    PixelFormat::name_of(codecpar.format)
                 );
                 PixelFormat::NONE
             });
@@ -438,14 +441,12 @@ impl StreamInfo {
         }
     }
 
-    /// Turn information back into parts for usage.
-    ///
-    /// Note: Consumes stream information object.
+    /// 查询本流可用的解码器名（借用 `self`，**不消费** [`StreamInfo`]，可反复调用）。
     ///
     /// # Return value
     ///
-    /// find codec name, if have hw_device_type, will use hw accelerated codec name
-    /// if not, will use current stream codec name
+    /// 给定 `hw_device_type` 时优先返回对应的硬件解码器名，否则（或硬件解码器在本
+    /// 构建里不存在时）回退到通用软件解码器名；连软件解码器都找不到则返回 `None`。
     ///
     /// 硬件解码器名先经 `find_decoder_by_name` 验证存在（表项可能因 FFmpeg
     /// 版本/编译选项不存在，如 ffmpeg6 无 `*_vulkan` 解码器），不存在时

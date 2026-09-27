@@ -165,8 +165,13 @@ pub trait Seekable: Reader {
         unsafe { !pb.is_null() && ((*pb).seekable & ffi::AVIO_SEEKABLE_NORMAL as i32) != 0 }
     }
 
-    /// Seek in reader. This will change the reader head so that it points to a location within one
-    /// second of the target timestamp or it will return an error.
+    /// Seek in reader: moves the reader head to the keyframe **at or before**
+    /// `timestamp_ms`, or returns an error.
+    ///
+    /// 落点在目标之前的一秒内（`[ts-1s, ts]`），不会漂到目标之后：实现给
+    /// `avformat_seek_file` 传的区间是 `[ts-1s, ts, ts+1s-1µs]`，上界那一秒只是
+    /// 用来把 FFmpeg 的方向推导固定成 BACKWARD（见下方注释），不是可落点的范围。
+    /// 目标之前一秒内没有关键帧时（大 GOP）直接返回 `Err`。
     ///
     /// # Arguments
     ///

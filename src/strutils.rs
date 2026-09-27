@@ -26,8 +26,10 @@ pub fn path_to_cstring<P: AsRef<Path> + ?Sized>(path: &P) -> Result<CString> {
     }
 }
 
-/// Option<&Path> -> `Option<CString>`
-/// 如果转换失败（内部包含\0），返回None
+/// Option<&Path> -> `Result<Option<CString>>`
+///
+/// `None` 只表示"输入是 `None`"。转换失败（内部含 `\0`）时返回 **`Err`**，
+/// 不是 `None` —— 错误因此不会被静默吞掉。
 pub fn path_to_cstring_opt<P: AsRef<Path> + ?Sized>(path: Option<&P>) -> Result<Option<CString>> {
     // path.and_then(|p| path_to_cstring(p).ok())
     match path {
@@ -70,8 +72,10 @@ pub fn str_to_cstring<S: AsRef<str> + ?Sized>(s: &S) -> Result<CString> {
     Ok(CString::new(s.as_ref())?)
 }
 
-/// Option<&str> -> `Option<CString>`
-/// 如果转换失败（内部包含\0），返回None
+/// Option<&str> -> `Result<Option<CString>>`
+///
+/// `None` 只表示"输入是 `None`"。转换失败（内部含 `\0`）时返回 **`Err`**，
+/// 不是 `None` —— 错误因此不会被静默吞掉。
 pub fn str_to_cstring_opt<S: AsRef<str> + ?Sized>(str: Option<&S>) -> Result<Option<CString>> {
     // s.and_then(|x| str_to_cstring(x).ok())
     match str {
@@ -153,8 +157,12 @@ pub fn cstr_to_os_string(cstr: impl AsRef<CStr>) -> OsString {
 ///
 /// # Safety
 ///
-/// - 指针必须指向一个有效的以 null 结尾的 C 字符串
-/// - 字符串内容必须是有效的 UTF-8
+/// * `ptr` 必须是 NULL，或指向一个有效的、以 NUL 结尾的 C 字符串
+///   （`CStr::from_ptr` 的要求）。传 NULL 是安全的，返回空 `String`。
+/// * 该字符串在调用期间必须保持有效。
+///
+/// 内容**不必**是合法 UTF-8：非法字节按 `U+FFFD` 替换（同
+/// [`cstr_to_string_lossy`]），所以编码问题不会导致未定义行为。
 pub unsafe fn c_char_to_str(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();

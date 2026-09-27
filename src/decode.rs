@@ -57,9 +57,10 @@ ffi_enum!(
     /// 解码错误识别力度（`AVCodecContext.err_recognition`，`AV_EF_*` 位）。
     ///
     /// 决定解码器**把什么当错误**，以及发现后是"带伤继续"还是直接失败：
-    /// 默认（仅 [`CRCCHECK`](Self::CRCCHECK)）是宽松容错，损坏的码流会被掩盖
-    /// 成错帧/糊帧继续输出；要"宁可失败也不出错帧"就加上
-    /// [`EXPLODE`](Self::EXPLODE)，解码 API 会以 `Err` 报告而不是静默继续。
+    /// 默认是 `0`（一个位都不置，FFmpeg 的 `err_detect` 选项默认值），损坏的码流
+    /// 会被掩盖成错帧/糊帧继续输出；要"宁可失败也不出错帧"就置上
+    /// [`EXPLODE`](Self::EXPLODE)（通常连同 [`BUFFER`](Self::BUFFER) /
+    /// [`CRCCHECK`](Self::CRCCHECK) 一起），解码 API 会以 `Err` 报告而不是静默继续。
     ///
     /// 位可组合（`ErrRecognition::BUFFER | ErrRecognition::EXPLODE`，结果为
     /// [`FlagSet<ErrRecognition>`](crate::FlagSet)，可直接传给
@@ -69,7 +70,8 @@ ffi_enum!(
     /// FFmpeg 内部顺序决定，调用方不应同时给出。
     #[allow(non_camel_case_types)]
     ErrRecognition, u32 {
-        /// 校验 CRC 之类的校验和（默认开启，`AV_EF_CRCCHECK`）。
+        /// 校验 CRC 之类的校验和（`AV_EF_CRCCHECK`）。**默认并不开启**：
+        /// `err_recognition` 的默认值是 0，要校验就得显式置这一位。
         CRCCHECK => ffi::AV_EF_CRCCHECK;
         /// 把码流层（比特流语法）的异常当错误（`AV_EF_BITSTREAM`）。
         BITSTREAM => ffi::AV_EF_BITSTREAM;
@@ -119,9 +121,12 @@ pub struct DecoderBuilder {
     pix_fmt: Option<PixelFormat>,
     /// 解码输出目标采样格式（仅音频）。`None` 表示保留编解码器原生格式。
     sample_fmt: Option<SampleFormat>,
-    /// 帧丢弃粒度（`AVCodecContext.skip_frame`）。`None` = FFmpeg 默认（不丢弃）。
+    /// 帧丢弃粒度（`AVCodecContext.skip_frame`）。`None` = FFmpeg 默认
+    /// （[`SkipFrame::DEFAULT`]：只丢弃 AVI 里长度为 0 的"无用包"这类帧，
+    /// 不是 [`SkipFrame::NONE`]）。
     skip_frame: Option<SkipFrame>,
-    /// 错误识别位集（`AVCodecContext.err_recognition`）。`None` = FFmpeg 默认。
+    /// 错误识别位集（`AVCodecContext.err_recognition`）。`None` = FFmpeg 默认，
+    /// 即 `0`（**所有位都不置**，连 [`CRCCHECK`](ErrRecognition::CRCCHECK) 也没开）。
     err_recognition: Option<FlagSet<ErrRecognition>>,
 }
 
@@ -257,7 +262,7 @@ impl DecoderBuilder {
 
     /// 设置错误识别掩码（`AVCodecContext.err_recognition`）。
     ///
-    /// 默认只有 [`ErrRecognition::CRCCHECK`]，即**宽松容错**：损坏的码流会被
+    /// 默认一个位都不置（即**宽松容错**）：损坏的码流会被
     /// 解码器尽力掩盖（`error_concealment`）成错帧继续输出，调用方拿到的是
     /// "看起来正常"的画面。需要"宁可失败也不出错帧"时，把
     /// [`ErrRecognition::EXPLODE`] 加进来，解码 API 就会以 `Err` 报告损坏，
@@ -1506,7 +1511,14 @@ impl Drop for Decoder {
         if !self.state.is_flushed() {
             let eos_sent = if self.state.is_normal() {
                 match self.send_packet_with_retry(None) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        // 与 `drain` 一致：EOS 送出即进入 draining。不置位的话下面
+                        // 的 `Ok(None)`（EAGAIN）会被当成"已到流末尾"立刻退出排空，
+                        // 而带帧级多线程的解码器在 EOS 之后完全可以先回一次 EAGAIN
+                        // 再吐帧 —— 尾部帧就是这么丢的。
+                        self.state = ProcessState::Drained;
+                        true
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "Failed to send flush packet to decoder during Decoder drop: {e}"

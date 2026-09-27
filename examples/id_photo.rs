@@ -174,7 +174,7 @@ fn swap_background(
     );
     // overlay 输入 0 = 主画面（新底色），输入 1 = 叠加层（抠像后的照片，
     // 原底色处已透明，透出白底；人像处不透明，盖在白底上）。
-    builder.add_node(FilterNode::new(video::overlay("0", "0", None)).with_inputs(["bg", "keyed"]));
+    builder.add_node(FilterNode::new(video::overlay("0", "0")).with_inputs(["bg", "keyed"]));
     builder.add_output_tail(endpoint);
     let mut graph = builder
         .build()

@@ -358,7 +358,9 @@ ffi_enum_wrap_from!(
 /// address a separate palette, and hardware formats keep their samples on the
 /// device. Both [`PixelFormat::data_layout`] and
 /// [`PixelFormat::is_plane_storable`] turn on this one predicate, so the two
-/// cannot disagree about which formats are storable.
+/// never disagree about *this* part of the answer — but `data_layout` has
+/// further reasons to return `None`, so `is_plane_storable` is a necessary,
+/// not a sufficient, condition (see that method).
 fn has_no_sample_planes(desc: &AVPixFmtDescriptorRef) -> bool {
     const UNSUPPORTED: u32 =
         ffi::AV_PIX_FMT_FLAG_BITSTREAM | ffi::AV_PIX_FMT_FLAG_PAL | ffi::AV_PIX_FMT_FLAG_HWACCEL;
@@ -422,10 +424,11 @@ impl PixelFormat {
 
     /// Whether this format can be stored as whole sample planes at all.
     ///
-    /// The size-independent counterpart of [`Self::data_layout`], for callers
-    /// judging a format before a frame size is known: bitstream, paletted and
-    /// hardware formats have no host samples per plane whatever the size, while
-    /// every other format does at every non-zero size.
+    /// [`Self::data_layout`] 的与尺寸无关版本，供还没拿到帧尺寸时判断格式用。
+    /// 它是 `data_layout` 能给出布局的**必要条件而非充分条件**：位流、调色板、
+    /// 硬件格式恒为 `false`；其余格式为 `true`，但其中一部分 `data_layout` 仍会
+    /// 返回 `None` —— 水平二次采样的打包格式可能每个像素占**分数个**样本
+    /// （`uyyvyy411`：4 像素 6 字节），整像素数组表达不了。
     pub fn is_plane_storable(self) -> bool {
         AVPixFmtDescriptorRef::get(self.into()).is_some_and(|desc| !has_no_sample_planes(&desc))
     }
@@ -483,9 +486,10 @@ impl PixelFormat {
     /// * a **planar** format is one array per plane, each chroma plane carrying
     ///   its own subsampled size, taken from `log2_chroma_w` / `log2_chroma_h`.
     ///
-    /// `None` means the format cannot be expressed as whole sample arrays at
-    /// this size: bitstream, paletted and hardware formats (whose components are
-    /// not whole samples), or a zero dimension.
+    /// `None` 有三种情形：位流/调色板/硬件格式（分量不是整样本）、任一维度为 0、
+    /// 以及该格式无法用整像素元素表达（水平二次采样的打包格式会出现分数个元素
+    /// 每像素，如 `uyyvyy411` 的 4 像素 6 字节）。前两种可由
+    /// [`Self::is_plane_storable`] 预判，第三种不行。
     pub fn data_layout(self, width: u32, height: u32) -> Option<DataLayout> {
         if width == 0 || height == 0 {
             return None;
@@ -572,7 +576,10 @@ impl PixelFormat {
     /// This is the element size a [`MediaFrame`](crate::frame::MediaFrame)'s type
     /// parameter has to match.
     ///
-    /// `None` for formats without host samples (hardware formats).
+    /// `None` 表示拿不到"每分量字节数"：未知/无效的格式值（`av_pix_fmt_desc_get`
+    /// 返回 NULL）、`nb_components == 0`（硬件格式在描述子里根本没有分量）、
+    /// 以及所有分量的深度都是 0。位流/调色板格式**不在**此列——它们有分量深度
+    /// （`pal8` 给 1），只是不能当整样本平面用（见 [`Self::is_plane_storable`]）。
     pub fn bytes_per_component(self) -> Option<usize> {
         let desc = AVPixFmtDescriptorRef::get(self.into())?;
         element_bytes(&desc)

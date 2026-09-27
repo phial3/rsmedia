@@ -15,8 +15,11 @@ const MAX_FFMPEG_PLANES: usize = 4;
 ///
 /// This mirrors `av_image_fill_linesizes` one-to-one, including its `int`
 /// parameters and result — hence `width: i32` and `[i32; 4]` rather than the
-/// `u32` the high-level API uses. Linesizes are signed in FFmpeg (a negative
-/// width yields negative strides), so the signedness is load-bearing here.
+/// `u32` the high-level API uses.
+///
+/// A negative `width` is **rejected**, not mirrored: FFmpeg's `image_get_linesize`
+/// answers `AVERROR(EINVAL)` for `width < 0`, so no stride is ever negative
+/// (verified 5.1…9.0). The signedness is kept purely to match FFmpeg's `int`.
 ///
 /// # Arguments
 ///
@@ -437,12 +440,12 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
 /// * `src` - 源数据
 /// * `src_linesize` - 源数据每行的字节数
 ///
-/// # Safety
+/// # Errors
 ///
-/// 调用者需要确保：
-/// 1. plane_idx 是有效的（小于平面总数）
-/// 2. src 包含足够的数据
-/// 3. src_linesize 是正确的
+/// 三条前置条件都由本函数自己校验，越界/不足时返回
+/// [`InvalidConfig`](crate::RsmediaError::InvalidConfig) 而不是 UB：
+/// 平面索引必须在平面总数之内、`src_linesize` 不得小于该平面的行字节数、
+/// `src` 至少要装下 `行数 × src_linesize`。帧不可写（`is_writable`）同样在这里拒绝。
 pub fn fill_plane_from_buffer(
     frame: &mut AVFrame,
     plane_idx: usize,
@@ -685,15 +688,23 @@ pub fn fill_black(frame: &mut AVFrame) -> Result<()> {
     Ok(())
 }
 
-/// 用指定 RGBA 颜色填充整幅图像（子矩形内的 padding 不会被触碰）。
-/// 颜色分量按 0..255 的整数值解释（见 `av_image_fill_color`）。
+/// 用指定颜色填充整幅图像（子矩形内的 padding 不会被触碰）。
+///
+/// ⚠️ 四个值**不是"RGBA 颜色"**：`av_image_fill_color` 把它们按**分量下标**
+/// 写进像素格式描述符的前四个分量，既不做 RGB→YUV 转换，也不按位深缩放。于是
+/// `YUV420P` 上传 `(255, 0, 0, …)` 得到的是 Y=255/U=0/V=0（真正的红色约
+/// 76/85/255），而 `YUV420P10LE` 上传 255 只是把 255 塞进 10 位域（满量程是
+/// 1023）。只有 8 位 RGB/BGR/GBR 家族里它们才真的等于 RGBA 分量。
+///
+/// 需要"某种颜色"的语义时，先用 [`crate::PixelFormat`] 确认目标格式，或改用
+/// [`fill_black`]（它按 `color_range` 算黑电平）。
 ///
 /// 注意：底层 `av_image_fill_color` 自 FFmpeg 7.0 起才提供，故该函数仅在
 /// `ffmpeg7`/`ffmpeg8`/`ffmpeg9` feature 下可用。
 ///
 /// # Arguments
 /// * `frame` - 目标 AVFrame（需已 alloc_buffer）
-/// * `r`/`g`/`b`/`a` - RGBA 分量（0..=255），`a` 为可选的 alpha
+/// * `r`/`g`/`b`/`a` - 写入分量 0..3 的原始值（0..=255，不按位深缩放）
 #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
 pub fn fill_color(frame: &mut AVFrame, r: u8, g: u8, b: u8, a: u8) -> Result<()> {
     if frame.data[0].is_null() {
@@ -706,7 +717,8 @@ pub fn fill_color(frame: &mut AVFrame, r: u8, g: u8, b: u8, a: u8) -> Result<()>
     // SAFETY: as in `fill_black` — `data[0]` was checked non-null, and the frame's
     // own `data`/`linesize`/`format`/`width`/`height` describe an `alloc_buffer`'d
     // allocation that FFmpeg fills row by row. `color` is a local 4-element array,
-    // which is the `uint32_t color[4]` the API expects (RGBA order).
+    // which is the `uint32_t color[4]` the API expects — entries are component
+    // values by index (see this function's docs), not an RGBA triple.
     let ret = unsafe {
         ffi::av_image_fill_color(
             frame.data.as_ptr(),
@@ -842,7 +854,7 @@ pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
 /// # Arguments
 ///
 /// * `source` - 输入（文件路径 / URL 等，见 [`Location`](crate::Location)）
-/// * `timestamp_milliseconds` - 取帧时间点；`None` 时取**流中点**
+/// * `timestamp_ms` - 取帧时间点；`None` 时取**流中点**
 ///   （视频开头往往是黑帧/淡入，中点更容易取到有代表性的画面；
 ///   时长未知的流退化为取第一帧）
 /// * `max_dims` - 缩略图最大 (宽, 高)；实际尺寸按纵横比缩放，

@@ -409,8 +409,9 @@ pub fn scale_frame(
 
 /// Persistent streaming video scaler, held by the encoder and the decoder.
 ///
-/// Unlike the free functions [`scale_frame`] / `scale_with_flags` (which create a
-/// temporary `SwsContext` on every call), `Scaler` owns the scaling **policy** — one
+/// Unlike the free function [`scale_frame`] (which creates a temporary `SwsContext`
+/// on every call — the flags live on [`Scaler::new_with_options`]), `Scaler` owns the
+/// scaling **policy** — one
 /// [`ScaleAlgorithm`] kernel plus a mask of [`ScaleQuality`] bits — and keeps a matching
 /// `SwsContext` alive across calls, so a continuous stream does not pay for a context
 /// allocation per frame.
@@ -759,8 +760,9 @@ impl std::fmt::Debug for Scaler {
     }
 }
 
-/// 池化帧的 stride 对齐（字节）。与 `av_frame_get_buffer` 的默认视频对齐一致，
-/// 编码器内部的 SIMD 读取路径按此假设优化。
+/// 池化帧的 stride 对齐（字节）。与 FFmpeg `#define ALIGN` 的**非 SIMD64** 取值
+/// 一致（`HAVE_SIMD_ALIGN_64` 打开时 FFmpeg 自己用 64，见 `libavutil/frame.c`）；
+/// 编码器内部的 SIMD 读取路径按此假设优化，32 也在所有平台上都被 FFmpeg 接受。
 const POOL_ALIGN: i32 = 32;
 
 /// 池化帧缓冲的额外留白（字节）。`av_image_fill_arrays` 只要求
@@ -788,11 +790,12 @@ fn pooled_frame_buffer_size(fmt: PixelFormat, width: i32, height: i32) -> Result
 /// 内部；缓冲所有权移交给 `frame.buf[0]`——帧被 unref（或引用计数归零）时，
 /// 缓冲自动归还池（池已析构则直接释放）。
 ///
-/// FFmpeg 的池在**复用**时不会重新清零缓冲（与 `av_frame_get_buffer` 的
-/// "每次清零分配"不同），这里在组装帧前把 swscale 不会写入的 padding 字节
-/// 清零（见 [`zero_frame_padding`]）：代价是一次只覆盖 padding 的写，换来与
-/// `alloc_buffer` 完全一致的跨平台语义——帧的 padding 字节内容确定为零，
-/// 编码器内部的 SIMD 读取路径不受脏数据影响。
+/// FFmpeg **两边都不清零**：`AVBufferPool` 复用时不重置内容，而
+/// `av_frame_get_buffer` 走 `av_buffer_alloc`（即 `av_malloc`，没有 memset），
+/// 所以 `alloc_buffer` 出来的帧 padding 同样是未初始化的。这里在组装帧前把
+/// swscale 不会写入的 padding 字节清零（见 [`zero_frame_padding`]）：代价是
+/// 一次只覆盖 padding 的写，换来比 `alloc_buffer` **更严格**的语义——帧的
+/// padding 字节内容确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。
 fn alloc_pooled_frame(
     pool: &mut AVBufferPool,
     width: i32,
@@ -842,12 +845,12 @@ fn alloc_pooled_frame(
         )));
     }
 
-    // 池缓冲在**复用**时不会重新清零（FFmpeg 只在首次分配时置零，见
-    // `AVBufferPool` 的文档），这里把 swscale 不会写入的字节（对齐偏移、行内
-    // stride 余量、平面间隙、尾部留白）恢复为零，保持与 `alloc_buffer`
-    // （`av_frame_get_buffer` 每次清零分配）一致的语义——帧的 padding 字节内容
-    // 确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。可见像素由 swscale
-    // 整体覆写，无需预先清零。
+    // 池缓冲在**复用**时不会重新清零。顺带更正一个常见误解：`alloc_buffer`
+    // 也不清零 —— `av_frame_get_buffer` 走 `av_buffer_alloc`（`av_malloc`），
+    // 所以本函数清零 padding 是比它更严格、而不是"与它一致"。swscale 不会写入
+    // 的字节（对齐偏移、行内 stride 余量、平面间隙、尾部留白）因此确定为零，
+    // 编码器内部的 SIMD 读取路径不受脏数据影响。可见像素由 swscale 整体覆写，
+    // 无需预先清零。
     // Safety: buffer 为独占引用（引用计数 1），data/linesize 是上面
     // `av_image_fill_arrays` 在 buffer 内部排布的结果。
     unsafe {
