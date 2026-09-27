@@ -28,11 +28,9 @@ fn main() -> Result<()> {
     println!("width x height: {}x{}", info.width, info.height);
     println!("bit_rate: {}", info.bit_rate);
     println!("format: {:?}", info.format);
-    println!("time_base: {}/{}", info.time_base.num, info.time_base.den);
-    println!(
-        "frame_rate: {}/{}",
-        info.frame_rate.num, info.frame_rate.den
-    );
+    // [`Rational`] 自带 `Display`（`num/den`），无需拆字段。
+    println!("time_base: {}", info.time_base);
+    println!("frame_rate: {}", info.frame_rate);
 
     // 2. 直接读取底层解码器已打开的上下文参数
     println!("=== Decoder getters ===");
@@ -41,11 +39,7 @@ fn main() -> Result<()> {
     println!("width: {}, height: {}", decoder.width(), decoder.height());
     println!("pix_fmt: {}", decoder.pix_fmt().get_pix_fmt_name());
     println!("duration: {:?}", decoder.duration());
-    println!(
-        "time_base: {}/{}",
-        decoder.time_base().num,
-        decoder.time_base().den
-    );
+    println!("time_base: {}", decoder.time_base());
     println!(
         "frame_rate: (real={}, avg={})",
         decoder.frame_rates().0,

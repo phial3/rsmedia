@@ -146,7 +146,7 @@ fn encode_video_container(container_type: &str, codec_name: &str) -> Result<bool
 
     let encoder = EncoderBuilder::new_video(WIDTH as u32, HEIGHT as u32)
         .with_fps(25.0)
-        .with_codec_name(codec_name.to_string())
+        .with_codec_name(codec_name)
         .build()?;
     let enc_tb = encoder.time_base();
     let mut muxer = rsmedia::mux::Muxer::new(&output_path)?;
@@ -163,7 +163,7 @@ fn encode_video_container(container_type: &str, codec_name: &str) -> Result<bool
     for i in 0..FRAME_COUNT {
         fill_test_frame(&mut frame, i)?;
         frame.set_pts(i as i64);
-        frame.set_time_base(enc_tb);
+        frame.set_time_base(enc_tb.into());
         muxer.mux(frame.clone(), v_idx)?;
     }
 

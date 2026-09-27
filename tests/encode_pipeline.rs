@@ -18,11 +18,12 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
+use rsmedia::Rational;
 use rsmedia::error::Context;
 use rsmedia::options::Options;
 use rsmedia::strutils;
-use rsmedia::time;
 use rsmedia::{
     CodecConfig, DecoderBuilder, EncoderBuilder, Filter, MediaFrame, MediaType, PixelFormat,
     Quality, Result, RsmediaError, SampleFormat, VideoProfile,
@@ -30,6 +31,11 @@ use rsmedia::{
 
 use rsmpeg::avutil;
 use rsmpeg::ffi;
+
+/// 测试用的有理数构造：字面量都是常量，失败即写错，直接 `unwrap`。
+fn rat(num: i32, den: i32) -> Rational {
+    Rational::new(num, den).unwrap()
+}
 
 // ====================================================================
 // 公共测试辅助
@@ -133,9 +139,9 @@ impl SineSample for i32 {
 /// 生成一帧全幅正弦波（幅度 0.5）音频帧，帧数据类型与采样格式自动匹配。
 fn sine_audio_frame<T: SineSample>(
     freq: f32,
-    channels: u32,
+    channels: i32,
     nb_samples: u32,
-    sample_rate: u32,
+    sample_rate: i32,
 ) -> MediaFrame<T> {
     use rsmedia::frame::MediaFrame;
     let mut frame =
@@ -289,7 +295,7 @@ mod video {
         // 否则编码器运行在默认 30fps，与帧 pts 的 25fps 语义不一致，
         // 会导致 flv 等严格 muxer 报 "Invalid pts <= last"）
         let mut builder = EncoderBuilder::new_video(width, height)
-            .with_codec_name(codec_name.to_str()?.to_string())
+            .with_codec_name(codec_name.to_str()?)
             .with_fps(fps as f32)
             .with_filters(filters);
         if spec.bit_rate > 0 {
@@ -310,16 +316,20 @@ mod video {
         // 按容器标准时间基计算帧间隔（验证不同时间基下 pts 均匀）
         let actual_timebase = encoder_time_base;
         let frame_duration_seconds = 1.0 / fps;
-        let duration_units = (frame_duration_seconds * actual_timebase.den as f64
-            / actual_timebase.num as f64)
+        let duration_units = (frame_duration_seconds * actual_timebase.den() as f64
+            / actual_timebase.num() as f64)
             .round() as i64;
         let duration = Time::new(Some(duration_units), actual_timebase);
-        let container_tb = time::new_rational(spec.time_base.0, spec.time_base.1);
+        let container_tb = rat(spec.time_base.0, spec.time_base.1);
         let mut position = Time::new(Some(0), container_tb);
 
         println!(
             "Encoding {} with actual timebase: {}/{}, duration units: {}, fps: {}",
-            spec.container, actual_timebase.num, actual_timebase.den, duration_units, fps
+            spec.container,
+            actual_timebase.num(),
+            actual_timebase.den(),
+            duration_units,
+            fps
         );
 
         // 帧编码并写入文件 0.5s 缩短 valgrind 全量测试耗时
@@ -335,7 +345,7 @@ mod video {
                     .unwrap(),
             );
             let mut avframe = frame.to_avframe()?;
-            avframe.set_time_base(encoder_time_base);
+            avframe.set_time_base(encoder_time_base.into());
 
             muxer.mux(avframe, video_index)?;
 
@@ -406,7 +416,7 @@ mod video {
             // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
             frame.set_pts(i);
             let mut av = frame.to_avframe()?;
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             muxer.mux(av, v_idx)?;
         }
         muxer.finish()?;
@@ -454,7 +464,7 @@ mod video {
             // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
             frame.set_pts(i);
             let mut av = frame.to_avframe()?;
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             muxer.mux(av, v_idx)?;
         }
         muxer.finish()?;
@@ -486,7 +496,7 @@ mod video {
         let path = common::test_output_path("encode", "rsmedia_mjpeg.avi");
         common::remove_test_output(&path);
         let video_encoder = EncoderBuilder::new_video(width, height)
-            .with_codec_name("mjpeg".to_string())
+            .with_codec_name("mjpeg")
             .build()?;
         let enc_tb = video_encoder.time_base();
         let mut muxer = rsmedia::mux::Muxer::new(&path)?;
@@ -496,7 +506,7 @@ mod video {
             // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
             frame.set_pts(i);
             let mut av = frame.to_avframe()?;
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             muxer.mux(av, v_idx)?;
         }
         muxer.finish()?;
@@ -513,7 +523,7 @@ mod video {
 
         // 显式指定编码器不支持的像素格式：build() 应 fail fast
         let result = EncoderBuilder::new_video(width, height)
-            .with_codec_name("mjpeg".to_string())
+            .with_codec_name("mjpeg")
             .with_pix_fmt(PixelFormat::RGB24)
             .build();
         assert!(
@@ -546,7 +556,7 @@ mod video {
             let mut frame = rainbow_video_frame(width, height, i as f32 / 5.0);
             frame.set_pts(i);
             let mut av = frame.to_avframe()?;
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             muxer.mux(av, v_idx)?;
         }
         muxer.finish()?;
@@ -594,7 +604,7 @@ mod video {
             let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
             frame.set_pts(i);
             let mut av = frame.to_avframe()?;
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             muxer.mux(av, v_idx)?;
         }
         muxer.finish()?;
@@ -642,7 +652,7 @@ mod video {
             // 编码器 time_base = 1/fps，每帧 ptp 为 1 tick（=1/fps 秒），帧索引即 pt
             frame.set_pts(i);
             let mut av = frame.to_avframe()?;
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             muxer.mux(av, v_idx)?;
         }
         muxer.finish()?;
@@ -658,7 +668,7 @@ mod video {
 
         // 解码 pts 位于输出流 time_base（movenc 可能调整，如 MP4 用 1/15360）
         let tb = decoder.time_base();
-        let expected_delta = (tb.den as f64 / tb.num as f64 / fps).round() as i64;
+        let expected_delta = (tb.den() as f64 / tb.num() as f64 / fps).round() as i64;
 
         // 排除 B 帧重排的影响：仅断言存在一致的正增量（B 帧可能为 0/负，取出现最多的增量）
         let mut counts: HashMap<i64, usize> = HashMap::new();
@@ -715,7 +725,7 @@ mod video {
 
         // 解码输出按显示顺序排列，pts 应严格等差（步长 = 1/fps 换算到流时间基）。
         let tb = decoder.time_base();
-        let expected_delta = (tb.den as f64 / tb.num as f64 / fps).round() as i64;
+        let expected_delta = (tb.den() as f64 / tb.num() as f64 / fps).round() as i64;
         assert!(
             expected_delta > 0,
             "non-positive expected pts delta: {expected_delta}"
@@ -724,9 +734,8 @@ mod video {
             assert_eq!(
                 *pts,
                 i as i64 * expected_delta,
-                "frame {i}: pts {pts} != {i}*{expected_delta} (tb {}/{})",
-                tb.num,
-                tb.den
+                "frame {i}: pts {pts} != {i}*{expected_delta} (tb {})",
+                tb
             );
         }
 
@@ -752,11 +761,9 @@ mod video {
             let tb = encoder_bare.time_base();
             let expected_tb = avutil::av_inv_q(avutil::av_d2q(fps as f64, 100_000));
             assert_eq!(
-                (tb.num, tb.den),
-                (expected_tb.num, expected_tb.den),
-                "fps={fps}: time_base {}/{} != 1/fps",
-                tb.num,
-                tb.den
+                tb,
+                Rational::from(expected_tb),
+                "fps={fps}: time_base {tb} != 1/fps"
             );
 
             let enc_tb = encoder_bare.time_base();
@@ -766,7 +773,7 @@ mod video {
                 let mut frame = rainbow_video_frame(64, 64, i as f32 / n_frames as f32);
                 frame.set_pts(i);
                 let mut av = frame.to_avframe()?;
-                av.set_time_base(enc_tb);
+                av.set_time_base(enc_tb.into());
                 muxer.mux(av, v_idx)?;
             }
             muxer.finish()?;
@@ -851,7 +858,7 @@ mod video {
 
                             // 编码
                             let enc_bare = EncoderBuilder::new_video(w, h)
-                                .with_codec_name(Some(codec.to_string()))
+                                .with_codec_name(codec)
                                 .with_fps(fps)
                                 .with_filters(if delayed {
                                     Some(vec![Filter::new(
@@ -872,7 +879,7 @@ mod video {
                                 // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick）
                                 frame.set_pts(i);
                                 let mut av = frame.to_avframe()?;
-                                av.set_time_base(enc_tb);
+                                av.set_time_base(enc_tb.into());
                                 muxer.mux(av, v_idx)?;
                             }
                             muxer.finish()?;
@@ -1075,7 +1082,7 @@ mod video {
                     let mut frame = rainbow_video_frame(width, height, i as f32 / n_frames as f32);
                     frame.set_pts(i as i64);
                     let mut av = frame.to_avframe()?;
-                    av.set_time_base(enc_tb);
+                    av.set_time_base(enc_tb.into());
                     muxer.mux(av, idx)?;
                 }
                 muxer.finish()?;
@@ -1159,7 +1166,7 @@ mod video {
             let mut frame = noise_video_frame(width, height, i as u32 + 1);
             frame.set_pts(i);
             let mut av = frame.to_avframe()?;
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             muxer.mux(av, idx)?;
         }
         muxer.finish()?;
@@ -1269,7 +1276,7 @@ mod video {
                 frame.force_key_frame();
             }
             let mut av = frame.to_avframe()?;
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             muxer.mux(av, idx)?;
         }
         // 编码器有内部缓冲，flush（`finish`）之后包里才有全部帧。
@@ -1319,7 +1326,7 @@ mod video {
         let mut muxer =
             rsmedia::mux::Muxer::new_segmented(pattern.to_string_lossy().to_string(), options)?;
         let encoder = EncoderBuilder::new_video(160, 120)
-            .with_codec_name(String::from("libx264"))
+            .with_codec_name("libx264")
             .with_fps(FPS)
             .with_gop_size(GOP)
             .with_bit_rate(400_000)
@@ -1330,7 +1337,7 @@ mod video {
             let mut frame = noise_video_frame(160, 120, i as u32 + 1);
             frame.set_pts(i);
             let mut av = frame.to_avframe()?;
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             muxer.mux(av, idx)?;
         }
         muxer.finish()?;
@@ -1383,17 +1390,17 @@ mod audio {
         /// 目标码率，`0` = 无损/未压缩（编码器自动决定）
         bit_rate: u64,
         /// 期望采样率（编码器不支持时回退其支持列表首项，如 Opus 固定 48kHz 族）
-        sample_rate: u32,
+        sample_rate: i32,
         /// 声道数
-        channels: u32,
+        channels: i32,
     }
 
     const fn ac(
         container: &'static str,
         codec: Option<&'static str>,
         bit_rate: u64,
-        sample_rate: u32,
-        channels: u32,
+        sample_rate: i32,
+        channels: i32,
     ) -> AudioContainerSpec {
         AudioContainerSpec {
             container,
@@ -1458,10 +1465,10 @@ mod audio {
         let rates = config.supported_sample_rates().ok().flatten();
         let sample_rate = match rates {
             Some(rates) if !rates.is_empty() => {
-                if rates.contains(&(spec.sample_rate as i32)) {
+                if rates.contains(&spec.sample_rate) {
                     spec.sample_rate
                 } else {
-                    rates[0] as u32
+                    rates[0]
                 }
             }
             _ => spec.sample_rate, // 固定速率编码器（PCM 等）无列表，直接用表值
@@ -1476,30 +1483,27 @@ mod audio {
         // 按容器规格创建编码器
         let encoder = EncoderBuilder::new_audio(
             spec.bit_rate as i64,
-            spec.channels as i32,
-            sample_rate as i32,
+            spec.channels,
+            sample_rate,
             sample_format,
         )
-        .with_codec_name(codec_name.to_string())
+        .with_codec_name(codec_name)
         .build()?;
 
         // 1) 音频 time_base 应为 1/sample_rate
         let tb = encoder.time_base();
-        let expected_timeb = time::new_rational(1, sample_rate as i32);
+        let expected_timeb = rat(1, sample_rate);
         assert_eq!(
-            (tb.num, tb.den),
-            (expected_timeb.num, expected_timeb.den),
-            "{}: audio time_base {}/{} != 1/sample_rate",
-            spec.container,
-            tb.num,
-            tb.den
+            tb, expected_timeb,
+            "{}: audio time_base {tb} != 1/sample_rate",
+            spec.container
         );
 
         // 2) 编码 5 秒正弦波（1024 采样/帧，末尾不足一帧的余数忽略）；
         //    帧数据类型种类按协商出的采样率格式自动匹配（FLTP/FLT→f32 / S16→S16P / S32P→i32）
         const AUDIO_DURATION_SECS: u32 = 1;
         let samples_per_frame = 1024u32;
-        let frames_to_write = AUDIO_DURATION_SECS * sample_rate / samples_per_frame;
+        let frames_to_write = AUDIO_DURATION_SECS * sample_rate as u32 / samples_per_frame;
         let input_samples = frames_to_write as u64 * samples_per_frame as u64;
         let mut total_pts: i64 = 0;
         {
@@ -1516,7 +1520,7 @@ mod audio {
                         );
                         let mut av = frame.to_avframe()?;
                         av.set_pts(total_pts);
-                        av.set_time_base(tb);
+                        av.set_time_base(tb.into());
                         total_pts += samples_per_frame as i64;
                         muxer.mux(av, a_idx)?;
                     }
@@ -1606,8 +1610,8 @@ mod audio {
     fn test_negotiate_sample_format_pcm() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
+        let sample_rate = 44_100i32;
+        let channels = 2i32;
         let samples_per_frame = 1024u32;
         let frames_to_write = 10u32;
 
@@ -1617,9 +1621,9 @@ mod audio {
         // 不经 new_audio，保持 sample_format 未显式指定
         let audio_encoder = EncoderBuilder::default()
             .with_media_type(MediaType::AUDIO)
-            .with_nb_channels(channels as i32)
-            .with_sample_rate(sample_rate as i32)
-            .with_codec_name("pcm_s16le".to_string())
+            .with_nb_channels(channels)
+            .with_sample_rate(sample_rate)
+            .with_codec_name("pcm_s16le")
             .build()?;
         let enc_tb = audio_encoder.time_base();
         let mut muxer = rsmedia::mux::Muxer::new(&path)?;
@@ -1629,7 +1633,7 @@ mod audio {
             let frame = sine_audio_frame::<f32>(440.0, channels, samples_per_frame, sample_rate);
             let mut av = frame.to_avframe()?;
             av.set_pts(total_pts);
-            av.set_time_base(enc_tb);
+            av.set_time_base(enc_tb.into());
             total_pts += samples_per_frame as i64;
             muxer.mux(av, a_idx)?;
         }
@@ -1654,9 +1658,9 @@ mod audio {
         // 显式指定编码器不支持的采样格式：build() 应 fail fast
         let result = EncoderBuilder::default()
             .with_media_type(MediaType::AUDIO)
-            .with_nb_channels(channels as i32)
-            .with_sample_rate(sample_rate as i32)
-            .with_codec_name("pcm_s16le".to_string())
+            .with_nb_channels(channels)
+            .with_sample_rate(sample_rate)
+            .with_codec_name("pcm_s16le")
             .with_sample_fmt(SampleFormat::FLTP)
             .build();
         assert!(
@@ -1673,8 +1677,8 @@ mod audio {
     fn test_audio_pts_fully_automatic() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType, SampleFormat};
 
-        let sample_rate: u32 = 44_100;
-        let channels: u32 = 2;
+        let sample_rate: i32 = 44_100;
+        let channels: i32 = 2;
         let frame_size: i64 = 1024;
         // 可变输入帧长，故意都不足/超过 1024，触发 fifo 的切分与合并。
         let input_sizes = [700u32, 1300, 900, 1100, 1000];
@@ -1683,13 +1687,8 @@ mod audio {
         let path = common::test_output_path("encode", "rsmedia_no_pts_audio.mp4");
         common::remove_test_output(&path);
 
-        let encoder = EncoderBuilder::new_audio(
-            128_000,
-            channels as i32,
-            sample_rate as i32,
-            SampleFormat::FLTP,
-        )
-        .build()?;
+        let encoder = EncoderBuilder::new_audio(128_000, channels, sample_rate, SampleFormat::FLTP)
+            .build()?;
         assert_eq!(encoder.frame_size(), frame_size as i32, "aac frame_size");
 
         let mut muxer = rsmedia::mux::Muxer::new(&path)?;
@@ -1714,7 +1713,8 @@ mod audio {
         // 解码 pts 位于输出流时间基；a从 0 起步、按 frame_size 等差。
         let tb = decoder.time_base();
         let expected_delta =
-            (frame_size as f64 * tb.den as f64 / tb.num as f64 / sample_rate as f64).round() as i64;
+            (frame_size as f64 * tb.den() as f64 / tb.num() as f64 / sample_rate as f64).round()
+                as i64;
         assert!(
             expected_delta > 0,
             "non-positive expected pts delta: {expected_delta}"
@@ -1723,9 +1723,7 @@ mod audio {
             assert_eq!(
                 *pts,
                 i as i64 * expected_delta,
-                "audio frame {i}: pts {pts} != {i}*{expected_delta} (tb {}/{})",
-                tb.num,
-                tb.den
+                "audio frame {i}: pts {pts} != {i}*{expected_delta} (tb {tb})",
             );
         }
         // Sample conservation: aac restores samples losslessly, but the
@@ -1794,7 +1792,7 @@ mod audio {
         let flac_path = common::test_output_path("encode", "rsmedia_global_header.flac");
         common::remove_test_output(&flac_path);
         let encoder = EncoderBuilder::new_audio(0, 2, 44_100, SampleFormat::S16)
-            .with_codec_name("flac".to_string())
+            .with_codec_name("flac")
             .build()?;
         let enc_tb = encoder.time_base();
         let mut total_pts: i64 = 0;
@@ -1805,7 +1803,7 @@ mod audio {
                 let frame = sine_audio_frame::<i16>(440.0, 2, 1024, 44_100);
                 let mut av = frame.to_avframe()?;
                 av.set_pts(total_pts);
-                av.set_time_base(enc_tb);
+                av.set_time_base(enc_tb.into());
                 total_pts += 1024;
                 muxer.mux(av, idx)?;
             }
@@ -1826,7 +1824,7 @@ mod audio {
         let m4a_path = common::test_output_path("encode", "rsmedia_global_header.m4a");
         common::remove_test_output(&m4a_path);
         let encoder = EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP)
-            .with_codec_name("aac".to_string())
+            .with_codec_name("aac")
             .build()?;
         let enc_tb = encoder.time_base();
         let mut total_pts: i64 = 0;
@@ -1837,7 +1835,7 @@ mod audio {
                 let frame = sine_audio_frame::<f32>(440.0, 2, 1024, 44_100);
                 let mut av = frame.to_avframe()?;
                 av.set_pts(total_pts);
-                av.set_time_base(enc_tb);
+                av.set_time_base(enc_tb.into());
                 total_pts += 1024;
                 muxer.mux(av, idx)?;
             }
@@ -1862,8 +1860,8 @@ mod audio {
         use rsmedia::frame::MediaFrame;
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
+        let sample_rate = 44_100i32;
+        let channels = 2i32;
         let format = SampleFormat::FLTP;
         // AAC 默认 frame_size = 1024 采样/帧
         let samples_per_frame = 1024u32;
@@ -1872,20 +1870,12 @@ mod audio {
         let path = common::test_output_path("encode", "rsmedia_audio_roundtrip.m4a");
         common::remove_test_output(&path);
 
-        let encoder =
-            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                .build()?;
+        let encoder = EncoderBuilder::new_audio(128_000, channels, sample_rate, format).build()?;
 
         // 1) 音频 time_base 应为 1/sample_rate
         let tb = encoder.time_base();
-        let expected_tb = time::new_rational(1, sample_rate as i32);
-        assert_eq!(
-            (tb.num, tb.den),
-            (expected_tb.num, expected_tb.den),
-            "audio time_base {}/{} != 1/sample_rate",
-            tb.num,
-            tb.den
-        );
+        let expected_tb = rat(1, sample_rate);
+        assert_eq!(tb, expected_tb, "audio time_base {tb} != 1/sample_rate");
 
         let mut total_pts: i64 = 0;
         {
@@ -1900,7 +1890,7 @@ mod audio {
                 )?;
                 frame.set_pts(total_pts);
                 let mut av = frame.to_avframe()?;
-                av.set_time_base(tb);
+                av.set_time_base(tb.into());
                 total_pts += samples_per_frame as i64;
                 muxer.mux(av, idx)?;
             }
@@ -1944,8 +1934,8 @@ mod audio {
         use rsmedia::frame::MediaFrame;
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
+        let sample_rate = 44_100i32;
+        let channels = 2i32;
         let format = SampleFormat::FLTP;
         let samples_per_frame = 1024u32;
         let frames_to_write = 5u32;
@@ -1953,9 +1943,7 @@ mod audio {
         let path = common::test_output_path("encode", "rsmedia_audio_undeclared_rate.m4a");
         common::remove_test_output(&path);
 
-        let encoder =
-            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                .build()?;
+        let encoder = EncoderBuilder::new_audio(128_000, channels, sample_rate, format).build()?;
         let enc_tb = encoder.time_base();
 
         let mut total_pts: i64 = 0;
@@ -1973,7 +1961,7 @@ mod audio {
                 // 模拟「调用方没有声明采样率」——用户手搓的 AVFrame 就是这个状态。
                 av.set_sample_rate(0);
                 av.set_pts(total_pts);
-                av.set_time_base(enc_tb);
+                av.set_time_base(enc_tb.into());
                 total_pts += samples_per_frame as i64;
                 muxer.mux(av, idx)?;
             }
@@ -2005,8 +1993,8 @@ mod audio {
         use rsmedia::frame::MediaFrame;
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
+        let sample_rate = 44_100i32;
+        let channels = 2i32;
         let format = SampleFormat::FLTP;
         // AAC frame_size = 1024；故意发非整倍数：3×1000 = 3000 样本
         let samples_per_frame = 1000u32;
@@ -2015,9 +2003,7 @@ mod audio {
         let path = common::test_output_path("encode", "rsmedia_audio_partial.m4a");
         common::remove_test_output(&path);
 
-        let encoder =
-            EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                .build()?;
+        let encoder = EncoderBuilder::new_audio(128_000, channels, sample_rate, format).build()?;
         let enc_tb = encoder.time_base();
         let mut total_pts: i64 = 0;
         {
@@ -2032,7 +2018,7 @@ mod audio {
                 )?;
                 frame.set_pts(total_pts);
                 let mut av = frame.to_avframe()?;
-                av.set_time_base(enc_tb);
+                av.set_time_base(enc_tb.into());
                 total_pts += samples_per_frame as i64;
                 muxer.mux(av, idx)?;
             }
@@ -2065,8 +2051,8 @@ mod audio {
         use rsmedia::frame::MediaFrame;
         use rsmedia::{DecoderBuilder, EncoderBuilder, MediaType, SampleFormat};
 
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
+        let sample_rate = 44_100i32;
+        let channels = 2i32;
         let format = SampleFormat::FLTP;
         let samples_per_frame = 1024u32;
         let frames_to_write = 10u32;
@@ -2077,8 +2063,7 @@ mod audio {
         common::remove_test_output(&dst);
 
         // 1) 生成源音频文件
-        let enc = EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-            .build()?;
+        let enc = EncoderBuilder::new_audio(128_000, channels, sample_rate, format).build()?;
         let src_enc_tb = enc.time_base();
         let mut total_pts: i64 = 0;
         {
@@ -2093,7 +2078,7 @@ mod audio {
                 )?;
                 frame.set_pts(total_pts);
                 let mut av = frame.to_avframe()?;
-                av.set_time_base(src_enc_tb);
+                av.set_time_base(src_enc_tb.into());
                 total_pts += samples_per_frame as i64;
                 muxer.mux(av, src_idx)?;
             }
@@ -2104,8 +2089,7 @@ mod audio {
         // 2) 转码：解码源 → 重编码到新文件
         let mut src_reader = rsmedia::StreamReader::new(&src)?;
         let mut dec = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&src_reader)?;
-        let enc2 = EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-            .build()?;
+        let enc2 = EncoderBuilder::new_audio(128_000, channels, sample_rate, format).build()?;
         let dst_enc_tb = enc2.time_base();
         let mut dst_pts: i64 = 0;
         let mut transcoded_samples = 0u64;
@@ -2116,7 +2100,7 @@ mod audio {
                 transcoded_samples += frame.nb_samples as u64;
                 let mut av = frame.to_avframe()?;
                 av.set_pts(dst_pts);
-                av.set_time_base(dst_enc_tb);
+                av.set_time_base(dst_enc_tb.into());
                 dst_pts += frame.nb_samples as i64;
                 muxer.mux(av, dst_idx)?;
             }
@@ -2164,8 +2148,8 @@ mod audio {
         use rsmedia::filter::{self, audio};
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100u32;
-        let channels = 2u32;
+        let sample_rate = 44_100i32;
+        let channels = 2i32;
         let format = SampleFormat::FLTP;
         let samples_per_frame = 1024u32;
         let frames_to_write = 12u32;
@@ -2215,7 +2199,15 @@ mod audio {
                 filter::setpts(MediaType::AUDIO, "PTS-STARTPTS"),
                 false,
             ),
-            ("atrim", filter::trim(MediaType::AUDIO, 0.0, 0.2), false),
+            (
+                "atrim",
+                filter::trim(
+                    MediaType::AUDIO,
+                    Duration::from_millis(0),
+                    Duration::from_millis(200),
+                ),
+                false,
+            ),
         ];
 
         for (name, audio_filter, duration_preserving) in cases {
@@ -2226,10 +2218,9 @@ mod audio {
                 continue;
             }
 
-            let enc =
-                EncoderBuilder::new_audio(128_000, channels as i32, sample_rate as i32, format)
-                    .with_filters(vec![audio_filter])
-                    .build()?;
+            let enc = EncoderBuilder::new_audio(128_000, channels, sample_rate, format)
+                .with_filters(vec![audio_filter])
+                .build()?;
             let enc_tb = enc.time_base();
             let mut total_pts: i64 = 0;
             {
@@ -2240,7 +2231,7 @@ mod audio {
                         sine_audio_frame::<f32>(440.0, channels, samples_per_frame, sample_rate);
                     frame.set_pts(total_pts);
                     let mut av = frame.to_avframe()?;
-                    av.set_time_base(enc_tb);
+                    av.set_time_base(enc_tb.into());
                     total_pts += samples_per_frame as i64;
                     muxer.mux(av, idx)?;
                 }

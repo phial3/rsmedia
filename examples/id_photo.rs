@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result};
 
-use rsmedia::ffmpeg::ffi::AVRational;
+use rsmedia::Rational;
 use rsmedia::filter::{Filter, FilterGraphBuilder, FilterNode, VideoEndpoint, video};
 use rsmedia::io::BufferWriter;
 use rsmedia::{
@@ -311,7 +311,7 @@ fn encode_jpeg(frame: &MediaFrame<u8>, qscale: u32) -> Result<Vec<u8>> {
     options.set("qmax", qscale.to_string());
 
     let encoder = EncoderBuilder::new_video(frame.width, frame.height)
-        .with_codec_name("mjpeg".to_string())
+        .with_codec_name("mjpeg")
         .with_pix_fmt(PixelFormat::YUVJ444P)
         .with_fps(25.0)
         .with_options(options)
@@ -326,7 +326,7 @@ fn encode_jpeg(frame: &MediaFrame<u8>, qscale: u32) -> Result<Vec<u8>> {
 
     let mut av = frame.to_avframe()?;
     av.set_pts(0);
-    av.set_time_base(enc_tb);
+    av.set_time_base(enc_tb.into());
     muxer.mux(av, stream)?;
     muxer.finish()?;
     Ok(muxer.into_writer().into_bytes())
@@ -338,8 +338,8 @@ fn rgb_endpoint(width: i32, height: i32) -> VideoEndpoint {
         width,
         height,
         PixelFormat::RGB24,
-        AVRational { num: 1, den: 25 },
-        AVRational { num: 25, den: 1 },
+        Rational::new(1, 25).unwrap(),
+        Rational::new(25, 1).unwrap(),
     )
 }
 

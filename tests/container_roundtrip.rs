@@ -47,7 +47,7 @@ const VIDEO_FRAMES: i64 = 10;
 /// lot (AAC 1024 samples, FLAC 4608), so counting frames would give a 0.23 s
 /// file for one container and a 1.05 s file for the next.
 const AUDIO_SECONDS: f64 = 0.4;
-const CHANNELS: u32 = 2;
+const CHANNELS: i32 = 2;
 /// Both cues live inside the video's duration.
 const CUES: [(i64, i64, &str); 2] = [
     (0, 150, "first cue"),
@@ -74,7 +74,7 @@ struct ContainerSpec {
     audio: Option<&'static str>,
     subtitle: Option<&'static str>,
     /// Audio sample rate: the Opus and AC-3 families are fixed at 48 kHz.
-    sample_rate: u32,
+    sample_rate: i32,
     /// Raw elementary stream: the output format has no global-header concept, so
     /// the encoder must keep its parameter sets in-band. The builder *guesses*
     /// `AV_CODEC_FLAG_GLOBAL_HEADER` by default (right for containers, wrong
@@ -87,7 +87,7 @@ const fn spec(
     video: Option<&'static str>,
     audio: Option<&'static str>,
     subtitle: Option<&'static str>,
-    sample_rate: u32,
+    sample_rate: i32,
 ) -> ContainerSpec {
     ContainerSpec {
         name,
@@ -108,7 +108,7 @@ const fn spec_as(
     video: Option<&'static str>,
     audio: Option<&'static str>,
     subtitle: Option<&'static str>,
-    sample_rate: u32,
+    sample_rate: i32,
 ) -> ContainerSpec {
     ContainerSpec {
         name,
@@ -245,7 +245,7 @@ fn codec_id(encoder: &str) -> ffi::AVCodecID {
 /// encoder converts them, but its own format has to be requested correctly or
 /// the builder rejects the configuration. The rate prefers the one the matrix
 /// asks for and falls back to the codec's list (Opus is fixed at 48 kHz).
-fn negotiate_audio(codec: &str, preferred_rate: u32) -> Result<(SampleFormat, u32)> {
+fn negotiate_audio(codec: &str, preferred_rate: i32) -> Result<(SampleFormat, i32)> {
     let Some(encoder) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec)?) else {
         return Err(RsmediaError::unsupported(format!(
             "encoder '{codec}' is not available in this FFmpeg build"
@@ -262,9 +262,7 @@ fn negotiate_audio(codec: &str, preferred_rate: u32) -> Result<(SampleFormat, u3
         })?;
 
     let sample_rate = match config.supported_sample_rates()? {
-        Some(rates) if !rates.is_empty() && !rates.contains(&(preferred_rate as i32)) => {
-            rates[0] as u32
-        }
+        Some(rates) if !rates.is_empty() && !rates.contains(&preferred_rate) => rates[0],
         _ => preferred_rate,
     };
 
@@ -277,8 +275,8 @@ struct Written {
     /// codecs re-chunk; lossy ones add padding, hence the tolerance below).
     frame_samples: u32,
     audio_samples: u64,
-    sample_rate: u32,
-    channels: u32,
+    sample_rate: i32,
+    channels: i32,
 }
 
 /// Decodes the audio stream into its **native** element type, returning
@@ -380,7 +378,7 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
             if spec.raw {
                 builder = builder.with_global_header(false);
             }
-            let encoder = builder.with_codec_name(Some(codec.to_string())).build()?;
+            let encoder = builder.with_codec_name(codec).build()?;
             Some(muxer.add_encoder(encoder)?)
         }
         None => None,
@@ -389,14 +387,9 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
     let (audio_index, frame_samples, sample_rate) = match spec.audio {
         Some(codec) => {
             let (sample_format, sample_rate) = negotiate_audio(codec, spec.sample_rate)?;
-            let encoder = EncoderBuilder::new_audio(
-                128_000,
-                CHANNELS as i32,
-                sample_rate as i32,
-                sample_format,
-            )
-            .with_codec_name(Some(codec.to_string()))
-            .build()?;
+            let encoder = EncoderBuilder::new_audio(128_000, CHANNELS, sample_rate, sample_format)
+                .with_codec_name(codec)
+                .build()?;
             // Fixed-frame-size codecs (AAC 1024, Opus 960, MP3 1152) want exactly
             // this many samples per frame; the rest take whole frames as they come.
             let frame_size = encoder.frame_size();
@@ -417,7 +410,7 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
     let subtitle_index = match spec.subtitle {
         Some(codec) => {
             let encoder = EncoderBuilder::new_subtitle()
-                .with_codec_name(Some(codec.to_string()))
+                .with_codec_name(codec)
                 .with_subtitle_header(SUBTITLE_HEADER)
                 .build()?;
             Some(muxer.add_encoder(encoder)?)
@@ -593,7 +586,7 @@ fn verify_container(path: &Path, spec: &ContainerSpec, written: &Written) -> Res
     if let Some(codec) = spec.subtitle {
         let mut reader = spec.reader(path)?;
         let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
-            .with_codec_name(Some(codec.to_string()))
+            .with_codec_name(codec)
             .build_from_reader(&reader)?;
         let mut decoded = Vec::new();
         while let Some(segment) = decoder.decode_subtitle_segment(&mut reader)? {

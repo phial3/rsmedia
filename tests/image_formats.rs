@@ -109,7 +109,7 @@ fn write_single_image(path: &Path, spec: &ImageSpec) -> Result<()> {
     let mut muxer = Muxer::new(path)?;
     let encoder = EncoderBuilder::new_video(WIDTH, HEIGHT)
         .with_fps(FPS)
-        .with_codec_name(spec.codec.to_string())
+        .with_codec_name(spec.codec)
         .build()?;
     let index = muxer.add_encoder(encoder)?;
 

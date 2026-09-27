@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result};
 
-use rsmedia::ffmpeg::ffi::AVRational;
+use rsmedia::Rational;
 use rsmedia::filter::{AudioEndpoint, FilterGraphBuilder, VideoEndpoint};
 use rsmedia::{EncoderBuilder, MediaFrame, Muxer, PixelFormat, SampleFormat};
 
@@ -83,7 +83,7 @@ fn compose_hstack_to_file() -> Result<usize> {
         // 图的输出时间基与编码器一致（都是 1/25），pts 直接用帧序号。
         let mut frame = frame;
         frame.set_pts(index);
-        frame.set_time_base(enc_tb);
+        frame.set_time_base(enc_tb.into());
         muxer.mux(frame, stream)?;
         written += 1;
     }
@@ -91,7 +91,7 @@ fn compose_hstack_to_file() -> Result<usize> {
     // 两路 EOF 之后图里可能还有残余帧（hstack 无延迟，通常为 0）。
     for mut frame in graph.drain_output(0)? {
         frame.set_pts(written as i64);
-        frame.set_time_base(enc_tb);
+        frame.set_time_base(enc_tb.into());
         muxer.mux(frame, stream)?;
         written += 1;
     }
@@ -270,8 +270,8 @@ fn video_endpoint(width: u32, height: u32) -> VideoEndpoint {
         width as i32,
         height as i32,
         PixelFormat::YUV420P,
-        AVRational { num: 1, den: FPS },
-        AVRational { num: FPS, den: 1 },
+        Rational::new(1, FPS).unwrap(),
+        Rational::new(FPS, 1).unwrap(),
     )
 }
 
@@ -281,10 +281,7 @@ fn audio_endpoint() -> AudioEndpoint {
         1,
         SAMPLE_RATE,
         SampleFormat::FLTP,
-        AVRational {
-            num: 1,
-            den: SAMPLE_RATE,
-        },
+        Rational::new(1, SAMPLE_RATE).unwrap(),
     )
 }
 
@@ -301,7 +298,7 @@ fn solid_frame(width: u32, height: u32, luma: u8, pts: i64) -> Result<MediaFrame
         planes[2].fill(128);
     }
     frame.set_pts(pts);
-    frame.set_time_base(AVRational { num: 1, den: FPS });
+    frame.set_time_base(Rational::new(1, FPS).unwrap());
     Ok(frame)
 }
 
@@ -309,7 +306,7 @@ fn solid_frame(width: u32, height: u32, luma: u8, pts: i64) -> Result<MediaFrame
 fn tone_frame(value: f32, pts: i64) -> Result<MediaFrame<f32>> {
     let nb_samples = SAMPLES_PER_FRAME as u32;
     let mut frame =
-        MediaFrame::<f32>::new_audio_frame(SampleFormat::FLTP, 1, nb_samples, SAMPLE_RATE as u32)?;
+        MediaFrame::<f32>::new_audio_frame(SampleFormat::FLTP, 1, nb_samples, SAMPLE_RATE)?;
     {
         let planes = frame
             .data

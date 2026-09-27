@@ -52,7 +52,7 @@ fn make_test_video(
         let mut avframe = frame.to_avframe()?;
         // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick = 1/fps 秒）
         avframe.set_pts(i as i64);
-        avframe.set_time_base(encoder_time_base);
+        avframe.set_time_base(encoder_time_base.into());
         muxer.mux(avframe, video_index)?;
     }
     muxer.finish()?;

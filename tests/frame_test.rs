@@ -8,6 +8,7 @@
 //!
 //! Requires the `ndarray` feature (`frame` itself is behind it).
 
+use rsmedia::Rational;
 use rsmedia::colors::Color;
 use rsmedia::error::{Context, Result};
 use rsmedia::{
@@ -441,7 +442,7 @@ fn test_audio_planar_frame_conversion() -> Result<()> {
         vec![(1, nb_samples as usize), (1, nb_samples as usize)]
     );
     assert_eq!(media_frame.nb_samples, nb_samples as u32);
-    assert_eq!(media_frame.nb_channels, nb_channels as u32);
+    assert_eq!(media_frame.nb_channels, nb_channels);
 
     // 验证数据（每个声道首样本）
     let planes = media_frame.data.as_planes().unwrap();
@@ -528,7 +529,7 @@ fn test_audio_interleaved_frame_conversion() -> Result<()> {
     let packed = media_frame.data.as_packed().expect("FLT is interleaved");
     assert_eq!(packed.dim(), (1, nb_samples as usize, nb_channels as usize));
     assert_eq!(media_frame.nb_samples, nb_samples as u32);
-    assert_eq!(media_frame.nb_channels, nb_channels as u32);
+    assert_eq!(media_frame.nb_channels, nb_channels);
 
     // 验证数据（首个采样点的两个声道）
     assert_eq!(packed[[0, 0, 0]], 0.0f32);
@@ -648,8 +649,8 @@ fn test_from_avframe_invalid_time_base() -> Result<()> {
     aframe.alloc_buffer()?;
     let media = MediaFrame::<f32>::from_avframe(&aframe)?;
     assert_eq!(media.media_type, MediaType::AUDIO);
-    assert_eq!(media.time_base.num, 1);
-    assert_eq!(media.time_base.den, 48000);
+    assert_eq!(media.time_base.num(), 1);
+    assert_eq!(media.time_base.den(), 48000);
 
     // 视频帧未设置 time_base，无法从帧内推断，保留原值（den==0）
     let mut vframe = AVFrame::new();
@@ -659,7 +660,7 @@ fn test_from_avframe_invalid_time_base() -> Result<()> {
     vframe.alloc_buffer()?;
     let vmedia = MediaFrame::<u8>::from_avframe(&vframe)?;
     assert_eq!(vmedia.media_type, MediaType::VIDEO);
-    assert_eq!(vmedia.time_base.num, 0); // 无效，保留原值
+    assert!(vmedia.time_base.is_zero()); // 无效，折叠为 0/1
 
     Ok(())
 }
@@ -679,7 +680,7 @@ fn test_avframe_metadata_roundtrip() -> Result<()> {
         (*av.as_mut_ptr()).color_primaries = ffi::AVCOL_PRI_BT709;
         (*av.as_mut_ptr()).color_trc = ffi::AVCOL_TRC_BT709;
         (*av.as_mut_ptr()).color_range = ffi::AVCOL_RANGE_JPEG;
-        (*av.as_mut_ptr()).sample_aspect_ratio = ffi::AVRational { num: 4, den: 3 };
+        (*av.as_mut_ptr()).sample_aspect_ratio = Rational::new(4, 3).unwrap().into();
         (*av.as_mut_ptr()).best_effort_timestamp = 42;
     }
     av.alloc_buffer()?;
@@ -692,8 +693,8 @@ fn test_avframe_metadata_roundtrip() -> Result<()> {
     assert_eq!(media.repeat_pict, 1);
     assert_eq!(media.colorspace, ffi::AVCOL_SPC_BT709);
     assert_eq!(media.color_range, ffi::AVCOL_RANGE_JPEG);
-    assert_eq!(media.sample_aspect_ratio.num, 4);
-    assert_eq!(media.sample_aspect_ratio.den, 3);
+    assert_eq!(media.sample_aspect_ratio.num(), 4);
+    assert_eq!(media.sample_aspect_ratio.den(), 3);
     assert_eq!(media.best_effort_timestamp, 42);
 
     // MediaFrame -> AVFrame -> MediaFrame，验证写回的元数据能再次读回
@@ -703,7 +704,7 @@ fn test_avframe_metadata_roundtrip() -> Result<()> {
     assert_eq!(back.quality, 12);
     assert_eq!(back.repeat_pict, 1);
     assert_eq!(back.colorspace, ffi::AVCOL_SPC_BT709);
-    assert_eq!(back.sample_aspect_ratio.num, 4);
+    assert_eq!(back.sample_aspect_ratio.num(), 4);
 
     Ok(())
 }
@@ -918,9 +919,9 @@ fn test_video_rgb24_data_roundtrip() -> Result<()> {
     assert_eq!(back.media_type, MediaType::VIDEO);
     assert_eq!(back.pts, 12345);
     assert_eq!(back.format, FrameFormat::Pixel(PixelFormat::RGB24));
+    // `Rational` 的分母恒为正：FFmpeg 的 0/0（未知）与 0/1 都归一成 `ZERO`。
     assert!(
-        back.sample_aspect_ratio.num == 0 && back.sample_aspect_ratio.den == 0
-            || back.sample_aspect_ratio.num == 0 && back.sample_aspect_ratio.den == 1,
+        back.sample_aspect_ratio.is_zero(),
         "sample_aspect_ratio 应保持 0/1 表示未知"
     );
 
@@ -972,8 +973,8 @@ fn test_video_yuv420p_data_roundtrip() -> Result<()> {
 #[test]
 fn test_audio_fltp_data_roundtrip() -> Result<()> {
     let nb_samples = 256u32;
-    let nb_channels = 2u32;
-    let sample_rate = 48000u32;
+    let nb_channels = 2i32;
+    let sample_rate = 48000i32;
     let mut media =
         MediaFrame::new_audio_frame(SampleFormat::FLTP, nb_channels, nb_samples, sample_rate)?;
     // 填充有区分度的样本（每采样点不同，且声道间不同）
@@ -1012,7 +1013,7 @@ fn test_audio_fltp_data_roundtrip() -> Result<()> {
 /// 交错音频（S16）往返：布局为单个 `(1, nb_samples, nb_channels)` 数组。
 #[test]
 fn test_audio_interleaved_data_roundtrip() -> Result<()> {
-    let (nb_samples, nb_channels) = (128u32, 2u32);
+    let (nb_samples, nb_channels) = (128u32, 2i32);
     let mut media =
         MediaFrame::<i16>::new_audio_frame(SampleFormat::S16, nb_channels, nb_samples, 48000)?;
     let packed = media.data.as_packed_mut().expect("S16 is interleaved");

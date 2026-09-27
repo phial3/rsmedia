@@ -89,7 +89,11 @@ fn main() -> Result<()> {
     let encoder = Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
     let mut muxer = Muxer::new(&output)?;
     let audio_index = muxer.add_encoder(encoder)?;
-    let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels))?;
+    let mut sink = PcmSink::new(
+        muxer,
+        audio_index,
+        PcmSpec::new(rate as i32, channels as i32),
+    )?;
 
     // ---- cpal 侧：音频回调线程 --mpsc--> 主线程（PcmSink 非线程安全，留在主线程）----
     let (chunk_tx, chunk_rx) = mpsc::channel::<Chunk>();
@@ -235,7 +239,11 @@ mod tests {
             Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
         let mut muxer = Muxer::new(&output)?;
         let audio_index = muxer.add_encoder(encoder)?;
-        let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels))?;
+        let mut sink = PcmSink::new(
+            muxer,
+            audio_index,
+            PcmSpec::new(rate as i32, channels as i32),
+        )?;
 
         // 1 秒 440Hz 正弦，模拟 cpal 回调块粒度
         let total = rate as usize;

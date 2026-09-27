@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
         // decoder with CUDA acceleration
         .with_hardware_device(Some(HWDeviceConfig::auto_platform()?))
         // h264_cuvid decoder name
-        // .with_codec_name("h264_cuvid".to_string())
+        // .with_codec_name("h264_cuvid")
         .with_filters(filters)
         .build_from_reader(&reader)
         .context("failed to create decoder")?;

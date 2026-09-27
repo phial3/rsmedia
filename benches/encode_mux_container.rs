@@ -15,13 +15,14 @@
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
+use rsmedia::Rational;
+use rsmedia::Writer;
 use rsmedia::encode::EncoderBuilder;
 use rsmedia::frame::MediaFrame;
 use rsmedia::io::StreamWriter;
 use rsmedia::pixel::PixelFormat;
 use rsmedia::subtitle::SubtitleSegment;
 use rsmedia::{SampleFormat, init};
-use rsmedia::{Writer, time};
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -35,21 +36,16 @@ use common::{
 
 /// One iteration: a complete 3-stream MP4 (2 s video + ~3 s audio + 30
 /// subtitle cues), every encoder using `enc_threads` threads.
-fn encode_container(path: &Path, enc_threads: u32) -> Result<()> {
+fn encode_container(path: &Path, enc_threads: i32) -> Result<()> {
     let mut v_enc = EncoderBuilder::new_video(WIDTH, HEIGHT)
         .with_fps(FPS)
         .with_thread_count(enc_threads)
         .build()?;
-    let mut a_enc = EncoderBuilder::new_audio(
-        128_000,
-        CHANNELS as i32,
-        SAMPLE_RATE as i32,
-        SampleFormat::FLTP,
-    )
-    .with_thread_count(enc_threads)
-    .build()?;
+    let mut a_enc = EncoderBuilder::new_audio(128_000, CHANNELS, SAMPLE_RATE, SampleFormat::FLTP)
+        .with_thread_count(enc_threads)
+        .build()?;
     let mut s_enc = EncoderBuilder::new_subtitle()
-        .with_codec_name(Some("mov_text".to_string()))
+        .with_codec_name("mov_text")
         .with_subtitle_header(ASS_HEADER)
         .with_thread_count(enc_threads)
         .build()?;
@@ -66,7 +62,8 @@ fn encode_container(path: &Path, enc_threads: u32) -> Result<()> {
     );
 
     // Video frames (60): pts left unset, the encoder numbers them automatically.
-    let v_frame_ticks = rsmpeg::avutil::av_rescale_q(1, time::new_rational(1, FPS as i32), v_tb);
+    let v_frame_ticks =
+        rsmpeg::avutil::av_rescale_q(1, Rational::new(1, FPS as i32).unwrap().into(), v_tb.into());
     for i in 0..VIDEO_FRAMES {
         let frame = rainbow_frame(i as f32 / VIDEO_FRAMES as f32).to_avframe()?;
         for mut pkt in v_enc.encode_raw(frame)? {
@@ -84,8 +81,8 @@ fn encode_container(path: &Path, enc_threads: u32) -> Result<()> {
     // Audio frames (variable sizes; the encoder's sample FIFO re-frames them).
     let a_frame_ticks = rsmpeg::avutil::av_rescale_q(
         a_enc.frame_size() as i64,
-        time::new_rational(1, SAMPLE_RATE as i32),
-        a_tb,
+        Rational::new(1, SAMPLE_RATE).unwrap().into(),
+        a_tb.into(),
     );
     for i in 0..AUDIO_FRAMES {
         let nb = 700u32 + ((i as u32 * 173) % 1200);
@@ -135,8 +132,8 @@ fn write_packet(
     writer: &mut StreamWriter,
     pkt: &mut rsmpeg::avcodec::AVPacket,
     stream_idx: usize,
-    enc_tb: rsmpeg::ffi::AVRational,
-    out_tb: rsmpeg::ffi::AVRational,
+    enc_tb: Rational,
+    out_tb: Rational,
     fallback_duration_ticks: i64,
 ) -> Result<()> {
     pkt.set_pos(-1);
@@ -145,7 +142,7 @@ fn write_packet(
     // duration must therefore be set AFTER this call: a value assigned in
     // out_tb units beforehand gets converted a second time (inflating it by
     // the enc_tb/out_tb ratio and corrupting the track's tkhd/elst duration).
-    pkt.rescale_ts(enc_tb, out_tb);
+    pkt.rescale_ts(enc_tb.into(), out_tb.into());
     if pkt.duration <= 0 && fallback_duration_ticks > 0 {
         pkt.set_duration(fallback_duration_ticks);
     }
@@ -190,7 +187,7 @@ fn sine_audio_frame(nb_samples: u32) -> MediaFrame<f32> {
 
 fn bench_container(c: &mut Criterion) {
     init().expect("rsmedia init failed");
-    let cores = cores() as u32;
+    let cores = cores() as i32;
     let dir = bench_dir();
     let path: PathBuf = dir.join("container_bench.mp4");
 

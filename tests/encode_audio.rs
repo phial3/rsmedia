@@ -504,7 +504,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
     ];
 
     let encoder = EncoderBuilder::new_audio(bit_rate, channels, sample_rate, sample_format)
-        .with_codec_name(codec_name.to_string())
+        .with_codec_name(codec_name)
         .with_filters(audio_filters)
         .build()?;
     let enc_tb = encoder.time_base();
@@ -529,7 +529,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
     for pts in (0..total_samples).step_by(frame_size as usize) {
         generate_sine_wave(&mut frame, 440.0, sample_rate).context("Failed to generate samples")?;
         frame.set_pts(pts);
-        frame.set_time_base(enc_tb);
+        frame.set_time_base(enc_tb.into());
         muxer.mux(frame.clone(), a_idx)?;
     }
 

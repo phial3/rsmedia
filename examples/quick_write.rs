@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
         let mut av = frame.to_avframe()?;
         // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick = 1/fps 秒）
         av.set_pts(i as i64);
-        av.set_time_base(enc_tb);
+        av.set_time_base(enc_tb.into());
         muxer.mux(av, v_idx)?;
     }
 

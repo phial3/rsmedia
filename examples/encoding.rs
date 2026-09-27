@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
         // encoder with CUDA acceleration
         .with_hardware_device(Some(HWDeviceConfig::auto_platform()?))
         // libx264, libx265, h264_nvenc, h264_vaapi
-        // .with_codec_name("h264_nvenc".to_string())
+        // .with_codec_name("h264_nvenc")
         // .with_options(Options::preset_h264_nvenc())
         .with_filters(filters)
         .build()
@@ -75,7 +75,7 @@ fn main() -> anyhow::Result<()> {
             p.set_pos(-1);
             p.set_stream_index(stream_idx as i32);
             // 把 packet 时间戳从编码器时间基换算到输出流时间基
-            p.rescale_ts(encoder.time_base(), out_stream_time_base);
+            p.rescale_ts(encoder.time_base().into(), out_stream_time_base.into());
             // 写出到容器：由 StreamWriter 承接，不丢包
             writer.write_frame(&mut p)?;
         }

@@ -19,8 +19,8 @@ const HEIGHT: u32 = 240;
 const FPS: f32 = 30.0;
 const VIDEO_FRAMES: usize = 90; // 3 s
 
-const SAMPLE_RATE: u32 = 44_100;
-const CHANNELS: u32 = 2;
+const SAMPLE_RATE: i32 = 44_100;
+const CHANNELS: i32 = 2;
 const AUDIO_FRAMES: usize = 129; // variable sizes, sums to ~3 s
 const FREQ: f32 = 440.0;
 
@@ -54,13 +54,8 @@ fn encode_video() -> anyhow::Result<()> {
 /// Variable-size audio frames (so the encoder's sample FIFO has to split and merge),
 /// pts left unset on every one of them.
 fn encode_audio() -> anyhow::Result<()> {
-    let encoder = EncoderBuilder::new_audio(
-        128_000,
-        CHANNELS as i32,
-        SAMPLE_RATE as i32,
-        SampleFormat::FLTP,
-    )
-    .build()?;
+    let encoder =
+        EncoderBuilder::new_audio(128_000, CHANNELS, SAMPLE_RATE, SampleFormat::FLTP).build()?;
     let mut muxer = Muxer::new("/tmp/rsmedia_auto_pts.m4a")?;
     let a_idx = muxer.add_encoder(encoder)?;
 

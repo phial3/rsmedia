@@ -32,7 +32,7 @@ fn check(codec: &'static str, ext: &str) -> anyhow::Result<()> {
     let dev = HWDeviceConfig::auto_platform_with(&[HWDeviceType::VIDEOTOOLBOX])?;
     let enc = EncoderBuilder::new_video(w, h)
         .with_fps(30.0)
-        .with_codec_name(codec.to_string())
+        .with_codec_name(codec)
         .with_hardware_device(Some(dev))
         .build()?;
     let enc_tb = enc.time_base();
@@ -41,7 +41,7 @@ fn check(codec: &'static str, ext: &str) -> anyhow::Result<()> {
     for i in 0..n {
         let mut av = rainbow_frame(w, h, i as f32 / n as f32).to_avframe()?;
         av.set_pts(i as i64);
-        av.set_time_base(enc_tb);
+        av.set_time_base(enc_tb.into());
         muxer.mux(av, v_idx)?;
     }
     muxer.finish()?;

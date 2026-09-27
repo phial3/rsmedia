@@ -2,24 +2,24 @@
 mod common;
 use anyhow::{Context, Result};
 use common::test_output_path;
+use rsmedia::Rational;
 use rsmpeg::{
     avcodec::AVPacket,
     avformat::{AVFormatContextInput, AVFormatContextOutput},
     avutil::{ts2str, ts2timestr},
-    ffi::AVRational,
 };
 use std::ffi::{CStr, CString};
 
-fn log_packet(time_base: AVRational, pkt: &AVPacket, tag: &str) {
+fn log_packet(time_base: Rational, pkt: &AVPacket, tag: &str) {
     println!(
         "{}: pts:{} pts_time:{} dts:{} dts_time:{} duration:{} duration_time:{} stream_index:{}",
         tag,
         ts2str(pkt.pts),
-        ts2timestr(pkt.pts, time_base),
+        ts2timestr(pkt.pts, time_base.into()),
         ts2str(pkt.dts),
-        ts2timestr(pkt.dts, time_base),
+        ts2timestr(pkt.dts, time_base.into()),
         ts2str(pkt.duration),
-        ts2timestr(pkt.duration, time_base),
+        ts2timestr(pkt.duration, time_base.into()),
         pkt.stream_index
     );
 }
@@ -70,11 +70,11 @@ fn remux(input_path: &CStr, output_path: &CStr) -> Result<()> {
         {
             let input_stream = &input_format_context.streams()[input_stream_index];
             let output_stream = &output_format_context.streams()[output_stream_index];
-            log_packet(input_stream.time_base, &packet, "in");
+            log_packet(input_stream.time_base.into(), &packet, "in");
             packet.rescale_ts(input_stream.time_base, output_stream.time_base);
             packet.set_stream_index(output_stream_index as i32);
             packet.set_pos(-1);
-            log_packet(output_stream.time_base, &packet, "out");
+            log_packet(output_stream.time_base.into(), &packet, "out");
         }
         output_format_context
             .interleaved_write_frame(&mut packet)

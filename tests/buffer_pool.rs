@@ -100,7 +100,7 @@ fn test_pooled_scaler_encode_roundtrip() -> Result<()> {
             assert_eq!(dst.data[0] as usize, first_ptr, "稳态复用失败");
         }
         dst.set_pts(i);
-        dst.set_time_base(enc_time_base);
+        dst.set_time_base(enc_time_base.into());
         muxer.mux(dst, video_index)?;
     }
     muxer.finish()?;
@@ -145,7 +145,7 @@ fn test_pooled_and_plain_frames_interleave() -> Result<()> {
             plain.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?
         };
         dst.set_pts(pts as i64);
-        dst.set_time_base(enc_time_base);
+        dst.set_time_base(enc_time_base.into());
         muxer.mux(dst, video_index)?;
     }
     muxer.finish()?;
@@ -222,7 +222,7 @@ fn test_encoder_with_scale_pool_roundtrip() -> Result<()> {
             }
         };
         yuv.set_pts(i as i64);
-        yuv.set_time_base(enc_time_base);
+        yuv.set_time_base(enc_time_base.into());
         muxer.mux(yuv, video_index)?;
     }
     muxer.finish()?;

@@ -47,9 +47,7 @@ fn picture_types(
     if let Some(max_b_frames) = max_b_frames {
         builder = builder.with_max_b_frames(max_b_frames);
     }
-    let encoder = builder
-        .with_codec_name(Some("libx264".to_string()))
-        .build()?;
+    let encoder = builder.with_codec_name("libx264").build()?;
 
     let mut muxer = Muxer::new(&path)?;
     let index = muxer.add_encoder(encoder)?;
