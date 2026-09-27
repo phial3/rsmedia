@@ -490,7 +490,7 @@ vs 裸 `Option<T>`（`HWDeviceConfig::new(options: Option<Options>)`、`with_har
 | # | 批次 | 状态 | 落点 |
 |---|---|---|---|
 | 1 | A4 + A1 | ✅ | `Rational{num: i32, den: NonZeroI32}`（现住 `src/time.rs`）+ `EncoderBuilder::with_frame_rate`；`with_fps` 文档标注 `av_d2q` 逼近实情 |
-| 2 | D2 | ✅ | `with_codec_name(impl Into<String>)` + 新增 `clear_codec_name()`；清掉 47 处 `.to_string()`/`Some(...)` |
+| 2 | D2 | ✅ | `with_codec_name(impl Into<String>)`；清掉 47 处 `.to_string()`/`Some(...)` |
 | 3 | D6 | ✅ | 10 处裸 `Option<T>` 参数统一为 `impl Into<Option<T>>` |
 | 4 | A2 + A3 + B1 | ✅ | filter 参数按 `ffmpeg -h filter=<name>` 对齐（`impl Into<f64>` ×23、`Expr` 表达式参数、`afade`/`trim` 收 `Duration`）；顺带发现并修掉 **A5**（`afftdn.tr` 写浮点给布尔位），记录 **A6**（`anlmdn.patch` 虽是 `<duration>` 但裸数按微秒，故不改） |
 | 5 | D1 | ✅ | 新增 `src/flags.rs` `FlagSet<E>`；`ffi_enum!` 的 `BitOr` 改为产出 `FlagSet<Enum>`（+`contains`/`From`/`Into<repr>`/`|=`/`&=`）；8 个位掩码 setter 收 `impl Into<FlagSet<_>>`；`Encoder`/`Decoder`/`Scaler` 的掩码 getter 同步强类型。**前提更正见 §6.2 D1** |

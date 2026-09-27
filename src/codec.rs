@@ -77,10 +77,6 @@ macro_rules! impl_codec_builder_setters {
         /// `&str` and a `String` are all passed directly: no `.to_string()`, no
         /// `Some(...)` wrapper.
         ///
-        /// Not calling this method is how "let the builder choose" is expressed.
-        /// To undo an earlier call, use [`Self::clear_codec_name`]; an unset name
-        /// means:
-        ///
         /// * decoder — follow the codec the input stream declares (chosen by the
         ///   container);
         /// * encoder — take the default for the media type (`libx264` / `aac` /
