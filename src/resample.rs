@@ -1,5 +1,6 @@
 use crate::error::{Context, Result, RsmediaError};
-use crate::{SampleFormat, imgutils, time};
+use crate::time::Rational;
+use crate::{SampleFormat, imgutils};
 
 use rsmpeg::avutil::{AVChannelLayout, AVFrame, AVSamples};
 use rsmpeg::ffi;
@@ -108,6 +109,11 @@ fn with_normalized_layout<R>(
 /// * `out_ch_layout` - Channel layout of the output.
 /// * `out_sample_fmt` - Sample format of the output.
 /// * `out_sample_rate` - Sample rate of the output.
+///
+/// This is an FFI-level entry point — it takes a bare `AVFrame` plus
+/// `ffi::AVChannelLayout` / `ffi::AVSampleFormat` and `i32` rates, mirroring
+/// `SwrContext`'s own signatures. The high-level audio path uses
+/// `MediaFrame`'s `u32` sample rate and converts at this boundary.
 pub fn convert_frame(
     src_frame: &AVFrame,
     out_ch_layout: ffi::AVChannelLayout,
@@ -174,7 +180,11 @@ fn convert_with(
     let out_samples = resampler.get_out_samples(src_frame.nb_samples).max(1);
     dst_frame.set_nb_samples(out_samples);
     dst_frame.set_sample_rate(out_sample_rate);
-    dst_frame.set_time_base(time::new_rational(1, out_sample_rate));
+    dst_frame.set_time_base(
+        Rational::new(1, out_sample_rate)
+            .unwrap_or(Rational::ZERO)
+            .into(),
+    );
     dst_frame
         .alloc_buffer()
         .context("Failed to allocate destination frame buffer")?;
@@ -430,7 +440,7 @@ impl Resampler {
 mod tests {
     use super::*;
     use crate::error::{Context, Result};
-    use crate::{SampleFormat, time};
+    use crate::{SampleFormat, time::Rational};
     use rsmpeg::avutil::AVChannelLayout;
     use rsmpeg::ffi;
 
@@ -582,7 +592,11 @@ mod tests {
         frame.set_ch_layout(AVChannelLayout::from_nb_channels(nb_channels).into_inner());
         frame.set_nb_samples(nb_samples);
         frame.set_sample_rate(sample_rate);
-        frame.set_time_base(time::new_rational(1, sample_rate));
+        frame.set_time_base(
+            Rational::new(1, sample_rate)
+                .unwrap_or(Rational::ZERO)
+                .into(),
+        );
 
         frame
             .alloc_buffer()

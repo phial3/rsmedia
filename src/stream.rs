@@ -3,6 +3,7 @@ use crate::fmt::FrameFormat;
 use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
 use crate::strutils;
+use crate::time::Rational;
 use crate::{Metadata, PixelFormat, SampleFormat};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecParameters};
@@ -54,6 +55,12 @@ impl Display for MediaType {
 
 /// Holds transferable stream information. This can be used to duplicate stream settings for the
 /// purpose of transmuxing or transcoding.
+///
+/// Every numeric field mirrors the width of the corresponding `AVCodecParameters`
+/// / `AVStream` field (`i32` / `i64`), so a `StreamInfo` can be written back to
+/// FFmpeg without a range check. The high-level API
+/// ([`EncoderBuilder`](crate::EncoderBuilder), [`MediaFrame`](crate::MediaFrame))
+/// uses `u32` for the non-negative quantities instead; cast at that boundary.
 #[derive(Clone)]
 pub struct StreamInfo {
     /// id
@@ -81,8 +88,8 @@ pub struct StreamInfo {
     /// including any padding or unused bits.
     pub padded_bits_per_pixel: i32,
 
-    /// time_base of stream
-    pub time_base: ffi::AVRational,
+    /// time_base of stream, as a [`Rational`]
+    pub time_base: Rational,
     /// Stream Duration
     pub duration: i64,
     /// Start time
@@ -104,17 +111,17 @@ pub struct StreamInfo {
     /// Video height
     pub height: i32,
     /// Video frame rate FPS
-    pub frame_rate: ffi::AVRational,
-    pub avg_frame_rate: ffi::AVRational,
-    pub real_frame_rate: ffi::AVRational,
+    pub frame_rate: Rational,
+    pub avg_frame_rate: Rational,
+    pub real_frame_rate: Rational,
     /// Number of bits in timestamps. Used for wrapping control.
     pub pts_wrap_bits: i32,
     /// video_delay
     pub video_delay: i32,
     /// Video sample aspect ratio
-    pub sample_aspect_ratio: ffi::AVRational,
+    pub sample_aspect_ratio: Rational,
     /// Display aspect ratio
-    pub display_aspect_ratio: ffi::AVRational,
+    pub display_aspect_ratio: Rational,
     /// Video color space, eg: ffi::AVCOL_SPC_*
     pub color_space: ffi::AVColorSpace,
     /// Video color range, eg: ffi::AVCOL_RANGE_*
@@ -287,7 +294,7 @@ impl StreamInfo {
             exact_bits_per_sample,
             bits_per_pixel,
             padded_bits_per_pixel,
-            time_base: stream.time_base,
+            time_base: stream.time_base.into(),
             duration: stream.duration,
             start_time: stream.start_time,
             nb_frames: stream.nb_frames,
@@ -298,14 +305,14 @@ impl StreamInfo {
             width: codecpar.width,
             height: codecpar.height,
             bit_rate: codecpar.bit_rate,
-            frame_rate: codecpar.framerate,
-            avg_frame_rate: stream.avg_frame_rate,
-            real_frame_rate: stream.r_frame_rate,
+            frame_rate: codecpar.framerate.into(),
+            avg_frame_rate: stream.avg_frame_rate.into(),
+            real_frame_rate: stream.r_frame_rate.into(),
             pts_wrap_bits: stream.pts_wrap_bits,
             video_delay: codecpar.video_delay,
-            sample_aspect_ratio: codecpar.sample_aspect_ratio,
+            sample_aspect_ratio: codecpar.sample_aspect_ratio.into(),
             display_aspect_ratio: Self::compute_display_aspect_ratio(
-                codecpar.sample_aspect_ratio,
+                codecpar.sample_aspect_ratio.into(),
                 codecpar.width,
                 codecpar.height,
             ),
@@ -341,20 +348,21 @@ impl StreamInfo {
     /// SAR 未知（0/1，FFmpeg 惯例按方形像素处理）时退化为 width/height。
     /// 用 `av_reduce` 规约分数（与 FFmpeg 内部一致），避免溢出且得到最简比。
     fn compute_display_aspect_ratio(
-        sample_aspect_ratio: ffi::AVRational,
+        sample_aspect_ratio: Rational,
         width: i32,
         height: i32,
-    ) -> ffi::AVRational {
+    ) -> Rational {
         if width <= 0 || height <= 0 {
-            return ffi::AVRational { num: 0, den: 1 };
+            return Rational::ZERO;
         }
-        // SAR 未知/非法时按方形像素（1/1）处理
-        let (sar_num, sar_den) = if sample_aspect_ratio.num <= 0 || sample_aspect_ratio.den <= 0 {
+        // SAR 未知/非法时按方形像素（1/1）处理。`Rational` 的分母恒为正，所以
+        // "非法" 只剩分子非正（含 `ZERO`，即 FFmpeg 的 0/1 未知标记）。
+        let (sar_num, sar_den) = if sample_aspect_ratio.num() <= 0 {
             (1, 1)
         } else {
             (
-                sample_aspect_ratio.num as i64,
-                sample_aspect_ratio.den as i64,
+                sample_aspect_ratio.num() as i64,
+                sample_aspect_ratio.den() as i64,
             )
         };
         let mut num: i32 = 0;
@@ -372,7 +380,7 @@ impl StreamInfo {
                 i32::MAX as i64,
             );
         }
-        ffi::AVRational { num, den }
+        Rational::new(num, den).unwrap_or(Rational::ZERO)
     }
 
     /// 读取视频流旋转角度（度，顺时针）。
@@ -442,7 +450,14 @@ impl StreamInfo {
     /// 硬件解码器名先经 `find_decoder_by_name` 验证存在（表项可能因 FFmpeg
     /// 版本/编译选项不存在，如 ffmpeg6 无 `*_vulkan` 解码器），不存在时
     /// 回退到通用软件解码器名。
-    pub fn find_decoder_name(&self, hw_device_type: Option<HWDeviceType>) -> Option<String> {
+    ///
+    /// `hw_device_type` 接受 [`HWDeviceType`] 本身或 `None`（= 只想要软件解码器名），
+    /// 无需包 `Some`。
+    pub fn find_decoder_name(
+        &self,
+        hw_device_type: impl Into<Option<HWDeviceType>>,
+    ) -> Option<String> {
+        let hw_device_type: Option<HWDeviceType> = hw_device_type.into();
         let codec_id = self.codec_id as ffi::AVCodecID;
         let codec_name = strutils::cstr_to_string_lossy(AVCodec::find_decoder(codec_id)?.name());
         let hw_codec_name = hw_device_type
@@ -465,8 +480,13 @@ impl StreamInfo {
     /// find encoder name, if we have hw_device_type, will use hw accelerated codec name
     /// if not, will use current stream codec name
     ///
-    /// 与 [`Self::find_decoder_name`] 对称：硬件编码器名同样经验证存在后才使用。
-    pub fn find_encoder_name(&self, hw_device_type: Option<HWDeviceType>) -> Option<String> {
+    /// 与 [`Self::find_decoder_name`] 对称：硬件编码器名同样经验证存在后才使用，
+    /// `hw_device_type` 同样是「值本身或 `None`」。
+    pub fn find_encoder_name(
+        &self,
+        hw_device_type: impl Into<Option<HWDeviceType>>,
+    ) -> Option<String> {
+        let hw_device_type: Option<HWDeviceType> = hw_device_type.into();
         let codec_id = self.codec_id as ffi::AVCodecID;
         let codec_name = strutils::cstr_to_string_lossy(AVCodec::find_encoder(codec_id)?.name());
         let hw_codec_name = hw_device_type
@@ -631,8 +651,8 @@ mod tests {
     /// DAR = SAR × (W/H)，各退化路径与规约均正确。
     #[test]
     fn test_compute_display_aspect_ratio() {
-        let ar = |num: i32, den: i32| ffi::AVRational { num, den };
-        let eq_ar = |a: ffi::AVRational, b: ffi::AVRational| a.num == b.num && a.den == b.den;
+        let ar = |num: i32, den: i32| Rational::new(num, den).expect("test rational");
+        let eq_ar = |a: Rational, b: Rational| a == b;
 
         // SAR 未知（0/1）→ 方形像素，DAR = W/H
         assert!(eq_ar(

@@ -6,6 +6,8 @@ use crate::io::{Reader, Writer};
 use crate::options::{Metadata, Options};
 use crate::stream::{MediaType, StreamInfo};
 use crate::subtitle::SubtitleSegment;
+use crate::time::Rational;
+use crate::time::TIME_BASE;
 use crate::{
     Decoder, DecoderBuilder, Encoder, EncoderBuilder, Location, StreamReader, StreamWriter,
 };
@@ -121,7 +123,7 @@ pub struct MuxerStream {
     pub stream_index: usize,
     /// 透传/remux 模式下源流的时间基，用于把 `mux_packet` 的 pts/dts
     /// 从源流时间基换算到输出流时间基。
-    pub src_time_base: Option<ffi::AVRational>,
+    pub src_time_base: Option<Rational>,
     /// 透传流可选的 bitstream filter（见 [`Muxer::add_copy_stream_with_bsf`]）。
     /// `None` = 原样搬运；有值时 `mux_packet` 与 `finish` 都先过它再写出。
     pub bsf: Option<Bsf>,
@@ -144,11 +146,12 @@ impl MuxerStream {
     /// 透传流：直接拷贝源的编解码参数，`src_time_base` 用于时间戳换算。
     ///
     /// `bsf` 是该流的可选 bitstream filter；构造输出流时其 codecpar 已按
-    /// `bsf.par_out()` 替换（见 [`Muxer::add_copy_stream_with_bsf`]）。
+    /// `bsf.par_out()` 替换（见 [`Muxer::add_copy_stream_with_bsf`]）。接受
+    /// [`Bsf`] 本身或 `None`，无需包 `Some`。
     pub fn new_copy(
         stream_info: StreamInfo,
-        src_time_base: ffi::AVRational,
-        bsf: Option<Bsf>,
+        src_time_base: Rational,
+        bsf: impl Into<Option<Bsf>>,
     ) -> Self {
         let media_type = stream_info.media_type;
         let stream_index = stream_info.index;
@@ -158,7 +161,7 @@ impl MuxerStream {
             stream_info,
             stream_index,
             src_time_base: Some(src_time_base),
-            bsf,
+            bsf: bsf.into(),
         }
     }
 }
@@ -238,9 +241,9 @@ impl Muxer<StreamWriter> {
     /// let idx = muxer.add_encoder(encoder)?;
     /// let mut frame = MediaFrame::<u8>::new_video_frame(640, 480, PixelFormat::RGB24)?;
     /// frame.set_pts(0);
-    /// let mut av = frame.to_avframe()?;
-    /// av.set_time_base(tb);
-    /// muxer.mux(av, idx)?;
+    /// // 时间基是 [`Rational`]，直接设在帧上——`to_avframe` 会把它带进 AVFrame。
+    /// frame.set_time_base(tb);
+    /// muxer.mux(frame.to_avframe()?, idx)?;
     /// muxer.finish()?;
     /// # Ok(())
     /// # }
@@ -344,14 +347,21 @@ impl<W: Writer> Muxer<W> {
     ///
     /// 首个有效时间戳建立基准并把自身恰好平移到 0（避免换算取整后首帧落在 ±1 tick）；
     /// 后续值减去同一基准。未开启归一化或时间戳为 `AV_NOPTS_VALUE` 时原样返回。
-    fn normalize_ts(&mut self, ts: i64, tb: ffi::AVRational) -> i64 {
+    fn normalize_ts(&mut self, ts: i64, tb: Rational) -> i64 {
         if !self.normalize_timestamps || ts == ffi::AV_NOPTS_VALUE {
             return ts;
         }
+        // FFmpeg 的 `AV_TIME_BASE_Q` 就是 1/1000000，即 [`TIME_BASE`]
         match self.pts_base_us {
-            Some(base_us) => ts - rsmpeg::avutil::av_rescale_q(base_us, ffi::AV_TIME_BASE_Q, tb),
+            Some(base_us) => {
+                ts - rsmpeg::avutil::av_rescale_q(base_us, TIME_BASE.into(), tb.into())
+            }
             None => {
-                self.pts_base_us = Some(rsmpeg::avutil::av_rescale_q(ts, tb, ffi::AV_TIME_BASE_Q));
+                self.pts_base_us = Some(rsmpeg::avutil::av_rescale_q(
+                    ts,
+                    tb.into(),
+                    TIME_BASE.into(),
+                ));
                 0
             }
         }
@@ -662,7 +672,7 @@ impl<W: Writer> Muxer<W> {
         let width = cover_frame.width as u32;
         let height = cover_frame.height as u32;
         let encoder = EncoderBuilder::new_video(width, height)
-            .with_codec_name("mjpeg".to_string())
+            .with_codec_name("mjpeg")
             .build()?;
         self.add_cover_art_with(encoder, cover_frame)
     }
@@ -743,6 +753,10 @@ impl<W: Writer> Muxer<W> {
 
         let count = self.chapters.len();
 
+        // 章节时间以整毫秒存储，故节点的 `time_base` = 1/1000。`AVChapter` 没有
+        // rsmedia 侧的 setter，只能写裸字段；值本身仍由 [`Rational`] 在边界上生成
+        let ms_time_base = Rational::new(1, 1000).unwrap_or(Rational::ZERO);
+
         // 1) 逐章分配节点。用 Rust Vec 暂存所有权，以便失败时统一释放。
         let mut chapter_nodes: Vec<*mut ffi::AVChapter> = Vec::with_capacity(count);
         for (i, chapter) in self.chapters.iter().enumerate() {
@@ -764,7 +778,7 @@ impl<W: Writer> Muxer<W> {
             unsafe {
                 // 未指定 id 时按顺序自动编号（FFmpeg 要求章节 id 唯一）。
                 (*chapter_ptr).id = chapter.id.unwrap_or(i as i64);
-                (*chapter_ptr).time_base = ffi::AVRational { num: 1, den: 1000 };
+                (*chapter_ptr).time_base = ms_time_base.into();
                 (*chapter_ptr).start = start_ms;
                 (*chapter_ptr).end = end_ms;
                 // SAFETY: `(*chapter_ptr).metadata` starts out NULL and the chapter
@@ -821,8 +835,7 @@ impl<W: Writer> Muxer<W> {
     fn refresh_stream_info(&mut self) -> Result<()> {
         for mux_stream in self.streams.iter_mut() {
             let stream_info = StreamInfo::from_writer(&self.writer, mux_stream.stream_index)?;
-            let tb_changed = stream_info.time_base.num != mux_stream.stream_info.time_base.num
-                || stream_info.time_base.den != mux_stream.stream_info.time_base.den;
+            let tb_changed = stream_info.time_base != mux_stream.stream_info.time_base;
             if tb_changed {
                 tracing::debug!(
                     "Muxer changed stream {} time_base: {:?} -> {:?}",
@@ -909,12 +922,12 @@ impl<W: Writer> Muxer<W> {
         &mut self,
         packet: &mut AVPacket,
         stream_idx: usize,
-        tb_from: ffi::AVRational,
+        tb_from: Rational,
     ) -> Result<W::Out> {
         let out_time_base = self.get_stream(stream_idx)?.stream_info.time_base;
         packet.set_pos(-1);
         packet.set_stream_index(stream_idx as i32);
-        packet.rescale_ts(tb_from, out_time_base);
+        packet.rescale_ts(tb_from.into(), out_time_base.into());
         self.write_packet(packet)
     }
 
@@ -945,9 +958,10 @@ impl<W: Writer> Muxer<W> {
         // 归一化在**编码前**应用：编码器内部的自动编号与 flush 出的延迟包就都在同一
         // 坐标系里，输出侧（含 `finish()` 的 flush 路径）无需再区分处理。
         // 帧自带有效时间基时以它为准；否则 pts 已按编码器时间基计数（见
-        // `MediaFrame.time_base` 的约定）。
-        let frame_time_base = if frame.time_base.num > 0 && frame.time_base.den > 0 {
-            frame.time_base
+        // `MediaFrame.time_base` 的约定）
+        let frame_time_base = Rational::from(frame.time_base);
+        let frame_time_base = if frame_time_base.num() > 0 {
+            frame_time_base
         } else {
             enc_time_base
         };
@@ -1104,7 +1118,7 @@ impl<W: Writer> Muxer<W> {
         &mut self,
         packet: &mut AVPacket,
         stream_idx: usize,
-        src_time_base: ffi::AVRational,
+        src_time_base: Rational,
     ) -> Result<W::Out> {
         // 与 `mux` 一致：归一化在写包前应用（透传包的 pts/dts 在源流时间基里），
         // 基准与编码流共享同一物理时刻。
@@ -1134,7 +1148,7 @@ impl<W: Writer> Muxer<W> {
         // 先冲刷透传流的 bitstream filter：filter 内部可能缓冲（如 `aac_adtstoasc`
         // 需要看到足够数据才决定），不 flush 会丢掉尾部包。收集到局部 Vec 是因为
         // 写包要独占 `self`，不能与 `self.streams` 的迭代借用共存。
-        let mut bsf_pending: Vec<(usize, ffi::AVRational, Vec<AVPacket>)> = Vec::new();
+        let mut bsf_pending: Vec<(usize, Rational, Vec<AVPacket>)> = Vec::new();
         for mux_stream in self.streams.iter_mut() {
             let Some(bsf) = mux_stream.bsf.as_mut() else {
                 continue;
@@ -1369,11 +1383,16 @@ impl<R: Reader> Demuxer<R> {
     }
 
     /// 全流解码模式：为容器中所有可解码的流构建解码器。
+    ///
+    /// `filters` 按媒体类型分组，`device_config` 为可选的硬件加速配置；两者都
+    /// 接受「值本身或 `None`」，不需要包 `Some`。
     pub fn new_from_reader(
         reader: R,
-        filters: Option<Vec<Filter>>,
-        device_config: Option<HWDeviceConfig>,
+        filters: impl Into<Option<Vec<Filter>>>,
+        device_config: impl Into<Option<HWDeviceConfig>>,
     ) -> Result<Demuxer<R>> {
+        let filters: Option<Vec<Filter>> = filters.into();
+        let device_config: Option<HWDeviceConfig> = device_config.into();
         let nb_streams = reader.input().nb_streams as usize;
         let filter_map = group_filters(filters);
 
@@ -1414,9 +1433,11 @@ impl<R: Reader> Demuxer<R> {
     pub fn new_single_stream(
         reader: R,
         media_type: MediaType,
-        filters: Option<Vec<Filter>>,
-        device_config: Option<HWDeviceConfig>,
+        filters: impl Into<Option<Vec<Filter>>>,
+        device_config: impl Into<Option<HWDeviceConfig>>,
     ) -> Result<Demuxer<R>> {
+        let filters: Option<Vec<Filter>> = filters.into();
+        let device_config: Option<HWDeviceConfig> = device_config.into();
         let filter_map = group_filters(filters);
 
         let (stream_index, _codec_name) = reader.find_best_stream(media_type)?;
@@ -1729,7 +1750,11 @@ impl<R: Reader> Iterator for Demuxer<R> {
 /// 仅承诺可移动到其他线程独占使用：内部的 AVFormatContextInput /
 /// AVCodecContext 均为 FFmpeg 非线程安全句柄，`&Demuxer` 不可跨线程共享，
 /// 故只实现 `Send`、不实现 `Sync`。
-unsafe impl<R: Reader> Send for Demuxer<R> {}
+///
+/// `R: Send` 是必需的：`Demuxer` 直接持有 `reader: R`，而 `Reader` 并没有
+/// `Send` 约束（见 [`Reader`]），少了它就可以把一个内含
+/// `Rc` 之类非 `Send` 类型的 reader 连同 `Demuxer` 一起送进别的线程。
+unsafe impl<R: Reader + Send> Send for Demuxer<R> {}
 
 #[cfg(test)]
 mod tests {
@@ -1852,10 +1877,10 @@ mod tests {
         let video_index = muxer.add_encoder(video_encoder)?;
 
         // 生成测试视频帧 // 3秒视频 30fps
-        for index in 0..3 * encoder_frame_rate.den as i64 {
+        for index in 0..3 * encoder_frame_rate.den() as i64 {
             let mut frame = generate_video_frame(width, height, index);
-            frame.set_pts(index * encoder_time_base.den as i64);
-            frame.set_time_base(encoder_time_base);
+            frame.set_pts(index * encoder_time_base.den() as i64);
+            frame.set_time_base(encoder_time_base.into());
 
             println!(
                 "encode video frame:{:?}, time_base:{:?}, encoder_time_base:{:?}",
@@ -1922,7 +1947,7 @@ mod tests {
 
             // 设置正确的PTS和时间基
             sine_frame.set_pts(total_samples);
-            sine_frame.set_time_base(encoder_time_base);
+            sine_frame.set_time_base(encoder_time_base.into());
 
             println!(
                 "audio frame: {:?}, time_base={:?}",
@@ -1991,10 +2016,10 @@ mod tests {
         muxer.set_stream_metadata(audio_index, "language", "chi")?;
 
         // 1 秒视频 + 1 秒音频（header 在首个 mux 调用时写入，metadata 届时生效）
-        for index in 0..video_frame_rate.den as i64 {
+        for index in 0..video_frame_rate.den() as i64 {
             let mut frame = generate_video_frame(width, height, index);
-            frame.set_pts(index * video_time_base.den as i64);
-            frame.set_time_base(video_time_base);
+            frame.set_pts(index * video_time_base.den() as i64);
+            frame.set_time_base(video_time_base.into());
             muxer.mux(frame, video_index)?;
         }
         let mut total_samples = 0i64;
@@ -2002,7 +2027,7 @@ mod tests {
             let mut frame =
                 generate_audio_sine_wave_frame(440.0, 2, nb_samples as usize, sample_rate)?;
             frame.set_pts(total_samples);
-            frame.set_time_base(audio_time_base);
+            frame.set_time_base(audio_time_base.into());
             muxer.mux(frame, audio_index)?;
             total_samples += nb_samples as i64;
         }
@@ -2052,8 +2077,8 @@ mod tests {
         let index = muxer.add_encoder(encoder)?;
         for i in 0..10i64 {
             let mut frame = generate_video_frame(width, height, i);
-            frame.set_pts(i * time_base.den as i64);
-            frame.set_time_base(time_base);
+            frame.set_pts(i * time_base.den() as i64);
+            frame.set_time_base(time_base.into());
             muxer.mux(frame, index)?;
         }
         muxer.finish()?;
@@ -2126,7 +2151,7 @@ mod tests {
         let audio_encoder =
             EncoderBuilder::new_audio(bit_rate, channels, sample_rate, SampleFormat::FLTP)
                 // 使用LAME MP3编码器
-                .with_codec_name("libmp3lame".to_string())
+                .with_codec_name("libmp3lame")
                 .build()?;
 
         let mut muxer = Muxer::new(output_path)?;
@@ -2148,7 +2173,7 @@ mod tests {
 
             // 设置正确的PTS和时间基
             sine_frame.set_pts(total_samples);
-            sine_frame.set_time_base(encoder_time_base);
+            sine_frame.set_time_base(encoder_time_base.into());
 
             println!(
                 "audio frame: {:?}, time_base={:?}",
@@ -2211,10 +2236,10 @@ mod tests {
             let mut video_frame = generate_video_frame(VIDEO_WIDTH, VIDEO_HEIGHT, frame_idx);
 
             // 设置视频帧PTS (以编码器 90kHz 为基准)
-            let frame_duration = video_time_base.den as i64 / VIDEO_FPS as i64;
+            let frame_duration = video_time_base.den() as i64 / VIDEO_FPS as i64;
             let video_pts = frame_idx * frame_duration;
             video_frame.set_pts(video_pts);
-            video_frame.set_time_base(video_time_base);
+            video_frame.set_time_base(video_time_base.into());
 
             println!(
                 "Video frame: {}, pts: {}, timebase: {:?}",
@@ -2251,7 +2276,7 @@ mod tests {
                 )?;
 
                 audio_frame.set_pts(audio_pts);
-                audio_frame.set_time_base(audio_time_base);
+                audio_frame.set_time_base(audio_time_base.into());
 
                 println!(
                     "Audio frame: pts: {}, samples: {}, timebase: {:?}",
@@ -2401,8 +2426,8 @@ mod tests {
             let video_index = muxer.add_encoder(video_encoder)?;
             for index in 0..12 {
                 let mut frame = generate_video_frame(width, height, index);
-                frame.set_pts(index * encoder_time_base.den as i64);
-                frame.set_time_base(encoder_time_base);
+                frame.set_pts(index * encoder_time_base.den() as i64);
+                frame.set_time_base(encoder_time_base.into());
                 muxer.mux(frame, video_index)?;
             }
             // 故意不调用 finish()，直接离开作用域触发 Drop 自动 flush
@@ -2438,7 +2463,7 @@ mod tests {
         let video_encoder = Encoder::new_video(320, 240)?;
         let video_tb = video_encoder.time_base();
         let subtitle_encoder = EncoderBuilder::new_subtitle()
-            .with_codec_name(Some("mov_text".to_string()))
+            .with_codec_name("mov_text")
             .with_subtitle_header(header)
             .build()?;
 
@@ -2458,7 +2483,7 @@ mod tests {
         // 1 秒视频（30fps），pts 走自动编号；字幕逐段编码进容器。
         for i in 0..30i64 {
             let mut frame = generate_video_frame(320, 240, i);
-            frame.set_time_base(video_tb);
+            frame.set_time_base(video_tb.into());
             muxer.mux(frame, video_index)?;
         }
         for segment in &segments {
@@ -2478,7 +2503,7 @@ mod tests {
         // 回读：字幕解码通道逐段无损还原。
         let mut reader = StreamReader::new(&output_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
-            .with_codec_name(Some("mov_text".to_string()))
+            .with_codec_name("mov_text")
             .build_from_reader(&reader)?;
         let mut decoded = Vec::new();
         while let Some(segment) = decoder.decode_subtitle_segment(&mut reader)? {
@@ -2519,10 +2544,10 @@ mod tests {
         })?;
 
         // 1 秒视频（30fps）
-        for index in 0..encoder_time_base.den as i64 {
+        for index in 0..encoder_time_base.den() as i64 {
             let mut frame = generate_video_frame(width, height, index);
-            frame.set_pts(index * encoder_time_base.den as i64);
-            frame.set_time_base(encoder_time_base);
+            frame.set_pts(index * encoder_time_base.den() as i64);
+            frame.set_time_base(encoder_time_base.into());
             muxer.mux(frame, video_index)?;
         }
         muxer.finish()?;
@@ -2556,10 +2581,10 @@ mod tests {
             id: Some(7),
             ..Chapter::new("MKV Explicit", 1.0, 2.0)
         })?;
-        for index in 0..(encoder_time_base.den as i64 * 2) {
+        for index in 0..(encoder_time_base.den() as i64 * 2) {
             let mut frame = generate_video_frame(width, height, index);
-            frame.set_pts(index * encoder_time_base.den as i64);
-            frame.set_time_base(encoder_time_base);
+            frame.set_pts(index * encoder_time_base.den() as i64);
+            frame.set_time_base(encoder_time_base.into());
             muxer.mux(frame, video_index)?;
         }
         muxer.finish()?;
@@ -2603,7 +2628,7 @@ mod tests {
 
         // 编码器按**输入**帧率（30fps）构建，滤镜图内 fps=10 完成抽帧
         let encoder = EncoderBuilder::new_video(width, height)
-            .with_codec_name("gif".to_string())
+            .with_codec_name("gif")
             .with_fps(in_fps)
             .with_filters(vec![gif_palette])
             .build()?;
@@ -2612,11 +2637,11 @@ mod tests {
         let video_index = muxer.add_encoder(encoder)?;
 
         // 2 秒 @30fps 输入（编码器 time_base = 1/30，帧间隔 1 tick）
-        let encoder_time_base = ffi::AVRational { num: 1, den: 30 };
+        let encoder_time_base = Rational::new(1, 30).unwrap();
         for index in 0..60i64 {
             let mut frame = generate_video_frame(width, height, index);
             frame.set_pts(index);
-            frame.set_time_base(encoder_time_base);
+            frame.set_time_base(encoder_time_base.into());
             muxer.mux(frame, video_index)?;
         }
         muxer.finish()?;
@@ -2695,10 +2720,10 @@ mod tests {
         let cover_index = muxer.add_cover_art(cover)?;
 
         // 1 秒主视频
-        for index in 0..encoder_time_base.den as i64 {
+        for index in 0..encoder_time_base.den() as i64 {
             let mut frame = generate_video_frame(width, height, index);
-            frame.set_pts(index * encoder_time_base.den as i64);
-            frame.set_time_base(encoder_time_base);
+            frame.set_pts(index * encoder_time_base.den() as i64);
+            frame.set_time_base(encoder_time_base.into());
             muxer.mux(frame, video_index)?;
         }
         muxer.finish()?;
@@ -3178,5 +3203,21 @@ mod tests {
 
         crate::test_support::remove_test_output(&path);
         Ok(())
+    }
+
+    /// `Demuxer` 的 `unsafe impl Send` 现在要求 `R: Send`（结构体直接持有
+    /// `reader: R`，而 `Reader` 本身没有 `Send` 约束）。
+    ///
+    /// 这条断言把"库内每个 Reader 实现在新约束下依然 `Send`"锁进编译期：将来若给
+    /// `Demuxer` 加进非 `Send` 字段，或者某个 Reader 实现悄悄变得非 `Send`，
+    /// 这里会先失败。
+    #[test]
+    fn test_demuxer_is_send_for_every_reader_impl() {
+        use crate::io::{BufferReader, IoReader};
+
+        fn assert_send<T: Send>() {}
+        assert_send::<Demuxer<StreamReader>>();
+        assert_send::<Demuxer<BufferReader>>();
+        assert_send::<Demuxer<IoReader>>();
     }
 }

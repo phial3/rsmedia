@@ -1,8 +1,10 @@
 use crate::error::{Context, Result, RsmediaError};
-use crate::init::AVLogLevel;
+use crate::flags::FlagSet;
+use crate::init::{AVLogFlag, AVLogLevel};
 use crate::location::Location;
 use crate::options::Options;
 use crate::stream::MediaType;
+use crate::time::Rational;
 use crate::{strutils, time};
 
 use rsmpeg::UnsafeDerefMut;
@@ -31,30 +33,35 @@ ffi_enum!(
     ///
     /// # Combining flags
     ///
-    /// `|` combines flag bits, and the result is the **raw `i32` mask** — a fieldless
-    /// enum cannot hold an unnamed combination such as `BACKWARD | ANY` — which
+    /// `|` combines flag bits and yields a [`FlagSet<AVSeekFlag>`](crate::FlagSet), which
     /// [`Seekable::seek_to_frame`] accepts directly, because its parameter is
-    /// `impl Into<i32>`. A single flag converts on its own:
+    /// `impl Into<i32>` and a set converts to the raw `i32` exactly as a single flag does:
     ///
     /// ```
     /// # use rsmedia::AVSeekFlag;
-    /// let mask: i32 = AVSeekFlag::BACKWARD | AVSeekFlag::ANY; // 0b101
+    /// let set = AVSeekFlag::BACKWARD | AVSeekFlag::ANY; // FlagSet<AVSeekFlag>, 0b101
+    /// let mask: i32 = set.into();
     /// let one: i32 = AVSeekFlag::ANY.into();
+    /// assert!(set.contains(AVSeekFlag::ANY));
     /// ```
     ///
     /// Mixing a flag with a raw mask needs an explicit `as i32`: the `AVSEEK_FLAG_*`
     /// constants in rsmpeg are **`u32`**, whereas the operators are generated for the
     /// enum's own `repr` (here `i32`, because `av_seek_frame` takes `int`) and for
-    /// `AVSeekFlag` only — a mixed-signedness overload is deliberately not provided:
+    /// `AVSeekFlag` only:
     ///
     /// ```
     /// # use rsmedia::AVSeekFlag;
-    /// let mixed: i32 = AVSeekFlag::FRAME | AVSeekFlag::BYTE;
+    /// # use rsmedia::ffmpeg::ffi;
+    /// let mixed = AVSeekFlag::FRAME | (ffi::AVSEEK_FLAG_BYTE as i32);
+    /// assert_eq!(mixed.bits(), ffi::AVSEEK_FLAG_FRAME | ffi::AVSEEK_FLAG_BYTE);
     /// // `AVSeekFlag::FRAME | ffi::AVSEEK_FLAG_BYTE` does not compile: u32 vs i32.
     /// ```
     ///
-    /// A combination is a bare `i32` from then on: no API turns it back into named
-    /// flags, so test individual bits against `AVSeekFlag::X.as_raw()`.
+    /// A mask that is not a combination of named flags goes through
+    /// [`FlagSet::from_bits`](crate::FlagSet::from_bits), which keeps the raw value visible.
+    /// The reverse direction — a raw mask back into named flags — does not exist: test
+    /// individual bits with [`FlagSet::contains`](crate::FlagSet::contains).
     AVSeekFlag, i32 {
         BACKWARD => ffi::AVSEEK_FLAG_BACKWARD;
         BYTE => ffi::AVSEEK_FLAG_BYTE;
@@ -166,9 +173,9 @@ pub trait Seekable: Reader {
     /// * `timestamp_ms` - Number of millisecond from start of video to seek to.
     fn seek_to_timestamp(&mut self, timestamp_ms: i64) -> Result<()> {
         // Conversion factor from timestamp in milliseconds to `TIME_BASE` units.
-        const CONVERSION_FACTOR: i64 = (time::TIME_BASE.den / 1000) as i64;
+        const CONVERSION_FACTOR: i64 = (time::TIME_BASE.den() / 1000) as i64;
         // One second left and right leeway when seeking.
-        const LEEWAY: i64 = time::TIME_BASE.den as i64;
+        const LEEWAY: i64 = time::TIME_BASE.den() as i64;
         let timestamp = CONVERSION_FACTOR * timestamp_ms;
         // 注意区间必须不对称（max 比 min 更贴近 ts）：`avformat_seek_file` 会
         // 忽略调用方的 BACKWARD 标志，并对不支持 read_seek2 的 demuxer 依据
@@ -243,9 +250,10 @@ pub trait Seekable: Reader {
     /// * `frame_ts` - The target timestamp (stream time-base units), or a byte offset
     ///   with `AVSeekFlag::BYTE`. "Frame index" only if a demuxer ever honours
     ///   `AVSeekFlag::FRAME`, which none does today — see above.
-    /// * `flags` - [`AVSeekFlag`] bits: a single flag, or a raw `i32` mask built with
-    ///   `|` (e.g. `AVSeekFlag::BACKWARD | AVSeekFlag::ANY`) — see [`AVSeekFlag`] for
-    ///   how to mix in rsmpeg's `u32` `AVSEEK_FLAG_*` constants.
+    /// * `flags` - [`AVSeekFlag`] bits: a single flag, or a [`FlagSet`] built with `|`
+    ///   (e.g. `AVSeekFlag::BACKWARD | AVSeekFlag::ANY`), or a mask that is already a bare
+    ///   `i32` — see [`AVSeekFlag`] for how to mix in rsmpeg's `u32` `AVSEEK_FLAG_*`
+    ///   constants.
     fn seek_to_frame(
         &mut self,
         stream_index: usize,
@@ -1117,11 +1125,7 @@ pub trait Writer {
     /// 返回新流的 index（写包时作为 stream index 使用）。自定义实现若覆盖本方法，
     /// 必须用 [`is_header_written`](Self::is_header_written) 做同样的拦截——这是
     /// 安全前提，不是风格问题。
-    fn add_stream(
-        &mut self,
-        codecpar: AVCodecParameters,
-        timebase: ffi::AVRational,
-    ) -> Result<usize> {
+    fn add_stream(&mut self, codecpar: AVCodecParameters, timebase: Rational) -> Result<usize> {
         if self.is_header_written() {
             return Err(RsmediaError::invalid_config(format!(
                 "Cannot add a stream after the container header has been written \
@@ -1131,7 +1135,7 @@ pub trait Writer {
         }
         let mut av_stream = self.output_mut().new_stream();
         av_stream.set_codecpar(codecpar);
-        av_stream.set_time_base(timebase);
+        av_stream.set_time_base(timebase.into());
         Ok(av_stream.index as usize)
     }
 
@@ -1143,11 +1147,11 @@ pub trait Writer {
     ///
     /// 流不存在时返回错误：早先这里回退为 [`TIME_BASE`](crate::time::TIME_BASE)
     /// （1/1000000），会让 `rescale_ts` 静默算出完全错误的时间戳。
-    fn stream_time_base(&self, stream_index: usize) -> Result<ffi::AVRational> {
+    fn stream_time_base(&self, stream_index: usize) -> Result<Rational> {
         self.output()
             .streams()
             .get(stream_index)
-            .map(|stream| stream.time_base)
+            .map(|stream| stream.time_base.into())
             .ok_or_else(|| {
                 RsmediaError::invalid_config(format!(
                     "Output stream {stream_index} does not exist ({} streams)",
@@ -1204,13 +1208,9 @@ trait WriterInner: Send {
 
     fn output_mut(&mut self) -> &mut AVFormatContextOutput;
 
-    fn add_stream(
-        &mut self,
-        codecpar: AVCodecParameters,
-        timebase: ffi::AVRational,
-    ) -> Result<usize>;
+    fn add_stream(&mut self, codecpar: AVCodecParameters, timebase: Rational) -> Result<usize>;
 
-    fn stream_time_base(&self, stream_index: usize) -> Result<ffi::AVRational>;
+    fn stream_time_base(&self, stream_index: usize) -> Result<Rational>;
 }
 
 /// 所有"直接写出"的 [`Writer`]（`Out`/`Accum` 均为 `()`）都可被擦除。
@@ -1247,15 +1247,11 @@ impl<W: Writer<Out = (), Accum = ()> + Send> WriterInner for W {
         <W as Writer>::output_mut(self)
     }
 
-    fn add_stream(
-        &mut self,
-        codecpar: AVCodecParameters,
-        timebase: ffi::AVRational,
-    ) -> Result<usize> {
+    fn add_stream(&mut self, codecpar: AVCodecParameters, timebase: Rational) -> Result<usize> {
         <W as Writer>::add_stream(self, codecpar, timebase)
     }
 
-    fn stream_time_base(&self, stream_index: usize) -> Result<ffi::AVRational> {
+    fn stream_time_base(&self, stream_index: usize) -> Result<Rational> {
         <W as Writer>::stream_time_base(self, stream_index)
     }
 }
@@ -1334,15 +1330,11 @@ impl Writer for DynWriter {
         self.0.output_mut()
     }
 
-    fn add_stream(
-        &mut self,
-        codecpar: AVCodecParameters,
-        timebase: ffi::AVRational,
-    ) -> Result<usize> {
+    fn add_stream(&mut self, codecpar: AVCodecParameters, timebase: Rational) -> Result<usize> {
         self.0.add_stream(codecpar, timebase)
     }
 
-    fn stream_time_base(&self, stream_index: usize) -> Result<ffi::AVRational> {
+    fn stream_time_base(&self, stream_index: usize) -> Result<Rational> {
         self.0.stream_time_base(stream_index)
     }
 }
@@ -2017,14 +2009,14 @@ unsafe impl<W: std::io::Write + Send + 'static> Send for IoWriter<W> {}
 /// 自带的默认回调，安装自定义回调后**所有**级别的消息都会送进回调，因此
 /// [`AVLogLevel::QUIET`] 必须由回调自己实现（见私有 `log_callback`）。
 ///
-/// `flag` 是 [`AVLogFlag`](crate::AVLogFlag) 位集，按 `impl Into<u32>` 给出（单个标志或 `|` 组合）。
-pub fn init_logging(level: AVLogLevel, flag: impl Into<u32>) {
+/// `flag` 是 [`AVLogFlag`] 位集，按 [`FlagSet<AVLogFlag>`](crate::FlagSet) 给出（单个标志或 `|` 组合）。
+pub fn init_logging(level: AVLogLevel, flag: impl Into<FlagSet<AVLogFlag>>) {
     let flag = flag.into();
     LOG_LEVEL.store(level as i32, Ordering::Relaxed);
     unsafe {
         ffi::av_log_set_callback(Some(log_callback));
         ffi::av_log_set_level(level as _);
-        ffi::av_log_set_flags(flag as _);
+        ffi::av_log_set_flags(flag.bits() as _);
     }
 }
 
@@ -2185,26 +2177,31 @@ mod tests {
     use crate::{DecoderBuilder, MediaType};
     use rsmpeg::avutil::AVFrame;
 
-    /// `ffi_enum!` 生成的位集合能力：`|` 组合与 `Into<i32>` 转换。
+    /// `ffi_enum!` 生成的位集合能力：`|` 组合产出 [`FlagSet`]，再由 `Into<i32>` 落到 FFI 类型。
     #[test]
     fn test_avseek_flag_bitops() {
-        // 注意：rsmpeg 侧的 AVSEEK_FLAG_* 常量类型为 u32，断言时归一化到 i32。
+        // 注意：rsmpeg 侧的 AVSEEK_FLAG_* 常量类型为 u32，断言时归一化到 u32。
         let combined = AVSeekFlag::BACKWARD | AVSeekFlag::ANY;
         assert_eq!(
-            combined,
-            ffi::AVSEEK_FLAG_BACKWARD as i32 | ffi::AVSEEK_FLAG_ANY as i32
+            combined.bits(),
+            ffi::AVSEEK_FLAG_BACKWARD | ffi::AVSEEK_FLAG_ANY
         );
+        assert!(combined.contains(AVSeekFlag::ANY));
+        assert!(!combined.contains(AVSeekFlag::FRAME));
 
         // 与 rsmpeg 的 u32 常量混合时需显式 `as i32`（宏只实现 BitOr<i32>，
         // 以免 repr=u32 的旗标枚举生成重复 impl）。
         let mixed = AVSeekFlag::FRAME | (ffi::AVSEEK_FLAG_BYTE as i32);
-        assert_eq!(
-            mixed,
-            ffi::AVSEEK_FLAG_FRAME as i32 | ffi::AVSEEK_FLAG_BYTE as i32
-        );
+        assert_eq!(mixed.bits(), ffi::AVSEEK_FLAG_FRAME | ffi::AVSEEK_FLAG_BYTE);
 
         let raw: i32 = AVSeekFlag::FRAME.into();
         assert_eq!(raw, ffi::AVSEEK_FLAG_FRAME as i32);
+        // 组合同样能落到 i32 —— 这正是 `seek_to_frame(impl Into<i32>)` 接受它的原因。
+        let combined_raw: i32 = combined.into();
+        assert_eq!(
+            combined_raw,
+            ffi::AVSEEK_FLAG_BACKWARD as i32 | ffi::AVSEEK_FLAG_ANY as i32
+        );
         // as_raw 与 Into 结果一致
         assert_eq!(AVSeekFlag::BYTE.as_raw(), i32::from(AVSeekFlag::BYTE));
     }
@@ -2248,7 +2245,7 @@ mod tests {
         let mut muxer = Muxer::new_from_writer(writer);
 
         let encoder = EncoderBuilder::new_video(64, 48)
-            .with_codec_name("png".to_string())
+            .with_codec_name("png")
             .build()?;
         let video_index = muxer.add_encoder(encoder)?;
 
@@ -2287,7 +2284,7 @@ mod tests {
                 .build()?;
             let mut muxer = Muxer::new_from_writer(writer);
             let encoder = EncoderBuilder::new_video(64, 48)
-                .with_codec_name("png".to_string())
+                .with_codec_name("png")
                 .build()?;
             let video_index = muxer.add_encoder(encoder)?;
             for i in 0..8 {
@@ -2407,7 +2404,7 @@ mod tests {
         for i in 0..8 {
             let mut frame = generate_rgb_frame(64, 48, i);
             frame.set_pts(i);
-            frame.set_time_base(tb);
+            frame.set_time_base(tb.into());
             let chunks = muxer.mux(frame, video_index)?;
             total += chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
         }
@@ -2438,7 +2435,7 @@ mod tests {
             for i in 0..8 {
                 let mut frame = generate_rgb_frame(64, 48, i);
                 frame.set_pts(i);
-                frame.set_time_base(tb);
+                frame.set_time_base(tb.into());
                 muxer.mux(frame, video_index)?;
             }
             muxer.finish()?;
@@ -2499,7 +2496,7 @@ mod tests {
             for i in 0..4 {
                 let mut frame = generate_rgb_frame(64, 48, i);
                 frame.set_pts(i);
-                frame.set_time_base(tb);
+                frame.set_time_base(tb.into());
                 muxer.mux(frame, video_index)?;
             }
             muxer.finish()?;
@@ -2526,7 +2523,7 @@ mod tests {
         for i in 0..4 {
             let mut frame = generate_rgb_frame(64, 48, i);
             frame.set_pts(i);
-            frame.set_time_base(tb);
+            frame.set_time_base(tb.into());
             muxer.mux(frame, video_index)?;
         }
         muxer.finish()?;
@@ -2603,7 +2600,7 @@ mod tests {
         for i in 0..4 {
             let mut frame = generate_rgb_frame(64, 48, i);
             frame.set_pts(i);
-            frame.set_time_base(tb);
+            frame.set_time_base(tb.into());
             muxer.mux(frame, video_index)?;
         }
         muxer.finish()?;
@@ -2796,8 +2793,9 @@ mod tests {
         Ok(())
     }
 
-    /// `seek_to_frame` 的参数是 `impl Into<i32>`：既要吃单个 `AVSeekFlag`，也要吃
-    /// `|` 组合出来的**裸掩码**（字段枚举装不下 `BACKWARD | ANY` 这种无名组合）。
+    /// `seek_to_frame` 的参数是 `impl Into<i32>`：单个 `AVSeekFlag`、
+    /// `|` 组合出的 [`FlagSet`]（字段枚举装不下 `BACKWARD | ANY` 这种无名组合）、
+    /// 以及本来就已经是裸 `i32` 的掩码，三条路径都要走通。
     ///
     /// 目标正好是帧边界，所以 `BACKWARD | ANY` 与两者单独使用都落在同一帧。
     #[test]
@@ -2833,11 +2831,11 @@ mod tests {
         let target_ts =
             (TARGET as f64 / FPS * f64::from(tb.den) / f64::from(tb.num)).round() as i64;
         assert!(target_ts > 0, "target_ts 计算异常：{target_ts}");
-        // 组合掩码、单个旗标、裸 i32 掩码三条路径，都必须落在第 TARGET 帧。
+        // 组合位集、单个旗标、裸 i32 掩码三条路径，都必须落在第 TARGET 帧。
         let cases: [(&str, i32); 3] = [
             (
                 "AVSeekFlag::BACKWARD | AVSeekFlag::ANY",
-                AVSeekFlag::BACKWARD | AVSeekFlag::ANY,
+                (AVSeekFlag::BACKWARD | AVSeekFlag::ANY).into(),
             ),
             ("AVSeekFlag::ANY", AVSeekFlag::ANY.into()),
             (

@@ -1,6 +1,9 @@
-use crate::codec::{AVCodecFlag, CodecConfig, impl_codec_builder_setters};
+use crate::codec::{
+    AVCodecFlag, AVCodecFlag2, CodecConfig, ThreadType, impl_codec_builder_setters,
+};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
+use crate::flags::FlagSet;
 use crate::fmt::FrameFormat;
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
@@ -12,6 +15,7 @@ use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
 use crate::state::ProcessState;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
+use crate::time::Rational;
 use crate::time::{self, Rescale};
 use crate::{MediaType, SampleFormat};
 
@@ -26,14 +30,23 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct EncoderBuilder {
     /// Video
-    /// 最近一次 [`Self::with_fps`] 传入的原值，仅供 `build()` 校验
-    req_fps: Option<f32>,
+    /// 最近一次传给 [`EncoderBuilder::with_fps`] 的浮点帧率，仅供 `build()` 校验。
+    ///
+    /// 非正或非有限的 `fps` 不会写进 [`Self::frame_rate`]（那里仍是上一个有效值），
+    /// 所以必须把调用方原本写的浮点数留到 `build()`，才能 fail fast 而不是静默
+    /// 沿用默认帧率。
+    fps: Option<f32>,
     width: u32,
     height: u32,
     /// `None` = 未显式指定，`build()` 时按编码器支持列表自动协商。
     pixel_format: Option<PixelFormat>,
     /// Audio
+    /// Channel count. `i32` — FFmpeg's own width (`AVChannelLayout.nb_channels`
+    /// is a `c_int`), so it reaches `AVChannelLayout::from_nb_channels` and the
+    /// supported-channel-count list without a cast.
     nb_channels: i32,
+    /// Sample rate in Hz. `i32`, matching `AVCodecContext.sample_rate` (an FFmpeg
+    /// `int`) and the codec's own supported-sample-rate list.
     sample_rate: i32,
     /// `None` = 未显式指定，`build()` 时按编码器支持列表自动协商。
     sample_format: Option<SampleFormat>,
@@ -49,19 +62,19 @@ pub struct EncoderBuilder {
     gop_size: Option<i32>,
     /// B 帧上限；`None` = 不设置，沿用编解码器自身默认值（默认 -1，libx264 为 3）。
     max_b_frames: Option<i32>,
-    frame_rate: ffi::AVRational,
+    frame_rate: Rational,
     /// config
     global_header: bool,
-    /// `AVCodecContext.flags`（`AV_CODEC_FLAG_*` 掩码，`i32` 是 FFmpeg 的字段类型）中由调用方显式设置的部分。
+    /// `AVCodecContext.flags`（`AV_CODEC_FLAG_*`）中由调用方显式设置的部分。
     /// `None` = 不额外设置；`GLOBAL_HEADER` 由 [`Self::with_global_header`] 单独管理，
     /// 两者在 `build()` 里按位合并（不同来源的位，不会互相覆盖）。
-    flags: Option<i32>,
-    /// `AVCodecContext.flags2`（`AV_CODEC_FLAG2_*` 掩码）。`None` = FFmpeg 默认。
-    flags2: Option<i32>,
-    /// `AVCodecContext.thread_type`（`FF_THREAD_*` 掩码）。`None` = FFmpeg 默认。
-    thread_type: Option<i32>,
+    flags: Option<FlagSet<AVCodecFlag>>,
+    /// `AVCodecContext.flags2`（`AV_CODEC_FLAG2_*`）。`None` = FFmpeg 默认。
+    flags2: Option<FlagSet<AVCodecFlag2>>,
+    /// `AVCodecContext.thread_type`（`FF_THREAD_*`）。`None` = FFmpeg 默认。
+    thread_type: Option<FlagSet<ThreadType>>,
     /// `None` = 未显式设置，构建时取 [`num_cpus::get`]。
-    thread_count: Option<u32>,
+    thread_count: Option<i32>,
     media_type: MediaType,
     codec_name: Option<String>,
     codec_opts: Option<Options>,
@@ -78,8 +91,8 @@ pub struct EncoderBuilder {
     hw_pool_size: Option<u32>,
     /// 缩放核选择（互斥，只取一个算法位）
     scale_algorithm: ScaleAlgorithm,
-    /// 缩放质量位掩码（可多位，见 [`ScaleQuality`]）。
-    scale_quality: u32,
+    /// 缩放质量位（可多位，见 [`ScaleQuality`]）。
+    scale_quality: FlagSet<ScaleQuality>,
     /// 是否用 `AVBufferPool` 池化缩放输出的帧缓冲（默认关闭）。
     scale_pool: bool,
 }
@@ -144,6 +157,12 @@ impl EncoderBuilder {
     /// * `nb_channels` - The number of channels in the audio stream.
     /// * `sample_rate` - The sample rate of the audio stream.
     /// * `sample_format` - The sample format of the audio stream.
+    ///
+    /// `nb_channels` and `sample_rate` are `i32`, FFmpeg's own width: the channel
+    /// count is an `AVChannelLayout.nb_channels` (`c_int`) and the sample rate is
+    /// an `AVCodecContext.sample_rate` (`int`), and the codec's supported-value
+    /// lists are signed too. Keeping that width means no cast can silently turn a
+    /// nonsensical negative into a huge positive on the way to FFmpeg.
     pub fn new_audio(
         bit_rate: i64,
         nb_channels: i32,
@@ -271,15 +290,55 @@ impl EncoderBuilder {
 
     /// Set the video frame rate from a floating-point number of frames per second.
     ///
-    /// The value is converted to a reduced rational via FFmpeg's `av_d2q` and used
-    /// as the encoder frame rate.
+    /// The value is converted to a **reduced rational** via FFmpeg's
+    /// `av_d2q(fps, 100_000)` and used as the encoder frame rate.
+    ///
+    /// ⚠️ That conversion approximates *the `f32` you passed*, not the fraction
+    /// you had in mind, and the two are not always the same: `24_000.0 / 1_001.0`
+    /// is not representable in `f32`, so the nearest rational to its `f32`
+    /// neighbours is `86_002/3_587` — 5.6e-7 fps off, and a **non-standard time
+    /// base in the container**. Nothing reports this; the file simply plays
+    /// fractionally fast.
+    ///
+    /// Use [`Self::with_frame_rate`] whenever the rate is a known rational
+    /// (anything with a `1_001` denominator, or any rate you need to match
+    /// exactly) — it takes the fraction verbatim. Reserve this method for
+    /// rates that genuinely come from a float measurement.
+    ///
     /// 非正或非有限的 `fps` 会在 [`Self::build`] 时报错（fail fast），而不是静默
     /// 退回默认帧率——那会产出"帧率与预期不符"这类最难排查的结果。
     pub fn with_fps(mut self, fps: f32) -> Self {
-        self.req_fps = Some(fps);
+        self.fps = Some(fps);
         if fps > 0.0 && fps.is_finite() {
-            self.frame_rate = avutil::av_d2q(fps as f64, Self::FPS_MAX);
+            self.frame_rate = Rational::from(avutil::av_d2q(fps as f64, Self::FPS_MAX));
         }
+        self
+    }
+
+    /// Set the video frame rate **exactly**, as a rational number of frames per
+    /// second.
+    ///
+    /// This is the entry point for rates that have to be right: the value is used
+    /// verbatim, with no float conversion and no `av_d2q` approximation step. It
+    /// is what [`Self::with_fps`] cannot express — see that method for the
+    /// `86_002/3_587` failure mode this avoids.
+    ///
+    /// ```
+    /// use rsmedia::{EncoderBuilder, Rational};
+    ///
+    /// // 23.976 fps, exactly 24000/1001 — the film-on-NTSC rate.
+    /// let rate = Rational::new(24_000, 1_001)?;
+    /// let builder = EncoderBuilder::new_video(1920, 1080).with_frame_rate(rate);
+    /// # let _ = builder;
+    /// # Ok::<(), rsmedia::RsmediaError>(())
+    /// ```
+    ///
+    /// The numerator must be positive; a zero or negative one is rejected by
+    /// [`Self::build`], the same fail-fast treatment [`Self::with_fps`] gives an
+    /// unusable float. A zero denominator is not representable — [`Rational`]
+    /// guarantees that by construction.
+    pub fn with_frame_rate(mut self, frame_rate: impl Into<Rational>) -> Self {
+        self.frame_rate = frame_rate.into();
         self
     }
 
@@ -317,11 +376,20 @@ impl EncoderBuilder {
         self
     }
 
+    /// Set the number of audio channels.
+    ///
+    /// The count is expanded into a channel layout by
+    /// `AVChannelLayout::from_nb_channels` at build time, so mono/stereo names
+    /// are derived from the count rather than passed explicitly.
     pub fn with_nb_channels(mut self, nb_channels: i32) -> Self {
         self.nb_channels = nb_channels;
         self
     }
 
+    /// Set the audio sample rate in Hz.
+    ///
+    /// Must appear in the encoder's supported-rate list, otherwise [`Self::build`]
+    /// fails with [`RsmediaError::invalid_config`](crate::RsmediaError::invalid_config).
     pub fn with_sample_rate(mut self, sample_rate: i32) -> Self {
         self.sample_rate = sample_rate;
         self
@@ -354,17 +422,22 @@ impl EncoderBuilder {
 
     /// 编码器使用的 time_base。
     ///
-    /// 视频由用户 fps 推导为 `1/fps`（libx264 等编码器在这种 time_base 下才
+    /// 视频由用户 fps 取倒数得到 `1/fps`（libx264 等编码器在这种 time_base 下才
     /// 能正确输出 packet duration，避免 MP4 muxer 丢弃末帧）；音频按
     /// `1/sample_rate` 推导，对所有音频编码器一致。
-    fn effective_time_base(&self) -> ffi::AVRational {
+    ///
+    /// # Errors
+    ///
+    /// 视频帧率为 0 时取不到倒数（`build()` 早已拒绝非正分子，故只在手工构造
+    /// `EncoderBuilder` 时才会遇到）；音频采样率为 0 时 `1/0` 不是有理数。
+    fn effective_time_base(&self) -> Result<Rational> {
         match self.media_type {
-            MediaType::VIDEO => avutil::av_inv_q(self.frame_rate),
-            MediaType::AUDIO => time::new_rational(1, self.sample_rate),
+            MediaType::VIDEO => self.frame_rate.inverse(),
+            MediaType::AUDIO => Rational::new(1, self.sample_rate),
             // 字幕：1/1000（毫秒精度），与 ffmpeg CLI 一致
-            MediaType::SUBTITLE => time::new_rational(1, Self::SUBTITLE_TIME_BASE_DEN),
+            MediaType::SUBTITLE => Rational::new(1, Self::SUBTITLE_TIME_BASE_DEN),
             // 其它媒体类型（DATA 等）没有可推导的时间基，用 FFmpeg 的微秒基准。
-            _ => time::TIME_BASE,
+            _ => Ok(time::TIME_BASE),
         }
     }
 
@@ -425,14 +498,14 @@ impl EncoderBuilder {
             if let Some(max_b_frames) = self.max_b_frames {
                 encoder.set_max_b_frames(max_b_frames);
             }
-            encoder.set_framerate(self.frame_rate);
-            encoder.set_time_base(self.effective_time_base());
+            encoder.set_framerate(self.frame_rate.into());
+            encoder.set_time_base(self.effective_time_base()?.into());
             // packet 时间戳在编码器自己的时间基里产出（写包时按
             // `time_base() -> 输出流时间基` 换算），故 pkt_timebase 与它一致。
             // 三种媒体类型一律如此设置——早先只有视频设置了它，音频/字幕留 0/1。
-            encoder.set_pkt_timebase(self.effective_time_base());
+            encoder.set_pkt_timebase(self.effective_time_base()?.into());
             encoder.set_pix_fmt(pixel_format.into());
-            encoder.set_sample_aspect_ratio(time::new_rational(1, 1));
+            encoder.set_sample_aspect_ratio(Rational::ONE.into());
         } else if media_type == MediaType::AUDIO {
             if !config.is_support_channel_count(self.nb_channels) {
                 return Err(RsmediaError::InvalidConfig(format!(
@@ -452,12 +525,12 @@ impl EncoderBuilder {
             encoder.set_bit_rate(self.effective_bit_rate());
             encoder.set_sample_rate(self.sample_rate);
             encoder.set_sample_fmt(sample_format as _);
-            encoder.set_time_base(self.effective_time_base());
-            encoder.set_pkt_timebase(self.effective_time_base());
+            encoder.set_time_base(self.effective_time_base()?.into());
+            encoder.set_pkt_timebase(self.effective_time_base()?.into());
         } else if media_type == MediaType::SUBTITLE {
             // 字幕编码器只需 time_base（毫秒精度），无像素/采样格式、码率等概念
-            encoder.set_time_base(self.effective_time_base());
-            encoder.set_pkt_timebase(self.effective_time_base());
+            encoder.set_time_base(self.effective_time_base()?.into());
+            encoder.set_pkt_timebase(self.effective_time_base()?.into());
         } else {
             return Err(RsmediaError::unsupported(format!(
                 "media type {media_type:?}"
@@ -466,17 +539,33 @@ impl EncoderBuilder {
 
         // 速率控制的可选约束（VBV）：rsmpeg 未生成 rc_* 访问器，直接写字段
         // （普通整型，无所有权/无缓冲）——与 `crate::codec::set_thread_count` 同法。
+        //
+        // 非正值一律不写字段（`rc_max_rate`/`rc_buffer_size` 只接受正值），但不同
+        // 来源给不同的诊断级别：负值只可能是调用方写错，用 `warn!`；显式 `0` 在文档
+        // 里是"视为未设置"的合法写法（`max_bit_rate = 0` 即"不限瞬时码率"），只在
+        // `debug!` 里留痕，免得把正常用法刷成警告。
         unsafe {
             let raw = encoder.as_mut_ptr();
-            if let Some(max_bit_rate) = self.max_bit_rate
-                && max_bit_rate.is_positive()
-            {
-                (*raw).rc_max_rate = max_bit_rate;
+            match self.max_bit_rate {
+                Some(rate) if rate.is_positive() => (*raw).rc_max_rate = rate,
+                Some(rate) if rate < 0 => tracing::warn!(
+                    "max_bit_rate {rate} is negative and was not applied; \
+                     rc_max_rate stays unset (no instantaneous rate cap)"
+                ),
+                Some(rate) => {
+                    tracing::debug!("max_bit_rate {rate} means \"no cap\"; rc_max_rate left unset")
+                }
+                None => {}
             }
-            if let Some(buffer_size) = self.buffer_size
-                && buffer_size.is_positive()
-            {
-                (*raw).rc_buffer_size = buffer_size;
+            match self.buffer_size {
+                Some(size) if size.is_positive() => (*raw).rc_buffer_size = size,
+                Some(size) if size < 0 => tracing::warn!(
+                    "buffer_size {size} is negative and was not applied; rc_buffer_size stays unset"
+                ),
+                Some(size) => {
+                    tracing::debug!("buffer_size {size} was treated as unset; rc_buffer_size unset")
+                }
+                None => {}
             }
         }
 
@@ -491,23 +580,22 @@ impl EncoderBuilder {
         // builder 自管的 `GLOBAL_HEADER` 各占不同位，同理按位合并。
         let mut flags = encoder.flags;
         if let Some(extra) = self.flags {
-            flags |= extra;
+            flags |= extra.bits() as i32;
         }
         if self.global_header {
             flags |= AVCodecFlag::GLOBAL_HEADER.as_raw() as i32;
         }
         encoder.set_flags(flags);
         if let Some(flags2) = self.flags2 {
-            crate::codec::set_flags2(encoder, flags2);
+            crate::codec::set_flags2(encoder, flags2.bits() as i32);
         }
         if let Some(thread_type) = self.thread_type {
-            crate::codec::set_thread_type(encoder, thread_type);
+            crate::codec::set_thread_type(encoder, thread_type.bits() as i32);
         }
-        // 未显式设置时取本机 CPU 数；显式值超出 `i32` 范围（如 `u32::MAX`）会
-        // 下溢成负数，被 `set_thread_count` 忽略，从而保持 FFmpeg 默认线程数。
+        // 未显式设置时取本机 CPU 数；`0`（自行推导）与负数跳过
         crate::codec::set_thread_count(
             encoder,
-            self.thread_count.unwrap_or_else(|| num_cpus::get() as u32) as i32,
+            self.thread_count.unwrap_or_else(|| num_cpus::get() as i32),
         );
 
         Ok(())
@@ -593,12 +681,35 @@ impl EncoderBuilder {
     /// * `settings` - Encoder settings to use.
     pub fn build(self) -> Result<Encoder> {
         let media_type = self.media_type;
-        if let Some(fps) = self.req_fps
+        // 帧率的合法性分两条判据，对应两个入口：浮点入口只可能"非正/非有限"，
+        // 精确入口只可能"分子非正"（分母非零由 [`Rational`] 的类型保证）。
+        if let Some(fps) = self.fps
             && !(fps > 0.0 && fps.is_finite())
         {
             return Err(RsmediaError::invalid_config(format!(
                 "fps must be a positive, finite number, got {fps}"
             )));
+        }
+        if self.frame_rate.num() <= 0 {
+            return Err(RsmediaError::invalid_config(format!(
+                "a frame rate must have a positive numerator, got {}",
+                self.frame_rate
+            )));
+        }
+
+        if media_type == MediaType::VIDEO {
+            // `width`/`height` 是 `u32`，却会以 `as i32` 写进 `AVCodecContext`
+            // （下面的 `setup_*` 与 `FilterParams`）：超过 `i32::MAX` 会回绕成负数，
+            // 一直拖到 `avcodec_open2` 才报一句不透明的错误。0 也不是合法画面尺寸
+            // （`buffer` 源要求正数）。这里前置拒绝，错误信息直接指向调用方传的值。
+            for (name, value) in [("width", self.width), ("height", self.height)] {
+                if value == 0 || value > i32::MAX as u32 {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "{name} must be in 1..={}, got {value}",
+                        i32::MAX
+                    )));
+                }
+            }
         }
 
         let codec_name: String = match &self.codec_name {
@@ -662,7 +773,7 @@ impl EncoderBuilder {
 
         // 编码器输入时间基：与滤镜图 buffer 源（下方 FilterParams）和"滤镜未改写
         // 帧率时的编码器 time_base"同源。必须在 self 被部分 move 之前求值。
-        let input_time_base = self.effective_time_base();
+        let input_time_base = self.effective_time_base()?;
 
         // 在 hw_device_config / codec_opts 被 move 之前构造 filter graph：
         // 此位置 self 尚未被部分 move，可直接借用 self 计算 time_base。
@@ -685,7 +796,8 @@ impl EncoderBuilder {
                         format: pixel_format,
                         time_base: input_time_base,
                         frame_rate: self.frame_rate,
-                        pixel_aspect: encode_ctx.sample_aspect_ratio, // sample aspect ratio (0 if unknown)
+                        // sample aspect ratio (0/1 if unknown)
+                        pixel_aspect: encode_ctx.sample_aspect_ratio.into(),
                     })
                 }
                 MediaType::AUDIO => {
@@ -726,18 +838,17 @@ impl EncoderBuilder {
         };
         if media_type == MediaType::VIDEO {
             if let Some(out_fr) = filter_frame_rate {
-                let changed =
-                    out_fr.num != self.frame_rate.num || out_fr.den != self.frame_rate.den;
-                if out_fr.num > 0 && out_fr.den > 0 && changed {
+                let changed = out_fr != self.frame_rate;
+                if out_fr.num() > 0 && changed {
+                    // 分子为正 ⇒ 倒数必然存在（`Rational` 的分母恒不为零）。
+                    let time_base = out_fr.inverse()?;
                     tracing::info!(
-                        "Filter changes frame rate: {}/{} -> {}/{}",
-                        self.frame_rate.num,
-                        self.frame_rate.den,
-                        out_fr.num,
-                        out_fr.den
+                        "Filter changes frame rate: {} -> {}",
+                        self.frame_rate,
+                        out_fr
                     );
-                    encode_ctx.set_framerate(out_fr);
-                    encode_ctx.set_time_base(avutil::av_inv_q(out_fr));
+                    encode_ctx.set_framerate(out_fr.into());
+                    encode_ctx.set_time_base(time_base.into());
                 }
             }
             if let Some((fw, fh)) = filter_size
@@ -874,8 +985,8 @@ impl Default for EncoderBuilder {
             bit_rate: None,
             max_bit_rate: None,
             buffer_size: None,
-            frame_rate: time::new_rational(Self::FRAME_RATE, 1),
-            req_fps: None,
+            frame_rate: Rational::integer(Self::FRAME_RATE),
+            fps: None,
             gop_size: None,
             max_b_frames: None,
             global_header: true,
@@ -961,7 +1072,7 @@ pub struct Encoder {
     /// `effective_time_base()`），否则等于编码器 time_base。滤镜改写输出帧率时
     /// 编码器 time_base 会被改为 `1/滤镜输出fps`，与输入时间基不再相等，因此
     /// 必须显式保存，供 pts 换算与自动编号使用。
-    input_time_base: ffi::AVRational,
+    input_time_base: Rational,
     /// 送进滤镜图前的音频采样格式转换（目标=图输入格式，采样率不变）。
     ///
     /// 与 `encode_converter` 分开：两者处理的规格不同（进图前 vs 滤镜后），
@@ -1253,15 +1364,13 @@ impl Encoder {
 
         // 时间基：帧自带有效且与编码器**不同**的时间基时（解码侧容器时间基，如 mp4 的
         // 1/15360），pts 需先换算过来；无论换算与否，离开时帧都带编码器输入时间基。
-        let frame_tb = frame.time_base;
-        let needs_rescale = frame.pts != ffi::AV_NOPTS_VALUE
-            && frame_tb.num > 0
-            && frame_tb.den > 0
-            && !time::av_rational_eq(&frame_tb, &input_tb);
+        let frame_tb = Rational::from(frame.time_base);
+        let needs_rescale =
+            frame.pts != ffi::AV_NOPTS_VALUE && frame_tb.num() > 0 && frame_tb != input_tb;
         if needs_rescale {
             frame.set_pts(frame.pts.rescale(frame_tb, input_tb));
         }
-        frame.set_time_base(input_tb);
+        frame.set_time_base(input_tb.into());
 
         // 固定帧长音频（aac 等）的输出 pts 由 `audio_fifo` 按已输出样本数维护
         // （见 buffer_audio_frame / drain_audio_fifo），故不为输入帧编号、计数器也不前进。
@@ -1295,10 +1404,10 @@ impl Encoder {
             .as_mut()
             .and_then(|g| g.output_time_base())
         {
-            let enc_tb = self.context.time_base;
+            let enc_tb = Rational::from(self.context.time_base);
             if frame.pts != ffi::AV_NOPTS_VALUE {
                 frame.set_pts(frame.pts.rescale(filter_tb, enc_tb));
-                frame.set_time_base(enc_tb);
+                frame.set_time_base(enc_tb.into());
             }
         }
 
@@ -1395,7 +1504,7 @@ impl Encoder {
         frame.set_ch_layout(self.ch_layout().clone().into_inner());
         frame.set_format(self.sample_fmt() as _);
         frame.set_sample_rate(self.sample_rate());
-        frame.set_time_base(self.time_base());
+        frame.set_time_base(self.time_base().into());
         // SAFETY: `frame` 已分配缓冲，`fifo.read` 最多写入 `count` 个样本/声道。
         unsafe {
             frame
@@ -1603,23 +1712,39 @@ impl Encoder {
 
     /// Get encoder time base.
     #[inline]
-    pub fn time_base(&self) -> ffi::AVRational {
-        self.context.time_base
+    pub fn time_base(&self) -> Rational {
+        self.context.time_base.into()
     }
 
+    /// The frame rate the encoder is actually using (`AVCodecContext.framerate`).
+    ///
+    /// This is the value that reaches the container, after any negotiation: the
+    /// exact rational from [`EncoderBuilder::with_frame_rate`], the `av_d2q`
+    /// approximation of [`EncoderBuilder::with_fps`], or a filter graph's output
+    /// rate when a filter like `fps` rewrote it. Read it to verify what a
+    /// pipeline really produces instead of assuming the requested rate survived.
     #[inline]
-    pub fn frame_rate(&self) -> ffi::AVRational {
-        self.context.framerate
+    pub fn frame_rate(&self) -> Rational {
+        self.context.framerate.into()
     }
 
+    /// Width of the encoder's negotiated video frame, in pixels.
+    ///
+    /// A width is non-negative by nature, so this is returned as `u32` — the same
+    /// width [`EncoderBuilder::with_width`] takes, which keeps a set/get
+    /// round-trip cast-free. The underlying `AVCodecContext.width` field is an
+    /// FFmpeg `int`; the conversion here can never see a negative value.
     #[inline]
-    pub fn width(&self) -> i32 {
-        self.context.width
+    pub fn width(&self) -> u32 {
+        self.context.width as u32
     }
 
+    /// Height of the encoder's negotiated video frame, in pixels.
+    ///
+    /// Returned as `u32` for the same reason as [`Self::width`].
     #[inline]
-    pub fn height(&self) -> i32 {
-        self.context.height
+    pub fn height(&self) -> u32 {
+        self.context.height as u32
     }
 
     #[inline]
@@ -1643,12 +1768,20 @@ impl Encoder {
 
     /// Each submitted frame except the last must contain exactly frame_size samples per channel.
     /// May be 0 when the codec has AV_CODEC_CAP_VARIABLE_FRAME_SIZE set, then the frame size is not restricted.
+    ///
+    /// Unlike [`Self::width`]/[`Self::height`] this stays `i32`: `0` is a
+    /// meaningful value here ("no fixed frame size"), so the sentinel and the
+    /// quantity share one range, exactly as in FFmpeg's `int` field.
     #[inline]
     pub fn frame_size(&self) -> i32 {
         self.context.frame_size
     }
 
-    /// audio samples per second
+    /// Audio samples per second.
+    ///
+    /// Returned as `i32`, the width of the underlying `AVCodecContext.sample_rate`
+    /// field, matching [`EncoderBuilder::with_sample_rate`] and
+    /// [`MediaFrame`]'s audio metadata.
     #[inline]
     pub fn sample_rate(&self) -> i32 {
         self.context.sample_rate
@@ -1675,27 +1808,28 @@ impl Encoder {
         self.context.extract_codecpar()
     }
 
-    /// `AVCodecContext.flags` 掩码（`AV_CODEC_FLAG_*`，取值见 [`AVCodecFlag`]）。
+    /// `AVCodecContext.flags` 位集（`AV_CODEC_FLAG_*`，取值见 [`AVCodecFlag`]）。
     ///
     /// 读的是 `avcodec_open2` **之后**的实际值，因此 `with_global_header(true)`
     /// 并入的 `GLOBAL_HEADER` 位也在内；编解码器自行调整过的位同样会反映出来。
+    /// 查询用 [`FlagSet::contains`]，需要原始整数时用 [`FlagSet::bits`]。
     #[inline]
-    pub fn flags(&self) -> u32 {
-        self.context.flags as u32
+    pub fn flags(&self) -> FlagSet<AVCodecFlag> {
+        FlagSet::from_bits(self.context.flags as u32)
     }
 
-    /// `AVCodecContext.flags2` 掩码（`AV_CODEC_FLAG2_*`，取值见
-    /// [`AVCodecFlag2`](crate::codec::AVCodecFlag2)）。
+    /// `AVCodecContext.flags2` 位集（`AV_CODEC_FLAG2_*`，取值见
+    /// [`AVCodecFlag2`]）。
     #[inline]
-    pub fn flags2(&self) -> u32 {
-        self.context.flags2 as u32
+    pub fn flags2(&self) -> FlagSet<AVCodecFlag2> {
+        FlagSet::from_bits(self.context.flags2 as u32)
     }
 
-    /// `AVCodecContext.thread_type` 掩码（`FF_THREAD_*`，取值见
-    /// [`ThreadType`](crate::codec::ThreadType)）。
+    /// `AVCodecContext.thread_type` 位集（`FF_THREAD_*`，取值见
+    /// [`ThreadType`]）。
     #[inline]
-    pub fn thread_type(&self) -> u32 {
-        self.context.thread_type as u32
+    pub fn thread_type(&self) -> FlagSet<ThreadType> {
+        FlagSet::from_bits(self.context.thread_type as u32)
     }
 
     /// `AVCodecContext.thread_count`（0 = 自动）。
@@ -1703,9 +1837,12 @@ impl Encoder {
     /// 读的是 `avcodec_open2` **之后**的实际值：帧级线程的编解码器会在
     /// `thread_count == 0` 时把它改写成自动推导出的线程数（见 FFmpeg
     /// `ff_frame_thread_init`），非 0 的调用方设置则原样保留。
+    ///
+    /// 类型与 FFmpeg 的字段一致（`int` 而非 `u32`）：与
+    /// [`Decoder::thread_count`](crate::Decoder::thread_count) 保持同型。
     #[inline]
-    pub fn thread_count(&self) -> u32 {
-        self.context.thread_count as u32
+    pub fn thread_count(&self) -> i32 {
+        self.context.thread_count
     }
 
     /// 单帧时长（编码器 time_base 单位），用于补全缺失的 packet duration。
@@ -1715,19 +1852,22 @@ impl Encoder {
     pub(crate) fn packet_duration(&self) -> i64 {
         let tb = self.time_base();
         let frame_dur_sec = match self.media_type {
-            // 视频：1 / frame_rate
-            MediaType::VIDEO => avutil::av_inv_q(self.frame_rate()),
+            // 视频：1 / frame_rate（帧率为 0 —— 未协商出帧率 —— 时无从得知单帧时长）
+            MediaType::VIDEO => match self.frame_rate().inverse() {
+                Ok(frame_duration) => frame_duration,
+                Err(_) => return 0,
+            },
             // 音频：frame_size / sample_rate
             MediaType::AUDIO => {
                 let fs = self.frame_size();
                 if fs <= 0 {
                     return 0;
                 }
-                time::new_rational(fs, self.sample_rate())
+                Rational::new(fs, self.sample_rate()).unwrap_or(Rational::ZERO)
             }
             _ => return 0,
         };
-        avutil::av_rescale_q(1, frame_dur_sec, tb).max(1)
+        avutil::av_rescale_q(1, frame_dur_sec.into(), tb.into()).max(1)
     }
 
     /// Internal: Pull an encoded packet from the decoder.
@@ -1782,17 +1922,24 @@ impl Encoder {
     /// an empty accumulator when nothing was written (a subtitle stream, or a
     /// writer whose output carries no data).
     /// May return an error if writing fails or encoder returns an error.
+    ///
+    /// Idempotent **only once the drain really finished** ([`is_flushed`](Self::is_flushed)):
+    /// a call after a failed drain (the encoder is `Drained` — EOS sent, packets
+    /// still buffered) retries the drain instead of reporting success, so a caller
+    /// that retries — or [`Muxer::finish`](crate::mux::Muxer::finish) running a
+    /// second time — cannot turn a truncated stream into a silent success.
     pub fn flush<W: Writer>(
         &mut self,
         writer: &mut W,
         interleaved: bool,
         index: usize,
-        out_stream_time_base: ffi::AVRational,
+        out_stream_time_base: Rational,
     ) -> Result<W::Accum> {
-        // 已经 flush 过就幂等返回：EOS 只能送一次，重复送会拿到 FFmpeg 的
-        // `EncoderFlushedError`。`Muxer::finish` 每个流都会调用本方法，而它自己
-        // 承诺可重复调用，所以第二次必须是 no-op 而不是错误。
-        if !self.state.is_normal() {
+        // 幂等只在**真正排空完成**时成立。`Drained` 表示 EOS 已送出、但上一次没排完
+        // （排空循环报错，或撞上迭代上限）：那种情况必须重试排空。若按"不是 Normal"
+        // 就返回，第二次调用会直接给出空累积器，`Muxer::finish` 随后照样写 trailer，
+        // 把截断的输出当成成功。
+        if self.is_flushed() {
             tracing::debug!("Encoder already flushed ({:?}), nothing to do.", self.state);
             return Ok(W::Accum::default());
         }
@@ -1806,23 +1953,27 @@ impl Encoder {
             return Ok(W::Accum::default());
         }
 
-        if let Some(filter) = self.filter_graph.as_mut() {
-            let frames = filter.flush()?;
-            for frame in frames {
-                // filter 已 Flushed，缓冲帧直接走 post-filter 路径，不可再进 process_frame
-                self.send_frame_post_filter(frame)?;
+        // `Normal` = EOS 还没送出：先排滤镜与音频 FIFO，再送 EOS；
+        // `Drained` = EOS 已送出，只是上次没排完，直接从下面的排空循环继续。
+        if self.state.is_normal() {
+            if let Some(filter) = self.filter_graph.as_mut() {
+                let frames = filter.flush()?;
+                for frame in frames {
+                    // filter 已 Flushed，缓冲帧直接走 post-filter 路径，不可再进 process_frame
+                    self.send_frame_post_filter(frame)?;
+                }
             }
+
+            // 冲刷音频缓冲中不足一帧的剩余样本（作为末帧送编码器）
+            self.flush_audio_fifo()?;
+
+            // EOF: Notify the encoder that the last frame has been sent.
+            self.send_frame_to_encoder(None)?;
+            // 只有 EOS 真正送出、才进入排空阶段（此后不允许再送帧）。置位点必须在这里，
+            // 而不是在 `receive_packet` 的 EAGAIN 分支——那里 read 阶段也会走到。
+            // 与 `Decoder::drain_raw` 同一写法：阶段只由 `state` 表示。
+            self.state = ProcessState::Drained;
         }
-
-        // 冲刷音频缓冲中不足一帧的剩余样本（作为末帧送编码器）
-        self.flush_audio_fifo()?;
-
-        // EOF: Notify the encoder that the last frame has been sent.
-        self.send_frame_to_encoder(None)?;
-        // 只有 EOS 真正送出、才进入排空阶段（此后不允许再送帧）。置位点必须在这里，
-        // 而不是在 `receive_packet` 的 EAGAIN 分支——那里 read 阶段也会走到。
-        // 与 `Decoder::drain_raw` 同一写法：阶段只由 `state` 表示。
-        self.state = ProcessState::Drained;
 
         // drain the items still on the queue before giving up.
         // EOF 已发送，理论上编码器最终会返回 EOF；但为防御个别编码器在 EOS 后
@@ -1844,7 +1995,7 @@ impl Encoder {
                     }
                     // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
                     // encode_ctx_timebase => out_stream_time_base
-                    packet.rescale_ts(self.time_base(), out_stream_time_base);
+                    packet.rescale_ts(self.time_base().into(), out_stream_time_base.into());
                     let out = if interleaved {
                         writer.write_interleaved(&mut packet)?
                     } else {
@@ -1929,8 +2080,8 @@ mod tests {
         AVCodec::find_encoder_by_name(&name).is_some()
     }
 
-    /// `with_flags`/`with_flags2`/`with_thread_type` 的 `impl Into<u32>` 参数落到
-    /// `AVCodecContext` 的对应字段（单个标志与 `|` 组合都要原样保留）；
+    /// `with_flags`/`with_flags2`/`with_thread_type` 的位集参数落到 `AVCodecContext`
+    /// 的对应字段（单个标志与 `|` 组合都原样保留）；
     /// `with_flags` 与 builder 自管的 `GLOBAL_HEADER` 是不同位，按位合并而非互相覆盖。
     #[test]
     fn test_builder_codec_flags_reach_context() -> Result<()> {
@@ -1944,38 +2095,33 @@ mod tests {
 
         let want = AVCodecFlag::CLOSED_GOP.as_raw() | AVCodecFlag::LOW_DELAY.as_raw();
         assert_eq!(
-            encoder.flags() & want,
+            encoder.flags().bits() & want,
             want,
             "caller flags must survive the GLOBAL_HEADER merge"
         );
-        assert_eq!(
-            encoder.flags2(),
-            AVCodecFlag2::FAST.as_raw() | AVCodecFlag2::CHUNKS.as_raw()
-        );
-        assert_eq!(encoder.thread_type(), ThreadType::SLICE.as_raw());
+        assert_eq!(encoder.flags2(), AVCodecFlag2::FAST | AVCodecFlag2::CHUNKS);
+        assert_eq!(encoder.thread_type(), ThreadType::SLICE.into());
 
         // 单个标志（不组合）同样可传，且不会带进别的位。
         let single = EncoderBuilder::new_video(64, 64)
             .with_flags2(AVCodecFlag2::FAST)
             .build()?;
-        assert_eq!(single.flags2(), AVCodecFlag2::FAST.as_raw());
+        assert_eq!(single.flags2(), AVCodecFlag2::FAST.into());
+        assert!(single.flags2().contains(AVCodecFlag2::FAST));
 
-        // 组合位（`FF_THREAD_FRAME | FF_THREAD_SLICE`）原样落到掩码。
+        // 组合位（`FF_THREAD_FRAME | FF_THREAD_SLICE`）原样落到位集。
         let encoder = EncoderBuilder::new_video(64, 64)
             .with_thread_type(ThreadType::FRAME | ThreadType::SLICE)
             .build()?;
-        assert_eq!(
-            encoder.thread_type(),
-            ThreadType::FRAME.as_raw() | ThreadType::SLICE.as_raw()
-        );
+        assert_eq!(encoder.thread_type(), ThreadType::FRAME | ThreadType::SLICE);
 
         // GLOBAL_HEADER 与调用方的 flags 是两个来源的不同位，必须同时存在。
         let encoder = EncoderBuilder::new_video(64, 64)
             .with_global_header(true)
             .with_flags(AVCodecFlag::LOW_DELAY)
             .build()?;
-        assert_ne!(encoder.flags() & AVCodecFlag::GLOBAL_HEADER.as_raw(), 0);
-        assert_ne!(encoder.flags() & AVCodecFlag::LOW_DELAY.as_raw(), 0);
+        assert!(encoder.flags().contains(AVCodecFlag::GLOBAL_HEADER));
+        assert!(encoder.flags().contains(AVCodecFlag::LOW_DELAY));
 
         // 调用方一个 flags 都不设时，上下文自带的默认位（FFmpeg 在
         // `avcodec_alloc_context3` 里写入，实测含 `CLOSED_GOP`）必须原样保留：
@@ -1991,36 +2137,108 @@ mod tests {
         assert_ne!(defaults, 0, "no default flags to preserve on this FFmpeg");
         let plain = EncoderBuilder::new_video(64, 64).build()?;
         assert_eq!(
-            plain.flags() & defaults,
+            plain.flags().bits() & defaults,
             defaults,
             "builder dropped FFmpeg's own default flags: got {:#x}, want at least {defaults:#x}",
-            plain.flags()
+            plain.flags().bits()
         );
         Ok(())
     }
 
-    /// 未设置时落到本机 CPU 数；显式设置时原样落入上下文；超出 `i32` 范围的值
-    /// 被 [`crate::codec::set_thread_count`] 忽略（负数是窄化溢出的产物，没有合法
-    /// 语义），上下文保持 FFmpeg 默认的 `0` = 由编码器自行推导。
+    /// 未设置时落到本机 CPU 数；显式正数原样落入上下文；`0`（FFmpeg 的"自行推导"）
+    /// 与负数（没有合法语义）都由 [`crate::codec::set_thread_count`] 跳过不写，上下文
+    /// 保持 FFmpeg 默认的 `0` = 由编码器自行推导。负数另有一条 `warn!`，让"线程数
+    /// 没生效"对调用方可见（日志断言需要 subscriber，故此处只锁行为）。
     #[test]
-    fn test_builder_thread_count_beyond_i32_is_ignored() -> Result<()> {
+    fn test_builder_thread_count_non_positive_is_ignored() -> Result<()> {
         let explicit = EncoderBuilder::new_video(64, 64)
             .with_thread_count(3)
             .build()?;
         assert_eq!(explicit.thread_count(), 3);
 
-        let cpu_count = num_cpus::get() as u32;
+        let cpu_count = num_cpus::get() as i32;
         let default = EncoderBuilder::new_video(64, 64).build()?;
         assert_eq!(default.thread_count(), cpu_count);
 
-        let overflow = EncoderBuilder::new_video(64, 64)
-            .with_thread_count(u32::MAX)
+        for ignored in [0, -1, i32::MIN] {
+            let non_positive = EncoderBuilder::new_video(64, 64)
+                .with_thread_count(ignored)
+                .build()?;
+            assert_eq!(
+                non_positive.thread_count(),
+                0,
+                "a non-positive thread_count ({ignored}) must be ignored, \
+                 leaving FFmpeg's default"
+            );
+        }
+        Ok(())
+    }
+
+    /// `width`/`height` 是 `u32`，却会以 `as i32` 写进 `AVCodecContext` 与
+    /// `FilterParams`：超过 `i32::MAX` 会回绕成负数，一直拖到 `avcodec_open2`
+    /// 才报一句不透明的错误；`0` 也不是合法画面尺寸。两者都必须在 `build()`
+    /// 里就报 `InvalidConfig`，且错误信息指到具体是哪一个参数。
+    #[test]
+    fn test_video_size_out_of_range_is_invalid_config() {
+        // `Encoder` 没有 `Debug`，只能这样取错误。
+        fn build_err(builder: EncoderBuilder) -> RsmediaError {
+            let Err(err) = builder.build() else {
+                panic!("an out-of-range video size must fail to build");
+            };
+            err
+        }
+
+        // 2^31：写进 `i32` 字段会变成负数（旧行为）。
+        let too_wide = i32::MAX as u32 + 1;
+        let err = build_err(EncoderBuilder::new_video(too_wide, 720));
+        assert!(err.is_invalid_config(), "{err}");
+        assert!(err.to_string().contains("width"), "{err}");
+        assert!(err.to_string().contains(&too_wide.to_string()), "{err}");
+
+        let err = build_err(EncoderBuilder::new_video(640, u32::MAX));
+        assert!(err.is_invalid_config(), "{err}");
+        assert!(err.to_string().contains("height"), "{err}");
+
+        // 0 不是合法尺寸
+        for (width, height, want) in [(0u32, 480u32, "width"), (640, 0, "height")] {
+            let err = build_err(EncoderBuilder::new_video(width, height));
+            assert!(err.is_invalid_config(), "{err}");
+            assert!(err.to_string().contains(want), "{err}");
+        }
+
+        // 正常尺寸不受影响（防止校验过严）。
+        assert!(EncoderBuilder::new_video(8, 8).build().is_ok());
+    }
+
+    /// `with_max_bit_rate`/`with_buffer_size` 的非正值不写进 `rc_*` 字段：
+    /// `0` 在文档里是"视为未设置"（`max_bit_rate = 0` 即不限瞬时码率），负值只可能
+    /// 是写错。两者都不生效，负值额外打 `warn!`（日志不便断言，这里锁住"负值不会
+    /// 污染字段"这一 fail-safe 行为）。
+    #[test]
+    fn test_non_positive_rate_control_is_not_applied() -> Result<()> {
+        let applied = EncoderBuilder::new_video(64, 64)
+            .with_bit_rate(500_000)
+            .with_max_bit_rate(600_000)
+            .with_buffer_size(1_200_000)
             .build()?;
-        assert_eq!(
-            overflow.thread_count(),
-            0,
-            "an out-of-range thread_count must be ignored, leaving FFmpeg's default"
-        );
+        assert_eq!(applied.context.rc_max_rate, 600_000);
+        assert_eq!(applied.context.rc_buffer_size, 1_200_000);
+
+        for (max_rate, buffer_size) in [(0i64, 0i32), (-1, -1), (i64::MIN, i32::MIN)] {
+            let ignored = EncoderBuilder::new_video(64, 64)
+                .with_bit_rate(500_000)
+                .with_max_bit_rate(max_rate)
+                .with_buffer_size(buffer_size)
+                .build()?;
+            assert_eq!(
+                ignored.context.rc_max_rate, 0,
+                "max_bit_rate {max_rate} must not reach rc_max_rate"
+            );
+            assert_eq!(
+                ignored.context.rc_buffer_size, 0,
+                "buffer_size {buffer_size} must not reach rc_buffer_size"
+            );
+        }
         Ok(())
     }
 
@@ -2059,7 +2277,7 @@ mod tests {
     #[test]
     fn test_missing_encoder_reports_unsupported() {
         let Err(err) = EncoderBuilder::new_video(64, 64)
-            .with_codec_name("no_such_encoder".to_string())
+            .with_codec_name("no_such_encoder")
             .build()
         else {
             panic!("unknown codec name must fail");
@@ -2080,7 +2298,7 @@ mod tests {
         let config = CodecConfig::new_with_name(c"pcm_s16le")?;
         let builder = EncoderBuilder::default()
             .with_media_type(MediaType::AUDIO)
-            .with_codec_name("pcm_s16le".to_string())
+            .with_codec_name("pcm_s16le")
             .with_nb_channels(2)
             .with_sample_rate(44_100);
         assert_eq!(
@@ -2102,7 +2320,7 @@ mod tests {
         let config = CodecConfig::new_with_name(c"aac")?;
         let builder = EncoderBuilder::default()
             .with_media_type(MediaType::AUDIO)
-            .with_codec_name("aac".to_string())
+            .with_codec_name("aac")
             .with_nb_channels(2)
             .with_sample_rate(44_100);
         assert_eq!(
@@ -2117,23 +2335,33 @@ mod tests {
     #[test]
     fn test_effective_time_base_per_media_type() {
         let video = EncoderBuilder::new_video(64, 64).with_fps(25.0);
-        let tb = video.effective_time_base();
-        assert_eq!((tb.num, tb.den), (1, 25), "video input time base = 1/fps");
+        assert_eq!(
+            video.effective_time_base().unwrap(),
+            Rational::new(1, 25).unwrap(),
+            "video input time base = 1/fps"
+        );
 
         let audio = EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP);
-        let tb = audio.effective_time_base();
         assert_eq!(
-            (tb.num, tb.den),
-            (1, 44_100),
+            audio.effective_time_base().unwrap(),
+            Rational::new(1, 44_100).unwrap(),
             "audio input time base = 1/sample_rate"
         );
 
         let subtitle = EncoderBuilder::new_subtitle();
-        let tb = subtitle.effective_time_base();
         assert_eq!(
-            (tb.num, tb.den),
-            (1, EncoderBuilder::SUBTITLE_TIME_BASE_DEN),
+            subtitle.effective_time_base().unwrap(),
+            Rational::new(1, EncoderBuilder::SUBTITLE_TIME_BASE_DEN).unwrap(),
             "subtitle input time base = 1/1000"
+        );
+
+        // 帧率为 0 ⇒ 取不到倒数：音频/视频都报 `InvalidConfig`，而不是给出 1/0。
+        let zero_rate = EncoderBuilder::new_video(64, 64).with_frame_rate(Rational::ZERO);
+        assert!(
+            zero_rate
+                .effective_time_base()
+                .unwrap_err()
+                .is_invalid_config()
         );
     }
 
@@ -2254,7 +2482,10 @@ mod tests {
         assert_eq!(encoder.next_pts, 2);
 
         // 输入时间基被统一为编码器的 1/fps。
-        assert_eq!((second.time_base.num, second.time_base.den), (1, 25));
+        assert_eq!(
+            Rational::from(second.time_base),
+            Rational::new(1, 25).unwrap()
+        );
 
         // 用户显式 pts：原样使用，计数器跳到该 pts 之后。
         let mut explicit = AVFrame::new();
@@ -2334,10 +2565,16 @@ mod tests {
         assert_eq!(encoder.pix_fmt(), PixelFormat::YUV420P);
         assert_eq!(encoder.media_type(), MediaType::VIDEO);
         assert_eq!(encoder.frame_size(), 0, "video codecs have no frame size");
-        let tb = encoder.time_base();
-        assert_eq!((tb.num, tb.den), (1, 30), "time base = 1/fps");
-        let fr = encoder.frame_rate();
-        assert_eq!((fr.num, fr.den), (30, 1), "frame rate = fps");
+        assert_eq!(
+            encoder.time_base(),
+            Rational::new(1, 30).unwrap(),
+            "time base = 1/fps"
+        );
+        assert_eq!(
+            encoder.frame_rate(),
+            Rational::integer(30),
+            "frame rate = fps"
+        );
         assert!(!encoder.is_drained(), "a fresh encoder is not drained");
         assert!(!encoder.is_flushed(), "a fresh encoder is not flushed");
         Ok(())
@@ -2455,7 +2692,7 @@ mod tests {
         let mut src_frames = hw_ctx.create_hw_frames_ctx(width as i32, height as i32, 2)?;
 
         let mut encoder = EncoderBuilder::new_video(width, height)
-            .with_codec_name(codec_name.to_string())
+            .with_codec_name(codec_name)
             .with_hardware_device(Some(config))
             .with_hw_pool_size(2)
             .build()?;
@@ -2548,6 +2785,72 @@ mod tests {
         }
     }
 
+    /// `with_fps` 无法表达分母带 `1001` 的标准帧率：`24_000.0 / 1_001.0` 先被舍
+    /// 入成 `f32`，`av_d2q` 再逼近**那个 f32**，得到的不是调用方写下的分数（实测
+    /// `86002/3587`）。偏差只有 5.6e-7 fps，短片段看不出来，长片会累积；而
+    /// `with_frame_rate` 走的是精确入口，原样使用调用方给的分数。
+    ///
+    /// 这个断言记录的是"浮点入口会逼近、精确入口不会"这一事实本身，所以它既
+    /// 不依赖某个具体的错误有理数，也不会因为 FFmpeg 换了逼近算法而失效。
+    #[test]
+    fn test_with_fps_cannot_express_a_1001_denominator_rate() {
+        const FILM_ON_NTSC: (i32, i32) = (24_000, 1_001);
+        let exact = Rational::new(FILM_ON_NTSC.0, FILM_ON_NTSC.1).unwrap();
+
+        let approx = EncoderBuilder::new_video(64, 64).with_fps(24_000.0 / 1_001.0);
+        let approx = approx.frame_rate;
+        assert_ne!(approx, exact, "`f32` 表示不出 24000/1001 这个分数");
+        let error = (approx.as_f64() - exact.as_f64()).abs();
+        assert!(
+            error > 0.0 && error < 1e-5,
+            "浮点入口给出的应当是「差之毫厘」的近似，实际 {approx}（偏差 {error}）"
+        );
+
+        let verbatim = EncoderBuilder::new_video(64, 64).with_frame_rate(exact);
+        assert_eq!(verbatim.frame_rate, exact);
+    }
+
+    /// 精确入口的合法性判据只有一条：分子为正（分母非零由 [`Rational`] 保证）。
+    /// 非法值同样在 `build()` 里 fail fast，而不是静默退回默认帧率。
+    #[test]
+    fn test_with_frame_rate_rejects_non_positive_numerator() {
+        for numerator in [0, -1] {
+            let rate = Rational::new(numerator, 1).unwrap();
+            let err = match EncoderBuilder::new_video(64, 64)
+                .with_frame_rate(rate)
+                .build()
+            {
+                Ok(_) => panic!("a non-positive frame rate must not build"),
+                Err(e) => e,
+            };
+            assert!(err.is_invalid_config(), "rate {rate} gave: {err}");
+        }
+    }
+
+    /// 精确设置帧率后，编码器实际采用的就是那个有理数（不经过任何浮点往返）。
+    #[test]
+    fn test_with_frame_rate_reaches_the_encoder() -> Result<()> {
+        if !default_video_encoder_available() {
+            println!(
+                "SKIP: {} is not in this FFmpeg build",
+                EncoderBuilder::VIDEO_CODEC_NAME
+            );
+            return Ok(());
+        }
+
+        let rate = Rational::new(30_000, 1_001).unwrap();
+        let encoder = EncoderBuilder::new_video(64, 64)
+            .with_frame_rate(rate)
+            .build()?;
+        assert_eq!(encoder.frame_rate(), rate);
+        assert_eq!(
+            encoder.time_base(),
+            Rational::new(1_001, 30_000).unwrap(),
+            "编码器时间基应当是帧率的倒数"
+        );
+        Ok(())
+    }
+
     /// 字幕编码器在打开时必须已有 ASS 脚本 header，否则 `build()` 报错
     /// （`ff_ass_split(NULL)` 会让 init 返回 `AVERROR_INVALIDDATA`）。
     #[test]
@@ -2567,7 +2870,7 @@ mod tests {
 
         // 缺 header：必须是 header 校验失败（编码器缺失时跳过，环境差异不算失败）。
         match EncoderBuilder::new_subtitle()
-            .with_codec_name(Some("mov_text".to_string()))
+            .with_codec_name("mov_text")
             .build()
         {
             Err(e) if e.is_invalid_config() => {}
@@ -2579,7 +2882,7 @@ mod tests {
 
         // 提供 header 后可正常构建。
         if let Err(e) = EncoderBuilder::new_subtitle()
-            .with_codec_name(Some("mov_text".to_string()))
+            .with_codec_name("mov_text")
             .with_subtitle_header(ASS_HEADER)
             .build()
         {
@@ -2608,7 +2911,7 @@ mod tests {
     fn test_crf_fallback_bitrate() -> Result<()> {
         let encoder = EncoderBuilder::new_video(64, 64)
             .with_fps(25.0)
-            .with_codec_name("mpeg4".to_string())
+            .with_codec_name("mpeg4")
             .with_quality(Quality::Crf(20))
             .build()?;
         assert_eq!(encoder.codecpar().bit_rate, EncoderBuilder::VIDEO_BIT_RATE);
@@ -2641,7 +2944,7 @@ mod tests {
         assert_eq!(encoder.scaler.quality(), ScaleQuality::default_mask());
         assert_eq!(
             encoder.scaler.flags(),
-            ScaleAlgorithm::LANCZOS.as_raw() | ScaleQuality::default_mask()
+            ScaleAlgorithm::LANCZOS.as_raw() | ScaleQuality::default_mask().bits()
         );
 
         // 默认策略：BICUBIC + 默认质量掩码。
@@ -2649,15 +2952,15 @@ mod tests {
         assert_eq!(encoder.scaler.algorithm(), ScaleAlgorithm::default());
         assert_eq!(encoder.scaler.quality(), ScaleQuality::default_mask());
 
-        // 单个质量位、以及裸掩码 `0`（= 无质量位）。
+        // 单个质量位、以及空集（= 无质量位）。
         let encoder = EncoderBuilder::new_video(320, 240)
             .with_scale_quality(ScaleQuality::BITEXACT)
             .build()?;
-        assert_eq!(encoder.scaler.quality(), ScaleQuality::BITEXACT.as_raw());
+        assert_eq!(encoder.scaler.quality(), ScaleQuality::BITEXACT.into());
         let encoder = EncoderBuilder::new_video(320, 240)
-            .with_scale_quality(0u32)
+            .with_scale_quality(FlagSet::EMPTY)
             .build()?;
-        assert_eq!(encoder.scaler.quality(), 0);
+        assert!(encoder.scaler.quality().is_empty());
 
         // 池化开关进入 Scaler：默认关闭，with_scale_pool(true) 打开。
         assert!(!encoder.scaler.pool_enabled());
@@ -2666,5 +2969,155 @@ mod tests {
             .build()?;
         assert!(encoder.scaler.pool_enabled());
         Ok(())
+    }
+
+    /// 排空失败后**必须能重试**：`Drained`（EOS 已送出、包还没排完）不等于"已经
+    /// flush 过"。回归点：守卫曾经只看"状态不是 `Normal`"，于是第二次 `flush` 直接
+    /// 返回空累积器，而 `Muxer::finish` 随后照样写 trailer ⇒ **截断的流以成功返回**。
+    ///
+    /// 用可切换失败的 writer 制造"排空循环中途报错"：第一次必然 `Err`；第二次仍必须
+    /// `Err`（说明它真的又去排空了，而不是报告成功）；切回正常 writer 后必须把剩下的
+    /// 包全部写出、进入 `Flushed`，此后再调用才允许幂等返回空。
+    #[test]
+    fn test_flush_retries_drain_after_a_failed_attempt() -> Result<()> {
+        if !default_video_encoder_available() {
+            println!(
+                "SKIP: {} is not in this FFmpeg build",
+                EncoderBuilder::VIDEO_CODEC_NAME
+            );
+            return Ok(());
+        }
+
+        let mut encoder = EncoderBuilder::new_video(64, 64)
+            .with_fps(25.0)
+            .with_pix_fmt(PixelFormat::YUV420P)
+            .build()?;
+        // 多喂几帧：EOS 时编码器内部还压着多个包（lookahead / B 帧重排序），
+        // 这样"某次写失败"之后仍有包可排，重试才有可观测的效果。
+        for index in 0..12i64 {
+            let mut frame = AVFrame::new();
+            frame.set_width(64);
+            frame.set_height(64);
+            frame.set_format(i32::from(PixelFormat::YUV420P));
+            frame
+                .alloc_buffer()
+                .context("Failed to allocate test frame buffer")?;
+            frame.set_pts(index);
+            encoder.encode_raw(frame)?;
+        }
+
+        let out_time_base = Rational::new(1, 25).unwrap();
+        let mut writer = FlakyWriter::new("matroska")?;
+        writer.add_stream(encoder.codecpar(), out_time_base)?;
+        writer.write_header()?;
+
+        writer.fail = true;
+        let first = encoder
+            .flush(&mut writer, false, 0, out_time_base)
+            .expect_err("writing must fail while the writer is switched to fail");
+        assert!(
+            !encoder.is_flushed(),
+            "a failed drain must not look flushed: {first}"
+        );
+
+        encoder
+            .flush(&mut writer, false, 0, out_time_base)
+            .expect_err("the retry must drain again instead of reporting success");
+
+        writer.fail = false;
+        encoder.flush(&mut writer, false, 0, out_time_base)?;
+        assert!(encoder.is_flushed(), "a complete drain must reach Flushed");
+        assert!(
+            writer.packets > 0,
+            "the retry must write the packets that were still buffered"
+        );
+        writer.write_trailer()?;
+        assert!(writer.bytes > 0, "the container must really have bytes");
+
+        // 只有真正排空完成之后才是幂等的 no-op。
+        assert_eq!(encoder.flush(&mut writer, false, 0, out_time_base)?, 0);
+        Ok(())
+    }
+
+    /// 包一层 [`BufferWriter`](crate::io::BufferWriter)，可切换"写包即失败"，
+    /// 用来在排空循环中途制造一次 I/O 错误。
+    ///
+    /// 单独记成功写出的包数：`BufferWriter` 的 `Out` 是**增量**字节，而 muxer 会先
+    /// 把数据攒在内部（header/簇/trailer 才吐出来），所以"排空确实写了包"必须用包数
+    /// 而不是字节数验收。
+    struct FlakyWriter {
+        inner: crate::io::BufferWriter,
+        fail: bool,
+        bytes: usize,
+        packets: usize,
+    }
+
+    impl FlakyWriter {
+        fn new(format: &str) -> Result<Self> {
+            Ok(Self {
+                inner: crate::io::BufferWriter::new(format)?,
+                fail: false,
+                bytes: 0,
+                packets: 0,
+            })
+        }
+
+        /// 计入本次写出的字节数，并把同样的大小作为本次的 `Out`。
+        fn count(&mut self, out: bytes::Bytes) -> usize {
+            self.bytes += out.len();
+            self.packets += 1;
+            out.len()
+        }
+    }
+
+    impl Writer for FlakyWriter {
+        type Out = usize;
+        type Accum = usize;
+
+        fn merge_out(acc: &mut usize, out: usize) {
+            *acc += out;
+        }
+
+        fn merge_accum(acc: &mut usize, other: usize) {
+            *acc += other;
+        }
+
+        fn write_header(&mut self) -> Result<usize> {
+            let bytes = self.inner.write_header()?;
+            Ok(self.count(bytes))
+        }
+
+        fn write_frame(&mut self, packet: &mut AVPacket) -> Result<usize> {
+            if self.fail {
+                return Err(RsmediaError::msg("simulated writer failure"));
+            }
+            let bytes = self.inner.write_frame(packet)?;
+            Ok(self.count(bytes))
+        }
+
+        fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<usize> {
+            if self.fail {
+                return Err(RsmediaError::msg("simulated writer failure"));
+            }
+            let bytes = self.inner.write_interleaved(packet)?;
+            Ok(self.count(bytes))
+        }
+
+        fn write_trailer(&mut self) -> Result<usize> {
+            let bytes = self.inner.write_trailer()?;
+            Ok(self.count(bytes))
+        }
+
+        fn output(&self) -> &rsmpeg::avformat::AVFormatContextOutput {
+            self.inner.output()
+        }
+
+        fn output_mut(&mut self) -> &mut rsmpeg::avformat::AVFormatContextOutput {
+            self.inner.output_mut()
+        }
+
+        fn is_header_written(&self) -> bool {
+            self.inner.is_header_written()
+        }
     }
 }

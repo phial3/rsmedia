@@ -13,6 +13,11 @@ const MAX_FFMPEG_PLANES: usize = 4;
 
 /// Fill plane linesizes for an image with pixel format pix_fmt and width.
 ///
+/// This mirrors `av_image_fill_linesizes` one-to-one, including its `int`
+/// parameters and result — hence `width: i32` and `[i32; 4]` rather than the
+/// `u32` the high-level API uses. Linesizes are signed in FFmpeg (a negative
+/// width yields negative strides), so the signedness is load-bearing here.
+///
 /// # Arguments
 ///
 /// * `pix_fmt` - The pixel format of the image.
@@ -234,10 +239,15 @@ struct PlaneGeom {
 
 /// 依据像素格式描述符，计算指定平面相对帧全分辨率的可见宽高与像素字节数。
 ///
-/// 色度子采样平面（如 YUV420P 的 U/V）宽高按 `log2_chroma_*` **向上取整**右移
-/// （等价于 FFmpeg 的 `AV_CEIL_RSHIFT`）：65x49 的画面其色度平面是 33x25，而不是
-/// 向下取整得到的 32x24 —— 后者会截断一整行/列，并在高度为 1 时算出 0 行，
-/// 让后续"最后一行"的偏移计算下溢。
+/// 色度子采样平面（如 YUV420P 的 U/V，即平面 1、2）宽高按 `log2_chroma_*`
+/// **向上取整**右移（等价于 FFmpeg 的 `AV_CEIL_RSHIFT`）：65x49 的画面其色度平面是
+/// 33x25，而不是向下取整得到的 32x24 —— 后者会截断一整行/列，并在高度为 1 时算出
+/// 0 行，让后续"最后一行"的偏移计算下溢。
+///
+/// 只有平面 1、2 会被子采样，这与 FFmpeg 的建模一致（`av_image_fill_plane_sizes`
+/// 同样只对它们应用色度位移）。**平面 3 不是色度平面**：`YUVA420P` 等带 alpha 的
+/// 格式把 alpha 放在平面 3，它是全分辨率的；按 `plane_idx > 0` 一律位移会把 alpha
+/// 平面算成半尺寸，返回的缓冲区少掉四分之三的 alpha 数据。
 ///
 /// 每像素字节数取自 `comp[plane].step`；`step` 为 0（如调色板格式）时按 1 处理。
 fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
@@ -252,10 +262,10 @@ fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
         )));
     }
 
-    let (shift_w, shift_h) = if plane_idx > 0 {
-        (desc.log2_chroma_w as u32, desc.log2_chroma_h as u32)
-    } else {
-        (0, 0)
+    // 与 `PixelFormat::data_layout` 用同一条规则：只有 1、2 是色度平面。
+    let (shift_w, shift_h) = match plane_idx {
+        1 | 2 => (desc.log2_chroma_w as u32, desc.log2_chroma_h as u32),
+        _ => (0, 0),
     };
     let ceil_shift = |value: usize, shift: u32| (value + (1usize << shift) - 1) >> shift;
 
@@ -824,7 +834,6 @@ pub fn thumbnail(
     use crate::error::Context;
     use crate::io::Seekable;
     use crate::stream::StreamInfo;
-    use rsmpeg::avutil;
 
     let mut reader = crate::StreamReader::new(source).context("Failed to open thumbnail source")?;
     let mut decoder = crate::DecoderBuilder::new(crate::MediaType::VIDEO)
@@ -838,7 +847,7 @@ pub fn thumbnail(
         Some(ts) => ts,
         None => {
             let info = StreamInfo::from_reader(&reader, decoder.stream_index())?;
-            let mid_secs = info.duration as f64 * avutil::av_q2d(info.time_base) / 2.0;
+            let mid_secs = info.duration as f64 * info.time_base.as_f64() / 2.0;
             (mid_secs * 1000.0).round().max(0.0) as i64
         }
     };
@@ -1315,6 +1324,50 @@ mod tests {
                 "row {y} of a vertically flipped frame"
             );
         }
+
+        Ok(())
+    }
+
+    /// 带 alpha 的格式里，平面 3 是 alpha 而不是色度平面，必须保持全分辨率。
+    ///
+    /// FFmpeg 只对平面 1、2 应用 `log2_chroma_*` 位移（`av_image_fill_plane_sizes`
+    /// 同理，`PixelFormat::data_layout` 也照此建模）。`plane_geom` 旧实现按
+    /// `plane_idx > 0` 一律位移，把 `YUVA420P` 的 alpha 平面算成半宽半高：
+    /// `get_plane_buffer` 于是只返回四分之一的 alpha 数据，每行还按错误的行宽读取。
+    #[test]
+    fn test_get_plane_buffer_alpha_plane_is_full_resolution() -> Result<()> {
+        let (width, height) = (64usize, 48usize);
+        let frame = create_test_frame(width as i32, height as i32, ffi::AV_PIX_FMT_YUVA420P)?;
+
+        // alpha 平面逐行写入行号，行内为定值。
+        unsafe {
+            let base = frame.data[3].cast::<u8>();
+            let linesize = frame.linesize[3] as usize;
+            for y in 0..height {
+                for x in 0..width {
+                    *base.add(y * linesize + x) = y as u8;
+                }
+            }
+        }
+
+        let buf = get_plane_buffer(&frame, 3)?;
+        assert_eq!(
+            buf.len(),
+            width * height,
+            "the alpha plane of YUVA420P is full resolution, not chroma-subsampled"
+        );
+        for y in 0..height {
+            assert!(
+                buf[y * width..(y + 1) * width]
+                    .iter()
+                    .all(|&v| v == y as u8),
+                "row {y} of the alpha plane was read with the wrong geometry"
+            );
+        }
+
+        // 平面 1、2 依旧按色度子采样（半宽半高）—— 修复不能把它们也放开。
+        let chroma = get_plane_buffer(&frame, 1)?;
+        assert_eq!(chroma.len(), (width / 2) * (height / 2));
 
         Ok(())
     }

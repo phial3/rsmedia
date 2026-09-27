@@ -1,8 +1,294 @@
+//! Time, and the exact rational numbers it is built on.
+//!
+//! Media metadata is rational by nature: a time base is `1 / sample_rate`, a
+//! frame rate is `30_000 / 1_001` rather than `29.97`, a pixel aspect ratio is
+//! `64 / 45`. This module holds [`Rational`] — the crate's exact rational — and
+//! [`Time`], the timestamp type built on top of it.
+
+use crate::error::{Result, RsmediaError};
+
 use rsmpeg::avutil;
 use rsmpeg::ffi;
-use rsmpeg::ffi::AVRational;
 
+use std::num::NonZeroI32;
 use std::time::Duration;
+
+/// An exact rational number `num / den`.
+///
+/// Media metadata is rational by nature: a time base is `1 / sample_rate`, a
+/// frame rate is `30_000 / 1_001` rather than `29.97`, a pixel aspect ratio is
+/// `64 / 45`. Storing those as `f32`/`f64` discards exactly the information that
+/// makes them meaningful — no binary float is `30_000 / 1_001` — so this type
+/// keeps the numerator and denominator as integers: the same representation, and
+/// the same field width, as FFmpeg's `AVRational`.
+///
+/// This type is also the crate's **only** face for a rational. FFmpeg's
+/// `AVRational` appears nowhere else in rsmedia: conversions in both directions
+/// are [`From`]/[`Into`] here (see [`Rational::from`] and the `From<Rational>`
+/// impl), so no other module — and no caller — ever has to name the raw type.
+///
+/// A [`Rational`] is normalised whenever it is built (see [`Rational::new`]):
+///
+/// * the denominator is positive,
+/// * `num` and `den` are in lowest terms — a common divisor is divided out, so
+///   `2 / 4` is stored as `1 / 2`,
+/// * a zero numerator is stored as `0 / 1`.
+///
+/// Normalisation is what makes [`PartialEq`] mean "the same number" instead of
+/// "the same spelling": `Rational::new(2, 4)? == Rational::new(1, 2)?`.
+///
+/// The fields are private so that every [`Rational`] this crate accepts or
+/// returns is normalised; read them with [`Rational::num`] and [`Rational::den`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rational {
+    num: i32,
+    den: NonZeroI32,
+}
+
+impl Rational {
+    /// The rational `0`, stored as `0/1`.
+    ///
+    /// Also what [`Rational::from`] yields for an FFmpeg rational that is
+    /// "unset", which is why [`Time`] treats it as "no time base" rather than as
+    /// a zero-width unit.
+    pub const ZERO: Self = Self::integer(0);
+
+    /// The rational `1`, i.e. `1/1`. The natural value for an *absent* scaling
+    /// factor such as a pixel aspect ratio.
+    pub const ONE: Self = Self::integer(1);
+
+    /// The exact rational `num / den`, normalised as described on the type.
+    ///
+    /// Unlike a float entry point there is no approximation step: the value you
+    /// pass is the value that is stored and that reaches FFmpeg.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::invalid_config`] when the number has no
+    /// representation as a pair of `i32`:
+    ///
+    /// * `den == 0` — `x / 0` is not a number;
+    /// * the normalised numerator or denominator would not fit in `i32`, which
+    ///   can only happen for `den == i32::MIN`, or for `num == i32::MIN` with
+    ///   `den == -1` (whose normalised form is `2^31 / 1`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsmedia::Rational;
+    ///
+    /// // Film-on-NTSC, exactly. No float ever sees this value.
+    /// let rate = Rational::new(24_000, 1_001)?;
+    /// assert_eq!((rate.num(), rate.den()), (24_000, 1_001));
+    ///
+    /// // Normalised on construction: the same number, whichever way it is spelled.
+    /// assert_eq!(Rational::new(50, 2)?, Rational::new(25, 1)?);
+    /// assert_eq!(Rational::new(0, 7)?, Rational::integer(0));
+    ///
+    /// assert!(Rational::new(1, 0).is_err());
+    /// # Ok::<(), rsmedia::RsmediaError>(())
+    /// ```
+    pub fn new(num: i32, den: i32) -> Result<Self> {
+        if den == 0 {
+            return Err(RsmediaError::invalid_config(format!(
+                "a rational's denominator must not be zero (got {num}/0)"
+            )));
+        }
+
+        // Everything below is computed in `i64`: `-i32::MIN` and `i32::MIN / -1`
+        // both overflow `i32`, and the machine-word width lets the reduction
+        // happen *before* the range check, so `i32::MIN / i32::MIN` (which is
+        // really `1/1`) is accepted.
+        let mut numerator = i64::from(num);
+        let mut denominator = i64::from(den);
+        if denominator < 0 {
+            numerator = -numerator;
+            denominator = -denominator;
+        }
+
+        let divisor = gcd(numerator.unsigned_abs(), denominator.unsigned_abs());
+        if divisor > 1 {
+            let divisor = divisor as i64;
+            numerator /= divisor;
+            denominator /= divisor;
+        }
+
+        let out_of_range = || {
+            RsmediaError::invalid_config(format!(
+                "the rational {num}/{den} has no exact i32 representation"
+            ))
+        };
+        let num = i32::try_from(numerator).map_err(|_| out_of_range())?;
+        let den = i32::try_from(denominator)
+            .ok()
+            .and_then(NonZeroI32::new)
+            .ok_or_else(out_of_range)?;
+
+        Ok(Self { num, den })
+    }
+
+    /// The whole number `num` as a rational, i.e. `num / 1`.
+    ///
+    /// ```
+    /// use rsmedia::Rational;
+    ///
+    /// let rate = Rational::integer(25);
+    /// assert_eq!((rate.num(), rate.den()), (25, 1));
+    /// assert_eq!(rate, Rational::new(25, 1)?);
+    /// # Ok::<(), rsmedia::RsmediaError>(())
+    /// ```
+    pub const fn integer(num: i32) -> Self {
+        Self {
+            num,
+            den: NonZeroI32::new(1).unwrap(),
+        }
+    }
+
+    /// The unit fraction `1 / den` — the shape every time base has.
+    ///
+    /// This is the `const` counterpart of [`Self::new`] for the case that
+    /// dominates media metadata: a time base is `1 / 1_000_000`, `1 /
+    /// sample_rate` or `1 / fps`. Being `const` is what lets a time base be
+    /// written as a `const` item, or used inside one, instead of being computed
+    /// at every call site.
+    ///
+    /// `den` must be positive. That is not an arbitrary restriction: `1 / 0` is
+    /// not a number, and `1 / -n` is simply `-1 / n`, which [`Self::new`] builds
+    /// when that is what you meant. In a `const` context a bad `den` is a
+    /// compile error; at run time it panics.
+    ///
+    /// ```
+    /// use rsmedia::Rational;
+    ///
+    /// const MICROS: Rational = Rational::unit(1_000_000);
+    /// assert_eq!((MICROS.num(), MICROS.den()), (1, 1_000_000));
+    /// assert_eq!(MICROS, Rational::new(1, 1_000_000)?);
+    /// # Ok::<(), rsmedia::RsmediaError>(())
+    /// ```
+    pub const fn unit(den: i32) -> Self {
+        assert!(den > 0, "a unit fraction's denominator must be positive");
+        Self {
+            num: 1,
+            den: NonZeroI32::new(den).unwrap(),
+        }
+    }
+
+    /// The numerator. May be negative — a time base is not required to be positive.
+    pub const fn num(&self) -> i32 {
+        self.num
+    }
+
+    /// The denominator. Always positive and never zero.
+    pub const fn den(&self) -> i32 {
+        self.den.get()
+    }
+
+    /// The reciprocal, `den / num` — the frame rate implied by a time base, or
+    /// the time base implied by a frame rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::invalid_config`] when the reciprocal has no
+    /// `(i32, i32)` representation. The case that matters in practice is
+    /// `num == 0`: zero has no reciprocal, its denominator would be zero, and
+    /// [`Rational`] deliberately cannot represent that.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsmedia::Rational;
+    ///
+    /// // 25 fps and a 1/25 s time base are each other's reciprocal.
+    /// let fps = Rational::integer(25);
+    /// assert_eq!(fps.inverse()?, Rational::new(1, 25)?);
+    /// assert_eq!(Rational::new(1, 25)?.inverse()?, fps);
+    ///
+    /// assert!(Rational::ZERO.inverse().is_err());
+    /// # Ok::<(), rsmedia::RsmediaError>(())
+    /// ```
+    pub fn inverse(self) -> Result<Self> {
+        Self::new(self.den.get(), self.num).map_err(|_| {
+            RsmediaError::invalid_config(format!("the rational {self} cannot be inverted"))
+        })
+    }
+
+    /// Whether this is exactly zero, i.e. [`Rational::ZERO`].
+    ///
+    /// A rational has exactly one zero spelling (`0/1`) — normalisation
+    /// guarantees it — so this is the same test as `*self == Self::ZERO`,
+    /// spelled out because "is the value zero" reads better than a comparison
+    /// at call sites that branch on it.
+    pub const fn is_zero(&self) -> bool {
+        self.num == 0
+    }
+
+    /// The value as an `f64`.
+    ///
+    /// Lossy: this is the conversion this type exists to avoid. It is provided
+    /// for printing, for thresholds, and for interop with float-based APIs; keep
+    /// the [`Rational`] itself whenever exactness matters.
+    pub fn as_f64(&self) -> f64 {
+        f64::from(self.num) / f64::from(self.den.get())
+    }
+}
+
+/// Euclid's algorithm on magnitudes. `gcd(0, x) == x`, which is what reduces a
+/// zero numerator to the canonical `0 / 1`.
+const fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
+}
+
+impl From<i32> for Rational {
+    /// A whole number is the rational `num / 1`.
+    fn from(num: i32) -> Self {
+        Self::integer(num)
+    }
+}
+
+impl From<Rational> for ffi::AVRational {
+    /// Convert to FFmpeg's representation.
+    ///
+    /// Lossless in both directions of the value range: [`Rational::num`] and
+    /// [`Rational::den`] are already `i32`, and the denominator is positive — the
+    /// convention every FFmpeg API that consumes a rational expects.
+    fn from(rational: Rational) -> Self {
+        avutil::ra(rational.num, rational.den.get())
+    }
+}
+
+impl From<ffi::AVRational> for Rational {
+    /// Reads FFmpeg's own representation.
+    ///
+    /// FFmpeg writes `x/0` into a structure whose rational is *not known yet*:
+    /// `AVFrame.time_base` before a decoder fills it in, `AVStream.avg_frame_rate`
+    /// on a stream that has no rate, `AVCodecContext.time_base` before the codec
+    /// is opened. That spelling is not a number, and [`Rational`] cannot hold it
+    /// by construction — so it folds to [`Rational::ZERO`], the spelling every
+    /// consumer in this crate already treats as "unset". A value outside the
+    /// `(i32, i32)` range is only reachable through such a denominator and folds
+    /// the same way.
+    ///
+    /// This is total on purpose: reading a rational out of an FFmpeg structure
+    /// should not force every caller to invent a policy for a placeholder FFmpeg
+    /// itself produces routinely. Use [`Rational::new`] when a zero denominator
+    /// must be an error instead.
+    fn from(rational: ffi::AVRational) -> Self {
+        Self::new(rational.num, rational.den).unwrap_or(Self::ZERO)
+    }
+}
+
+impl std::fmt::Display for Rational {
+    /// Formats as `num/den`, the way FFmpeg and `ffprobe` print a rational:
+    /// `30000/1001`, not `29.97`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.num, self.den.get())
+    }
+}
 
 /// Represents a time or duration.
 ///
@@ -23,7 +309,12 @@ use std::time::Duration;
 #[derive(Debug, Copy, Clone)]
 pub struct Time {
     pub time: Option<i64>,
-    pub time_base: AVRational,
+    /// The time base, as a [`Rational`] — see that type for why.
+    ///
+    /// [`Rational::ZERO`] is the "no time base" spelling: FFmpeg's own `0/0`
+    /// placeholder is normalised to it on the way in, and every accessor below
+    /// treats a zero time base as "nothing to convert".
+    pub time_base: Rational,
 }
 
 impl Time {
@@ -38,7 +329,7 @@ impl Time {
     ///
     /// * `time` - Relative time in `time_base` units.
     /// * `time_base` - Time base of source.
-    pub fn new(time: Option<i64>, time_base: AVRational) -> Time {
+    pub fn new(time: Option<i64>, time_base: Rational) -> Time {
         Self {
             time: time.filter(|time| *time != ffi::AV_NOPTS_VALUE),
             time_base,
@@ -53,7 +344,7 @@ impl Time {
     pub fn from_nth_of_a_second(nth: usize) -> Self {
         Self {
             time: Some(1),
-            time_base: new_rational(1, nth as i32),
+            time_base: one_over(nth as i32),
         }
     }
 
@@ -64,7 +355,7 @@ impl Time {
     /// * `secs` - Number of seconds.
     pub fn from_secs(secs: f32) -> Self {
         Self {
-            time: Some((secs * TIME_BASE.den as f32).round() as i64),
+            time: Some((secs * TIME_BASE.den() as f32).round() as i64),
             time_base: TIME_BASE,
         }
     }
@@ -76,7 +367,7 @@ impl Time {
     /// * `secs` - Number of seconds.
     pub fn from_secs_f64(secs: f64) -> Self {
         Self {
-            time: Some((secs * TIME_BASE.den as f64).round() as i64),
+            time: Some((secs * TIME_BASE.den() as f64).round() as i64),
             time_base: TIME_BASE,
         }
     }
@@ -90,7 +381,7 @@ impl Time {
     pub fn from_units(time: usize, base_den: usize) -> Self {
         Self {
             time: Some(time as i64),
-            time_base: new_rational(1, base_den as i32),
+            time_base: one_over(base_den as i32),
         }
     }
 
@@ -129,16 +420,20 @@ impl Time {
     }
 
     /// The instant in seconds, or `None` when there is nothing to convert: no
-    /// value at all, or a degenerate time base (`0/0`).
+    /// value at all, or a zero time base.
     ///
     /// The comparison and formatting impls key off this, so "equal", "ordered"
     /// and "printed" always refer to the same number.
+    ///
+    /// The old "degenerate `0/0`" case is gone as a *separate* case: a zero
+    /// denominator cannot exist in a [`Rational`], so the only degenerate time
+    /// base left is [`Rational::ZERO`], and one test covers it.
     fn seconds_or_none(&self) -> Option<f64> {
         let time = self.value()?;
-        if self.time_base.num == 0 || self.time_base.den == 0 {
+        if self.time_base.is_zero() {
             return None;
         }
-        Some(time as f64 * (self.time_base.num as f64 / self.time_base.den as f64))
+        Some(time as f64 * self.time_base.as_f64())
     }
 
     /// Align the timestamp with another timestamp, which will convert the `rhs` timestamp to the
@@ -173,8 +468,8 @@ impl Time {
     /// Get number of seconds as floating point value.
     ///
     /// Returns `0.0` when there is no usable value ([`Self::has_value`] is
-    /// `false`) or the time base is degenerate (`0/0`), which also keeps the
-    /// result finite — a NOPTS would otherwise turn into ≈ -9.2e13 seconds.
+    /// `false`) or the time base is zero, which also keeps the result finite — a
+    /// NOPTS would otherwise turn into ≈ -9.2e13 seconds.
     pub fn as_secs_f64(&self) -> f64 {
         self.seconds_or_none().unwrap_or(0.0)
     }
@@ -195,7 +490,7 @@ impl Time {
     /// # Arguments
     ///
     /// * `time_base` - Target time base.
-    pub fn aligned_with_rational(&self, time_base: AVRational) -> Time {
+    pub fn aligned_with_rational(&self, time_base: Rational) -> Time {
         Time {
             time: self
                 .value()
@@ -205,60 +500,76 @@ impl Time {
     }
 }
 
+/// `1 / den` as a time base.
+///
+/// A denominator of zero cannot be a time base, and [`Rational`] cannot hold one;
+/// such a value folds to [`Rational::ZERO`], so the resulting [`Time`] simply has
+/// no convertible value (see [`Time::as_secs_f64`]) instead of carrying an
+/// infinity around.
+fn one_over(den: i32) -> Rational {
+    if den > 0 {
+        Rational::unit(den)
+    } else {
+        Rational::ZERO
+    }
+}
+
 /////////////////////////////////
 /////////////////////////////////
 
-pub const TIME_BASE: AVRational = avutil::ra(ffi::AV_TIME_BASE_Q.num, ffi::AV_TIME_BASE_Q.den);
+/// The microsecond time base (`1/1_000_000`), FFmpeg's `AV_TIME_BASE_Q` — the
+/// unit [`Time`] uses for its "by seconds" constructors and for timestamps that
+/// have no stream time base of their own.
+pub const TIME_BASE: Rational = Rational::unit(1_000_000);
 
+/// Rescale a timestamp between two time bases.
+///
+/// Implemented for every integer type, so a pts value can be rescaled in place:
+/// `pts.rescale(from, to)`. Both time bases are [`Rational`], like every other
+/// rational in this crate.
 pub trait Rescale {
     fn rescale<S, D>(&self, source: S, destination: D) -> i64
     where
-        S: Into<AVRational>,
-        D: Into<AVRational>;
+        S: Into<Rational>,
+        D: Into<Rational>;
 
     fn rescale_with<S, D>(&self, source: S, destination: D, rounding: ffi::AVRounding) -> i64
     where
-        S: Into<AVRational>,
-        D: Into<AVRational>;
+        S: Into<Rational>,
+        D: Into<Rational>;
 }
 
 impl<T: Into<i64> + Clone> Rescale for T {
     fn rescale<S, D>(&self, source: S, destination: D) -> i64
     where
-        S: Into<AVRational>,
-        D: Into<AVRational>,
+        S: Into<Rational>,
+        D: Into<Rational>,
     {
-        avutil::av_rescale_q(self.clone().into(), source.into(), destination.into())
+        avutil::av_rescale_q(
+            self.clone().into(),
+            source.into().into(),
+            destination.into().into(),
+        )
     }
 
     fn rescale_with<S, D>(&self, source: S, destination: D, rounding: ffi::AVRounding) -> i64
     where
-        S: Into<AVRational>,
-        D: Into<AVRational>,
+        S: Into<Rational>,
+        D: Into<Rational>,
     {
         avutil::av_rescale_q_rnd(
             self.clone().into(),
-            source.into(),
-            destination.into(),
+            source.into().into(),
+            destination.into().into(),
             rounding as _,
         )
     }
 }
 
-#[inline(always)]
-pub fn new_rational(num: i32, den: i32) -> AVRational {
-    avutil::ra(num, den)
-}
-
-#[inline(always)]
-pub fn av_rational_eq(a: &AVRational, b: &AVRational) -> bool {
-    a.num == b.num && a.den == b.den
-}
-
 impl PartialEq for Time {
     /// Compares the instants, **in seconds**, not the `(time, time_base)` pairs:
-    /// `Time::from_units(1, 4)` and `Time::new(Some(2), new_rational(1, 2))` both
-    /// mean 0.5 s and are therefore equal.
+    /// `Time::from_units(1, 4)` and `Time::new(Some(2), Rational::new(1, 2).unwrap())`
+    /// both mean 0.5 s and are therefore equal.
     ///
     /// Requiring the raw fields to match used to make "the same instant" compare
     /// unequal whenever the time bases differed. Two "no value" times are equal
@@ -327,7 +638,7 @@ impl std::fmt::Display for Time {
 pub struct Aligned {
     lhs: Option<i64>,
     rhs: Option<i64>,
-    time_base: AVRational,
+    time_base: Rational,
 }
 
 impl Aligned {
@@ -369,9 +680,144 @@ impl Aligned {
 mod tests {
     use super::*;
 
+    /// `num / den` for the tests. Every literal below is a valid rational except
+    /// `rat(0, 0)`, which stands for "no time base" and folds to
+    /// [`Rational::ZERO`] — exactly what FFmpeg's own `0/0` placeholder becomes
+    /// on the way in.
+    fn rat(num: i32, den: i32) -> Rational {
+        Rational::new(num, den).unwrap_or(Rational::ZERO)
+    }
+
+    // ---- Rational ----
+
+    #[test]
+    fn test_rational_new_normalises_sign_and_terms() {
+        // 分母为负 ⇒ 整体取反，分母恒正
+        let rate = Rational::new(1, -2).unwrap();
+        assert_eq!((rate.num(), rate.den()), (-1, 2));
+
+        // 约分到最简
+        assert_eq!(Rational::new(50, 2).unwrap(), Rational::new(25, 1).unwrap());
+        assert_eq!(Rational::new(24_000, 1_001).unwrap().num(), 24_000);
+
+        // 分子为 0 ⇒ 规范化成 0/1，与分母无关
+        assert_eq!(Rational::new(0, 7).unwrap(), Rational::integer(0));
+        assert_eq!(Rational::new(0, -7).unwrap(), Rational::integer(0));
+    }
+
+    #[test]
+    fn test_rational_new_rejects_zero_denominator() {
+        let err = Rational::new(1, 0).unwrap_err();
+        assert!(err.is_invalid_config(), "got: {err}");
+    }
+
+    /// 规范化在范围检查**之前**做，所以 `i32::MIN / i32::MIN`（其实是 `1/1`）
+    /// 必须被接受，而不是先按 `i32::MIN` 判成越界。
+    #[test]
+    fn test_rational_new_reduces_before_range_check() {
+        let one = Rational::new(i32::MIN, i32::MIN).unwrap();
+        assert_eq!(one, Rational::integer(1));
+
+        // `i32::MIN` 与 `i32::MAX` 互素，约不掉，但两个分量都在范围内
+        let almost_minus_one = Rational::new(i32::MIN, i32::MAX).unwrap();
+        assert_eq!(
+            (almost_minus_one.num(), almost_minus_one.den()),
+            (i32::MIN, i32::MAX)
+        );
+        assert!(almost_minus_one.as_f64() < 0.0);
+    }
+
+    /// 只有两种真正无法用 `(i32, i32)` 表示的情况：`den == i32::MIN`，以及
+    /// `(i32::MIN, -1)`（规范形是 `2^31 / 1`）。
+    #[test]
+    fn test_rational_new_rejects_unrepresentable_values() {
+        for (num, den) in [(1, i32::MIN), (i32::MIN, -1)] {
+            let err = Rational::new(num, den).unwrap_err();
+            assert!(err.is_invalid_config(), "{num}/{den} gave: {err}");
+        }
+    }
+
+    #[test]
+    fn test_rational_integer_and_conversions() {
+        assert_eq!(Rational::integer(25).as_f64(), 25.0);
+        assert_eq!(Rational::from(25), Rational::integer(25));
+
+        let rational = Rational::new(30_000, 1_001).unwrap();
+        let ffi_rational: ffi::AVRational = rational.into();
+        assert_eq!((ffi_rational.num, ffi_rational.den), (30_000, 1_001));
+        assert_eq!(Rational::from(ffi_rational), rational);
+
+        // 整数值往返：`Rational` 的字段宽度与 `AVRational` 一致，0/1 与 1/1 都能原样回来
+        for value in [Rational::ZERO, Rational::ONE] {
+            let raw: ffi::AVRational = value.into();
+            assert_eq!(Rational::from(raw), value);
+        }
+    }
+
+    /// FFmpeg 侧用 `x/0` 表示"尚未填写"；`Rational` 表示不了，读取时归一成 `ZERO`。
+    /// 这是刻意的**全函数**读取口：调用方不该为 FFmpeg 自己产出的占位值准备策略。
+    #[test]
+    fn test_rational_from_ffi_folds_zero_denominator_to_zero() {
+        for raw in [
+            ffi::AVRational { num: 1, den: 0 },
+            ffi::AVRational { num: 0, den: 0 },
+            ffi::AVRational { num: -1, den: 0 },
+        ] {
+            assert_eq!(
+                Rational::from(raw),
+                Rational::ZERO,
+                "{}/{} 应归一成 0/1",
+                raw.num,
+                raw.den
+            );
+        }
+
+        // 严格的构造口仍然拒绝 `x/0`
+        assert!(Rational::new(1, 0).unwrap_err().is_invalid_config());
+    }
+
+    #[test]
+    fn test_rational_inverse() {
+        let fps = Rational::integer(25);
+        assert_eq!(fps.inverse().unwrap(), Rational::new(1, 25).unwrap());
+        assert_eq!(
+            Rational::new(1, 25).unwrap().inverse().unwrap(),
+            fps,
+            "互逆"
+        );
+        assert_eq!(Rational::integer(1).inverse().unwrap(), Rational::ONE);
+
+        // 负分子：结果仍规范化为"分母为正"
+        let negative = Rational::new(-3, 2).unwrap().inverse().unwrap();
+        assert_eq!((negative.num(), negative.den()), (-2, 3));
+
+        // 0 没有倒数（分母会是 0，`Rational` 表示不了）
+        let err = Rational::ZERO.inverse().unwrap_err();
+        assert!(err.is_invalid_config(), "got: {err}");
+    }
+
+    #[test]
+    fn test_rational_is_zero() {
+        assert!(Rational::ZERO.is_zero());
+        assert!(Rational::new(0, 7).unwrap().is_zero());
+        assert!(!Rational::ONE.is_zero());
+        assert!(!Rational::new(-1, 2).unwrap().is_zero());
+    }
+
+    #[test]
+    fn test_rational_display_prints_the_exact_rational() {
+        assert_eq!(
+            Rational::new(30_000, 1_001).unwrap().to_string(),
+            "30000/1001"
+        );
+        assert_eq!(Rational::integer(25).to_string(), "25/1");
+    }
+
+    // ---- Time ----
+
     #[test]
     fn test_new() {
-        let time = Time::new(Some(2), new_rational(3, 9));
+        let time = Time::new(Some(2), rat(3, 9));
         assert!(time.has_value());
         assert_eq!(time.as_secs(), 2.0 / 3.0);
         assert_eq!(time.into_value(), Some(2));
@@ -379,9 +825,9 @@ mod tests {
 
     #[test]
     fn test_aligned_with_rational() {
-        let time = Time::new(Some(2), new_rational(3, 9));
+        let time = Time::new(Some(2), rat(3, 9));
         assert_eq!(time.as_secs(), 2.0 / 3.0);
-        let time = time.aligned_with_rational(new_rational(1, 9));
+        let time = time.aligned_with_rational(rat(1, 9));
         assert_eq!(time.as_secs(), 2.0 / 3.0);
         assert_eq!(time.into_value(), Some(6));
     }
@@ -459,8 +905,8 @@ mod tests {
     /// `partial_cmp` 与 `PartialEq` 同键（秒）：同一时刻即使时间基不同也相等且有序。
     #[test]
     fn test_partial_cmp_is_consistent_with_eq() {
-        let a = Time::new(None, new_rational(1, 2));
-        let b = Time::new(None, new_rational(1, 4));
+        let a = Time::new(None, rat(1, 2));
+        let b = Time::new(None, rat(1, 4));
         assert_eq!(a, b, "两个无值的时间戳相等");
         assert_eq!(
             a.partial_cmp(&b),
@@ -468,16 +914,16 @@ mod tests {
             "无值之间可比且相等"
         );
 
-        let same = Time::new(None, new_rational(1, 2));
+        let same = Time::new(None, rat(1, 2));
         assert_eq!(a, same);
         assert_eq!(a.partial_cmp(&same), Some(std::cmp::Ordering::Equal));
 
-        let later = Time::new(Some(3), new_rational(1, 2));
+        let later = Time::new(Some(3), rat(1, 2));
         assert_eq!(a.partial_cmp(&later), Some(std::cmp::Ordering::Less));
         assert_eq!(later.partial_cmp(&a), Some(std::cmp::Ordering::Greater));
 
         // 同一时刻、时间基不同 —— 秒是唯一比较键
-        let same_instant = new_rational(1, 4);
+        let same_instant = rat(1, 4);
         let later_other_base = Time::new(Some(6), same_instant);
         assert_eq!(later, later_other_base);
         assert_eq!(
@@ -485,7 +931,7 @@ mod tests {
             Some(std::cmp::Ordering::Equal)
         );
 
-        let earlier = Time::new(Some(1), new_rational(1, 4));
+        let earlier = Time::new(Some(1), rat(1, 4));
         assert_eq!(
             earlier.partial_cmp(&later_other_base),
             Some(std::cmp::Ordering::Less)
@@ -496,10 +942,10 @@ mod tests {
     /// `Display` 打印秒数且不会因 `time * time_base.num` 溢出 `i64` 而 panic。
     #[test]
     fn test_display_prints_seconds_without_overflow() {
-        assert_eq!(Time::new(Some(2), new_rational(1, 2)).to_string(), "1 secs");
+        assert_eq!(Time::new(Some(2), rat(1, 2)).to_string(), "1 secs");
         assert_eq!(Time::new(None, TIME_BASE).to_string(), "none");
         // 旧实现会计算 `time_base.num as i64 * time`，在 debug 下 panic
-        let huge = Time::new(Some(i64::MAX / 2), new_rational(1_000_000, 1_000_000));
+        let huge = Time::new(Some(i64::MAX / 2), rat(1_000_000, 1_000_000));
         assert!(huge.to_string().ends_with(" secs"));
     }
 
@@ -527,7 +973,7 @@ mod tests {
         assert_eq!(time.as_secs(), 0.25);
         let time = Time::from_secs(0.3);
         assert_eq!(time.as_secs(), 0.3);
-        let time = Time::new(None, new_rational(0, 0));
+        let time = Time::new(None, rat(0, 0));
         assert_eq!(time.as_secs(), 0.0);
     }
 
@@ -537,13 +983,13 @@ mod tests {
         assert_eq!(time.as_secs_f64(), 0.25);
         let time = Time::from_secs_f64(0.3);
         assert_eq!(time.as_secs_f64(), 0.3);
-        let time = Time::new(None, new_rational(0, 0));
+        let time = Time::new(None, rat(0, 0));
         assert_eq!(time.as_secs_f64(), 0.0);
     }
 
     #[test]
     fn test_into_value_none() {
-        let time = Time::new(None, new_rational(0, 0));
+        let time = Time::new(None, rat(0, 0));
         assert_eq!(time.into_value(), None);
     }
 
@@ -573,7 +1019,7 @@ mod tests {
 
     #[test]
     fn test_apply_different_time_bases() {
-        let a = Time::new(Some(3), new_rational(2, 32));
+        let a = Time::new(Some(3), rat(2, 32));
         let b = Time::from_nth_of_a_second(4);
         assert!(
             (a.aligned_with(b).apply(|x, y| x + y).as_secs()
@@ -586,7 +1032,7 @@ mod tests {
     #[test]
     fn test_negative_into_duration_clamps() {
         assert_eq!(
-            Duration::from(Time::new(Some(-100), new_rational(0, 0))),
+            Duration::from(Time::new(Some(-100), rat(0, 0))),
             Duration::ZERO,
         )
     }
@@ -595,7 +1041,7 @@ mod tests {
     /// 按"无值"处理（早先 `into_value` 会把哨兵原样吐出来，与 `has_value` 矛盾）。
     #[test]
     fn test_av_no_pts_value_is_normalized() {
-        let nopts = Time::new(Some(ffi::AV_NOPTS_VALUE), new_rational(0, 0));
+        let nopts = Time::new(Some(ffi::AV_NOPTS_VALUE), rat(0, 0));
         assert_eq!(nopts.time, None);
         assert!(!nopts.has_value());
         assert_eq!(nopts.into_value(), None);

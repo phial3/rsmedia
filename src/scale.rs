@@ -1,4 +1,5 @@
 use crate::error::{Context, Result, RsmediaError};
+use crate::flags::FlagSet;
 use crate::{PixelFormat, imgutils};
 use rsmpeg::avutil::{AVBufferPool, AVBufferRef};
 
@@ -38,10 +39,11 @@ use rsmpeg::{UnsafeDerefMut, swscale::SwsContext};
 ffi_enum!(
     /// Video scaler algorithm selector (SWS_* algorithm bits, 1 << 0 .. 1 << 10).
     ///
-    /// Represents the scaling kernel choice — **mutually exclusive** (pick one),
-    /// but the enum still implements `BitOr`/`Into<u32>` so it can be combined
-    /// with non-algorithm quality flags (`SWS_FULL_CHR_H_INT`, `SWS_ACCURATE_RND`,
-    /// `SWS_BITEXACT`, …) before handing the assembled mask to FFI.
+    /// Represents the scaling kernel choice — **mutually exclusive** (pick one).
+    /// The enum still implements `BitOr`/`Into<u32>`: `BitOr` yields a
+    /// [`FlagSet<ScaleAlgorithm>`](FlagSet) so an algorithm bit can be carried next to the
+    /// quality bits, which is how the two groups are assembled into the single
+    /// `SwsContext.flags` mask FFmpeg wants — see [`ScaleQuality`] and [`Scaler::flags`].
     #[derive(Default)]
     #[allow(non_camel_case_types)]
     ScaleAlgorithm, u32 {
@@ -81,12 +83,13 @@ ffi_enum!(
     /// of this type may be combined**.
     ///
     /// Consequently a quality **mask**, not a single variant, is what the scaler takes:
-    /// combine the named bits with `BitOr` (which yields the raw `u32` mask, per this
-    /// crate's flag-set convention) and pass the result to [`Scaler::new_with_options`],
-    /// e.g. `ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND |
-    /// ScaleQuality::BITEXACT` — the baseline FFmpeg recommends, available as
-    /// [`ScaleQuality::default_mask`]. The header explicitly notes that `ACCURATE_RND` and
-    /// `BITEXACT` are meant to be set together.
+    /// combine the named bits with `|` — the result is a [`FlagSet<ScaleQuality>`](FlagSet),
+    /// which is what [`Scaler::new_with_options`] and `with_scale_quality` accept — e.g.
+    /// `ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND | ScaleQuality::BITEXACT`,
+    /// the baseline FFmpeg recommends, available as [`ScaleQuality::default_mask`]. The header
+    /// explicitly notes that `ACCURATE_RND` and `BITEXACT` are meant to be set together. A raw
+    /// mask (including `0`, "no quality bits at all") goes through
+    /// [`FlagSet::from_bits`](crate::FlagSet::from_bits).
     ///
     /// Deprecated `SWS_DIRECT_BGR` / `SWS_ERROR_DIFFUSION` (no effect) are intentionally
     /// **not** modelled here.
@@ -117,15 +120,16 @@ impl ScaleQuality {
     /// `BITEXACT` are meant to be set together.
     ///
     /// ```
-    /// use rsmedia::ScaleQuality;
+    /// use rsmedia::{ScaleQuality, Scaler};
     ///
     /// let mask = ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND | ScaleQuality::BITEXACT;
     /// assert_eq!(mask, ScaleQuality::default_mask());
     /// // A single flag converts on its own, and the mask is what `Scaler` takes.
     /// let one: u32 = ScaleQuality::BITEXACT.into();
     /// assert_eq!(one, ScaleQuality::BITEXACT.as_raw());
+    /// assert_eq!(Scaler::new().quality(), ScaleQuality::default_mask());
     /// ```
-    pub fn default_mask() -> u32 {
+    pub fn default_mask() -> FlagSet<ScaleQuality> {
         Self::FULL_CHR_H_INT | Self::ACCURATE_RND | Self::BITEXACT
     }
 }
@@ -391,6 +395,12 @@ fn set_scaler_colorspace_details(sws: &mut SwsContext, src_frame: &AVFrame, dst_
 /// Free-function form for a single conversion; a stream should keep a [`Scaler`]
 /// instead, which reuses its `SwsContext` (and, optionally, the output buffers)
 /// across frames. See [`Scaler::scale_frame`] for the details.
+/// Scale a raw [`AVFrame`] into a newly allocated `AVFrame`.
+///
+/// This is an FFI-level entry point: it takes a bare `AVFrame` and `i32` sizes,
+/// mirroring FFmpeg's own signatures. Callers working with the high-level
+/// [`MediaFrame`](crate::MediaFrame) should use
+/// [`MediaFrame::convert_to`](crate::MediaFrame::convert_to) instead.
 pub fn scale_frame(
     src_frame: &AVFrame,
     dst_width: i32,
@@ -435,8 +445,8 @@ pub fn scale_frame(
 pub struct Scaler {
     /// The (mutually exclusive) scaling kernel selector.
     algorithm: ScaleAlgorithm,
-    /// Quality/behaviour bit mask; zero or more [`ScaleQuality`] bits.
-    quality: u32,
+    /// Quality/behaviour bit set; zero or more [`ScaleQuality`] bits.
+    quality: FlagSet<ScaleQuality>,
     /// Context bound on first use, together with the parameters it was created for.
     bound: Option<BoundScaler>,
     /// Whether destination frames are allocated from an internal [`BufferPool`](rsmpeg::avutil::AVBufferPool)
@@ -475,13 +485,13 @@ impl Scaler {
 
     /// Create a scaler with an explicit kernel and quality bits.
     ///
-    /// `quality` is the quality/behaviour bit mask, given as `impl Into<u32>` like the
-    /// builders' `with_flags`: one bit (`ScaleQuality::BITEXACT`), several combined with
-    /// `|` (the result is the raw `u32` mask, per this crate's flag-set convention), or
-    /// `0` for none.
+    /// `quality` is the quality/behaviour bit set, given as `impl Into<FlagSet<ScaleQuality>>`
+    /// like the builders' `with_scale_quality`: one bit (`ScaleQuality::BITEXACT`), several
+    /// combined with `|`, or [`FlagSet::EMPTY`] for none. A mask that arrives as a bare integer
+    /// goes through [`FlagSet::from_bits`].
     ///
     /// ```
-    /// use rsmedia::{ScaleAlgorithm, ScaleQuality, Scaler};
+    /// use rsmedia::{FlagSet, ScaleAlgorithm, ScaleQuality, Scaler};
     ///
     /// // One algorithm bit (mutually exclusive) plus a set of quality bits.
     /// let scaler = Scaler::new_with_options(
@@ -490,8 +500,24 @@ impl Scaler {
     /// );
     /// assert_eq!(scaler.algorithm(), ScaleAlgorithm::LANCZOS);
     /// assert_eq!(scaler.quality(), ScaleQuality::default_mask());
+    ///
+    /// // No quality bits, and a mask that is already numeric.
+    /// assert!(Scaler::new_with_options(ScaleAlgorithm::POINT, FlagSet::EMPTY)
+    ///     .quality()
+    ///     .is_empty());
+    /// assert_eq!(
+    ///     Scaler::new_with_options(
+    ///         ScaleAlgorithm::AREA,
+    ///         FlagSet::from_bits(ScaleQuality::BITEXACT.as_raw())
+    ///     )
+    ///     .quality(),
+    ///     ScaleQuality::BITEXACT.into()
+    /// );
     /// ```
-    pub fn new_with_options(algorithm: ScaleAlgorithm, quality: impl Into<u32>) -> Self {
+    pub fn new_with_options(
+        algorithm: ScaleAlgorithm,
+        quality: impl Into<FlagSet<ScaleQuality>>,
+    ) -> Self {
         Self {
             algorithm,
             quality: quality.into(),
@@ -536,15 +562,30 @@ impl Scaler {
         self.algorithm
     }
 
-    /// The quality/behaviour bit mask this scaler was configured with (possibly several
-    /// bits; test individual bits against `ScaleQuality::X.as_raw()`).
-    pub fn quality(&self) -> u32 {
+    /// The quality/behaviour bit set this scaler was configured with (possibly empty).
+    ///
+    /// Test one bit with `contains` (or `&`), and read the whole set as the raw mask with
+    /// [`FlagSet::bits`]:
+    ///
+    /// ```
+    /// use rsmedia::{ScaleAlgorithm, ScaleQuality, Scaler};
+    ///
+    /// let scaler = Scaler::new_with_options(ScaleAlgorithm::AREA, ScaleQuality::BITEXACT);
+    /// assert!(scaler.quality().contains(ScaleQuality::BITEXACT));
+    /// assert_eq!(scaler.quality().bits(), ScaleQuality::BITEXACT.as_raw());
+    /// ```
+    pub fn quality(&self) -> FlagSet<ScaleQuality> {
         self.quality
     }
 
     /// The combined algorithm + quality mask handed to FFmpeg.
+    ///
+    /// This one stays a bare `u32` on purpose: it is the union of **two different flag types**
+    /// ([`ScaleAlgorithm`] and [`ScaleQuality`]), so no single [`FlagSet`] describes it. It is
+    /// the value written to `SwsContext.flags`, and mixing the two groups is exactly the
+    /// "assemble the mask at the FFI boundary" job a raw integer is for.
     pub fn flags(&self) -> u32 {
-        self.algorithm.as_raw() | self.quality
+        self.algorithm.as_raw() | self.quality.bits()
     }
 
     /// Scale a frame into a newly allocated destination frame of `dst_width` ×
@@ -712,11 +753,12 @@ impl Default for Scaler {
 
 /// Only the policy is caller-visible, so `Debug` reports it along with whether a context
 /// has been bound and whether pooling is on — `SwsContext` itself implements no `Debug`.
+/// The quality bits print through [`FlagSet`]'s own `Debug` (binary), which is how flags read.
 impl std::fmt::Debug for Scaler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scaler")
             .field("algorithm", &self.algorithm)
-            .field("quality", &format!("{:#x}", self.quality))
+            .field("quality", &self.quality)
             .field("bound", &self.bound.is_some())
             .field("pool_enabled", &self.pool_enabled)
             .finish()
@@ -1287,7 +1329,8 @@ mod tests {
         Ok(())
     }
 
-    /// 质量位是**集合**：`Scaler` 接收具名位（单个或用 `|` 组合的掩码；算法位仍只能有一个）。
+    /// 质量位是**集合**：`Scaler` 接收具名位（单个或用 `|` 组合的集合；算法位仍只能有一个）。
+    /// 裸掩码必须显式走 [`FlagSet::from_bits`]，这样"任意 `u32` 混进来"在类型上就不可能。
     #[test]
     fn test_scaler_quality_mask_accepts_multiple_bits() -> Result<()> {
         // 多个质量位 = FFmpeg 建议的基线。
@@ -1299,17 +1342,20 @@ mod tests {
         assert_eq!(scaler.quality(), ScaleQuality::default_mask());
         assert_eq!(
             scaler.flags(),
-            (ScaleAlgorithm::LANCZOS.as_raw() | ScaleQuality::default_mask()),
+            (ScaleAlgorithm::LANCZOS.as_raw() | ScaleQuality::default_mask().bits()),
         );
 
-        // 单个位、裸掩码、空（= 无质量位）。
+        // 单个位、显式裸掩码、空集（= 无质量位）。
         let single = Scaler::new_with_options(ScaleAlgorithm::AREA, ScaleQuality::BITEXACT);
-        assert_eq!(single.quality(), ScaleQuality::BITEXACT.as_raw());
-        let raw =
-            Scaler::new_with_options(ScaleAlgorithm::BICUBLIN, ScaleQuality::BITEXACT.as_raw());
-        assert_eq!(raw.quality(), ScaleQuality::BITEXACT.as_raw());
-        let none = Scaler::new_with_options(ScaleAlgorithm::POINT, 0u32);
-        assert_eq!(none.quality(), 0);
+        assert_eq!(single.quality(), ScaleQuality::BITEXACT.into());
+        let raw = Scaler::new_with_options(
+            ScaleAlgorithm::BICUBLIN,
+            FlagSet::from_bits(ScaleQuality::BITEXACT.as_raw()),
+        );
+        assert_eq!(raw.quality(), ScaleQuality::BITEXACT.into());
+        let none = Scaler::new_with_options(ScaleAlgorithm::POINT, FlagSet::EMPTY);
+        assert!(none.quality().is_empty());
+        assert!(ScaleQuality::default_mask().contains(ScaleQuality::ACCURATE_RND));
 
         // 默认构造 = 默认算法 + 默认质量掩码。
         let mut default = Scaler::new();
@@ -1424,7 +1470,7 @@ mod tests {
         }
 
         let mut ctx = SwsContext::alloc().context("allocate sws context")?;
-        ctx.set_flags(ScaleAlgorithm::LANCZOS.as_raw() | ScaleQuality::default_mask());
+        ctx.set_flags(ScaleAlgorithm::LANCZOS.as_raw() | ScaleQuality::default_mask().bits());
         ctx.set_threads(0);
         ctx.set_dither(ffi::SWS_DITHER_AUTO);
         ctx.set_alpha_blend(ffi::SWS_ALPHA_BLEND_NONE);

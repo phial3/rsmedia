@@ -1,6 +1,7 @@
 use crate::error::{Result, RsmediaError};
 use crate::stream::MediaType;
 use crate::strutils;
+use crate::time::Rational;
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecRef};
 use rsmpeg::ffi;
@@ -13,15 +14,21 @@ use std::fmt;
 /// rsmpeg 的 `settable!` 字段表不含 `thread_count`，只能直接写字段；把这个
 /// unsafe 收敛在这里，`Encoder`/`Decoder` 都不再自己碰裸指针。
 ///
-/// 只写正值：`0` 表示交给 codec 自行推导（FFmpeg 的默认语义），负数没有合法含义
-/// （只可能来自窄化转换的溢出），两者都不写字段、保持调用前的状态。
-pub(crate) fn set_thread_count(context: &mut AVCodecContext, count: i32) {
-    if count <= 0 {
+/// 与 FFmpeg 的字段同为 `int`：只写正值。`0` 是 FFmpeg 的"自行推导"语义，负数没有
+/// 合法含义（调用方写错），两者都不写字段、让 FFmpeg 自己决定；负数另打一条 `warn!`。
+pub(crate) fn set_thread_count(context: &mut AVCodecContext, thread_count: i32) {
+    if thread_count < 0 {
+        tracing::warn!(
+            "thread count {thread_count} is negative and was ignored; \
+             leaving FFmpeg's default in place"
+        );
+    }
+    if thread_count <= 0 {
         return;
     }
     // SAFETY: `context` 由 `AVCodecContext::new` 分配、在借用期内一直有效；
     unsafe {
-        (*context.as_mut_ptr()).thread_count = count;
+        (*context.as_mut_ptr()).thread_count = thread_count;
     }
 }
 
@@ -63,30 +70,52 @@ pub(crate) fn set_flags2(context: &mut AVCodecContext, flags2: i32) {
 /// 重名，在 `with_options` 的文档里补上这个键（重名时以透传为准，见该方法文档）。
 macro_rules! impl_codec_builder_setters {
     () => {
-        /// Set the codec name.
+        /// Set the codec name — the encoder or decoder to use (`"libx264"`,
+        /// `"aac"`, `"mov_text"`, `"h264_nvenc"`, `"h264_cuvid"`).
         ///
-        /// 解码器：`None` = 按输入流自带的编解码器名（由容器决定）解码。
-        /// 编码器：`None` = 按媒体类型取默认编码器（`libx264` / `aac` / `subrip`）。
-        pub fn with_codec_name(mut self, codec_name: impl Into<Option<String>>) -> Self {
-            self.codec_name = codec_name.into();
+        /// Takes anything that converts into a `String`, so a string literal, a
+        /// `&str` and a `String` are all passed directly: no `.to_string()`, no
+        /// `Some(...)` wrapper.
+        ///
+        /// Not calling this method is how "let the builder choose" is expressed.
+        /// To undo an earlier call, use [`Self::clear_codec_name`]; an unset name
+        /// means:
+        ///
+        /// * decoder — follow the codec the input stream declares (chosen by the
+        ///   container);
+        /// * encoder — take the default for the media type (`libx264` / `aac` /
+        ///   `subrip`).
+        ///
+        /// # Example
+        ///
+        /// ```ignore
+        /// let builder = EncoderBuilder::new_video(640, 480).with_codec_name("libx264");
+        /// ```
+        pub fn with_codec_name(mut self, codec_name: impl Into<String>) -> Self {
+            self.codec_name = Some(codec_name.into());
             self
         }
 
         /// Set the thread count.
         ///
+        /// 与 FFmpeg 的 `AVCodecContext.thread_count` 同为 `i32`，直接写该字段。
         /// 未设置时取 `num_cpus::get()`；同名 AVOption 若经 `with_options` 透传，
-        /// 以透传值为准（见 [`Self::with_options`]）。
-        pub fn with_thread_count(mut self, thread_count: u32) -> Self {
+        /// 以透传值为准（见 [`Self::with_options`]）。`0` 表示交给 codec 自行推导，
+        /// 负数没有合法含义：两者都不写字段、由 FFmpeg 自己决定（负数另打 `warn!`）。
+        pub fn with_thread_count(mut self, thread_count: i32) -> Self {
             self.thread_count = Some(thread_count);
             self
         }
 
         /// Set `AVCodecContext.flags` (`AV_CODEC_FLAG_*`).
         ///
-        /// 位集按 `impl Into<u32>` 给出（解码器的 `with_err_recognition` 也是这个形态）：
-        /// 单个标志（`AVCodecFlag::LOW_DELAY`）或 `|` 组合出的掩码
-        /// （`AVCodecFlag::CLOSED_GOP | AVCodecFlag::LOW_DELAY`）都能直接传——
-        /// `ffi_enum!` 的 `BitOr` 结果就是原始掩码，因为无字段枚举表示不了组合。
+        /// Takes a [`FlagSet<AVCodecFlag>`](crate::FlagSet): a single flag
+        /// (`AVCodecFlag::LOW_DELAY`) or any `|` combination of them
+        /// (`AVCodecFlag::CLOSED_GOP | AVCodecFlag::LOW_DELAY`) — both are the same parameter,
+        /// so no `Some(...)` wrapper and no raw integer is involved. A mask that arrives from
+        /// elsewhere as a bare `u32` goes through
+        /// [`FlagSet::from_bits`](crate::FlagSet::from_bits), which keeps the conversion
+        /// visible.
         ///
         /// 解码器未设置时取 `AVCodecFlag::LOW_DELAY`（rsmedia 的解码默认值）。
         /// 编码器侧则是在上下文既有 flags 上按位合并：FFmpeg 的默认位（如
@@ -101,16 +130,20 @@ macro_rules! impl_codec_builder_setters {
         /// let builder = EncoderBuilder::new_video(640, 480)
         ///     .with_flags(AVCodecFlag::CLOSED_GOP | AVCodecFlag::LOW_DELAY);
         /// ```
-        pub fn with_flags(mut self, flags: impl Into<u32>) -> Self {
-            self.flags = Some(flags.into() as i32);
+        pub fn with_flags(mut self, flags: impl Into<crate::flags::FlagSet<AVCodecFlag>>) -> Self {
+            self.flags = Some(flags.into());
             self
         }
 
         /// Set `AVCodecContext.flags2` (`AV_CODEC_FLAG2_*`).
         ///
-        /// Same shape as [`Self::with_flags`]: a single flag or a `|` combination.
-        pub fn with_flags2(mut self, flags2: impl Into<u32>) -> Self {
-            self.flags2 = Some(flags2.into() as i32);
+        /// Same shape as [`Self::with_flags`]: a single flag or a `|` combination, as a
+        /// [`FlagSet<AVCodecFlag2>`](crate::FlagSet).
+        pub fn with_flags2(
+            mut self,
+            flags2: impl Into<crate::flags::FlagSet<AVCodecFlag2>>,
+        ) -> Self {
+            self.flags2 = Some(flags2.into());
             self
         }
 
@@ -122,8 +155,11 @@ macro_rules! impl_codec_builder_setters {
         /// latency, needs codec support). Same shape as [`Self::with_flags`], so both
         /// granularities can be requested: `ThreadType::FRAME | ThreadType::SLICE`.
         /// Left unset, FFmpeg picks its default.
-        pub fn with_thread_type(mut self, thread_type: impl Into<u32>) -> Self {
-            self.thread_type = Some(thread_type.into() as i32);
+        pub fn with_thread_type(
+            mut self,
+            thread_type: impl Into<crate::flags::FlagSet<ThreadType>>,
+        ) -> Self {
+            self.thread_type = Some(thread_type.into());
             self
         }
 
@@ -157,9 +193,15 @@ macro_rules! impl_codec_builder_setters {
 
         /// Enable hardware acceleration with the specified device type.
         ///
-        /// * `device_config` - Device to use for hardware acceleration.
-        pub fn with_hardware_device(mut self, device_config: Option<HWDeviceConfig>) -> Self {
-            self.hw_device_config = device_config;
+        /// * `device_config` - Device to use for hardware acceleration. Accepts a
+        ///   [`HWDeviceConfig`] directly, or `None` to decode/encode on the CPU —
+        ///   the same `impl Into<Option<_>>` shape [`Self::with_options`] uses, so
+        ///   a device chosen at runtime needs no `Some(...)` wrapper.
+        pub fn with_hardware_device(
+            mut self,
+            device_config: impl Into<Option<HWDeviceConfig>>,
+        ) -> Self {
+            self.hw_device_config = device_config.into();
             self
         }
 
@@ -207,12 +249,16 @@ macro_rules! impl_codec_builder_setters {
         /// Set the scaling quality/behaviour bits used when converting frames to
         /// the target pixel format.
         ///
-        /// Unlike the algorithm (exactly one bit), the quality flags are a set, given as
-        /// `impl Into<u32>` like [`Self::with_flags`] — one bit
+        /// Unlike the algorithm (exactly one bit), the quality flags are a set, given as a
+        /// [`FlagSet<ScaleQuality>`](crate::FlagSet) like [`Self::with_flags`] — one bit
         /// (`ScaleQuality::BITEXACT`), several combined with `|`
-        /// (`ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND`), or `0` for none.
-        /// Defaults to [`ScaleQuality::default_mask`].
-        pub fn with_scale_quality(mut self, quality: impl Into<u32>) -> Self {
+        /// (`ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND`), or
+        /// [`FlagSet::EMPTY`](crate::FlagSet::EMPTY) for none. Defaults to
+        /// [`ScaleQuality::default_mask`](crate::scale::ScaleQuality::default_mask).
+        pub fn with_scale_quality(
+            mut self,
+            quality: impl Into<crate::flags::FlagSet<ScaleQuality>>,
+        ) -> Self {
             self.scale_quality = quality.into();
             self
         }
@@ -412,15 +458,32 @@ impl CodecConfig {
         }
     }
 
-    pub fn supported_frame_rates(&self) -> Result<Option<&[ffi::AVRational]>> {
+    /// Lists the frame rates the codec declares support for.
+    ///
+    /// `None` means "no restriction" — that is how FFmpeg spells an empty
+    /// list. Unlike the other `supported_*` accessors this returns an owned
+    /// [`Vec`]: FFmpeg hands out an `AVRational` array, and [`Rational`] has a
+    /// different layout, so the values cannot be re-borrowed as a slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if FFmpeg fails to query the codec's configuration.
+    pub fn supported_frame_rates(&self) -> Result<Option<Vec<Rational>>> {
         #[cfg(feature = "ffmpeg6")]
         {
-            Ok(self.codec.supported_framerates())
+            Ok(self
+                .codec
+                .supported_framerates()
+                .map(|rates| rates.iter().copied().map(Rational::from).collect()))
         }
         #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
         {
             let rates = self.context.get_supported_frame_rates(Some(&self.codec))?;
-            Ok(if rates.is_empty() { None } else { Some(rates) })
+            Ok(if rates.is_empty() {
+                None
+            } else {
+                Some(rates.iter().copied().map(Rational::from).collect())
+            })
         }
     }
 

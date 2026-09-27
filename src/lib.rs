@@ -8,6 +8,7 @@ pub mod decode;
 pub mod encode;
 pub mod error;
 pub mod filter;
+pub mod flags;
 pub mod fmt;
 pub mod frame;
 pub mod hwaccel;
@@ -34,7 +35,8 @@ pub use colors::Color;
 pub use decode::{Decoder, DecoderBuilder, ErrRecognition, SkipFrame};
 pub use encode::{Encoder, EncoderBuilder};
 pub use error::{Result, RsmediaError};
-pub use filter::{Filter, FilterGraph, FilterGraphBuilder, FilterNode};
+pub use filter::{Expr, Filter, FilterGraph, FilterGraphBuilder, FilterNode};
+pub use flags::FlagSet;
 pub use fmt::{DataLayout, FrameFormat, SampleFormat};
 pub use frame::{ElementType, FrameData, FrameSideData, MediaFrame};
 pub use hwaccel::{HWDeviceConfig, HWDeviceType, ProbeDepth};
@@ -51,7 +53,7 @@ pub use resize::Resize;
 pub use scale::{ScaleAlgorithm, ScaleQuality, Scaler};
 pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
-pub use time::Time;
+pub use time::{Rational, Time};
 
 pub(crate) const MAX_DRAIN_ITERATIONS: usize = 1_000;
 

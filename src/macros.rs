@@ -11,8 +11,9 @@
 //! | `as_raw()` | no | yes | yes |
 //! | conversion variant to raw value | yes (`From<Enum> for ffi`) | yes (`From<Enum> for ffi`) | yes (`From<Enum> for repr`, i.e. `Into<repr>`) |
 //! | conversion raw value to variant | yes (`From<ffi> for Enum`) | no | no |
-//! | combine flags into a raw mask | no | no | yes (`BitOr`, either operand order) |
-//! | test a bit inside a raw mask | no | no | yes (`BitAnd`: `mask & Enum::A`) |
+//! | conversion variant to flag set | no | no | yes (`From<Enum> for FlagSet<Enum>`) |
+//! | combine flags | no | no | yes (`BitOr`, either operand order, yielding [`FlagSet<E>`](crate::FlagSet)) |
+//! | test one bit in a set | no | no | yes ([`FlagSet::contains`](crate::FlagSet::contains), or `set & Enum::A`) |
 //! | fallback for an unlisted value | panics; every table fails fast (the expression form is still supported but unused) | n/a | n/a |
 //!
 //! In practice the split is mostly by kind: the `ffi_enum!` call sites are bit sets
@@ -32,11 +33,17 @@
 //!
 //! Points worth remembering, because they are easy to get wrong:
 //!
-//! - A fieldless enum cannot hold an unnamed discriminant, so the bit-set operators yield the
-//!   raw integer rather than the enum, and `ffi_enum!` can never convert a raw value back into
-//!   a variant. `BitOr` is implemented for both operand orders (`A | B`, `A | raw`, `raw | A`),
-//!   so a chain such as `A | B | C` reads as written; the read side is `raw & A` (`BitAnd`,
-//!   mask on the left). If a combination must be stored, keep it as the raw value.
+//! - A fieldless enum cannot hold an unnamed discriminant, so the bit-set operators cannot yield
+//!   the enum back: `LOW_DELAY | CLOSED_GOP` is not a variant of anything. They yield
+//!   [`FlagSet<E>`](crate::FlagSet) — the crate's type for "a mask of `Enum`'s bits" — which is also what
+//!   makes `ffi_enum!` unable to ever convert a raw value back into a variant. `BitOr` is
+//!   implemented for both operand orders as well as for a set on either side (`A | B`,
+//!   `A | raw`, `raw | A`, `set | A`, `A | set`), so a chain such as `A | B | C` reads as
+//!   written and stays a `FlagSet` throughout; the read side is
+//!   [`FlagSet::contains`](crate::FlagSet::contains), or
+//!   `set & A` when the common bits are what matter. A mask that cannot be described as a
+//!   combination of named flags goes through
+//!   [`FlagSet::from_bits`](crate::FlagSet::from_bits).
 //! - `ffi_enum!` does not declare an FFI type, but that is a statement about the macro's shape,
 //!   not a restriction on its constants: `SWS_*` is a bare constant on FFmpeg 6/7 and the
 //!   `ffi::SwsFlags` alias on 8+, and one table covers both.
@@ -47,6 +54,9 @@
 //!   `Into<ffi>` for IDs), and that is the conversion to reach for by default. `as_raw()` exists
 //!   only on the bit-set macros, where the same value is also needed for bit-level masking; treat
 //!   it as the explicit counterpart of the operators rather than a second generic conversion.
+//!   A `FlagSet` converts to the same raw `repr` (it is what makes a combination acceptable
+//!   anywhere a single flag is), and [`FlagSet::bits`](crate::FlagSet::bits) is the explicit
+//!   spelling of that read.
 
 /// Wraps a mutually exclusive FFI enum: from a single `variant => constant` table it generates
 /// the Rust enum plus the `From` impls in both directions.
@@ -373,20 +383,24 @@ macro_rules! ffi_enum_wrap {
 /// - `pub enum` whose discriminants equal the FFmpeg values, plus `as_raw()`.
 /// - `impl From<$enum> for $repr_ty` (that is, `Into<repr>`), so a flag can be passed straight
 ///   to an API taking `impl Into<repr>`.
-/// - `BitOr<Self>` and `BitOr<repr>`, both with `Output = $repr_ty`, so `A | B`, `A | raw` and
-///   chained combinations all produce the raw mask.
-/// - `BitAnd<Self>` for `$repr_ty` (`raw & A`), so a mask can be queried with a named flag:
-///   `flags & AVSeekFlag::BYTE != 0`.
+/// - `impl From<$enum> for `[`FlagSet`](crate::FlagSet)`, plus the set's `Into<$repr_ty>`, its
+///   `contains`, and the `|` / `&` operators whose result is the set — so one flag and any
+///   combination of flags are accepted by the same `impl Into<FlagSet<$enum>>` parameter.
+/// - `BitAnd<Self>` for `$repr_ty` (`raw & A`), so a mask that is already raw can be queried
+///   with a named flag: `flags & AVSeekFlag::BYTE != 0`.
 ///
-/// # Why the operators yield the raw integer
+/// # Why the operators yield a `FlagSet`, not the enum
 ///
 /// A fieldless Rust enum cannot represent an unnamed discriminant, and most useful
 /// combinations (`BACKWARD | ANY`, `GLOBAL_HEADER | NOTIMESTAMPS`) have no variant of their
-/// own. The operators therefore return `$repr_ty`: they exist to assemble a mask **at the FFI
-/// boundary**, not to model a first-class set type. All three `|` operand orders are accepted
-/// (`A | B`, `A | raw`, `raw | A`), so a longer chain keeps reading naturally. When a
-/// combination has to be stored or queried, keep it in the raw integer — `mask & Enum::X`
-/// (or `Enum::X.as_raw()`) then tests an individual bit.
+/// own. The operators therefore cannot return `$enum`; they return
+/// [`FlagSet`](crate::FlagSet) instead. That keeps the combination **typed**: a
+/// `FlagSet<AVCodecFlag>` cannot be handed to an API expecting `FlagSet<ScaleQuality>` even
+/// though both are 32-bit masks, while `A | B | C` still reads as written because the set
+/// implements `|` against itself and against the enum. Five `|` operand pairs are accepted —
+/// `A | B`, `A | raw`, `raw | A`, `set | A`, `A | set` — so no operand order has to be looked
+/// up. Reading goes through [`FlagSet::contains`](crate::FlagSet::contains) (one bit) or
+/// `set & A` (the common bits).
 ///
 /// `raw` means `$repr_ty` — no other integer type is accepted, because a table only
 /// implements the operators for its own `repr` and for itself. An FFI constant whose type
@@ -422,9 +436,10 @@ macro_rules! ffi_enum_wrap {
 ///     FRAME    => ffi::AVSEEK_FLAG_FRAME;
 /// });
 ///
-/// let mask = AVSeekFlag::BACKWARD | AVSeekFlag::ANY; // i32
-/// let raw: i32 = AVSeekFlag::FRAME.into();
-/// let decided_by_keyframe_only = mask & AVSeekFlag::ANY != 0; // read a bit back
+/// let set = AVSeekFlag::BACKWARD | AVSeekFlag::ANY; // FlagSet<AVSeekFlag>
+/// let raw: i32 = AVSeekFlag::FRAME.into();          // a single flag, straight to FFI
+/// let also_raw: i32 = set.into();                   // ...and so is a combination
+/// let decided_by_keyframe_only = set.contains(AVSeekFlag::ANY); // read a bit back
 /// ```
 macro_rules! ffi_enum {
     (
@@ -460,37 +475,116 @@ macro_rules! ffi_enum {
             }
         }
 
-        /// `Enum::A | Enum::B`: combines flag bits, yielding the raw integer.
+        /// A single flag is a one-bit set.
+        impl From<$enum_ident> for $crate::flags::FlagSet<$enum_ident> {
+            fn from(value: $enum_ident) -> Self {
+                $crate::flags::FlagSet::from_bits(value.as_raw() as u32)
+            }
+        }
+
+        /// The set hands its mask back to FFmpeg, as the type the FFI field wants.
+        impl From<$crate::flags::FlagSet<$enum_ident>> for $repr_ty {
+            fn from(value: $crate::flags::FlagSet<$enum_ident>) -> Self {
+                value.bits() as $repr_ty
+            }
+        }
+
+        impl $crate::flags::FlagSet<$enum_ident> {
+            /// Whether `flag`'s bit is set in this set.
+            ///
+            /// ```
+            /// # use rsmedia::{AVCodecFlag, FlagSet};
+            /// let set = AVCodecFlag::LOW_DELAY | AVCodecFlag::CLOSED_GOP;
+            /// assert!(set.contains(AVCodecFlag::LOW_DELAY));
+            /// assert!(!set.contains(AVCodecFlag::BITEXACT));
+            /// ```
+            pub fn contains(self, flag: $enum_ident) -> bool {
+                self.bits() & (flag.as_raw() as u32) != 0
+            }
+        }
+
+        /// `Enum::A | Enum::B`: combines flag bits into a [`FlagSet`](crate::FlagSet).
+        ///
+        /// The result is the *set*, not a bare integer, so a chain keeps its type:
+        /// `A | B | C` is a `FlagSet<Self>` throughout, and the per-table conversions
+        /// (`From<Self>`, `Into<repr>`) apply to it exactly as they do to a single flag.
         impl ::std::ops::BitOr for $enum_ident {
-            type Output = $repr_ty;
+            type Output = $crate::flags::FlagSet<$enum_ident>;
 
             fn bitor(self, rhs: Self) -> Self::Output {
-                self.as_raw() | rhs.as_raw()
+                $crate::flags::FlagSet::from_bits(self.as_raw() as u32 | rhs.as_raw() as u32)
             }
         }
 
-        /// `Enum::A | raw`: mixes a named flag with a raw mask, yielding the raw integer.
+        /// `Enum::A | raw`: mixes a named flag with an untyped mask, still yielding the set.
+        ///
+        /// `raw` means `$repr_ty`, as for the rest of this macro; a constant of another width
+        /// needs an explicit cast. Prefer [`FlagSet::from_bits`](crate::FlagSet::from_bits) when
+        /// the whole mask is raw — this form exists so a *mostly named* expression reads as one.
         impl ::std::ops::BitOr<$repr_ty> for $enum_ident {
-            type Output = $repr_ty;
+            type Output = $crate::flags::FlagSet<$enum_ident>;
 
             fn bitor(self, rhs: $repr_ty) -> Self::Output {
-                self.as_raw() | rhs
+                $crate::flags::FlagSet::from_bits(self.as_raw() as u32 | rhs as u32)
             }
         }
 
-        /// `raw | Enum::A`: continues a chain that has already produced the raw integer,
-        /// so `A | B | C` compiles as written (the first `|` yields `$repr_ty`).
+        /// `raw | Enum::A`: the mirror of the arm above, so either operand order reads naturally.
         impl ::std::ops::BitOr<$enum_ident> for $repr_ty {
-            type Output = $repr_ty;
+            type Output = $crate::flags::FlagSet<$enum_ident>;
 
             fn bitor(self, rhs: $enum_ident) -> Self::Output {
-                self | rhs.as_raw()
+                $crate::flags::FlagSet::from_bits(self as u32 | rhs.as_raw() as u32)
             }
         }
 
-        /// `raw & Enum::A`: reads a flag bit back out of a mask that is already raw, so a
-        /// query such as `flags & AVSeekFlag::BYTE != 0` needs no `as_raw()` on the flag.
-        /// Note the operand order: the mask is the `repr` side.
+        /// `set | Enum::A`: continues a chain that has already produced the set, so an
+        /// expression such as `(A | B) | C` compiles with the same result as `A | B | C`.
+        impl ::std::ops::BitOr<$enum_ident> for $crate::flags::FlagSet<$enum_ident> {
+            type Output = $crate::flags::FlagSet<$enum_ident>;
+
+            fn bitor(self, rhs: $enum_ident) -> Self::Output {
+                $crate::flags::FlagSet::from_bits(self.bits() | rhs.as_raw() as u32)
+            }
+        }
+
+        /// `Enum::A | set`: the mirror of the arm above.
+        impl ::std::ops::BitOr<$crate::flags::FlagSet<$enum_ident>> for $enum_ident {
+            type Output = $crate::flags::FlagSet<$enum_ident>;
+
+            fn bitor(self, rhs: $crate::flags::FlagSet<$enum_ident>) -> Self::Output {
+                $crate::flags::FlagSet::from_bits(self.as_raw() as u32 | rhs.bits())
+            }
+        }
+
+        /// `set & Enum::A`: keeps only `flag`'s bit, so `(set & F).is_empty()` asks whether `F`
+        /// is clear — the read-side counterpart of
+        /// [`FlagSet::contains`](crate::FlagSet::contains).
+        impl ::std::ops::BitAnd<$enum_ident> for $crate::flags::FlagSet<$enum_ident> {
+            type Output = $crate::flags::FlagSet<$enum_ident>;
+
+            fn bitand(self, rhs: $enum_ident) -> Self::Output {
+                $crate::flags::FlagSet::from_bits(self.bits() & rhs.as_raw() as u32)
+            }
+        }
+
+        /// `set |= Enum::A`: adds one named flag in place. The assign form of `set | A`, so
+        /// accumulating a mask bit by bit needs no `into()` at each step.
+        impl ::std::ops::BitOrAssign<$enum_ident> for $crate::flags::FlagSet<$enum_ident> {
+            fn bitor_assign(&mut self, rhs: $enum_ident) {
+                *self = $crate::flags::FlagSet::from_bits(self.bits() | rhs.as_raw() as u32);
+            }
+        }
+
+        /// `set &= Enum::A`: keeps only one named flag in place. The assign form of `set & A`.
+        impl ::std::ops::BitAndAssign<$enum_ident> for $crate::flags::FlagSet<$enum_ident> {
+            fn bitand_assign(&mut self, rhs: $enum_ident) {
+                *self = $crate::flags::FlagSet::from_bits(self.bits() & rhs.as_raw() as u32);
+            }
+        }
+
+        /// `raw & Enum::A`: reads a flag bit back out of a mask that is *already* raw, keeping
+        /// the raw integer. Note the operand order: the mask is the `repr` side.
         impl ::std::ops::BitAnd<$enum_ident> for $repr_ty {
             type Output = $repr_ty;
 
@@ -518,11 +612,13 @@ mod tests {
     use rsmpeg::ffi;
 
     /// `ffi_enum!` is the **bit-set** macro. It is the only one that can combine flags, and the
-    /// combination is the raw integer, because a fieldless enum cannot hold an unnamed
-    /// combination such as `BACKWARD | ANY`.
+    /// combination is a [`FlagSet`](crate::FlagSet) — not the enum (a fieldless enum cannot hold
+    /// an unnamed combination such as `BACKWARD | ANY`) and not a bare integer (which would let
+    /// one flag type's mask slip into another's parameter).
     #[test]
     #[allow(clippy::unnecessary_cast)] // `SWS_*` is a bare integer before FFmpeg 8.
     fn ffi_enum_provides_bit_combination() {
+        use crate::FlagSet;
         use crate::io::AVSeekFlag;
 
         // Discriminants are the FFmpeg values.
@@ -532,36 +628,51 @@ mod tests {
         );
 
         // `Into<repr>`: a single flag can be handed to an `impl Into<i32>` parameter — the
-        // crate has exactly one (`Seekable::seek_to_frame`), and it is also what lets the
-        // raw mask below be passed to it.
+        // crate has exactly one (`Seekable::seek_to_frame`), and the same conversion on the
+        // *set* is what lets a combination be passed to it too.
         let single: i32 = AVSeekFlag::FRAME.into();
         assert_eq!(single, ffi::AVSEEK_FLAG_FRAME as i32);
 
-        // `BitOr<Self>`: two named flags combine into the raw mask.
-        let two = AVSeekFlag::BACKWARD | AVSeekFlag::ANY;
+        // `BitOr<Self>`: two named flags combine into a set of that flag type.
+        let two: FlagSet<AVSeekFlag> = AVSeekFlag::BACKWARD | AVSeekFlag::ANY;
         assert_eq!(
-            two,
+            two.bits(),
+            (ffi::AVSEEK_FLAG_BACKWARD | ffi::AVSEEK_FLAG_ANY) as u32
+        );
+        // ...and the set converts to the raw `repr` just like a single flag does.
+        let two_raw: i32 = two.into();
+        assert_eq!(
+            two_raw,
             (ffi::AVSEEK_FLAG_BACKWARD | ffi::AVSEEK_FLAG_ANY) as i32
         );
 
-        // `BitOr<repr>`: a named flag can be mixed with an already-raw mask.
+        // `BitOr<repr>`: a named flag can be mixed with an already-raw mask, and stays typed.
         let mixed = AVSeekFlag::FRAME | (ffi::AVSEEK_FLAG_BYTE as i32);
         assert_eq!(
-            mixed,
-            (ffi::AVSEEK_FLAG_FRAME | ffi::AVSEEK_FLAG_BYTE) as i32
+            mixed.bits(),
+            (ffi::AVSEEK_FLAG_FRAME | ffi::AVSEEK_FLAG_BYTE) as u32
         );
 
-        // The result is the raw integer, so further combination stays in the raw domain —
-        // and `repr | Variant` is provided precisely so that a chain can be written as
-        // `A | B | C` and still produce the raw mask. The reverse direction (raw -> variant)
-        // does not exist here at all; that is `ffi_enum_wrap_from!`'s job.
+        // The first `|` yields the set, and `set | Enum` / `Enum | set` both continue it, so
+        // `A | B | C` reads as written and stays a `FlagSet`. The reverse direction
+        // (raw -> variant) does not exist here at all; that is `ffi_enum_wrap_from!`'s job.
         let three = AVSeekFlag::BACKWARD | AVSeekFlag::ANY | AVSeekFlag::FRAME;
-        assert_eq!(three, 1 | 4 | 8);
+        assert_eq!(three.bits(), 1 | 4 | 8);
+        assert_eq!(three, two | AVSeekFlag::FRAME);
+        assert_eq!(three, AVSeekFlag::FRAME | two);
 
-        // `BitAnd`: a mask that is already raw is queried with a named flag — the read side of
-        // the operators, where `as_raw()` would otherwise be needed on the flag.
-        assert_ne!(two & AVSeekFlag::BACKWARD, 0);
-        assert_eq!(two & AVSeekFlag::BYTE, 0);
+        // The read side: `contains` for a single bit, `set & Enum` for the common bits.
+        assert!(three.contains(AVSeekFlag::FRAME));
+        assert!(two.contains(AVSeekFlag::BACKWARD));
+        assert!(!two.contains(AVSeekFlag::BYTE));
+        assert_eq!(two & AVSeekFlag::BACKWARD, AVSeekFlag::BACKWARD.into());
+        assert!((two & AVSeekFlag::BYTE).is_empty());
+
+        // A mask that is *already* raw is still queried by the raw `BitAnd`, which keeps the
+        // integer: `raw & Enum::A`.
+        let raw_two: i32 = two.into();
+        assert_ne!(raw_two & AVSeekFlag::BACKWARD, 0);
+        assert_eq!(raw_two & AVSeekFlag::BYTE, 0);
 
         // `repr` picks the conversion target, which is how one table covers every FFmpeg
         // version: `SWS_*` is a bare constant on 6/7 and a named alias on 8+, and both

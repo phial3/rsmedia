@@ -21,6 +21,7 @@
 
 use crate::error::{Result, RsmediaError};
 use crate::io::{Reader, Writer};
+use crate::time::Rational;
 
 use rsmpeg::avcodec::AVSubtitle;
 use rsmpeg::ffi;
@@ -47,7 +48,7 @@ pub fn copy_subtitle_stream<R: Reader, W: Writer>(
         .input()
         .streams()
         .get(src_index)
-        .map(|s| s.time_base)
+        .map(|s| Rational::from(s.time_base))
         .ok_or_else(|| {
             RsmediaError::invalid_config(format!(
                 "Input stream {src_index} does not exist ({} streams)",
@@ -62,7 +63,7 @@ pub fn copy_subtitle_stream<R: Reader, W: Writer>(
         if stream_index != src_index {
             continue;
         }
-        packet.rescale_ts(src_tb, out_tb);
+        packet.rescale_ts(src_tb.into(), out_tb.into());
         packet.set_stream_index(out_index as i32);
         packet.set_pos(-1);
         writer.write_interleaved(&mut packet)?;
@@ -103,7 +104,7 @@ pub fn encode_subtitle_segments(
         for mut packet in encoder.encode_subtitle_segment(segment)? {
             packet.set_stream_index(index as i32);
             packet.set_pos(-1);
-            packet.rescale_ts(enc_tb, out_tb);
+            packet.rescale_ts(enc_tb.into(), out_tb.into());
             writer.write_interleaved(&mut packet)?;
         }
     }
@@ -291,7 +292,7 @@ mod tests {
         // 1) Encode: mov_text segments into an MP4
         let segments = sample_segments();
         let mut encoder = EncoderBuilder::new_subtitle()
-            .with_codec_name(Some("mov_text".to_string()))
+            .with_codec_name("mov_text")
             .with_subtitle_header(ASS_HEADER)
             .build()?;
         let mut writer = crate::io::StreamWriter::new(&path)?;
@@ -300,7 +301,7 @@ mod tests {
         // 2) Decode: via the generic Decoder subtitle channel
         let mut reader = crate::io::StreamReader::new(&path)?;
         let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
-            .with_codec_name(Some("mov_text".to_string()))
+            .with_codec_name("mov_text")
             .build_from_reader(&reader)?;
         let mut decoded: Vec<SubtitleSegment> = Vec::new();
         while let Some(segment) = decoder.decode_subtitle_segment(&mut reader)? {
@@ -396,7 +397,7 @@ mod tests {
         // 1) Write: create an MP4 with a mov_text subtitle stream
         let segments = sample_segments();
         let mut encoder = EncoderBuilder::new_subtitle()
-            .with_codec_name(Some("mov_text".to_string()))
+            .with_codec_name("mov_text")
             .with_subtitle_header(ASS_HEADER)
             .build()?;
         let mut writer = crate::io::StreamWriter::new(&path)?;
@@ -432,7 +433,7 @@ mod tests {
             start_ms.push(
                 packet
                     .pts
-                    .rescale(stream_tb, crate::time::new_rational(1, 1000)),
+                    .rescale(stream_tb, Rational::new(1, 1000).unwrap()),
             );
             if let Some(subtitle) = dctx.decode_subtitle(Some(&mut packet))? {
                 for rect in subtitle.rect_iter() {
@@ -532,7 +533,10 @@ mod tests {
         // on reader before calling copy_subtitle_stream which needs &mut reader).
         let (codecpar, src_tb) = {
             let src_stream = reader.input().streams().get(src_index).unwrap();
-            (src_stream.codecpar().clone(), src_stream.time_base)
+            (
+                src_stream.codecpar().clone(),
+                Rational::from(src_stream.time_base),
+            )
         };
         let out_index = out_writer.add_stream(codecpar, src_tb)?;
 
@@ -574,7 +578,7 @@ mod tests {
         // 1) Write: create an MKV with an ASS subtitle stream
         let segments = sample_segments();
         let mut encoder = EncoderBuilder::new_subtitle()
-            .with_codec_name(Some("ass".to_string()))
+            .with_codec_name("ass")
             .with_subtitle_header(ASS_HEADER)
             .build()?;
         let mut writer = crate::io::StreamWriter::new(&path)?;
@@ -610,7 +614,7 @@ mod tests {
             start_ms.push(
                 packet
                     .pts
-                    .rescale(stream_tb, crate::time::new_rational(1, 1000)),
+                    .rescale(stream_tb, Rational::new(1, 1000).unwrap()),
             );
             if let Some(subtitle) = dctx.decode_subtitle(Some(&mut packet))? {
                 for rect in subtitle.rect_iter() {

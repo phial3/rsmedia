@@ -13,11 +13,12 @@
 //! descriptors instead of naming formats. Every sample-copy routine below is
 //! therefore written once and serves packed and planar, audio and video alike.
 
+use crate::MediaType;
 use crate::error::{Context, Result, RsmediaError};
 use crate::fmt::{DataLayout, FrameFormat, SampleFormat};
 use crate::options::Metadata;
 use crate::pixel::PixelFormat;
-use crate::{MediaType, time};
+use crate::time::Rational;
 
 use ndarray::{Array2, Array3, ArrayView2, ArrayViewMut2};
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
@@ -447,13 +448,20 @@ fn rgb24_to_yuv420p<T: ElementType>(
 /// The size comes from the luma plane, whose `(height, width)` shape the
 /// `YUV420P` layout fixes. `range` is the range the *source* samples are in;
 /// `RGB24` output is always full range.
+///
+/// Chroma dimensions are **rounded up** (`div_ceil`), matching
+/// [`PixelFormat::data_layout`] and FFmpeg's own `av_image_fill_linesizes`: an
+/// odd side still covers one more whole chroma unit, so 65 columns of luma carry
+/// 33 columns of chroma. Rounding down would hand the `yuv` crate a stride
+/// narrower than the plane really is, which it rejects (and which would
+/// otherwise read every chroma row shifted by one).
 fn yuv420p_to_rgb24<T: ElementType>(
     data: &FrameData<T>,
     matrix: YuvStandardMatrix,
     range: YuvRange,
 ) -> Result<FrameData<T>> {
     let (height, width) = yuv420p_extent(data)?;
-    let (uv_width, uv_height) = (width / 2, height / 2);
+    let (uv_width, uv_height) = (width.div_ceil(2), height.div_ceil(2));
 
     let y = data.plane_samples::<u8>(0)?;
     let u = data.plane_samples::<u8>(1)?;
@@ -595,7 +603,7 @@ pub struct MediaFrame<T> {
     /// container time base. So [`set_pts`](Self::set_pts) needs a matching
     /// `set_time_base` only when the pts is not already counted in the encoder's
     /// time base.
-    pub time_base: ffi::AVRational,
+    pub time_base: Rational,
     /// 媒体类型（仅 Video / Audio 二者之一）。
     /// only for Video / Audio: [`MediaType`]
     pub media_type: MediaType,
@@ -611,11 +619,17 @@ pub struct MediaFrame<T> {
     ///
     /// 与编码器的目标率是两个量：二者不同时编码器会自动重采样，因此这里应填数据的真实
     /// 速率。`0` 表示未声明，编码器接收该帧时按自己的目标率补齐。
-    pub sample_rate: u32,
+    ///
+    /// `i32`, FFmpeg's own width for a sample rate (`AVFrame.sample_rate` is an
+    /// `int`), so it reaches `set_sample_rate`/the encoder's supported-rate list
+    /// unchanged.
+    pub sample_rate: i32,
     /// 仅音频字段：本帧采样数（每通道）。
     pub nb_samples: u32,
-    /// 仅音频字段：声道数。
-    pub nb_channels: u32,
+    /// 仅音频字段：声道数。`i32` — FFmpeg's `AVChannelLayout.nb_channels` is a
+    /// `c_int`, and the value goes straight to `AVChannelLayout::from_nb_channels`.
+    /// [`MediaFrame::new_audio`] rejects a non-positive count.
+    pub nb_channels: i32,
     /// 是否为关键帧（来自 AV_FRAME_FLAG_KEY）。
     pub key_frame: bool,
     /// 帧标志（AV_FRAME_FLAG_* 组合）。
@@ -639,8 +653,8 @@ pub struct MediaFrame<T> {
     /// Chroma sample location (`AVChromaLocation`): where the chroma samples sit
     /// relative to the luma grid. `AVCHROMA_LOC_UNSPECIFIED` when unknown.
     pub chroma_location: ffi::AVChromaLocation,
-    /// 像素宽高比（视频帧的 sample_aspect_ratio，0/1 表示未知）。
-    pub sample_aspect_ratio: ffi::AVRational,
+    /// 像素宽高比（视频帧的 sample_aspect_ratio；[`Rational::ZERO`] 表示未知）。
+    pub sample_aspect_ratio: Rational,
     /// Cropping rectangle in pixels: the coded picture has `crop_top` / `crop_bottom`
     /// rows and `crop_left` / `crop_right` columns discarded to obtain the region
     /// intended for presentation. All zero when the whole coded picture is shown.
@@ -688,7 +702,7 @@ impl<T: ElementType> Default for MediaFrame<T> {
             // 占位格式，具体构造器会覆盖；默认中性值用于避免越界访问。
             format: FrameFormat::Pixel(PixelFormat::NONE),
             data: FrameData::default(),
-            time_base: time::new_rational(0, 1),
+            time_base: Rational::ZERO,
             media_type: MediaType::DATA,
             width: 0,
             height: 0,
@@ -707,7 +721,7 @@ impl<T: ElementType> Default for MediaFrame<T> {
             color_trc: ffi::AVCOL_TRC_UNSPECIFIED,
             color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
             chroma_location: ffi::AVCHROMA_LOC_UNSPECIFIED,
-            sample_aspect_ratio: time::new_rational(0, 1),
+            sample_aspect_ratio: Rational::ZERO,
             crop_top: 0,
             crop_bottom: 0,
             crop_left: 0,
@@ -749,7 +763,11 @@ where
                 .format
                 .into_sample()
                 .ok_or_else(|| RsmediaError::invalid_config("Audio frame needs a sample format"))?;
-            Ok(format.data_layout(self.nb_channels as usize, self.nb_samples as usize))
+            // `nb_channels` is signed; a nonsensical count must not turn into an
+            // enormous `usize` here. Construction already rejects it (`validated`),
+            // the fold keeps a hand-edited field from allocating.
+            let channels = usize::try_from(self.nb_channels).unwrap_or(0);
+            Ok(format.data_layout(channels, self.nb_samples as usize))
         }
     }
 
@@ -808,19 +826,15 @@ where
     /// 编码器接收该帧时会按自己的目标率补齐。
     pub fn new_audio(
         format: SampleFormat,
-        nb_channels: u32,
+        nb_channels: i32,
         nb_samples: u32,
-        sample_rate: u32,
+        sample_rate: i32,
         data: impl Into<FrameData<T>>,
     ) -> Result<Self> {
         Self {
             format: FrameFormat::Sample(format),
             data: data.into(),
-            time_base: if sample_rate > 0 {
-                time::new_rational(1, sample_rate as i32)
-            } else {
-                time::new_rational(0, 1)
-            },
+            time_base: Rational::new(1, sample_rate).unwrap_or(Rational::ZERO),
             sample_rate,
             nb_samples,
             nb_channels,
@@ -836,11 +850,16 @@ where
     /// `sample_rate` 推出，见 [`new_audio`](Self::new_audio)。
     pub fn new_audio_frame(
         format: SampleFormat,
-        nb_channels: u32,
+        nb_channels: i32,
         nb_samples: u32,
-        sample_rate: u32,
+        sample_rate: i32,
     ) -> Result<Self> {
-        let layout = format.data_layout(nb_channels as usize, nb_samples as usize);
+        // `nb_channels` is signed (FFmpeg's width), but a sample layout needs a
+        // real channel count. Fold a nonsensical one to 0 here so that
+        // `new_audio`'s shared validation rejects it with its own message,
+        // instead of `as usize` turning `-1` into a request for 2^64 planes.
+        let channels = usize::try_from(nb_channels).unwrap_or(0);
+        let layout = format.data_layout(channels, nb_samples as usize);
         Self::new_audio(
             format,
             nb_channels,
@@ -858,9 +877,10 @@ where
     /// [`to_avframe`](Self::to_avframe)。
     fn validated(self) -> Result<Self> {
         // 音频的声道数/采样数必须为正。否则平面布局是空列表、`matches` 会接受，
-        // 一个"没有声道"的帧就能一路走到 FFmpeg。视频侧的等价约束由
+        // 一个"没有声道"的帧就能一路走到 FFmpeg。声道数是 `i32`（FFmpeg 的宽度），
+        // 所以判据是 `<= 0` 而不是 `== 0`。视频侧的等价约束由
         // `PixelFormat::data_layout` 对 0 尺寸返回 `None` 覆盖，无需在此重复。
-        if self.media_type == MediaType::AUDIO && (self.nb_channels == 0 || self.nb_samples == 0) {
+        if self.media_type == MediaType::AUDIO && (self.nb_channels <= 0 || self.nb_samples == 0) {
             return Err(RsmediaError::msg(format!(
                 "Audio frame needs a positive sample and channel count, got {} samples x {} channels",
                 self.nb_samples, self.nb_channels
@@ -957,11 +977,11 @@ where
         self.pkt_dts = pkt_dts;
     }
 
-    pub fn set_time_base(&mut self, time_base: ffi::AVRational) {
+    pub fn set_time_base(&mut self, time_base: Rational) {
         self.time_base = time_base;
     }
 
-    pub fn set_sample_rate(&mut self, sample_rate: u32) {
+    pub fn set_sample_rate(&mut self, sample_rate: i32) {
         self.sample_rate = sample_rate;
     }
 
@@ -985,18 +1005,18 @@ where
         // AVFrame 的 time_base 常未被解码器填充（默认 0/0）。无效时：
         // - 音频可由采样率推断为 1/sample_rate
         // - 视频无法从帧内推断帧率，告警并提示调用方设置
-        let time_base = if frame.time_base.num == 0 || frame.time_base.den == 0 {
+        let time_base = Rational::from(frame.time_base);
+        let time_base = if time_base.is_zero() {
             if frame.nb_samples > 0 && frame.sample_rate > 0 {
-                time::new_rational(1, frame.sample_rate)
+                Rational::new(1, frame.sample_rate).unwrap_or(Rational::ZERO)
             } else {
                 tracing::warn!(
-                    "AVFrame has no valid time_base ({:?}); call MediaFrame::set_time_base",
-                    frame.time_base
+                    "AVFrame has no valid time_base ({time_base}); call MediaFrame::set_time_base"
                 );
-                frame.time_base
+                time_base
             }
         } else {
-            frame.time_base
+            time_base
         };
 
         // 判断依据：nb_samples 是音频帧专属字段（视频帧恒为 0），
@@ -1023,9 +1043,9 @@ where
                 time_base,
                 data: FrameData::default(),
                 media_type: MediaType::AUDIO,
-                sample_rate: frame.sample_rate as u32,
+                sample_rate: frame.sample_rate,
                 nb_samples: frame.nb_samples as u32,
-                nb_channels: frame.ch_layout.nb_channels as u32,
+                nb_channels: frame.ch_layout.nb_channels,
                 ..Self::default()
             };
             media.data = read_samples::<T>(frame, &media.data_layout()?)?;
@@ -1083,7 +1103,7 @@ where
         self.color_trc = frame.color_trc;
         self.color_range = frame.color_range;
         self.chroma_location = frame.chroma_location;
-        self.sample_aspect_ratio = frame.sample_aspect_ratio;
+        self.sample_aspect_ratio = Rational::from(frame.sample_aspect_ratio);
         self.crop_top = frame.crop_top;
         self.crop_bottom = frame.crop_bottom;
         self.crop_left = frame.crop_left;
@@ -1123,7 +1143,7 @@ where
             (*raw).color_trc = self.color_trc;
             (*raw).color_range = self.color_range;
             (*raw).chroma_location = self.chroma_location;
-            (*raw).sample_aspect_ratio = self.sample_aspect_ratio;
+            (*raw).sample_aspect_ratio = self.sample_aspect_ratio.into();
             (*raw).crop_top = self.crop_top;
             (*raw).crop_bottom = self.crop_bottom;
             (*raw).crop_left = self.crop_left;
@@ -1252,10 +1272,8 @@ where
             frame.set_pict_type(self.pict_type);
         } else {
             frame.set_nb_samples(self.nb_samples as i32);
-            frame.set_sample_rate(self.sample_rate as i32);
-            frame.set_ch_layout(
-                AVChannelLayout::from_nb_channels(self.nb_channels as i32).into_inner(),
-            );
+            frame.set_sample_rate(self.sample_rate);
+            frame.set_ch_layout(AVChannelLayout::from_nb_channels(self.nb_channels).into_inner());
         }
         frame
             .alloc_buffer()
@@ -1268,14 +1286,14 @@ where
 
         // 统一口径：无论视频/音频都优先使用 `time_base`；仅在未设置时才按
         // 音频采样率推导 `1/sample_rate`，与 `from_avframe` 的推断规则一致。
-        let time_base = if self.time_base.num > 0 && self.time_base.den > 0 {
+        let time_base = if self.time_base.num() > 0 {
             self.time_base
         } else if self.media_type == MediaType::AUDIO && self.sample_rate > 0 {
-            time::new_rational(1, self.sample_rate as i32)
+            Rational::new(1, self.sample_rate).unwrap_or(Rational::ZERO)
         } else {
             self.time_base
         };
-        frame.set_time_base(time_base);
+        frame.set_time_base(time_base.into());
         Ok(frame)
     }
 
@@ -1307,9 +1325,14 @@ where
 
     /// 选择 RGB <-> YUV 转换用的标准色彩矩阵。
     ///
-    /// 优先读帧携带的 `colorspace` 元数据；未标记时按分辨率启发式
-    /// （SD -> BT.601 / HD -> BT.709 / UHD -> BT.2020），与 ffmpeg 的
-    /// `sws_getCoefficients` 缺省行为一致。
+    /// 优先读帧携带的 `colorspace` 元数据；未标记时按分辨率启发式回落：
+    /// 低于 720 行算 SD（BT.601）、低于 2160 行算 HD（BT.709）、再高算 UHD
+    /// （BT.2020）。**上界必须是 2160**：1080p 属于 HD，写成 `height < 1080`
+    /// 会把最常见的 1080p 判成 BT.2020。
+    ///
+    /// 未标记时的矩阵由这里的启发式决定，而 [`Scaler`](crate::scale::Scaler) 走
+    /// swscale 自己的默认（BT.601/BT.709 分界同为 720 行）—— 两条路径对 UHD 的
+    /// 处理不同，需要精确控制时请给帧带上 `colorspace`。
     fn yuv_matrix(&self) -> YuvStandardMatrix {
         let colorspace = self.colorspace;
         if colorspace == ffi::AVCOL_SPC_BT709 {
@@ -1331,7 +1354,7 @@ where
         let height = self.height;
         if height < 720 {
             YuvStandardMatrix::Bt601
-        } else if height < 1080 {
+        } else if height < 2160 {
             YuvStandardMatrix::Bt709
         } else {
             YuvStandardMatrix::Bt2020
@@ -1898,7 +1921,10 @@ mod tests {
 
     const TEST_WIDTH: u32 = 320;
     const TEST_HEIGHT: u32 = 240;
-    const TIME_BASE: ffi::AVRational = ffi::AVRational { num: 1, den: 30 }; // 30 fps
+    /// 30 fps, as a time base: `1/30`.
+    fn time_base_30fps() -> Rational {
+        Rational::new(1, 30).expect("1/30 is a rational")
+    }
 
     /// 用 `Color::from_rgb` 生成渐变测试图案并填充 RGB24 帧。
     /// 返回 r/g/b 三个平面，方便调用方做断言。
@@ -2217,18 +2243,19 @@ mod tests {
     /// 意义（`set_time_base` 的用途），否则编码器用自己的输入时间基解释 pts。
     #[test]
     fn test_frame_timestamps() -> Result<()> {
-        let fps = TIME_BASE.den as f64 / TIME_BASE.num as f64;
+        let tb = time_base_30fps();
+        let fps = tb.den() as f64 / tb.num() as f64;
         let frame_duration = Duration::from_secs_f64(1.0 / fps);
 
         let mut frames = Vec::new();
         for i in 0..5 {
             let mut frame =
                 MediaFrame::<u8>::new_video_frame(TEST_WIDTH, TEST_HEIGHT, PixelFormat::RGB24)?;
-            assert_eq!(
-                frame.time_base.num, 0,
+            assert!(
+                frame.time_base.is_zero(),
                 "video frames start with no time base"
             );
-            frame.set_time_base(TIME_BASE);
+            frame.set_time_base(tb);
             frame.set_pts(i as i64);
             frames.push(frame);
         }
@@ -2236,9 +2263,7 @@ mod tests {
         // 验证时间戳的正确性（pts 按显式声明的 1/30 换算为物理时间）
         for (i, frame) in frames.iter().enumerate() {
             let expected_time = frame_duration * i as u32;
-            let actual_time = Duration::from_secs_f64(
-                frame.pts as f64 * frame.time_base.num as f64 / frame.time_base.den as f64,
-            );
+            let actual_time = Duration::from_secs_f64(frame.pts as f64 * frame.time_base.as_f64());
             assert!((actual_time - expected_time).as_secs_f32().abs() < 0.01);
         }
 
@@ -2346,7 +2371,8 @@ mod tests {
         assert_eq!(frame.format, FrameFormat::Pixel(PixelFormat::RGB24));
         // 视频帧不带时间基：分辨率里没有帧率信息，编码器会用自身的输入时间基解释 pts。
         assert_eq!(
-            frame.time_base.num, 0,
+            frame.time_base.num(),
+            0,
             "video frames start with no time base"
         );
         assert!(
@@ -2471,7 +2497,7 @@ mod tests {
             MediaFrame::<f32>::new_audio_frame(SampleFormat::FLTP, channels, samples, sample_rate)?;
 
         // 音频帧的时间基由采样率推出，无需调用方传递。
-        assert_eq!((frame.time_base.num, frame.time_base.den), (1, 44100));
+        assert_eq!(frame.time_base, Rational::new(1, 44_100).unwrap());
 
         assert_eq!(frame.data.num_planes(), channels as usize);
         assert_eq!(
@@ -2671,6 +2697,132 @@ mod tests {
         // 往返一致：to_dynamic_image(from_dynamic_image) 逐字节还原
         let img = frame.to_dynamic_image()?;
         assert_eq!(img.to_rgb8().into_raw(), expected);
+        Ok(())
+    }
+
+    /// 未标 `colorspace` 时 `yuv_matrix` 的分辨率启发式必须把 1080p 归为 HD。
+    ///
+    /// 上界写成 `height < 1080` 会把最常见的 1080p 判成 BT.2020（旧行为），
+    /// BT.2020 的色度系数与 BT.709 差得很远，整帧会明显偏绿。
+    #[test]
+    fn test_yuv_matrix_heuristic_boundaries() -> Result<()> {
+        for (height, expected) in [
+            (480u32, YuvStandardMatrix::Bt601), // SD
+            (719, YuvStandardMatrix::Bt601),    // SD 上界（取 719 避开偶数约束）
+            (720, YuvStandardMatrix::Bt709),    // HD 起点
+            (1080, YuvStandardMatrix::Bt709),   // 最常见的 HD —— 旧代码在此错判
+            (2159, YuvStandardMatrix::Bt709),   // HD 上界
+            (2160, YuvStandardMatrix::Bt2020),  // UHD 起点
+        ] {
+            let frame = MediaFrame::<u8>::new_video_frame(64, height, PixelFormat::YUV420P)?;
+            assert_eq!(
+                frame.colorspace,
+                ffi::AVCOL_SPC_UNSPECIFIED,
+                "the heuristic only applies when nothing marked the colorspace"
+            );
+            assert_eq!(
+                frame.yuv_matrix(),
+                expected,
+                "height {height} picked the wrong matrix"
+            );
+        }
+
+        // 显式 colorspace 优先于分辨率（两种方向都要压过分辨率启发式）。
+        let mut uhd_tagged_hd = MediaFrame::<u8>::new_video_frame(64, 1080, PixelFormat::YUV420P)?;
+        uhd_tagged_hd.colorspace = ffi::AVCOL_SPC_BT2020_NCL;
+        assert_eq!(uhd_tagged_hd.yuv_matrix(), YuvStandardMatrix::Bt2020);
+
+        let mut sd_tagged_uhd = MediaFrame::<u8>::new_video_frame(64, 2160, PixelFormat::YUV420P)?;
+        sd_tagged_uhd.colorspace = ffi::AVCOL_SPC_SMPTE170M;
+        assert_eq!(sd_tagged_uhd.yuv_matrix(), YuvStandardMatrix::Bt601);
+
+        Ok(())
+    }
+
+    /// 奇数尺寸的 `YUV420P -> RGB24`：色度平面是 **ceil** 尺寸，传给 `yuv`
+    /// crate 的 stride 也必须是 ceil。
+    ///
+    /// FFmpeg 的 `av_image_fill_linesizes` 把行宽向上取整到整个色度单元，
+    /// [`PixelFormat::data_layout`] 与 `imgutils` 都遵循同一规则；`yuv` crate 的
+    /// `check_chroma_channel` 也以 `width.div_ceil(2)` 为最小行宽。这里若用
+    /// `width / 2`（floor），32 列的行宽小于要求的 33 列 —— 旧行为会在进入转换前
+    /// 就报 `ChromaPlaneMinimumSizeMismatch { expected: 825, received: 800 }`
+    /// （包成 `Other` 的 "Failed to convert YUV420P to RGB24"），
+    /// 于是这条快路径对整个奇数尺寸不可用。
+    #[test]
+    fn test_yuv420p_to_rgb24_odd_dimensions() -> Result<()> {
+        // 色度平面应为 ceil：(65/2, 49/2) = (33, 25)，而不是 floor 的 (32, 24)。
+        let (width, height) = (65u32, 49u32);
+        let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::YUV420P)?;
+        assert_eq!(
+            frame.data.shapes(),
+            vec![(height as usize, width as usize), (25, 33), (25, 33)],
+            "odd dimensions must produce ceil-sized chroma planes"
+        );
+
+        // 每行色度取不同值，行内保持一致：stride 用 floor 时会把第 y 行读到
+        // y*32 而不是 y*33，行首像素会落到上一行的最后一列上 ⇒ 行内不再均匀。
+        let (chroma_rows, chroma_cols) = (25usize, 33usize);
+        let planes = frame.data.as_planes_mut().expect("YUV420P is planar");
+        planes[0].fill(128); // 亮度恒定
+        for y in 0..chroma_rows {
+            // U (Cb) < 128 使画面偏黄 —— 顺带锁住 U/V 两平面不被互换。
+            // 取值保持在 128 以下（90..114），黄色方向才在每一行都成立。
+            let u = 90 + (y as u8);
+            planes[1].slice_mut(ndarray::s![y, ..]).fill(u);
+            planes[2].slice_mut(ndarray::s![y, ..]).fill(128);
+        }
+        assert_eq!(planes[1].shape(), &[chroma_rows, chroma_cols]);
+
+        let rgb = frame.convert_yuv420p_to_rgb24()?;
+        assert_eq!((rgb.width, rgb.height), (width, height));
+        let packed = rgb.data.as_packed().expect("RGB24 is interleaved");
+
+        // 每个亮度行像素必须一致，且相邻两行成对共享同一色度行。
+        //
+        // ⚠️ 容差 ±1，不能要求逐像素完全相等：`yuv` crate 在 x86_64 上对"宽度不是
+        // SIMD 通道数整数倍"的帧，**最后一列**会比同行其它像素差 1（实测 amd64 上
+        // 65 宽的 x=64 是 `[130,145,..]` 而 x=0..63 是 `[131,146,..]`；aarch64 与
+        // macOS 上整行完全均匀）。1/255 是定点取整差异，不是 stride 错位 ——
+        // stride 错位会让行内读到**上一个色度行**的值，差值在几十的量级，
+        // 这个容差照样抓得到（也正是上面 `shapes()` 断言要钉死的事）。
+        for y in 0..height as usize {
+            let row = packed.slice(ndarray::s![y, .., ..]);
+            let first = [row[[0, 0]], row[[0, 1]], row[[0, 2]]];
+            for x in 0..width as usize {
+                let pixel = [row[[x, 0]], row[[x, 1]], row[[x, 2]]];
+                assert!(
+                    pixel
+                        .iter()
+                        .zip(first.iter())
+                        .all(|(got, want)| got.abs_diff(*want) <= 1),
+                    "row {y} column {x} = {pixel:?} differs from {first:?} by more than 1: \
+                     chroma was read with the wrong stride"
+                );
+            }
+            if y % 2 == 1 {
+                // 与上一行共用色度行，必须一致（同上，容差 ±1）。
+                let prev = packed.slice(ndarray::s![y - 1, .., ..]);
+                let prev_first = [prev[[0, 0]], prev[[0, 1]], prev[[0, 2]]];
+                assert!(
+                    prev_first
+                        .iter()
+                        .zip(first.iter())
+                        .all(|(got, want)| got.abs_diff(*want) <= 1),
+                    "rows {} and {y} share one chroma row but differ: {prev_first:?} vs {first:?}",
+                    y - 1
+                );
+            }
+            // U (Cb) < 128 使画面偏黄：BT.601 下 R 高于 B。U/V 若互换，
+            // 送进 Cb 的就会是恒定的 128、送进 Cr 的是 90，方向随即反转。
+            assert!(
+                first[0] > first[2],
+                "row {y} is not yellow-shifted (R={}, B={}) — chroma planes may be swapped",
+                first[0],
+                first[2]
+            );
+        }
+
         Ok(())
     }
 }

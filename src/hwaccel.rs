@@ -40,19 +40,23 @@ impl HWDeviceConfig {
     ///   e.g. for NVIDIA CUDA, device_id should be explicitly the GPU ID  "0" or "1",
     ///   for VAAPI: device_id should be set like "/dev/dri/renderD128"
     /// * `options` - Additional (type-specific) options to use in opening the device
+    ///
+    /// Both optional arguments take an `impl Into<Option<_>>`, so a value that is
+    /// always present is passed bare and "no value" is spelled `None`: no
+    /// `Some(...)` wrapper at the call site.
     pub fn new(
         device_type: HWDeviceType,
         hw_pixel_format: PixelFormat,
         sw_pixel_format: PixelFormat,
-        device_id: Option<String>,
-        options: Option<Options>,
+        device_id: impl Into<Option<String>>,
+        options: impl Into<Option<Options>>,
     ) -> Self {
         Self {
             device_type,
             hw_pixel_format,
             sw_pixel_format,
-            device_id,
-            options,
+            device_id: device_id.into(),
+            options: options.into(),
         }
     }
 
@@ -74,24 +78,27 @@ impl HWDeviceConfig {
     /// build CUDA HWDeviceConfig
     ///
     /// `device_id` 为 GPU 编号字符串（如 `"0"`、`"1"`），与其他设备构造器
-    /// 的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。
-    pub fn cuda(device_id: Option<String>) -> Self {
-        Self::default_for(HWDeviceType::CUDA, device_id)
+    /// 的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。也可以直接传
+    /// 一个 `&str`；`None` 表示让后端自选默认设备。
+    pub fn cuda(device_id: impl Into<Option<String>>) -> Self {
+        Self::default_for(HWDeviceType::CUDA, device_id.into())
     }
 
     /// build VAAPI HWDeviceConfig
-    pub fn vaapi(device_id: Option<String>) -> Self {
-        Self::default_for(HWDeviceType::VAAPI, device_id)
+    ///
+    /// `device_id` 一般是 DRM 渲染节点路径（如 `"/dev/dri/renderD128"`）。
+    pub fn vaapi(device_id: impl Into<Option<String>>) -> Self {
+        Self::default_for(HWDeviceType::VAAPI, device_id.into())
     }
 
     /// build VULKAN HWDeviceConfig
-    pub fn vulkan(device_id: Option<String>) -> Self {
-        Self::default_for(HWDeviceType::VULKAN, device_id)
+    pub fn vulkan(device_id: impl Into<Option<String>>) -> Self {
+        Self::default_for(HWDeviceType::VULKAN, device_id.into())
     }
 
     /// build QSV (Intel Quick Sync Video) HWDeviceConfig
-    pub fn qsv(device_id: Option<String>) -> Self {
-        Self::default_for(HWDeviceType::QSV, device_id)
+    pub fn qsv(device_id: impl Into<Option<String>>) -> Self {
+        Self::default_for(HWDeviceType::QSV, device_id.into())
     }
 
     /// build AMD AMF HWDeviceConfig（Windows 平台，基于 D3D11 设备）。
@@ -100,8 +107,8 @@ impl HWDeviceConfig {
     /// hw_context 类型，挂在 `AV_HWDEVICE_TYPE_D3D11VA` 下：软件帧（NV12）
     /// 先上传到 D3D11 surface，再由 AMF 编码。
     #[cfg(target_os = "windows")]
-    pub fn amf(device_id: Option<String>) -> Self {
-        Self::default_for(HWDeviceType::D3D11VA, device_id)
+    pub fn amf(device_id: impl Into<Option<String>>) -> Self {
+        Self::default_for(HWDeviceType::D3D11VA, device_id.into())
     }
 
     /// 按当前平台自动选择最佳可用的硬件加速配置。
@@ -907,7 +914,11 @@ impl HWDeviceType {
     /// # Arguments
     ///
     /// * `candidates` - 自定义候选顺序（空切片必报错）；`None` 使用平台默认优先级。
-    pub fn auto_platform_config(candidates: Option<&[HWDeviceType]>) -> Result<HWDeviceConfig> {
+    ///   接受 `&[HWDeviceType]` 本身或 `None`，无需包 `Some`。
+    pub fn auto_platform_config<'a>(
+        candidates: impl Into<Option<&'a [HWDeviceType]>>,
+    ) -> Result<HWDeviceConfig> {
+        let candidates: Option<&[HWDeviceType]> = candidates.into();
         let preference: Vec<HWDeviceType> = match candidates {
             Some(list) => list.to_vec(),
             None => Self::platform_preference(),

@@ -41,6 +41,7 @@
 //! ```
 
 use crate::error::{Context, Result, RsmediaError};
+use crate::time::Rational;
 use rsmpeg::avcodec::{
     AVBSFContext, AVBSFContextUninit, AVBitStreamFilter, AVCodecParameters, AVPacket,
 };
@@ -80,11 +81,7 @@ impl Bsf {
     /// * `name` - filter 名（如 `h264_mp4toannexb`，完整列表见 [`Bsf::list`]）
     /// * `codecpar` - 输入流的 codec 参数（决定 filter 是否适用该 codec）
     /// * `time_base` - 输入包的时间基（写入 `AVBSFContext.time_base_in`）
-    pub fn new(
-        name: &str,
-        codecpar: &AVCodecParameters,
-        time_base: ffi::AVRational,
-    ) -> Result<Self> {
+    pub fn new(name: &str, codecpar: &AVCodecParameters, time_base: Rational) -> Result<Self> {
         let name_c = CString::new(name).context(format!("bsf name {name:?}"))?;
         let filter = AVBitStreamFilter::find_by_name(&name_c).ok_or_else(|| {
             RsmediaError::unsupported(format!(
@@ -93,7 +90,7 @@ impl Bsf {
         })?;
         let mut ctx = AVBSFContextUninit::new(&filter);
         ctx.set_par_in(codecpar);
-        ctx.set_time_base_in(time_base);
+        ctx.set_time_base_in(time_base.into());
         let inner = ctx.init()?;
         Ok(Self {
             inner,
@@ -337,12 +334,8 @@ mod tests {
     #[test]
     fn test_bsf_unknown_name_rejected() {
         let codecpar = AVCodecParameters::new();
-        let err = Bsf::new(
-            "no_such_bsf",
-            &codecpar,
-            ffi::AVRational { num: 1, den: 30 },
-        )
-        .expect_err("unknown filter must be rejected");
+        let err = Bsf::new("no_such_bsf", &codecpar, Rational::new(1, 30).unwrap())
+            .expect_err("unknown filter must be rejected");
         assert!(err.is_unsupported(), "{err}");
         assert!(!err.is_invalid_config(), "{err}");
         assert!(err.to_string().contains("no_such_bsf"), "{err}");
