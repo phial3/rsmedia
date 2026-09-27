@@ -1,0 +1,504 @@
+# rsmedia 代码审读：架构与现存缺陷
+
+审读时间：2026-09-27 ｜ 基线：`dbad3f3`（`dev`，与 `origin/dev` 同步，工作区干净）
+审查范围：`src/` 29 个文件 / 32555 行（含 `#[cfg(test)]`）＋ 新增提交 `1f6c004`→`dbad3f3`
+方法：模块通读＋三条正交检查＋ `rsmedia-codebase-audit` 脚本量化。**每条缺陷都标了复核状态**。
+
+---
+
+## 一、架构速览
+
+### 1.1 分层与职责
+
+| 层 | 模块 | 职责 |
+|---|---|---|
+| I/O 与容器 | `io.rs` `mux.rs` `location.rs` | `Reader`/`Writer` trait（`Stream*`/`Buffer*`/`Io*` 三种后端）、`Demuxer`/`Muxer`、章节/封面/metadata、`Options` 注入 |
+| 编解码 | `decode.rs` `encode.rs` `codec.rs` `stream.rs` `bsf.rs` `subtitle.rs` | `Decoder`/`Encoder` 构建器与排空状态机、能力查询、码流过滤器、字幕 |
+| 媒体表示 | `frame.rs` `fmt.rs` `pixel.rs` `scale.rs` `resample.rs` `resize.rs` `imgutils.rs` `pcm.rs` `colors.rs` | `MediaFrame`/`FrameData`（自己持有 ndarray）、像素/采样格式布局推导、swscale/swresample、PCM 分块 |
+| 滤镜 | `filter.rs` | 线性链 `FilterGraph::init` + 多入多出 `FilterGraphBuilder`，pad 校验、标签接线、`send_command` |
+| 硬件 | `hwaccel.rs` | `ProbeDepth{CompiledIn,DeviceOpen,SurfaceAlloc}`、平台自动选择、DRM 节点解析、hw↔sw 传输、进程级设备缓存 |
+| 基础设施 | `error.rs` `state.rs` `init.rs` `time.rs` `strutils.rs` `options.rs` `macros.rs` | 错误分类、`ProcessState`（`Normal→Drained→Flushed`）、日志初始化、时间基 |
+
+### 1.2 数据流
+
+```
+bytes → Reader(io.rs) → Demuxer(mux.rs) → Decoder(decode.rs)
+                                              ↓  AVFrame → MediaFrame
+                       Scaler / FilterGraph / Resampler（表示层，frame.rs 统一承载）
+                                              ↓  编码前归一
+       bytes ← StreamWriter(io.rs) ← Muxer(mux.rs) ← Encoder(encode.rs)
+```
+
+- **跨界一律拷贝**：`MediaFrame` 自己持有 ndarray，`from_avframe`/`to_avframe` 每次都 `alloc_buffer` + 逐平面复制；没有 ndarray-over-AVFrame 的零拷贝视图（唯一例外：`FilterData::with_normalized_layout` 用 `av_frame_clone` 引用计数共享，`Resizer` 纯整数计算）。
+- **所有 FFmpeg 句柄都是 RAII**：`ReaderCore`/`WriterCore` 持 `AVFormatContext{,Input,Output}`；`Decoder`/`Encoder` 持 `AVCodecContext` + `FilterGraph` + 复用型 `Scaler`/`SwrContext`；`MuxerStream` 持 `Bsf`。只能 `Send` 不能 `Sync`。
+- **排空语义**：`Decoder::flush_buffers`（**丢弃**，seek 后用） vs `Encoder::flush`（**排空到 writer**）；`ProcessState` 只在 EOS 真正送出后前进，`EAGAIN` 不回退；`MAX_DRAIN_ITERATIONS=1000` 兜底。
+- **错误分类**（2026-09-23 定稿，`error.rs`）：`Unsupported`＝本构建/本平台/本 crate 做不到（构造点唯一：`RsmediaError::unsupported`），`InvalidConfig`＝调用本身有问题，`Other`＝数据形状/不变量，`FFmpeg(AVError)`＝FFmpeg 调用失败；`is_*` 谓词穿透 `Context` 链。
+
+### 1.3 正交检查结果（全部通过，无退化）
+
+| 检查 | 结果 |
+|---|---|
+| 特性门 vs `data/ffmpeg-*/binding.rs` | ✅ `every feature gate matches the per-version bindings` |
+| `cargo check --all-targets --no-default-features --features ffmpeg9,link_system_ffmpeg` | ✅ 无警告 |
+| `cargo clippy --all-targets ... -- -D warnings` | ✅ 干净 |
+| `cargo fmt --check` | ✅ 干净 |
+
+---
+
+## 二、缺陷清单
+
+> **修复记录（本轮，2026-09-27）**：已按 §三 的建议顺序修完 **A5 / A4 / A2 / A1、B4 / B1、B2、C2 / C1**，每条都带回归测试，并逐条验证过"回退实现则测试失败"。明细见下；未动的项在表内以 `〔未修〕` 标注。
+>
+> | 编号 | 结论 | 改动位置 | 回归测试 |
+> |---|---|---|---|
+> | A5 | 已修 | `encode.rs` `Encoder::flush` 守卫改 `is_flushed()`，EOS/FIFO 段移进 `if self.state.is_normal()` | `test_flush_retries_drain_after_a_failed_attempt` |
+> | A2 | 已修 | `frame.rs` `yuv_matrix` 阈值 `< 1080` → `< 2160`（1080p 归 HD） | `test_yuv_matrix_heuristic_boundaries` |
+> | A1 | 已修 | `frame.rs` `yuv420p_to_rgb24` 色度尺寸改 `div_ceil(2)`（与 `data_layout` 一致）；**实测症状是报错而非静默错位** | `test_yuv420p_to_rgb24_odd_dimensions` |
+> | A4 | 已修 | `imgutils.rs` `plane_geom` 色度位移限 `1 \| 2`，平面 3（alpha）保持全分辨率 | `test_get_plane_buffer_alpha_plane_is_full_resolution` |
+> | A3 | 〔未修〕 | `MediaFrame` 增 `AVChannelLayout` 字段属 API 变更，单独一轮 | — |
+> | B1 | 已修 | `mux.rs` `unsafe impl<R: Reader + Send> Send for Demuxer<R>` | `test_demuxer_is_send_for_every_reader_impl` |
+> | B2 | 已修 | `decode.rs` 新增 `send_packet_with_retry` + `drain_decoder_frames` + `pending_frames` 队列；`decode_raw_packet`/`drain_raw` 改走重试入口 | `test_send_packet_with_retry_recovers_from_a_full_decoder`、`test_decode_raw_packet_recovers_from_a_full_decoder` |
+> | B3 | 〔未修〕 | rsmpeg 侧 `hwframe_ctx_alloc().unwrap()`，需上游改 | — |
+> | B4 | 已修 | `filter.rs` `init` 前置拒绝空 `filters`（`InvalidConfig`）；顺手修正 `build` 的过时文档（缺滤镜是 `Unsupported`） | `test_empty_filter_list_is_invalid_config` |
+> | B5–B7 | 〔未修〕 | 均为"仅在畸形输入下出问题" | — |
+> | C1 | 已修 | `encode.rs` `build()` 前置校验 `width`/`height` ∈ `1..=i32::MAX`（视频） | `test_video_size_out_of_range_is_invalid_config` |
+> | C2 | 已修 | 新增 `codec.rs` `apply_thread_count`（超 `i32` 打 `warn!`）；`rc_max_rate`/`rc_buffer_size` 负值 `warn!`、显式 0 只 `debug!` | `test_builder_thread_count_beyond_i32_is_ignored`、`test_non_positive_rate_control_is_not_applied` |
+> | C3–C5 | 〔未修〕 | 同上，`b68f5ed` 的有意设计 | — |
+> | D | 〔未修〕 | 纯增量：`# Errors` 优先 | — |
+>
+> 验证：`cargo fmt --check` ✅、`clippy -D warnings`（含 / 不含 `image`）✅、
+> `check --all-targets --no-default-features` ✅、特性门脚本 ✅、lib 302(tests 306 with `image`) +
+> 集成 21 个 binary + 44 doctest 全绿。
+
+### A. 会**静默产出错误数据**（最高优先级，建议先修）　**（A5 / A1 / A2 / A4 已修；A3 未修）**
+
+**A1〔已修·中〕奇数尺寸 `YUV420P` → `RGB24` 静默错位**
+`src/frame.rs:456`
+```rust
+let (uv_width, uv_height) = (width / 2, height / 2);   // 向下取整
+...
+u_stride: uv_width as u32,                              // 真实色度行宽是 ceil(width/2)
+```
+`PixelFormat::data_layout` 对奇数尺寸按 **ceil** 推导（`pixel.rs:450-457`，65×49 → 色度 33×25），而这里用 floor。`rgb24_to_yuv420p` 却在 `frame.rs:403-408` 明确拒绝奇数尺寸 —— 两个方向不对称。修法：奇数尺寸要么同样拒绝（`InvalidConfig`），要么按 ceil 传 stride。
+
+> **⚠️ 复核更正（2026-09-27，实测）**：原文写"静默错位且不报错"是**错的**。写单测实测后，floor 的 stride 会在进入转换前就被 `yuv` crate 拒绝：`check_chroma_channel` 以 `width.div_ceil(2) = 33` 为最小行宽，`stride 32 × chroma_height 25 = 800 < 33 × 25 = 825` ⇒ `ChromaPlaneMinimumSizeMismatch { expected: 825, received: 800 }`，被 `.context()` 包成一句 `Other`（`"Failed to convert YUV420P to RGB24"`）。所以真实症状是**这条快路径对整个奇数尺寸不可用 + 错误信息不可定位**，不是静默错数据。修法取 **ceil**（与 `data_layout`、`imgutils` 一致），保留能力。
+> 写侧（`rgb24_to_yuv420p` 拒绝奇数）经查 `yuv` crate 的 `YuvPlanarImageMut::alloc` 其实用 `div_ceil`，本可支持奇数；本轮**不改**，因为拒绝属于对调用方配置的正确分类，且已有测试锁定，避免扩大范围。
+
+**A2〔已修·高〕`1080p` 被判成 BT.2020**
+`src/frame.rs:1331-1338`
+```rust
+let height = self.height;
+if height < 720 { Bt601 } else if height < 1080 { Bt709 } else { Bt2020 }
+```
+`height == 1080` 落进 `else` ⇒ **BT.2020**，而 1080p 属于 HD（BT.709），UHD 从 2160 起。文档还写着"与 ffmpeg 的 `sws_getCoefficients` 缺省行为一致"。仅当帧没有 `colorspace` 标记时触发（`yuv` crate 快路径 `convert_rgb24_to_yuv420p` / `convert_yuv420p_to_rgb24`），所以最常见的 1080p 素材 + 无标记正是命中场景。修法：阈值改成 `< 2160`（或分成 720/2160 两档）。
+
+**A3〔未修·中高〕声道布局被"规范化"成默认布局**
+`src/frame.rs:618`（只存 `nb_channels`）→ `src/frame.rs:1256-1258`
+```rust
+frame.set_ch_layout(AVChannelLayout::from_nb_channels(self.nb_channels as i32).into_inner());
+```
+`from_nb_channels` 即 `av_channel_layout_default`：3 通道的 2.1（FL/FR/LFE）来回一趟变成默认的 FL/FR/FC，**声道被静默重排**；`resample.rs:59-62` 同样用它。`MediaFrame` 上根本没有承载 `AVChannelMask` 的字段，所以这不是"某处写错"，而是表示层缺一个字段。影响仅限非默认多声道布局，但完全没有提示。
+
+**A4〔已修·中〕`imgutils` 把 YUVA 的 alpha 平面当色度平面**
+`src/imgutils.rs:255-259`
+```rust
+let (shift_w, shift_h) = if plane_idx > 0 { (desc.log2_chroma_w, desc.log2_chroma_h) } else { (0, 0) };
+```
+FFmpeg 只对平面 1/2 做色度下采样，平面 3（alpha）是全分辨率 —— 本项目自己的 `pixel.rs:450-457` 就是这么写的（`match plane { 1 | 2 => shift, _ => 0 }`）。于是 `YUVA420P`/`YUVA422P`（及 9~16 bit 变体）的平面 3 被算成 `ceil(w/2)×ceil(h/2)`，`get_plane_buffer` 返回截断缓冲、`fill_plane_from_buffer` 只写部分 alpha。两处必须统一。
+
+**A5〔已修·高〕`Encoder::flush` 失败后重试会**静默截断**并被当成成功**
+`src/encode.rs:1795` + `1825` + `1873-1880`
+```rust
+if !self.state.is_normal() {           // ← 把 Drained 也当成"已经 flush 过"
+    return Ok(W::Accum::default());     // 直接返回空，什么都不排
+}
+...
+self.state = ProcessState::Drained;    // 先置位，再进排空循环
+loop { ... Err(e) => return Err(e.with_context("... output is truncated")) }
+```
+排空循环里 `receive_packet()` 报错、或撞上 `MAX_DRAIN_ITERATIONS` 时返回 `Err`，但 `state` 已经停在 `Drained` 且不会回退。此时**第二次**调用 `flush()`（用户重试、或 `Muxer::flush_if_needed`/`Drop` 再次驱动，`mux.rs:1190`）命中这个守卫 → 返回 `Ok(默认累加器)` → `finish()` 照常写 trailer → **截断的容器以成功返回**。守卫的判定应该是 `is_flushed()`（真的排空完成）而不是 `!is_normal()`。这是"把可恢复的 I/O 错误升级成静默数据丢失"，值得优先修。
+
+### B. 健壮性 / 健全性　**（B1 / B2 / B4 已修；B3、B5–B7 未修）**
+
+| # | 位置 | 问题 | 复核 |
+|---|---|---|---|
+| B1 | `mux.rs:1732` | `unsafe impl<R: Reader> Send for Demuxer<R> {}` **缺 `R: Send` 约束**（`Muxer` 那边写的是 `W: Writer + Send`）。自定义一个含 `Rc`/线程亲和状态的 `Reader` 就能构造出"假 Send"，跨线程移动是 UB。类型级问题，现有 Reader 实现都 Send | 已复核 |
+| B2 | `decode.rs:1029-1035` | `decode_raw_packet` = 送 1 包 + 收 **1** 帧；`encode` 侧有 `send_frame_with_retry` + 全量排空，解码侧没有对应物。H.264 场编码 / MPEG-2 field picture 这类"一个包出多帧"的流，下一次 `send_packet` 会返回 `EAGAIN`，被 rsmpeg 映射成 `DecoderFullError` 抛出，而不是先把已就绪的帧交出来 | 已复核（`EAGAIN` 映射为推理，未实测） |
+| B3 | `hwaccel.rs:865` | `hw_device_ctx.hwframe_ctx_alloc()` 内部是 rsmpeg 的 `av_hwframe_ctx_alloc(...).upgrade().unwrap()`：FFmpeg 返回 NULL（OOM/未知类型）时 **panic**，而 `is_available()` 是 `-> bool` 的探测 API，不该 unwind | 已复核 |
+| B4 | `filter.rs:1952-1988` | `with_filters(Some(vec![]))` 不被拒绝：`filter_spec = ""` → `setup_endpoints` → `graph.config()` 失败，报的是一句**不透明 FFmpeg 错误**，而不是像 `FilterGraphBuilder::build`（`filter.rs:2717`）那样给 `InvalidConfig`。`decode.rs:547`/`encode.rs:708` 的注释还承诺"校验在 `init` 里做" | 已复核 |
+| B5 | `stream.rs:452` `stream.rs:476` `options.rs:122-123` | 对 `str_to_cstring(...)` 的 `.unwrap()`。当前输入分别是静态表和"NUL 已预检过"的键值，**都不可达**；但这是唯一一类"未来改动即 panic"的写法，建议顺手换成 `?`/`InvalidConfig` | 已复核 |
+| B6 | `time.rs:56` `time.rs:92-93` | `from_nth_of_a_second(0)` → 时间基 `1/0`（退化）；`from_nth_of_a_second(usize::MAX)`/`from_units(_, usize::MAX)` 在 `as i32` 处回绕成负数。且 `has_value()` 对 `1/0` 返回 true，`seconds_or_none()` 返回 `None`，两个"可用"定义不一致 | 已复核 |
+| B7 | `scale.rs:728` `hwaccel.rs:486` `frame.rs:1591` | 池化缓冲固定 32 字节对齐（`av_frame_get_buffer` 默认是 `av_cpu_max_align()`，AVX-512 上是 64）；`pool_size as i32` 对 `u32::MAX` 回绕成 -1；`plane_stride` 对单行平面跳过全部校验。都是"只在畸形输入下出问题" | 部分复核 |
+
+### C. 静默接受矛盾/越界配置（多数是 `b68f5ed` 的有意设计，但缺诊断）　**（C1 / C2 已修；C3–C5 未修）**
+
+| # | 位置 | 问题 |
+|---|---|---|
+| C1 | `encode.rs:594-602`（校验点）+ `encode.rs:411`、`680`（`as i32`） | `width/height` 改成 `u32` 后没有任何范围校验，`build()` 只校验 `req_fps`。`new_video(1 << 31, 720)` 得到负的 `AVCodecContext.width`，最终报的是 `avcodec_open2` 的不透明错误 |
+| C2 | `codec.rs:18-21` + `encode.rs:506` + `decode.rs:326` | `thread_count` 超出 `i32` 会**下溢成负数被忽略**，静默退回 FFmpeg 默认；`with_buffer_size(0)`/`with_max_bit_rate(0)` 从"build 报错"变成"视为未设置"（doc 已同步，但没有 `warn!`）。三处都只在代码注释里说明 |
+| C3 | `codec.rs:130-147` | 删掉 `owned_option_keys` 守卫后，typed setter 与 `with_options` 同名键（`threads`/`flags`/`b`/`crf`/`g`/`bf`…）冲突时**由 dict 静默胜出**，build 期无任何提示 |
+| C4 | `encode.rs:1707` vs `decode.rs:703` | 同一个 `thread_count` 在 `Encoder` 上返回 `u32`、在 `Decoder` 上返回 `i32` |
+| C5 | `codec.rs:104-128` + `init.rs:80-95` | `impl Into<u32>` 的 flag setter 接受任意 u32（`u32::MAX`）直接写进 `flags/flags2/thread_type`，不再受枚举约束 |
+
+### D. 工程质量债（量化）
+
+| 维度 | 现状 | 说明 |
+|---|---|---|
+| 公开文档语言 | 英文 **1675** 行 / 中文 **1828** 行 | 项目规则要求公开项英文；集中在 `filter.rs`(665)、`mux.rs`(257)、`decode.rs`(166)、`io.rs`(114)、`hwaccel.rs`(109) |
+| `# Errors` 段 | **146** 个返回 `Result` 的公开函数缺（本轮未变） | 用户靠它知道该 match `is_invalid_config` 还是 `is_unsupported` |
+| 公开项无文档 | **100** 个（`codec.rs` 的 `CodecConfig` 整块、`scale.rs` 等；本轮未变） | |
+| `unsafe` 缺 `SAFETY:` | **95 / 143**（本轮未变） | 优先补 `unsafe impl Send` 这类健全性声明（`io.rs` 17、`scale.rs` 15、`mux.rs` 12、`imgutils.rs` 11） |
+| 泛化 `Other` | **39 → 40** 处 | 本轮新增的 1 处是 `decode.rs` 的"重试仍 EAGAIN"防挂死不变量（与 `encode.rs` 既有那条同形），**保留是正确的**。仍然只有 `io.rs:587` 该用 `.context()` |
+| 长函数 | `encode.rs:607 build` **286 行**（C1 校验 +7）、`filter.rs:2723 build` 279、`decode.rs:361 build_from_reader` 217、`decode.rs:1224 receive_normalized_frame` 138、`stream.rs:200 from_stream` 138 | `filter.rs` 单文件 **4680** 行（本轮净增 51） |
+| 重复守卫 | "header 之后不准加流"在 `io.rs:1125`、`mux.rs:364`、`mux.rs:443` **三份**（两份逐字相同、消息不一致）；`get_stream`/`get_stream_mut` 在 `Muxer`/`Demuxer` 各一份 | 该不变量坏掉会 SIGSEGV，漂移有实际风险 |
+
+---
+
+## 三、建议修复顺序
+
+**1–3 已完成（2026-09-27），剩余 4 与 A3/B3/C3–C5 未动。**
+
+1. ~~**A5**（`flush` 守卫，1 行改动 + 一个回归测试）→ **A2**（阈值改 `< 2160`）→ **A1**（奇数尺寸按 ceil）→ **A4**（对齐 `pixel.rs` 的规则）~~ ✅ 已完成
+   → **A3**（`MediaFrame` 增 `AVChannelLayout` 字段，是 API 变更，单独一轮）**未修**。
+2. ~~**B4**（空 filters 前置拒绝）、**B1**（补 `R: Send`）、**B2**（解码侧补全量排空）~~ ✅ 已完成。
+3. ~~**C2/C1**：给静默路径补 `tracing::warn!` 或范围校验~~ ✅ 已完成。
+4. **D**：`# Errors` 优先（信息量最大、纯增量），再翻译公开文档，`SAFETY:` 按文件清。**未动用**。
+5. 未列入本轮：**A3**（声道布局字段）、**B3**（rsmpeg 侧 `unwrap`，需上游）、**B5–B7**（仅畸形输入）、**C3–C5**（`b68f5ed` 的有意设计）、§D 全部。
+
+## 四、已确认健康（勿重复报警）
+
+- 特性门与每版 binding 完全一致；`--no-default-features` + `clippy -D warnings` + `fmt` 全绿。
+- `MAX_DRAIN_ITERATIONS` 与各处裸 `loop` 的终止性可证；`ProcessState` 的 EAGAIN 语义正确。
+- FFI 镜像枚举表（含零调用点）、`#[allow(non_camel_case_types)]`、`#[allow(unused_macros)]` 都是有意保留。
+- `Unsupported`/`InvalidConfig` 边界（2026-09-23 定稿）在本次新增代码里没有回退。
+
+### 本轮修复后的复检（2026-09-27）
+
+- 回归测试都做了**反向验证**：回退实现后测试确实失败（A1 报 `ChromaPlaneMinimumSizeMismatch`、A4 报 alpha 缓冲 768 ≠ 3072、A5 报 `Ok(0)`、B2 报 `Decoder isn't accepting input`）。
+- 新增 10 个测试：`frame.rs` ×2、`imgutils.rs` ×1、`filter.rs` ×1、`mux.rs` ×1、`encode.rs` ×3、`decode.rs` ×2。
+- 规模：lib **302**（`--no-default-features`）/ **306**（+`image`）、集成 21 个 binary、doctest 44，全绿且 `clippy -D warnings` 干净。
+- 唯一的量级回退：§D 的泛化 `Other` **39 → 40**，新增那条已判定为**应保留**（防挂死不变量）。
+
+---
+
+## 五、公开 API 参数类型一致性（2026-09-27）
+
+方法：提取 `src/*.rs` 全部 `pub fn` 的 **589** 个参数，按**参数名**分组，找同名参数出现多种类型的点
+（脚本 `/tmp/audit_api_types.py`）。
+
+**根因**：crate 里并存两种取向 —— 编解码层**照抄 FFmpeg 字段宽度**（`i32`/`i64`），
+表示层**用域类型**（`u32`，非负）。同一概念跨层时两边都得 cast，**设置端与读取端还各选一边**。
+
+| # | 概念 | 现状 | 问题 |
+|---|---|---|---|
+| P1 | 尺寸 `width`/`height` | 设：`EncoderBuilder::new_video(u32,u32)`/`with_width(u32)`/`with_height(u32)`（`encode.rs:133/189/195`）、`MediaFrame::new_video_frame(u32,u32)`（`frame.rs:793`）、`Resize::Exact(u32,u32)`、`filter::video::scale(u32,u32)`（`filter.rs:407`）<br>读：**`Encoder::width() -> i32`**（`encode.rs:1647`）、**`Decoder::width() -> i32`**（`decode.rs:676`） | **设 u32 / 读 i32**，往返必须 cast。实测修 `rsmedia_test` 时为此改了 30+ 处。`VideoParams`/`VideoEndpoint { pub width: i32 }`（`filter.rs:1539/1607`）、`scale::scale_frame(dst_width:i32)`、`imgutils::fill_linesizes(width:i32)` 是**真·FFI 直通**，i32 合理但缺注释说明 |
+| P2 | 音频 `nb_channels`/`sample_rate` | `EncoderBuilder::new_audio(bit_rate:i64, **nb_channels:i32**, **sample_rate:i32**, ..)`、`with_nb_channels(i32)`、`with_sample_rate(i32)`（`encode.rs:147/320/325`）<br>`MediaFrame::new_audio_frame(.., **nb_channels:u32**, nb_samples:u32, **sample_rate:u32**)`（`frame.rs:844`）、`set_sample_rate(u32)`（`971`）<br>`filter::audio::{resample,format}(nb_channels:u32, sample_rate:u32, ..)`（`filter.rs:1150/1169`）<br>`AudioEndpoint::new(nb_channels:i32, sample_rate:i32, ..)`（`filter.rs:1661`）<br>**`PcmSpec::new(sample_rate:u32, channels:u16)`**（`pcm.rs:69`）<br>读：`Encoder::sample_rate() -> i32`、`Decoder::sample_rate() -> i32` | 同一个"声道数"有 **i32 / u32 / u16 三种写法**，采样率 **i32 / u32 两种**。`PcmSpec` 的 `u16` 是全 crate 唯一的通道数宽度 |
+| P3 | `thread_count` | 设 `with_thread_count(u32)`（`codec.rs` 宏）；读 **`Encoder::thread_count() -> u32`**（`encode.rs:1738`）但 **`Decoder::thread_count() -> i32`**（`decode.rs:715`）；FFmpeg 字段是 `int` | 一个概念三种宽度；且 u32 让"超出 `i32`"变成**可表示但无意义**的值，逼出 `i32::try_from` + 丢弃分支 |
+| P4 | 位掩码 setter | `with_flags`/`with_flags2`/`with_thread_type`/`with_err_recognition`/`with_scale_quality` 全是 `impl Into<u32>` | 任意 `u32` 都能塞，**枚举约束被绕开**（＝ §C5）。旁边 `with_quality(Quality)` 却是强类型，风格不一致。想保留 `A\|B` 组合能力的话，正解是给枚举实现 `BitOr` 并把泛型收紧（如 `impl Into<AVCodecFlag>`） |
+| P5 | `with_level(impl ToString)`（`encode.rs:267`） | 全 crate 唯一的 `impl ToString` | `with_level(42u8)` 都能编译，校验推到运行时；对照 `with_profile(VideoProfile)` |
+| P6 | `Encoder::flush(writer, interleaved: bool, index: usize, out_stream_time_base: ffi::AVRational)`（`encode.rs:1822`） | 4 个位置参数，含裸 `bool` + 裸 FFI 类型 | 调用处 `flush(&mut w, true, 0, tb)` 完全不可读；`bool` 应换枚举、时间基应换 `Time`（或收进结构体） |
+| P7 | hwaccel 同义不同形 | `auto_platform_with(candidates: &[HWDeviceType])`（`hwaccel.rs:123`） vs `HWDeviceType::auto_platform_config(candidates: Option<&[HWDeviceType]>)`（`910`）；`HWDeviceConfig::new(.., options: Option<Options>)`（`43`） vs 全 crate 的 `impl Into<Option<Options>>` | 同一概念两种签名；`None`/空 slice 语义还不一样 |
+| P8 | 秒 | `Time::from_secs(f32)` vs `from_secs_f64(f64)`（`time.rs:65/77`）；`Chapter::new(title, start: f64, end: f64)`（`mux.rs:43`） | f32 在时长 > ~4.6h 时已丢到毫秒以下；"秒"到底是 f32 还是 f64 没有统一 |
+| P9 | `SampleFormat::data_layout(channels: usize, samples: usize)`（`fmt.rs:100`） | `usize`，因为要喂 ndarray 形状 | 量纲上是 usize 合理，但和 u32 通道数互通时又要 cast；属"可接受，但应写明为什么是 usize" |
+| P10 | `filter::video::crop(x:i32, y:i32, w:u32, h:u32)`（`filter.rs:433`，`delogo`/`drawbox`/`add_region` 同形） | 一条签名里**坐标有符号、尺寸无符号** | 设计上说得通（坐标可为负），但**没有文档说明**，看起来像笔误 |
+
+**关于 P3 的结论：`i32` 更合适。** 理由：
+1. **镜像 FFmpeg 字段**（`AVCodecContext.thread_count` 是 `int`）。类型上就穷尽了合法域，
+   `i32::try_from` + "超出范围"分支**整条消失** —— 正是这轮为了简化才删掉的那种复杂度，用 i32 后压根不需要。
+2. **消除 Encoder/Decoder 不对称**：`Decoder::thread_count()` 已经是 `i32`，`Encoder` 那个 `u32` 是唯一的异类。
+3. **与 crate 既有惯例一致**：`with_gop_size(i32)`/`with_max_b_frames(i32)`/`with_buffer_size(i32)`/`nb_frames() -> i64` 都是照抄 FFmpeg 宽度。
+4. `0` = 自行推导的语义不受影响；负数无意义，`count <= 0 → return` 这个守卫**本来就有**（为 `0` 而设），不新增成本。
+
+反向考虑（不选 u32 的理由要弱）：u32 能在类型上表达"非负"，但既然 `0` 已经占用了"自动"，
+"正数"并不能用一个类型精确表达，u32 只挡住了负数这一种非法值，却引入了"超出 i32"这第二种非法值。
+
+**建议的统一方向**：高层（builder / `MediaFrame` / `Resize` / `filter` 构造器）一律 `u32` 表"非负量"，
+getter 跟着 `u32`；**唯一允许 i32 的地方是直接写进 AVFrame/AVCodecContext 字段的 FFI 直通函数**，
+并在文档里写明"此处镜像 FFmpeg 的 `int`"。
+
+### 落地记录（2026-09-27，P3 → P1 → P2）
+
+按上面的统一方向落地，三个都是**破坏性签名改动**（调用方少写 cast）。判据是：
+
+> 公开项用 `i32` **仅当**该值原样写进 FFmpeg 结构体字段、且负半轴有含义（哨兵/方向）。
+
+| 项 | 改动 | 保留 `i32` 的部分（附文档说明） |
+|---|---|---|
+| **P3** | `with_thread_count(i32)`、`Encoder::thread_count() -> i32`；`set_thread_count(ctx, i32)` 非正值不写字段（负数另打 `warn!`） | —— `0` = 自行推导、镜像 `int`，故整条用 `i32` |
+| **P1** | `Encoder/Decoder::width()/height() -> u32`（原 `i32`） | `VideoParams`/`VideoEndpoint`/`scale::scale_frame`/`imgutils::fill_linesizes`：逐字段镜像 `AVFrame`/`SwsContext`，`i32` 保留并补注释 |
+| **P2** | `new_audio(nb_channels: u32, sample_rate: u32)`、`with_nb_channels/with_sample_rate(u32)`、`Encoder/Decoder::sample_rate() -> u32`、`PcmSpec::new(channels: u32)`（原 `u16`，全 crate 唯一一处） | `AudioParams`/`AudioEndpoint`/`resample::convert_frame`/`StreamInfo`：同上，FFI 镜像层，补注释 |
+
+**附带发现并修掉的缺陷**：工作区的 `codec::set_thread_count` 守卫被写成 `if thread_count == 0 { return; }`，
+与它自己的文档（"两者都不写字段"）和两个单元测试矛盾 ⇒ 负数会被真的写进 `AVCodecContext.thread_count`。
+已改回 `<= 0`。**这是本轮唯一一处"静默错值"**，由 `cargo test --lib` 抓出（harness 因为当时只喂 `u32::MAX`
+没覆盖负值，没有报警）。
+
+**`frame_size()` 有意保留 `i32`**：`0` 在 FFmpeg 里是"可变帧长"这个**有意义**的值，与被测量的正数共用一个
+值域，属于上表判据的"负半轴/哨兵有含义"一类，已补注释说明为什么它和 `width()` 不同宽。
+
+
+
+## 六、公开 API 类型逐个复审（2026-09-27，第一性原理）
+
+上一节（§五）的出发点是"**同一个概念的类型有没有漂移**"，所以它天然只会得出"统一到某一侧"的结论，
+而"哪一侧"是靠**项目惯例**决定的 —— 那正是"适配以前的 API"。本节换判据：对**每一个**公开字段 /
+参数 / 返回，问"这个值实际能取哪些值 / 是什么量纲 / 调用方需要什么"，再决定类型。
+
+### 6.0 方法与规模
+
+脚本 `rsmedia-codebase-audit/scripts/dump_api_surface.py`（本轮的产物）：
+
+```bash
+python3 ~/.workbuddy/skills/rsmedia-codebase-audit/scripts/dump_api_surface.py            # 全量
+python3 ~/.workbuddy/skills/rsmedia-codebase-audit/scripts/dump_api_surface.py --flat     # 可 grep
+```
+
+盘点结果：**公开字段 155 / 公开函数参数 591 / 公开函数返回 549**。
+
+参数类型分布（前几）：`u32` 70、`f32` **51**、`i32` 50、`&str` 43、`usize` 40、`u8` 15、
+`impl Into<u32>` 8、`bool` 11、`i64` 8、`ffi::AVRational` 8。
+
+三类**外部可验证**证据（不是推测）：
+- `ffmpeg -h filter=<name>` 打印的选项类型（`<float>` / `<double>` / `<duration>` / `<string>`）。
+- FFmpeg 的 `av_d2q`/`av_reduce` 实测（见 A1）。
+- 调用点计数（见 D2）。
+
+### 6.1 判据（按优先级；第 6 条故意排在最后）
+
+1. **值域忠实** —— 非法值能否在类型上不可表示（`NonZero`/`Option`/枚举），代价低时就该做。
+2. **量纲与单位** —— 时长 / 速率 / 计数 / 下标 / 比值 / 位掩码是六种不同的量，不能共用一个原语。
+3. **哨兵语义** —— `0`/`-1`/`i64::MIN` 有意义就保留原语并写文档，否则不该让它可表示。
+4. **能力不丢失** —— 类型不能比 FFmpeg 实际接收的域更窄（窄了就是**功能缺失**，不只是风格）。
+5. **调用点代价** —— 样板/cast 的**出现次数**是硬证据，不是主观感受。
+6. **一致性** —— **仅作平票时的 tie-breaker**，不能作为主理由。
+
+### 6.2 问题清单
+
+#### A 级：类型选错 ⇒ 行为错误 / 能力丢失（可复现）
+
+**A1 `with_fps(fps: f32)` 会把标准帧率算错。**
+帧率是**有理数**（NTSC 是 `30000/1001`、电影转 NTSC 是 `24000/1001`）。`f32` 只有 24 位尾数，
+而 `with_fps` 把它 `as f64` 后交给 `av_d2q(fps, FPS_MAX=100_000)` 做连分数逼近 —— 逼近的是**被 f32 舍入过的值**，
+于是可能选中一个**不同于标准值**的有理数。实测（真链接 FFmpeg，非推测）：
+
+| 调用 | 期望 | 实得 |
+|---|---|---|
+| `with_fps(24000.0 / 1001.0)` | `24000/1001` | **`86002/3587`** ✘ |
+| `with_fps(30000.0 / 1001.0)` | `30000/1001` | `30000/1001` ✔ |
+| `with_fps(60000.0 / 1001.0)` | `60000/1001` | `60000/1001` ✔ |
+| `with_fps(25.0)` / `(30.0)` | `25/1` / `30/1` | ✔ |
+
+`86002/3587` 与 `24000/1001` 相差 2/(3587·1001) ≈ 5.6e-7 fps：短片段看不出来，长片会累积成可见偏差，
+且容器里写的是**非标准**时基。
+**这不是精度洁癖，是"标准值表达不出来"**。修法：补一个精确入口
+`with_frame_rate(num: u32, den: u32)`（或 `FrameRate` 类型，带 `FrameRate::ntsc(30)` / `film()` 之类的构造器），
+`with_fps` 保留为便捷方法并在文档里写明它经由 `av_d2q` 逼近。
+
+**A2 `filter::video::{afade, trim}` 把"时长"当 `f32` 秒。**
+`ffmpeg -h filter=afade`：`start_time <duration>`、`duration <duration>`；`-h filter=trim`：
+`start/end/duration <duration>`。`<duration>` 是**时长类型**，接受 `"1.5s"`、`"00:00:01.5"` 等。
+而 crate 的实现是 `format!("afade=t={fade_type}:st={start}:d={duration}")` —— `f32` 经 `Display`
+只能吐出裸小数，**既丢精度（f32 在 10⁴ s 量级 ULP≈1 ms）又丢单位语法**，而且类型本身不表达"这是时长"。
+修法：`start`/`duration` 收 `std::time::Duration`（或 crate 的 `Time`）并格式化成时长字面量。
+
+**A3 `filter::video::eq` / `boxblur` 的 `f32` 让"表达式"能力失效。**
+`ffmpeg -h filter=eq`：`brightness/contrast/saturation/gamma <string>`；`-h filter=boxblur`：
+`luma_radius <string>`。这几个选项在 FFmpeg 里是**可求值表达式**（`"sin(t)"`、`"iw/2"`、按帧变化）。
+crate 收 `f32` ⇒ 只能传常量，**表达式形式在 API 上不可达**。
+修法：`&str`（表达式）或一个 `Expr::{Const(f64), Expr(&str)}` 枚举。至少不要用 `f32` 把能力锁死。
+
+**A4 `time::new_rational(num: i32, den: i32)` 允许 `den == 0`。**
+它直接转 `avutil::ra(num, den)`，不校验；退化的 `0/0` 有理数会顺着 `Time`/`StreamInfo`/滤镜端点传播
+（`Time` 甚至专门为它写了 `0/0` 分支）。`den: NonZeroI32` 能让非法值**不可表示**，删掉一整类防御代码。
+
+**A5（实施批 4 时新发现）`filter::audio::advanced_fft_denoise` 把浮点写进了布尔选项。**
+参数叫 `time_smoothing: Option<f32>`、文档写"Temporal smoothing factor. Default 0."，实现是
+`format!("…:tr={tr}")`。但 `ffmpeg -h filter=afftdn` 里 `tr` 是 **`track_residual <boolean>`** ——
+既不是"时间平滑系数"，也不是浮点。实测（真链接 FFmpeg 9.0.2）：
+
+```
+$ ffmpeg -f lavfi -i "sine=frequency=440:duration=1" -af "afftdn=nr=12:nf=-50:nt=w:tr=0.5" -f null -
+[Parsed_afftdn_0] Unable to parse "tr" option value "0.5" as boolean
+Error applying option 'tr' to filter 'afftdn': Invalid argument
+```
+
+即**只要传任何非整数，整条滤镜链都建不起来**（`FilterGraph` 初始化直接失败）；而 `tr=0`（默认路径）
+恰好能解析成 `false`，所以问题一直被默认值掩盖着。
+这是 A 级（行为错误）而不是 B 级（收窄）：类型和名字指向"一个浮点系数"，掩盖了选项真实语义。
+
+**A6（同批发现，属"反例"，不改）`anlm_denoise` 的 `patch_size`/`search_range` 对应 `anlmdn.patch`/`research`，
+FFmpeg 9.0 声明它们是 `<duration>`。** 看似"应该改成 `Duration`"，但 `<duration>` 的无单位数值在 FFmpeg 里
+就是**微秒**量纲：`p=7` 与 CLI 的 `p=7` 完全等价，改成 `Duration::from_micros(7)` 反而扭曲语义。
+⇒ 保持 `Option<i32>`。记录在此，说明判据不是"见到 `<duration>` 就得换类型"。
+
+#### B 级：类型比 FFmpeg 窄（narrowing，无行为错误）
+
+**B1 10 处 filter 参数 FFmpeg 声明 `<double>`，crate 收 `f32`。**
+逐条 `ffmpeg -h filter=<name>` 可验：`hqdn3d{luma,chroma}_spatial/tmp`、`nlmeans.s`、`loudnorm.{I,LRA,TP}`、
+`equalizer.{frequency,width,gain}`、`bass/treble/lowshelf/highshelf.gain`、`atempo.tempo`、`acompressor.ratio`。
+
+对照 —— 这些 crate 用 `f32` 是**正确**的（FFmpeg 就是 `<float>`）：`smartblur.{luma,chroma}_{radius,strength}`、
+`chromakey`/`colorkey.{similarity,blend}`、`vibrance.intensity`、`gblur.sigma`。
+⇒ 结论不是"全部改 f64"，而是**按 FFmpeg 声明的类型对齐**：`<float>`→`f32` 保持不变，`<double>`→`f64`。
+
+**B2 "历史 API" 被当成保留理由。**
+`time.rs` 里 `as_secs() -> f32` 的文档原话是 *"Single-precision on purpose (**the historical API**)"*，
+并且 `from_secs(f32)` / `from_secs_f64(f64)` / `as_secs() -> f32` / `as_secs_f64() -> f64` 四者并存 ——
+同一个量两种精度、调用方没有依据可选。crate 版本 **0.10.1（pre-1.0）**，破坏性改动是预期内的，
+"历史 API" 不构成理由。且 `Time` 缺 `From<Duration>` / `From<f64>`，没有惯用入口。
+⇒ 让 `f64`/`Duration` 成为唯一规范入口，`f32` 若保留必须显式命名（如 `as_secs_f32_lossy`）。
+
+#### C 级：FFI 类型泄漏到高层 API
+
+> **已实施（批次 6 前半，`Rational` 收口）。** `Rational` 已是 crate 对有理数的**唯一**出口：
+> `ffi::AVRational` 在 `src/` 下只剩 `time.rs` 里的两个 `From` impl（双向）与它自己的测试 ——
+> `src/rational.rs` 已并入 `src/time.rs`（有理数与时间是同一件事，两个模块反而让人找不到
+> `Rational` 在哪；`pub use time::{Rational, Time}` 保持顶层再导出不变）。
+> 高层一律用 `Rational`，只在**调用 rsmpeg/FFmpeg 的那一行**写 `.into()`。四处值得记：
+> ① `CodecConfig::supported_frame_rates()` 由 `Result<Option<&[ffi::AVRational]>>` 改为
+> `Result<Option<Vec<Rational>>>` —— `Rational` 与 `AVRational` 布局不同，借不出切片，只能拥有；
+> ② `Writer::add_stream` / `Writer::stream_time_base`（含 `DynWriter` 转发）同步改 `Rational`，
+> 于是 `Muxer` / `subtitle` / `PcmSink` 三条写包路径不再有裸类型；
+> ③ `mux.rs` 的 `AVChapter.time_base`（毫秒）是唯一必须写裸 FFI 字段的地方，
+> 值仍由 `Rational::new(1, 1000)` 在边界上生成，不在该文件里拼字面量；
+> ④ 顺带修掉一个**实测到的回归**：`time::TIME_BASE` 曾被写成 `Rational::integer(1_000_000)`
+> （＝ 1000000/1），而 `AV_TIME_BASE_Q` 是 1/1000000 —— 症状是 `Time::as_secs()` 差 10^12 倍、
+> `seek_to_timestamp` 的毫秒→微秒换算系数为 0。为能在 `const` 里正确表达 1/n，
+> 给 `Rational` 加了 `const fn unit(den)`（`den > 0`，`const` 场景下非法值即编译错误）。
+
+**C1 `ffi::AVRational` 出现在 30 处公开位置**（16 个字段 + 8 个参数 + 6 个返回）：
+`VideoParams.time_base/frame_rate/pixel_aspect`、`VideoEndpoint.*`、`AudioParams.time_base`、
+`StreamInfo.time_base`、`MediaFrame.time_base`、`Encoder/Decoder::time_base() -> ffi::AVRational`、
+`bsf::new(time_base)`、`mux::new_copy(src_time_base)`、`Encoder::flush(.., out_stream_time_base)`、
+`CodecConfig::supported_frame_rates() -> &[ffi::AVRational]` 等。
+有理数是媒体领域的一等概念（时基 / 帧率 / 像素宽高比），crate 却**没有公开的 `Rational` 类型** ⇒
+调用方要构造一个 `VideoEndpoint` 就必须自己依赖 `rsmpeg::ffi`（或 `AVRational { num, den }` 字面量）。
+⇒ 引入公开的 `Rational`（`num: i32`, `den: NonZeroI32`，见 A4）并让高层结构体用它；
+`ffi::` 只应出现在**显式低层**的模块（`scale`/`imgutils`/`resample` 的裸 `AVFrame` 路径）。
+
+**C2 9 类 FFI 枚举直接作为公开字段**（15 处）：`AVColorSpace`/`AVColorRange`/`AVColorPrimaries`/
+`AVColorTransferCharacteristic`/`AVChromaLocation`/`AVFieldOrder`/`AVPictureType`/`AVAlphaMode`/`AVFrameSideDataType`。
+crate 对 `PixelFormat`/`SampleFormat` 都做了自己的枚举，颜色却没有 —— 不一致，且都要求用户懂 FFmpeg 头文件。
+
+**C3 参数/返回里的 FFI 类型**：`ffi::AVSampleFormat`(4)、`ffi::AVChannelLayout`(4)、`ffi::AVCodecID`(3)、
+`ffi::AVPixelFormat`(2)。其中 `AVChannelLayout` 尤其值得包一层（`nb_channels` 与 `ch_layout` 两个概念在 crate 里反复互相转换）。
+
+**C4 同一概念两种形态，且更差的那个是 `u32`**：`StreamInfo.codec_id: u32` vs `Decoder::codec_id() -> ffi::AVCodecID`。
+`codec_id` 本质是 `AVCodecID` 枚举，用 `u32` 连类型信息都没有。同理 `StreamInfo.codec_tag: u32` 应为 `[u8; 4]` 或 newtype。
+
+#### D 级：一致性与可读性
+
+**D1 `impl Into<u32>` 的位掩码 setter ×8** —— `with_flags`/`with_flags2`/`with_thread_type`/`with_scale_quality`/
+`with_err_recognition`/`init_with`/`init_logging`/`new_with_options`。任意 `u32` 都能进，`AVCodecFlag`/
+`ThreadType`/`ScaleQuality` 的枚举约束**完全被绕开**（＝ §C5 / P4）。最能说明问题的是
+`init_with(level: AVLogLevel, flag: impl Into<u32>)`：同一次调用里一个参数强类型、另一个裸 `u32`。
+
+> **已实施（批次 5）＋ 本条前提更正。** 原写的"正解：给枚举实现 `BitOr`，setter 收
+> `impl Into<AVCodecFlag>`"**两半都不成立**：① `ffi_enum!` 早已生成 `BitOr`/`BitAnd`（`macros.rs`），
+> 无需再补；② 但它的 `BitOr` 产出的是**裸 `repr`**，而无字段枚举表示不了 `LOW_DELAY | CLOSED_GOP`
+> 这种无名组合，所以 setter 收 `impl Into<AVCodecFlag>` 会让 `A | B`（`encode.rs:2094`、`decode.rs:1621`
+> 都在用）和 `0`（"无质量位"，`encode.rs:2950`）**编译不过** —— 为满足判据 1 而破坏判据 4。
+>
+> 真正的正解是引入**集合类型**：[`FlagSet<E>`](src/flags.rs)（`u32` + `PhantomData<E>`）。
+> `ffi_enum!` 的 `BitOr` 改为产出 `FlagSet<Enum>`（5 种操作数组合：`A|B`、`A|raw`、`raw|A`、`set|A`、`A|set`，
+> 另有 `|=`/`&=`），setter 收 `impl Into<FlagSet<_>>`。于是：`A | B` 照写、`A | B | C` 链条保持类型、
+> 空集用 `FlagSet::EMPTY`、裸掩码只能显式走 `FlagSet::from_bits` ——**任意 `u32` 再也进不来，且一项能力都没丢**。
+> 读取侧 `FlagSet::contains` / `set & Enum`；`Encoder`/`Decoder`/`Scaler` 的位掩码 getter 同步改为 `FlagSet`。
+> 唯一保持 `u32` 的是 `Scaler::flags`：它是 `ScaleAlgorithm` 与 `ScaleQuality` **两种**位集的并集，
+> 没有哪**一个** `FlagSet` 能描述它。
+
+**D2 `with_codec_name(impl Into<Option<String>>)` 根本不接受 `&str`。**
+它只能收 `String` 或 `Option<String>`，所以 **38 个调用点全部要 `.to_string()`，其中 16 个还要额外包 `Some(...)`**：
+`with_codec_name(Some("mov_text".to_string()))` ×9、`with_codec_name("mjpeg".to_string())` ×4 …
+"让调用方写样板"是明确要避免的。⇒ `with_codec_name(name: impl Into<String>)` + 一个显式的
+"恢复默认选择"方法（`None` 表达的是**另一种意图**，不是一个值）。
+
+**D3 bool 位置参数**：`Encoder::flush(writer, interleaved: bool, index: usize, out_stream_time_base)`、
+`imgutils::copy_frame_metadata(.., copy_data: bool)`、`pixel::find_best_pix_fmt(.., has_alpha: bool)`。
+调用处 `(w, true, 0, tb)` 不可读（P6）。注意区分：`with_global_header(enabled: bool)` 这类 **setter 收 bool 没问题**
+（方法名承载了语义），坏的是**多参数函数里的裸 bool**。
+
+**D4 ⚠️ 自我更正：`VideoParams`/`VideoEndpoint`/`AudioParams`/`AudioEndpoint`/`StreamInfo` 的尺寸用 `i32`，我上一轮的理由不成立。**
+P1 我以"逐字段镜像 FFmpeg"为由保留了 `i32`。但这个理由经不起推敲：
+这些结构体是**公开可写字段 + crate 自己构造**、面向调用方的；负宽度 / 负声道数 / 负采样率在**任何**边界都无意义，
+"镜像"只发生在写进 `AVFrame` 的那一刻 —— 那是**边界**，不是 API 该承担的义务。
+它们唯一真"像 FFI"的地方是有 `ffi::AVRational` 字段，而那是 **C1 的问题**，不能反过来当尺寸用 `i32` 的理由。
+⇒ 应改为 `u32`：`width`/`height`、`nb_channels`、`sample_rate`、`StreamInfo.{width,height,sample_rate,frame_size,block_align,initial_padding,trailing_padding,seek_preroll,bits_per_sample,bits_per_coded_sample,bits_per_raw_sample,bits_per_pixel,padded_bits_per_pixel,pts_wrap_bits}`。
+
+**真正该保留有符号 / 原语的**（这才是判据 3 的正例）：
+| 项 | 为什么 |
+|---|---|
+| `StreamInfo.profile` / `level` | `AV_PROFILE_UNKNOWN = -99` 是真实值 |
+| `StreamInfo.duration` / `start_time` / `nb_frames` | `AV_NOPTS_VALUE = i64::MIN` 哨兵 |
+| `MediaFrame.pts` / `pkt_dts` / `duration` / `pkt_duration` / `best_effort_timestamp` | 同上 |
+| `filter::crop`/`delogo`/`drawbox` 的 `x`/`y` | 坐标**可为负**（让内容移出画面），`w`/`h` 已是非负 |
+| `Encoder::frame_size() -> i32` | `0` = "可变帧长"是**有意义**的值 |
+| `Encoder/Decoder::thread_count() -> i32` | 见 6.4 |
+
+**D5 `Option<i32>` 用于计数**：`zoompan(duration: Option<i32>)`、`anlm_denoise(patch_size/search_range: Option<i32>)`
+⇒ `Option<u32>`（`0` 无意义时甚至 `Option<NonZeroU32>`）。`Option` 本身用得对（`None` = 用 FFmpeg 默认），
+错的只是内层宽度。
+
+**D6 两种"可选值"写法并存**：`impl Into<Option<T>>`（`with_options` ×3、`with_filters`、`with_interrupt`）
+vs 裸 `Option<T>`（`HWDeviceConfig::new(options: Option<Options>)`、`with_hardware_device(Option<HWDeviceConfig>)`、
+`new_from_reader(filters: Option<Vec<Filter>>)`、`hwaccel::{cuda,vaapi,...}(Option<String>)`）。
+前者能直接 `with_options(opts)` 而不用包 `Some`，**样板更少**，应统一到它。
+
+**D7 四种时间表示**：`Chapter{start, end: f64 秒}`、`SubtitleSegment{start_ms, end_ms: i64}`、
+`Time{time: Option<i64>, time_base}`、`Muxer::duration() -> f64`。至少 `Chapter` 与 `SubtitleSegment` 应统一
+（`Chapter` 用 `Time`/`Duration` 更自然：章节是容器时间，毫秒整数其实比 f64 秒更精确）。
+
+**D8 `MediaFrame` 内部两种像素量宽度**：`crop_{top,bottom,left,right}: usize` vs `width`/`height: u32`。
+`usize` 是为了喂 ndarray 下标，可接受，但应注释说明（＝ P9 同类）。
+
+**D9 `MediaFrame` 的位掩码字段**：`flags: i32`、`decode_error_flags: i32` 都是位集 ⇒ 应 bitflags；
+`quality`/`repeat_pict` 是普通整数，`i32` 合理。
+
+**D10 闭集选项用 `&str`**：
+- `filter::video::afade(fade_type: &str)` —— 只有 `in`/`out` 两个值，应收窄为枚举（传错字符串现在会静默走 FFmpeg 默认）。
+- `filter::video::scale(flags: Option<&str>)` —— crate **已经有** `ScaleAlgorithm`/`ScaleQuality` 强类型枚举，
+  这里却绕过它们收裸字符串。
+- `curves(preset)`/`gif_palette(dither)`/`advanced_fft_denoise(noise_type)`/`lutyuv(y,u,v)` —— 这些是**有意**的
+  "FFmpeg 语法逃逸舱口"，本身合理，但应在文档里统一声明为"直接透传 filtergraph 语法"，
+  而不是与强类型 API 混在一起看不出区别。
+
+### 6.3 与 §五 的差异（自我更正汇总）
+
+| §五 结论 | §六 复审 | 说明 |
+|---|---|---|
+| P1 保留 `VideoParams`/`VideoEndpoint`/`StreamInfo` 的 `i32`（"FFI 镜像层"） | **推翻** | 判据 1/2 优先于"镜像"；见 D4 |
+| P3 `thread_count` 用 `i32` | **结论保留，理由更换** | 正确理由是"`i32` 值域完整包含 FFmpeg `int` 字段的值域 ⇒ 转换无损且不可能失败"，不是"与 crate 惯例一致"。语义上最精确的是 `Option<NonZeroU32>`（`None` = 自行推导），但调用代价过高（`with_thread_count(4)` 要变 `NonZeroU32::new(4).unwrap()`），故不选 |
+| P2 `nb_channels`/`sample_rate` → `u32` | 维持 | 判据 2/3 支持 |
+| P4/P6/P9/P10 | 维持并升级为 D1/D3/D8/D10 | 本轮给了更硬的证据 |
+
+### 6.4 建议的修复顺序（按 收益/风险 排序）
+
+1. **A4 + A1**（`NonZeroI32` 的有理数 + 精确帧率入口）—— 小而纯增量，直接修掉一个**实测到的错误**。
+2. **D2**（`with_codec_name`）—— 纯 ergonomics，38 个调用点立即受益，无行为变化。
+3. **D6**（统一 `impl Into<Option<T>>`）—— 同上，改动零散但机械。
+4. **A2 + A3 + B1**（filter 参数按 `ffmpeg -h` 的类型对齐：`<duration>`→时长、`<double>`→f64、`<string>`→表达式）——
+   面广，需要 harness 同步；建议按 filter 分组提交。
+5. **D1**（位掩码强类型）—— 需要先给 4 个枚举实现 `BitOr`。
+6. **D4 + C1 + C2**（尺寸统一 `u32` + 公开 `Rational`/颜色类型）—— 最大的一批，破坏面最广，建议**单独一轮**。
+7. D5/D7/D8/D9/D10 收尾。
+
+> 全部都是破坏性签名改动。crate 当前 **0.10.1（pre-1.0）**，这类改动是预期内的；
+> 每一批都应同步 `rsmedia_test` 并跑 §二 的正交检查 + 全量 harness。
+
+### 6.5 落地进度
+
+| # | 批次 | 状态 | 落点 |
+|---|---|---|---|
+| 1 | A4 + A1 | ✅ | `Rational{num: i32, den: NonZeroI32}`（现住 `src/time.rs`）+ `EncoderBuilder::with_frame_rate`；`with_fps` 文档标注 `av_d2q` 逼近实情 |
+| 2 | D2 | ✅ | `with_codec_name(impl Into<String>)` + 新增 `clear_codec_name()`；清掉 47 处 `.to_string()`/`Some(...)` |
+| 3 | D6 | ✅ | 10 处裸 `Option<T>` 参数统一为 `impl Into<Option<T>>` |
+| 4 | A2 + A3 + B1 | ✅ | filter 参数按 `ffmpeg -h filter=<name>` 对齐（`impl Into<f64>` ×23、`Expr` 表达式参数、`afade`/`trim` 收 `Duration`）；顺带发现并修掉 **A5**（`afftdn.tr` 写浮点给布尔位），记录 **A6**（`anlmdn.patch` 虽是 `<duration>` 但裸数按微秒，故不改） |
+| 5 | D1 | ✅ | 新增 `src/flags.rs` `FlagSet<E>`；`ffi_enum!` 的 `BitOr` 改为产出 `FlagSet<Enum>`（+`contains`/`From`/`Into<repr>`/`|=`/`&=`）；8 个位掩码 setter 收 `impl Into<FlagSet<_>>`；`Encoder`/`Decoder`/`Scaler` 的掩码 getter 同步强类型。**前提更正见 §6.2 D1** |
+| 6a | C1 | ✅ | 30 处公开 `ffi::AVRational` → `Rational`；`Rational` 成为唯一出口（`ffi::AVRational` 只存在于 `time.rs`）；`supported_frame_rates()` 改拥有 `Vec<Rational>`；`Writer` 的时间基接口同步；新增 `Rational::unit(den)` 供 `const` 场景；修掉 `TIME_BASE` 分子分母颠倒的回归（细节见 §6.2 C1）。**`src/rational.rs` 已并入 `src/time.rs`** |
+| 6b | D4 + C2 | ⬜ | 尺寸统一 `u32` + 9 类 FFI 枚举封箱 |
+| 7 | D5/D7/D8/D9/D10 | ⬜ | 收尾 |
+
+> 批次 1–6a 已过的正交检查（每批都跑）：`cargo fmt --check`、`check --all-targets`、
+> `clippy -D warnings`（含 / 不含 `image`）、`RUSTDOCFLAGS="-D warnings" cargo doc`（两种特性组合）、
+> `ffmpeg-feature-audit` 脚本、`rsmedia-codebase-audit` 脚本、lib 322 + 集成 17 个 binary + 65 doctest 全绿。
+> **批次 6b/7 与 `rsmedia_test` 同步（任务 #21）尚未做。**

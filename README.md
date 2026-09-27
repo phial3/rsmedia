@@ -162,7 +162,7 @@ fn main() -> anyhow::Result<()> {
 
     let encoder = EncoderBuilder::new_video(width, height)
         .with_fps(30.0)                     // encoder time base becomes 1/30
-        .with_codec_name("libx264".to_string())
+        .with_codec_name("libx264")
         .build()?;
     let enc_tb = encoder.time_base();
 
