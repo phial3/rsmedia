@@ -309,22 +309,16 @@ fn setup_scaler(
     Ok(sws_ctx)
 }
 
-/// `fmt` 的样本是否按 full range 编码（RGB/BGR/GRAY 家族：样本按定义铺满
-/// `0..2^n-1`），判据与 `frame::converted_color` 一致。
-fn is_full_range_format(fmt: PixelFormat) -> bool {
-    fmt.descriptor()
-        .is_ok_and(|desc| desc.flags as u32 & ffi::AV_PIX_FMT_FLAG_RGB != 0)
-}
-
 /// 按**目标像素格式**修正缩放输出帧的色彩标记。
 ///
 /// 缩放前的 `imgutils::copy_frame_metadata` 会把源帧的色域元数据整套搬给目标帧，
-/// 而换了像素格式后这套标记不再成立：full range 的 RGB/灰度样本若沿用源帧的
-/// limited range 标签，下游再编码一次就会发灰（`frame.rs` 的 `converted_color`
-/// 记录了同一约定）。因此这里按目标格式修正范围与色度位置：
-/// - RGB/BGR/GRAY 目标：恒标 full range（`AVCOL_RANGE_JPEG`），色度位置无意义；
-/// - YUV/NV 目标：范围随源帧（`UNSPECIFIED` 按 FFmpeg 约定等同 limited），保持
-///   `copy_frame_metadata` 搬来的取值。
+/// 而换了像素格式后这套标记不再成立：full range 的 RGB 样本若沿用源帧的 limited
+/// range 标签，下游再编码一次就会发灰（`frame.rs` 的 `converted_color` 记录了同一
+/// 约定）。因此这里按目标格式修正范围与色度位置：
+/// - RGB/BGR/GBR 目标：恒标 full range（`AVCOL_RANGE_JPEG`），色度位置无意义；
+/// - YUV/NV **与 GRAY** 目标：范围随源帧（`UNSPECIFIED` 按 FFmpeg 约定等同
+///   limited），保持 `copy_frame_metadata` 搬来的取值 —— 灰度与 YUV 同档，
+///   FFmpeg 同样按 `color_range` 解释它（见 `PixelFormat::is_full_range`）。
 ///
 /// `colorspace`/`color_primaries`/`color_trc` 描述色度学本身，缩放不改变它们，
 /// 故一律沿用源帧取值。
@@ -333,7 +327,7 @@ fn is_full_range_format(fmt: PixelFormat) -> bool {
 /// 是它需要的输入；FFmpeg 6/7 的 legacy 上下文另由 `set_scaler_colorspace_details`
 /// 逐帧告知范围。
 fn fix_output_color_metadata(dst_frame: &mut AVFrame, dst_pix_fmt: PixelFormat) {
-    if !is_full_range_format(dst_pix_fmt) {
+    if !dst_pix_fmt.is_full_range() {
         return;
     }
     // Safety: dst_frame 由本模块新建/持有（引用计数为 1）；rsmpeg 的 wrap 不实现

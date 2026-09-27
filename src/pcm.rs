@@ -340,19 +340,25 @@ impl<W: Writer> PcmSink<W> {
         let Some((_, mut resampler)) = self.resampler.take() else {
             return Ok(());
         };
-        // 上界：按 1 秒容量分配，循环取空（swr 滤波延迟通常仅几十毫秒）
-        loop {
+        // 上界：按 1 秒容量分配，循环取空（swr 滤波延迟通常仅几十毫秒）。
+        // **循环次数也要有上限**：`flush` 的实现不在我们控制之内，一旦它持续吐出
+        // 非零样本，无界的 `loop` 会让「结束音频流」这个公开 API 永不返回。上限
+        // 与解码/编码/滤镜的排空一致（`crate::MAX_DRAIN_ITERATIONS`）。
+        for _ in 0..crate::MAX_DRAIN_ITERATIONS {
             let mut dst = self.alloc_encoder_frame(self.encoder_sample_rate)?;
             resampler.flush(&mut dst)?;
             let out_nb = dst.nb_samples;
             if out_nb <= 0 {
-                break;
+                return Ok(());
             }
             dst.set_pts(self.output_samples as i64);
             self.output_samples += out_nb as u64;
             self.muxer.mux(dst, self.stream_index)?;
         }
-        Ok(())
+        Err(RsmediaError::msg(format!(
+            "Resampler keeps producing samples while draining ({} iterations); giving up",
+            crate::MAX_DRAIN_ITERATIONS
+        )))
     }
 }
 

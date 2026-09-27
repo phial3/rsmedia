@@ -359,30 +359,25 @@ fn not_contiguous(plane: usize, layout: &str) -> RsmediaError {
 /// 转换结果的颜色范围与色度位置。
 ///
 /// 换了像素格式，源帧的色域元数据不能整套照搬——最典型的现象是 full range 的
-/// `RGB`/`GRAY` 样本沿用源帧的 limited range 标签，下游再压缩一次就发灰。
+/// RGB 样本沿用源帧的 limited range 标签，下游再压缩一次就发灰。
 ///
-/// * `AV_PIX_FMT_FLAG_RGB` 覆盖 RGB/BGR 与 GRAY 家族：这些格式的样本按定义就是
-///   full range（`0..2^n-1`），因此结果恒标 `AVCOL_RANGE_JPEG`；
-/// * YUV/NV 族的实际范围由 `color_range` 声明，转换以源帧声明的范围为输入，
-///   故随源帧保留（`UNSPECIFIED` 按 FFmpeg 约定等同 limited）；
+/// * RGB/BGR/GBR 家族的样本按定义铺满 `0..2^n-1`，因此结果恒标
+///   `AVCOL_RANGE_JPEG`（判据见 [`PixelFormat::is_full_range`]）；
+/// * YUV/NV **与 GRAY** 族的实际范围由 `color_range` 声明，转换以源帧声明的范围
+///   为输入，故随源帧保留（`UNSPECIFIED` 按 FFmpeg 约定等同 limited）。灰度与 YUV
+///   同档（FFmpeg 的 `range_override_needed` 只对非 YUV 且非 gray 的格式强制
+///   full range），把它也标成 JPEG 会给 16..235 的 luma 打上错误的标签；
 /// * `chroma_location` 描述色度采样点相对亮度栅格的位置，只对带色度平面的目标有意义。
 fn converted_color(
     dst: PixelFormat,
     color_range: ffi::AVColorRange,
     chroma_location: ffi::AVChromaLocation,
 ) -> (ffi::AVColorRange, ffi::AVChromaLocation) {
-    if is_full_range_format(dst) {
+    if dst.is_full_range() {
         (ffi::AVCOL_RANGE_JPEG, ffi::AVCHROMA_LOC_UNSPECIFIED)
     } else {
         (color_range, chroma_location)
     }
-}
-
-/// `format` 的样本是否按 full range 编码（RGB/BGR/GRAY 家族）。
-fn is_full_range_format(format: PixelFormat) -> bool {
-    format
-        .descriptor()
-        .is_ok_and(|desc| desc.flags as u32 & ffi::AV_PIX_FMT_FLAG_RGB != 0)
 }
 
 /// Converts a packed `RGB24` frame into a planar `YUV420P` frame.

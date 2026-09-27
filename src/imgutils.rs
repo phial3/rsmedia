@@ -1,7 +1,7 @@
 use crate::PixelFormat;
 use crate::error::{Result, RsmediaError};
 
-use rsmpeg::avutil::AVFrame;
+use rsmpeg::avutil::{AVFrame, AVPixFmtDescriptorRef};
 use rsmpeg::ffi;
 
 /// FFmpeg's plane arrays are fixed at 4 entries (`AV_NUM_DATA_POINTERS` is 8, but
@@ -230,53 +230,85 @@ fn frame_pixel_format(frame: &AVFrame) -> Result<PixelFormat> {
     })
 }
 
-/// 某个帧平面的几何信息：可见宽（像素）、可见高（行）与每像素字节数。
+/// 某个帧平面的行几何：可见行数与每行字节数。
 struct PlaneGeom {
-    width: usize,
-    height: usize,
-    bytes_per_pixel: usize,
+    rows: usize,
+    bytes_per_row: usize,
 }
 
-/// 依据像素格式描述符，计算指定平面相对帧全分辨率的可见宽高与像素字节数。
+/// 复刻 FFmpeg 的 `av_image_fill_max_pixsteps`：遍历描述符的四个分量槽，
+/// 求每个平面的最大步长（`step`，字节/像素）与取得该步长的**分量下标**。
 ///
-/// 色度子采样平面（如 YUV420P 的 U/V，即平面 1、2）宽高按 `log2_chroma_*`
-/// **向上取整**右移（等价于 FFmpeg 的 `AV_CEIL_RSHIFT`）：65x49 的画面其色度平面是
+/// 返回的 `max_step_comp` 是后续判据的关键 —— 见 [`plane_geom`]。
+fn max_pixsteps(
+    desc: &AVPixFmtDescriptorRef,
+) -> ([i32; MAX_FFMPEG_PLANES], [usize; MAX_FFMPEG_PLANES]) {
+    let mut max_step = [0i32; MAX_FFMPEG_PLANES];
+    let mut max_step_comp = [0usize; MAX_FFMPEG_PLANES];
+    for (component, comp) in desc.comp.iter().enumerate().take(MAX_FFMPEG_PLANES) {
+        // 描述符是 FFmpeg 的静态数据，但 `plane` 一旦越界就会写坏栈上的数组，
+        // 这里按越界跳过处理，而不是照抄 FFmpeg 的无校验索引。
+        let plane = match usize::try_from(comp.plane) {
+            Ok(plane) if plane < MAX_FFMPEG_PLANES => plane,
+            _ => continue,
+        };
+        if comp.step > max_step[plane] {
+            max_step[plane] = comp.step;
+            max_step_comp[plane] = component;
+        }
+    }
+    (max_step, max_step_comp)
+}
+
+/// 依据像素格式描述符，计算指定平面的行几何（与 FFmpeg 的
+/// `av_image_fill_linesizes` / `av_image_fill_plane_sizes` 逐字对应）。
+///
+/// **横向位移的判据是分量下标，不是平面下标**：`av_image_fill_linesizes` 只在
+/// 「该平面取得最大步长的分量是 1 或 2（色度分量）」时应用 `log2_chroma_w`。
+/// 按平面下标判会漏掉 packed 格式 —— `yuyv422` 的全部分量都在平面 0，而它一步
+/// 跨两个像素（一个色度单元），65 宽要按 33 个单元 × 4 字节 = **132** 字节算，
+/// 按平面下标得到的是 65 × 2 = 130，每行尾部 2 字节因此被丢掉。这也让本函数与
+/// [`PixelFormat::data_layout`](crate::PixelFormat::data_layout) 对同一帧给出一致答案。
+///
+/// 纵向位移按平面下标 1、2（FFmpeg 的 `av_image_fill_plane_sizes` 同理），
+/// 位移一律**向上取整**右移（等价于 `AV_CEIL_RSHIFT`）：65x49 的画面其色度平面是
 /// 33x25，而不是向下取整得到的 32x24 —— 后者会截断一整行/列，并在高度为 1 时算出
-/// 0 行，让后续"最后一行"的偏移计算下溢。
+/// 0 行，让后续"最后一行"的偏移计算下溢。**平面 3 不是色度平面**：`YUVA420P` 等带
+/// alpha 的格式把 alpha 放在平面 3，它是全分辨率的；按 `plane_idx > 0` 一律位移会把
+/// alpha 平面算成半尺寸，返回的缓冲区少掉四分之三的 alpha 数据。
 ///
-/// 只有平面 1、2 会被子采样，这与 FFmpeg 的建模一致（`av_image_fill_plane_sizes`
-/// 同样只对它们应用色度位移）。**平面 3 不是色度平面**：`YUVA420P` 等带 alpha 的
-/// 格式把 alpha 放在平面 3，它是全分辨率的；按 `plane_idx > 0` 一律位移会把 alpha
-/// 平面算成半尺寸，返回的缓冲区少掉四分之三的 alpha 数据。
-///
-/// 每像素字节数取自 `comp[plane].step`；`step` 为 0（如调色板格式）时按 1 处理。
+/// 每像素字节数取该平面的最大步长；步长为 0（如调色板格式）时按 1 处理。
 fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
     let format = frame_pixel_format(frame)?;
     let desc = format.descriptor()?;
 
-    // `comp` 是定长数组，越界索引会读到无关分量的 `step`。
-    if plane_idx >= desc.nb_components as usize {
+    // `max_pixsteps` 只填长度 4 的数组；越界的平面索引会读到数组之外。
+    if plane_idx >= MAX_FFMPEG_PLANES {
         return Err(RsmediaError::invalid_config(format!(
-            "Invalid plane index {}: format {:?} has {} components",
-            plane_idx, format, desc.nb_components
+            "Invalid plane index {plane_idx}: FFmpeg's plane arrays hold at most \
+             {MAX_FFMPEG_PLANES} entries"
         )));
     }
 
-    // 与 `PixelFormat::data_layout` 用同一条规则：只有 1、2 是色度平面。
-    let (shift_w, shift_h) = match plane_idx {
-        1 | 2 => (desc.log2_chroma_w as u32, desc.log2_chroma_h as u32),
-        _ => (0, 0),
-    };
+    let (max_step, max_step_comp) = max_pixsteps(&desc);
     let ceil_shift = |value: usize, shift: u32| (value + (1usize << shift) - 1) >> shift;
+    let shift_w = if matches!(max_step_comp[plane_idx], 1 | 2) {
+        desc.log2_chroma_w as u32
+    } else {
+        0
+    };
+    let shift_h = match plane_idx {
+        1 | 2 => desc.log2_chroma_h as u32,
+        _ => 0,
+    };
 
+    let bytes_per_pixel = match max_step[plane_idx] {
+        step if step > 0 => step as usize,
+        _ => 1,
+    };
     Ok(PlaneGeom {
-        width: ceil_shift(frame.width.max(0) as usize, shift_w),
-        height: ceil_shift(frame.height.max(0) as usize, shift_h),
-        bytes_per_pixel: if desc.comp[plane_idx].step > 0 {
-            desc.comp[plane_idx].step as usize
-        } else {
-            1
-        },
+        rows: ceil_shift(frame.height.max(0) as usize, shift_h),
+        bytes_per_row: ceil_shift(frame.width.max(0) as usize, shift_w) * bytes_per_pixel,
     })
 }
 
@@ -325,14 +357,14 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
     let linesize = frame.linesize[plane_idx] as isize;
 
     // 创建一个新的缓冲区，只包含实际的像素数据（不包括填充）
-    let bytes_per_row = geom.width * geom.bytes_per_pixel;
-    let total_size = geom.height * bytes_per_row;
+    let bytes_per_row = geom.bytes_per_row;
+    let total_size = geom.rows * bytes_per_row;
     // 退化尺寸的平面没有数据可读；`plane_geom` 之后这不该发生，故报错而不是
     // 让下面的偏移计算落到平面数据之外。
     if total_size == 0 {
         return Err(RsmediaError::invalid_config(format!(
-            "Plane {} has no data at {}x{}",
-            plane_idx, geom.width, geom.height
+            "Plane {} has no data: {} rows of {} bytes",
+            plane_idx, geom.rows, bytes_per_row
         )));
     }
     let mut result = Vec::with_capacity(total_size);
@@ -369,7 +401,7 @@ pub fn get_plane_buffer(frame: &AVFrame, plane_idx: usize) -> Result<Vec<u8>> {
         // 使用批量复制操作逐行复制数据，跳过填充字节。每一行单独做边界检查，
         // 因此负行步长（行向低地址延伸）同样安全。
         let dst_ptr: *mut u8 = result.as_mut_ptr();
-        for y in 0..geom.height {
+        for y in 0..geom.rows {
             let row_start = (y as isize)
                 .checked_mul(linesize)
                 .and_then(|offset| data_offset.checked_add(offset))
@@ -445,11 +477,11 @@ pub fn fill_plane_from_buffer(
         )));
     }
 
-    // 计算平面尺寸（宽/高按像素格式色度子采样右移，每像素字节数取 desc.comp.step）
+    // 计算平面尺寸（宽/高按像素格式色度子采样右移，每像素字节数取平面最大步长）
     let geom = plane_geom(frame, plane_idx)?;
 
     // 计算实际数据宽度（字节数）
-    let byte_width = geom.width * geom.bytes_per_pixel;
+    let byte_width = geom.bytes_per_row;
     let dst_linesize = frame.linesize[plane_idx];
 
     // 验证行大小
@@ -469,7 +501,7 @@ pub fn fill_plane_from_buffer(
     }
 
     // 计算所需的最小源数据大小（考虑行填充）
-    let required_size = geom.height * src_linesize;
+    let required_size = geom.rows * src_linesize;
     if src.len() < required_size {
         return Err(RsmediaError::invalid_config(format!(
             "Incorrect source data size: got {}, need {}",
@@ -486,7 +518,7 @@ pub fn fill_plane_from_buffer(
             src.as_ptr(),          // 源数据指针
             src_linesize as i32,   // 源数据行大小
             byte_width as i32,     // 要复制的宽度（字节数）
-            geom.height as i32,    // 平面高度
+            geom.rows as i32,      // 平面高度
         );
     }
 
@@ -1325,6 +1357,99 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// `plane_geom` 的行宽必须与 FFmpeg 的 `av_image_fill_linesizes` 逐字节一致。
+    ///
+    /// 奇数宽度最能暴露横向取整的错误。**判据是「取得该平面最大步长的分量是否为
+    /// 色度分量」，不是平面下标**：packed 的 `yuyv422` 全部分量都在平面 0，而它
+    /// 一步跨两个像素（一个色度单元），65 像素占 33 个单元 = 132 字节/行；按平面
+    /// 下标判断（平面 0 不位移）会得到 65 × 2 = 130，每行尾部 2 字节被丢掉。
+    #[test]
+    fn test_plane_geom_row_width_matches_ffmpeg_at_odd_width() -> Result<()> {
+        let (width, height) = (65i32, 49i32);
+        // packed 且横向子采样 / planar / 半平面 / 带 alpha / 高位深 / RGB / 灰度
+        let formats = [
+            PixelFormat::YUYV422,
+            PixelFormat::UYVY422,
+            PixelFormat::YVYU422,
+            PixelFormat::Y210LE,
+            PixelFormat::YUV420P,
+            PixelFormat::YUV422P,
+            PixelFormat::YUV444P,
+            PixelFormat::YUV420P10LE,
+            PixelFormat::NV12,
+            PixelFormat::P010LE,
+            PixelFormat::YUVA420P,
+            PixelFormat::RGB24,
+            PixelFormat::GRAY8,
+        ];
+
+        for format in formats {
+            let frame = create_test_frame(width, height, format.into())?;
+            let linesizes = fill_linesizes(format, width)?;
+            for (plane, &linesize) in linesizes
+                .iter()
+                .enumerate()
+                .take(format.count_planes()? as usize)
+            {
+                let geom = plane_geom(&frame, plane)?;
+                assert_eq!(
+                    geom.bytes_per_row, linesize as usize,
+                    "{format:?} plane {plane} at width {width}: plane_geom says {} bytes/row, \
+                     av_image_fill_linesizes says {}",
+                    geom.bytes_per_row, linesize,
+                );
+                assert!(
+                    geom.rows > 0,
+                    "{format:?} plane {plane} at height {height} collapsed to zero rows"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 端到端版：65 宽的 `yuyv422` 帧，每行第 132 字节必须被 `get_plane_buffer` 取到。
+    ///
+    /// 这是上面那条单位测试在公开 API 上的落点 —— 行宽算少 2 字节时，最后一列的
+    /// 色度样本就永远读不出来。
+    #[test]
+    fn test_get_plane_buffer_packed_subsampled_keeps_the_last_unit() -> Result<()> {
+        let (width, height) = (65usize, 8usize);
+        let frame = create_test_frame(width as i32, height as i32, PixelFormat::YUYV422.into())?;
+        const ROW_BYTES: usize = 132; // ceil(65 / 2) 个色度单元 × 4 字节
+        assert_eq!(
+            fill_linesizes(PixelFormat::YUYV422, width as i32)?[0] as usize,
+            ROW_BYTES,
+            "FFmpeg's own linesize for a 65-wide yuyv422 row"
+        );
+
+        // 在每行最后一个字节（第 33 个单元的最后一字节）打标记
+        unsafe {
+            let base = frame.data[0].cast::<u8>();
+            let linesize = frame.linesize[0] as usize;
+            for y in 0..height {
+                *base.add(y * linesize + ROW_BYTES - 1) = 0xAB;
+            }
+        }
+
+        let buf = get_plane_buffer(&frame, 0)?;
+        assert_eq!(
+            buf.len(),
+            ROW_BYTES * height,
+            "a 65-wide yuyv422 plane is {} bytes per row, not {}",
+            ROW_BYTES,
+            width * 2,
+        );
+        for y in 0..height {
+            assert_eq!(
+                buf[y * ROW_BYTES + ROW_BYTES - 1],
+                0xAB,
+                "row {y} lost its tail: the last chroma unit was dropped"
+            );
+        }
         Ok(())
     }
 

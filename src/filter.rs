@@ -2214,6 +2214,8 @@ impl FilterGraph {
         self.output_labels.clear();
         self.src_names.clear();
         self.sink_names.clear();
+        // 输入描述随 `input_labels` 一起重建：留着旧值会让错误信息指向上一张图。
+        self.input_specs.clear();
         self.init(params, filters)
     }
 
@@ -2238,9 +2240,10 @@ impl FilterGraph {
 
     /// 主输出（下标 0）是否正在排空（EOF 已送出，图里还有缓冲帧要出）。
     ///
-    /// 判据是"EOF 已送到每一路输入"，**不是** `av_buffersink_get_frame` 返回过
-    /// `EAGAIN`：流中段的 `EAGAIN`（还在等其它输入、滤镜缓冲未攒够）不改变状态，
-    /// 否则它在流中段就永久为真（契约见 `state::ProcessState`）。
+    /// 判据是"EOF 已送到每一路输入"（最后一路 EOF 推送成功的那一刻置位），
+    /// **不是** `av_buffersink_get_frame` 返回过 `EAGAIN`：流中段的 `EAGAIN`
+    /// （还在等其它输入、滤镜缓冲未攒够）不改变状态，否则它在流中段就永久为真
+    /// （契约见 `state::ProcessState`）。
     pub fn is_drained(&self) -> bool {
         self.is_drained_at(0)
     }
@@ -2299,6 +2302,13 @@ impl FilterGraph {
         // （见 `SINGLE_INPUT_LABEL` 的说明），端点名与实例名都用这两个名字。
         self.input_labels = vec![SINGLE_INPUT_LABEL.to_string()];
         self.output_labels = vec![SINGLE_OUTPUT_LABEL.to_string()];
+        // 与 `FilterGraphBuilder::build` 一样登记输入描述：`init` 这条路径
+        // （解码/编码流水线用的单输入线性链）同样会在取帧失败时打印它，漏了就只剩
+        // 一句没有上下文的 `EINVAL`。
+        self.input_specs = vec![format!(
+            "{SINGLE_INPUT_LABEL}={}",
+            describe_endpoint(&input)
+        )];
         self.eof_sent = vec![false];
         self.states = vec![ProcessState::Normal];
 
@@ -2594,18 +2604,38 @@ impl FilterGraph {
                 self.eof_sent.len()
             )));
         }
-        if frame.is_none() {
-            if self.eof_sent[input] {
-                return Ok(());
-            }
-            self.eof_sent[input] = true;
+        let is_eof = frame.is_none();
+        if is_eof && self.eof_sent[input] {
+            return Ok(());
         }
 
-        // src_ctx 在本块结束时释放借用
-        let mut src_ctx = self.get_src_context(input)?;
-        src_ctx
-            .buffersrc_add_frame(frame, None)
-            .context("Error submitting the frame to the filter graph.")
+        // src_ctx 在本块结束时释放借用（它借的是 `self.graph`，下面的状态记账
+        // 因此必须等它释放之后再做）
+        {
+            let mut src_ctx = self.get_src_context(input)?;
+            src_ctx
+                .buffersrc_add_frame(frame, None)
+                .context("Error submitting the frame to the filter graph.")?;
+        }
+
+        // EOF 只在**推送成功之后**才记账：失败的推送并没有让图进入 EOF，若先置位，
+        // 这一路输入就被永久"毒化"——后面再推（含重试）都会被上面的短路直接跳过，
+        // 帧静默丢失而调用方看到的是一路 `Ok(())`。
+        if is_eof {
+            self.eof_sent[input] = true;
+            // `Drained` 的判据是"EOF 已送到每一路输入"，与 `state::ProcessState`
+            // 的定义一致，因此在这里推进，而不是等取帧拿到 `EAGAIN`：后者会让
+            // "刚推完 EOF、一次 `EAGAIN` 都没遇到过"的图仍停在 `Normal`。
+            // 多输入图里只喂了一路时不会触发（还有输入没送 EOF）。
+            if self.eof_sent.iter().all(|sent| *sent) {
+                for state in &mut self.states {
+                    if state.is_normal() {
+                        *state = ProcessState::Drained;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 从第 `output` 路输出取一帧：`Ok(Some)` 是产出帧，`Ok(None)` 表示这一刻没有帧
@@ -2631,12 +2661,8 @@ impl FilterGraph {
             Err(rsmpeg::error::RsmpegError::BufferSinkDrainError) => {
                 // `EAGAIN` 只说明**这一刻**没有帧：流中段同样会出现（帧同步类滤镜
                 // 还在等其它输入、滤镜自身的缓冲未攒够），并不等于已经在排空。
-                // 因此只有"EOF 已送到每一路输入"时才推进到 `Drained`——否则多输入图
-                // 里只喂了一路的一次 `EAGAIN` 就会让 `is_drained()` 在流中段永久为真
-                // （契约见 `state::ProcessState`）。
-                if self.eof_sent.iter().all(|sent| *sent) {
-                    self.states[output] = ProcessState::Drained;
-                }
+                // 推进到 `Drained` 由 `push_frame_to` 在"EOF 已送到每一路输入"时完成
+                // （契约见 `state::ProcessState`）；这里只记日志。
                 tracing::debug!(
                     "filter graph: output {output} has no frame available (EAGAIN, eof sent: {})",
                     self.eof_sent.iter().all(|sent| *sent)
@@ -4535,6 +4561,90 @@ mod tests {
         assert!(
             graph.is_flushed(),
             "after EOF the graph must end up flushed: {graph:?}"
+        );
+        Ok(())
+    }
+
+    /// `Drained` 在**最后一路 EOF 推送成功**的那一刻置位，而不等取帧拿到 `EAGAIN`
+    /// —— 判据是"EOF 已送到每一路输入"（`state::ProcessState` 里 `Drained` 的定义）。
+    ///
+    /// 旧实现把推进放在 `receive_frame_from` 的 `EAGAIN` 分支里，于是"刚推完 EOF、
+    /// 一次 `EAGAIN` 都还没遇到"的图仍报 `Normal`，与文档里的判据不符。
+    #[test]
+    fn test_eof_marks_the_graph_drained_before_any_eagain() -> Result<()> {
+        let (w, h) = (8, 4);
+        let params = FilterParams::Video(VideoParams {
+            width: w,
+            height: h,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: rat(1, 25),
+            frame_rate: rat(25, 1),
+            pixel_aspect: Rational::ONE,
+        });
+        let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
+        let mut graph = FilterGraph::build(&params, &[null])?;
+
+        graph.push_frame_to(0, Some(make_gray8_frame(w, h)))?;
+        assert!(!graph.is_drained(), "mid-stream is not draining");
+
+        graph.push_frame_to(0, None)?;
+        assert!(
+            graph.is_drained(),
+            "EOF sent to every input means draining — the state must not wait for an EAGAIN"
+        );
+        assert!(!graph.is_flushed(), "draining is not the end of the stream");
+
+        // 重复推 EOF 是 no-op，不会把阶段推过头（也不会报 AVERROR_EOF）。
+        graph.push_frame_to(0, None)?;
+        assert!(graph.is_drained());
+
+        let frames = graph.drain_output(0)?;
+        assert_eq!(frames.len(), 1, "the frame pushed before EOF comes out");
+        assert!(graph.is_flushed(), "after the drain the graph is flushed");
+        Ok(())
+    }
+
+    /// `init` 这条路径（解码/编码流水线用的单输入线性链）也必须登记输入描述：
+    /// 取帧失败时 FFmpeg 只回一句 `EINVAL`，错误信息全靠这份描述定位"声明的
+    /// 格式 vs 实际喂进去的格式"。以前只有 `FilterGraphBuilder::build` 登记它，
+    /// 于是解码/编码路径上的诊断恒为空。
+    #[test]
+    fn test_init_records_declared_input_specs() -> Result<()> {
+        let (w, h) = (8, 4);
+        let params = FilterParams::Video(VideoParams {
+            width: w,
+            height: h,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: rat(1, 25),
+            frame_rate: rat(25, 1),
+            pixel_aspect: Rational::ONE,
+        });
+        let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
+        let mut graph = FilterGraph::build(&params, &[null])?;
+
+        assert_eq!(
+            graph.input_specs.len(),
+            1,
+            "a linear chain has exactly one input: {:?}",
+            graph.input_specs
+        );
+        let spec = &graph.input_specs[0];
+        assert!(spec.contains("8x4"), "must name the declared size: {spec}");
+        assert!(
+            spec.contains("GRAY8"),
+            "must name the declared format: {spec}"
+        );
+
+        // rebuild 不能留下旧图的描述（旧代码漏了这一步 ⇒ 描述会越攒越多并指向上一张图）
+        let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
+        graph.rebuild(&params, &[null])?;
+        assert_eq!(
+            graph.input_specs.len(),
+            1,
+            "rebuild must re-register, not append: {:?}",
+            graph.input_specs
         );
         Ok(())
     }

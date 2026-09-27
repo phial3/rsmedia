@@ -419,11 +419,32 @@ impl Time {
         self.time.filter(|time| *time != ffi::AV_NOPTS_VALUE)
     }
 
+    /// The instant as an exact rational `(time, num, den)`, meaning
+    /// `time * num / den` seconds — or `None` when there is nothing to compare:
+    /// no value at all, or a zero time base.
+    ///
+    /// This is the key the comparison impls use (see [`compare_instants`]); the
+    /// seconds conversions and [`std::fmt::Display`] go through
+    /// [`Self::seconds_or_none`] instead, because printing wants a rounded
+    /// number.
+    ///
+    /// The old "degenerate `0/0`" case is gone as a *separate* case: a zero
+    /// denominator cannot exist in a [`Rational`], so the only degenerate time
+    /// base left is [`Rational::ZERO`], and one test covers it.
+    fn instant(&self) -> Option<(i64, i32, i32)> {
+        let time = self.value()?;
+        if self.time_base.is_zero() {
+            return None;
+        }
+        Some((time, self.time_base.num(), self.time_base.den()))
+    }
+
     /// The instant in seconds, or `None` when there is nothing to convert: no
     /// value at all, or a zero time base.
     ///
-    /// The comparison and formatting impls key off this, so "equal", "ordered"
-    /// and "printed" always refer to the same number.
+    /// Rounded to the nearest `f64`, so it is what [`Self::as_secs_f64`] and
+    /// [`std::fmt::Display`] want and **not** what the comparisons use — those
+    /// are exact (see [`Self::instant`]).
     ///
     /// The old "degenerate `0/0`" case is gone as a *separate* case: a zero
     /// denominator cannot exist in a [`Rational`], so the only degenerate time
@@ -566,6 +587,31 @@ impl<T: Into<i64> + Clone> Rescale for T {
     }
 }
 
+/// 两个时刻的**精确**比较：`time * num / den` 是有理数，用 `i128` 交叉相乘比大小，
+/// 而不是先换算成 `f64`。
+///
+/// 浮点化过不了 [`Eq`] 的传递性：`9/15` 与 `3/5` 数学上相等，但两条不同的
+/// 计算路径各带一次舍入就可能相差一个 ulp，于是 `a == b`、`b == c` 而 `a != c`
+/// —— 放进 `HashSet`/排序里就是不稳定结果。[`Rational`] 保证 `den > 0`，故交叉
+/// 相乘不会翻转符号。
+///
+/// `i128` 装得下最坏情况：`i64::MAX * i32::MAX * i32::MAX ≈ 4.3e37 < i128::MAX ≈ 1.7e38`。
+///
+/// "无值"（`None` 或零时间基）排在**最前面**且彼此相等，与 [`Time::has_value`]
+/// 的语义一致。
+fn compare_instants(lhs: &Time, rhs: &Time) -> std::cmp::Ordering {
+    match (lhs.instant(), rhs.instant()) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some((lhs_time, lhs_num, lhs_den)), Some((rhs_time, rhs_num, rhs_den))) => {
+            let lhs = i128::from(lhs_time) * i128::from(lhs_num) * i128::from(rhs_den);
+            let rhs = i128::from(rhs_time) * i128::from(rhs_num) * i128::from(lhs_den);
+            lhs.cmp(&rhs)
+        }
+    }
+}
+
 impl PartialEq for Time {
     /// Compares the instants, **in seconds**, not the `(time, time_base)` pairs:
     /// `Time::from_units(1, 4)` and `Time::new(Some(2), Rational::new(1, 2).unwrap())`
@@ -575,8 +621,13 @@ impl PartialEq for Time {
     /// unequal whenever the time bases differed. Two "no value" times are equal
     /// (`None == None`); a "no value" time never equals a valued one. The result
     /// matches [`PartialOrd`]: `a == b` ⟺ `a.partial_cmp(&b) == Some(Equal)`.
+    ///
+    /// The comparison is exact — the two instants are cross-multiplied in `i128`
+    /// instead of being converted to `f64` first, so unreduced time bases such as
+    /// `9/15` and `3/5` compare equal even when the two floating-point paths
+    /// differ by an ulp.
     fn eq(&self, other: &Self) -> bool {
-        self.seconds_or_none() == other.seconds_or_none()
+        compare_instants(self, other) == std::cmp::Ordering::Equal
     }
 }
 
@@ -585,16 +636,10 @@ impl Eq for Time {}
 impl PartialOrd for Time {
     /// Orders by seconds, "no value" first; [`PartialEq`] uses the same key, so
     /// the `PartialOrd` contract holds. Always `Some`, since the key is always
-    /// comparable.
+    /// comparable — and total, being an exact rational comparison rather than a
+    /// floating-point one.
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(match (self.seconds_or_none(), other.seconds_or_none()) {
-            (None, None) => std::cmp::Ordering::Equal,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            // `den != 0` and a finite `time` cannot produce NaN; the fallback
-            // just keeps the ordering total if that ever changes.
-            (Some(lhs), Some(rhs)) => lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal),
-        })
+        Some(compare_instants(self, other))
     }
 }
 
@@ -937,6 +982,43 @@ mod tests {
             Some(std::cmp::Ordering::Less)
         );
         assert!(earlier < later_other_base);
+    }
+
+    /// 比较必须是**精确**的：同一时刻的两条不同计算路径在 `f64` 下可能相差 1 ulp，
+    /// 而 `Eq` 要求传递性，浮点比较给不了。
+    ///
+    /// 这两组 `(time, time_base)` 在有理数上完全相等（后者 = 前者 × 43/43），
+    /// 但 `time as f64 * time_base.as_f64()` 的两次舍入让它们相差一个 ulp
+    /// （实测 `0x1.a653df01b3eb5p+27` vs `0x1.a653df01b3eb4p+27`）。
+    #[test]
+    fn test_equality_is_exact_not_floating_point() {
+        let a = Time::new(Some(502_765), rat(1_804_821_558, 4_098_075));
+        let b = Time::new(Some(21_618_895), rat(1_804_821_558, 176_217_225));
+
+        // 数学上同一个时刻（交叉相乘相等）
+        let lhs = i128::from(502_765) * i128::from(1_804_821_558) * i128::from(176_217_225);
+        let rhs = i128::from(21_618_895) * i128::from(1_804_821_558) * i128::from(4_098_075);
+        assert_eq!(lhs, rhs, "测试用的两组值必须真的表示同一时刻");
+        // 而换算成 f64 后并不相等 —— 这正是旧实现会判它们不等的原因
+        assert_ne!(
+            a.as_secs_f64(),
+            b.as_secs_f64(),
+            "这个断言是前提：两条路径的 f64 结果相差 1 ulp"
+        );
+
+        assert_eq!(a, b, "同一时刻即使 f64 相差 1 ulp 也必须相等");
+        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Equal));
+    }
+
+    /// `Eq` 的传递性：三条彼此相等的链，任一两两比较都必须相等（浮点键做不到）。
+    #[test]
+    fn test_equality_is_transitive() {
+        let a = Time::new(Some(1), rat(1, 3));
+        let b = Time::new(Some(2), rat(1, 6));
+        let c = Time::new(Some(3), rat(1, 9));
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert_eq!(a, c, "a == b 且 b == c ⇒ a == c");
     }
 
     /// `Display` 打印秒数且不会因 `time * time_base.num` 溢出 `i64` 而 panic。

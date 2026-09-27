@@ -563,8 +563,8 @@ impl HWContext {
         }
 
         tracing::debug!(
-            "Mapped HW frame into the codec frames context: {:?} {}x{}",
-            PixelFormat::from(dst.format),
+            "Mapped HW frame into the codec frames context: {} {}x{}",
+            PixelFormat::name_of(dst.format),
             dst.width,
             dst.height
         );
@@ -613,8 +613,8 @@ impl HWContext {
         self.copy_frame_props(hw_frame, &mut sw_frame)?;
 
         tracing::debug!(
-            "Downloaded from GPU: format={:?}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
-            PixelFormat::from(sw_frame.format),
+            "Downloaded from GPU: format={}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
+            PixelFormat::name_of(sw_frame.format),
             sw_frame.width,
             sw_frame.height,
             sw_frame.linesize[0],
@@ -679,8 +679,8 @@ impl HWContext {
         self.copy_frame_props(sw_frame, &mut hw_frame)?;
 
         tracing::debug!(
-            "Uploaded to GPU: format={:?}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
-            PixelFormat::from(hw_frame.format),
+            "Uploaded to GPU: format={}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
+            PixelFormat::name_of(hw_frame.format),
             hw_frame.width,
             hw_frame.height,
             hw_frame.linesize[0],
