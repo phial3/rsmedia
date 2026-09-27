@@ -9,6 +9,7 @@ use crate::fmt::{FrameFormat, SampleFormat};
 use crate::pixel::PixelFormat;
 use crate::state::ProcessState;
 use crate::strutils;
+use crate::time::Rational;
 
 use rsmpeg::avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut, AVFilterRef};
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
@@ -17,6 +18,7 @@ use rsmpeg::ffi;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Filter {
@@ -157,11 +159,11 @@ impl FilterNode {
     ///
     /// ```no_run
     /// # use rsmedia::filter::{self, FilterGraphBuilder, FilterNode, VideoEndpoint};
-    /// # use rsmedia::ffmpeg::ffi::AVRational;
+    /// # use rsmedia::Rational;
     /// # use rsmedia::PixelFormat;
     /// # fn main() -> rsmedia::Result<()> {
     /// # let endpoint = VideoEndpoint::new(320, 240, PixelFormat::YUV420P,
-    /// #     AVRational { num: 1, den: 25 }, AVRational { num: 25, den: 1 });
+    /// #     Rational::new(1, 25).unwrap(), Rational::new(25, 1).unwrap());
     /// let mut builder = FilterGraphBuilder::new();
     /// builder.add_input_with("src", endpoint);
     /// // 一路输入复制成两路：一路原样输出、一路水平翻转后输出。
@@ -352,6 +354,115 @@ fn escape_filter_option(input: &str) -> String {
     escape_filter_graph_str(&escape_filter_str(input))
 }
 
+/// A filter option that FFmpeg **evaluates**, i.e. one declared `<string>` in
+/// `ffmpeg -h filter=<name>` rather than `<int>`, `<float>` or `<double>`.
+///
+/// Several filters take options that are not plain numbers: `eq`'s `brightness`
+/// and `contrast`, `volume`'s `volume`, `fps`'s `fps` are all `<string>`
+/// *because* FFmpeg evaluates them. They accept expression syntax
+/// (`"sin(t)"`, `"iw/2"`, `"min(cw/2,ch/2)"`), alternative units
+/// (`volume` takes `"-6dB"`), exact rationals (`fps` takes `"30000/1001"`
+/// where a float cannot represent the rate), and — with `eval=frame` — a
+/// different value on every frame.
+///
+/// Typing such an option as `f32` silently restricts the wrapper to constants,
+/// which is a loss of capability rather than a style choice. [`Expr`] keeps both
+/// spellings reachable through a single parameter type:
+///
+/// ```
+/// use rsmedia::filter::{audio, video};
+///
+/// // A constant still reads like a constant.
+/// let _ = video::eq(0.1, 1.2);
+///
+/// // ...and the expression form is reachable without dropping to raw strings.
+/// let _ = video::eq("sin(t)", "1 + 0.2*sin(t)");
+///
+/// // `volume` additionally accepts dB, which no float can spell.
+/// let _ = audio::volume("-6dB");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Expr<'a> {
+    /// A constant value, written into the filter description as a decimal.
+    Const(f64),
+    /// An FFmpeg expression, passed through verbatim apart from the usual filter
+    /// escaping (so `"if(lt(val,100),val,val+20)"` can be written as-is).
+    Expression(&'a str),
+}
+
+impl Expr<'_> {
+    /// The option value as it must appear in a filter description.
+    fn to_filter_value(self) -> String {
+        match self {
+            Self::Const(value) => format!("{value}"),
+            Self::Expression(expr) => escape_filter_option(expr),
+        }
+    }
+}
+
+impl std::fmt::Display for Expr<'_> {
+    /// Renders the option value exactly as it is written into the filter
+    /// description, so a `format!` over it produces the same text the
+    /// constructors emit.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_filter_value())
+    }
+}
+
+impl From<f64> for Expr<'_> {
+    fn from(value: f64) -> Self {
+        Self::Const(value)
+    }
+}
+
+impl From<i32> for Expr<'_> {
+    fn from(value: i32) -> Self {
+        Self::Const(f64::from(value))
+    }
+}
+
+impl<'a> From<&'a str> for Expr<'a> {
+    fn from(expr: &'a str) -> Self {
+        Self::Expression(expr)
+    }
+}
+
+/// The literal FFmpeg's `<duration>` options take — e.g. `afade`'s `st`/`d`,
+/// `trim`'s `start`/`end`, `fade`'s `start_time`.
+///
+/// A bare number in a `<duration>` option means **seconds**: `atrim=start=0.5`
+/// trims half a second, not half a microsecond (verified against FFmpeg 9.0).
+/// The exact seconds value is therefore the most faithful spelling, and
+/// `f64`'s shortest-round-trip formatting keeps it readable (`1.5`, not
+/// `1.5000000000000002`).
+fn duration_literal(duration: Duration) -> String {
+    format!("{}", duration.as_secs_f64())
+}
+
+/// Render a filter's numeric option value.
+///
+/// Filter options are plain decimals by the time they reach FFmpeg, so the
+/// question is only which Rust type to accept. These parameters are typed
+/// `impl Into<f64>` for two reasons, in this order:
+///
+/// * **No boilerplate.** Every spelling a caller already has keeps working
+///   unchanged — an integer literal (`highpass(80)`), a float literal
+///   (`nlmeans(1.0)`), an `f32` value from elsewhere in a pipeline, and an
+///   `f64` computation. A plain `f64` parameter would force `.0` onto every
+///   integer call site, which is exactly the "make the caller write
+///   boilerplate" cost this crate avoids elsewhere.
+/// * **No narrowing.** FFmpeg declares most of these `<double>` (and the rest
+///   `<float>`/`<int>`); an `f32` or `i32` parameter would reject values FFmpeg
+///   accepts — fractional dB, fractional gain, fractional frequency (31.5 Hz is
+///   a standard 1/3-octave centre). `f64` is the narrowest type that contains all
+///   three declarations.
+///
+/// Options FFmpeg declares `<float>` are still `f32` inside FFmpeg; a wider
+/// value is rounded there, exactly as it would be from the `ffmpeg` CLI.
+fn number(value: impl Into<f64>) -> String {
+    format!("{}", value.into())
+}
+
 /// 转义文本，但保留 FFmpeg 的 `%{...}` 展开块（如 `%{localtime}`、`%{pts:hms}`）。
 ///
 /// 用于 `drawtext` 等需要显示动态时间/帧号的场景，避免 `{` `}` 被转义后无法展开。
@@ -404,7 +515,8 @@ pub mod video {
     ///     - `bitexact`: Enable bitexact output.
     ///
     /// See: <https://ffmpeg.org/ffmpeg-scaler.html#Scaler-Options>
-    pub fn scale(width: u32, height: u32, flags: Option<&str>) -> Filter {
+    pub fn scale<'a>(width: u32, height: u32, flags: impl Into<Option<&'a str>>) -> Filter {
+        let flags: Option<&str> = flags.into();
         // 默认与 FFmpeg `scale` 滤镜一致，也与本 crate 的 `Scaler::default()`
         // 一致（BICUBIC）；早先这里是 `fast_bilinear`，与上方文档矛盾。
         let flags_str = escape_filter_option(flags.unwrap_or("bicubic"));
@@ -678,7 +790,8 @@ pub mod video {
     ///
     /// `zoom`/`x`/`y` 均为 FFmpeg 表达式（如 `"1.5"`、`"iw/2-(iw/zoom/2)"`），
     /// 内部会做选项级 + 图级转义。
-    pub fn zoompan(zoom: &str, x: &str, y: &str, duration: Option<i32>) -> Filter {
+    pub fn zoompan(zoom: &str, x: &str, y: &str, duration: impl Into<Option<i32>>) -> Filter {
+        let duration: Option<i32> = duration.into();
         let (zoom, x, y) = (
             escape_filter_option(zoom),
             escape_filter_option(x),
@@ -757,28 +870,43 @@ pub mod video {
 
     /// 视频模糊
     /// Applies box blur filter.
-    /// `luma_radius`: Radius of the luma blur.
-    pub fn blur(radius: f32) -> Filter {
+    /// `radius`: Radius of the luma blur — a constant, or an expression such as
+    /// `"min(cw/2,ch/2)"` (`boxblur`'s `luma_radius` is declared `<string>`
+    /// because FFmpeg evaluates it).
+    pub fn blur<'a>(radius: impl Into<Expr<'a>>) -> Filter {
         // Consider adding other boxblur params: luma_power, chroma_radius, chroma_power, alpha_radius, alpha_power
         Filter::new(
             "boxblur",
             MediaType::VIDEO,
-            format!("boxblur=luma_radius={radius}"),
+            format!("boxblur=luma_radius={}", radius.into()),
         )
     }
 
     /// 亮度/对比度调节
-    pub fn eq(brightness: f32, contrast: f32) -> Filter {
+    ///
+    /// `brightness` / `contrast` are FFmpeg `<string>` options: constants work
+    /// (`eq(0.1, 1.2)`), and so do expressions (`eq("sin(t)", "1.2")`), which is
+    /// what `eval=frame` needs. See [`Expr`].
+    pub fn eq<'a>(brightness: impl Into<Expr<'a>>, contrast: impl Into<Expr<'a>>) -> Filter {
         Filter::new(
             "eq",
             MediaType::VIDEO,
-            format!("eq=brightness={brightness}:contrast={contrast}"),
+            format!(
+                "eq=brightness={}:contrast={}",
+                brightness.into(),
+                contrast.into()
+            ),
         )
     }
 
     /// 帧率控制
-    pub fn fps(fps: f32) -> Filter {
-        Filter::new("fps", MediaType::VIDEO, format!("fps={fps}"))
+    ///
+    /// `fps` is a `<string>` option, so besides a constant it accepts the exact
+    /// rationals a float cannot represent (`"30000/1001"`) and `"source"`.
+    /// A rate that has to be exact should be given as a rational expression —
+    /// the same caveat as [`crate::EncoderBuilder::with_fps`].
+    pub fn fps<'a>(fps: impl Into<Expr<'a>>) -> Filter {
+        Filter::new("fps", MediaType::VIDEO, format!("fps={}", fps.into()))
     }
 
     /// 去交错（Deinterlace），将隔行扫描转为逐行扫描。
@@ -846,48 +974,85 @@ pub mod video {
     ///
     /// * `luma` - 亮度空间降噪强度（0-4，默认 4）。
     /// * `chroma` - 色度空间降噪强度（0-3，默认 3）。
-    pub fn hqdn3d(luma: f32, chroma: f32) -> Filter {
+    ///
+    /// `hqdn3d.luma_spatial` / `chroma_spatial` 在 FFmpeg 里是 `<double>`，因此这里
+    /// 收 `f64`：包一层 `f32` 会比 FFmpeg 实际接受的域更窄。
+    pub fn hqdn3d(luma: impl Into<f64>, chroma: impl Into<f64>) -> Filter {
         Filter::new(
             "hqdn3d",
             MediaType::VIDEO,
-            format!("hqdn3d=luma_spatial={luma}:chroma_spatial={chroma}"),
+            format!(
+                "hqdn3d=luma_spatial={}:chroma_spatial={}",
+                number(luma),
+                number(chroma)
+            ),
         )
     }
 
     /// 视频降噪（nlmeans），非局部均值降噪，降噪效果更好但更耗时。
     /// `strength` 为降噪强度（建议 0-20，默认 1.0）。
-    pub fn nlmeans(strength: f32) -> Filter {
-        Filter::new("nlmeans", MediaType::VIDEO, format!("nlmeans=s={strength}"))
+    ///
+    /// 对应 `nlmeans.s`，FFmpeg 声明为 `<double>`。
+    pub fn nlmeans(strength: impl Into<f64>) -> Filter {
+        Filter::new(
+            "nlmeans",
+            MediaType::VIDEO,
+            format!("nlmeans=s={}", number(strength)),
+        )
+    }
+
+    /// 智能模糊 / 磨皮（smartblur）
+    ///
+    /// 与整体模糊不同，smartblur 只平滑**平坦区域**、保留边缘，因此是证件照
+    /// "磨皮"的常用滤镜：`strength` 取小正值（如 `0.05~0.15`）即可抹平细纹
+    /// 而不糊掉五官轮廓。
+    ///
+    /// * `luma_strength` - 亮度平滑强度（-1~1）。**正值 = 平滑/磨皮**，
+    ///   负值 = 锐化；证件照建议 `0.05~0.2`。
+    /// * `luma_radius` - 平滑半径（0.1~5），越大越柔和，证件照建议 `3` 左右。
+    ///
+    /// 色度通道默认与亮度同参数（`chroma_mode=me`）；如需单独控制请用
+    /// [`Filter::new`] 逃生舱传完整 spec。
+    pub fn smartblur(luma_strength: impl Into<f64>, luma_radius: impl Into<f64>) -> Filter {
+        Filter::new(
+            "smartblur",
+            MediaType::VIDEO,
+            format!(
+                "smartblur=luma_radius={}:luma_strength={}",
+                number(luma_radius),
+                number(luma_strength)
+            ),
+        )
     }
 
     /// Gamma 校正（画质增强）。
-    /// `gamma` 为 gamma 值（通常 0.5-2.0，1.0 表示不变）。
-    /// 伽马校正。
+    ///
+    /// `gamma` 为 gamma 值（通常 0.5-2.0，1.0 表示不变），也可以是表达式。
     ///
     /// **版本差异**：FFmpeg 8+ 移除了独立的 `gamma` 滤镜，该功能并入 `eq`
     /// （`eq=gamma=…`）。为在新版本上可用，这里直接生成 `eq` 滤镜，
     /// 语义与旧 `gamma` 滤镜一致。
-    pub fn gamma(gamma: f32) -> Filter {
-        Filter::new("eq", MediaType::VIDEO, format!("eq=gamma={gamma}"))
+    pub fn gamma<'a>(gamma: impl Into<Expr<'a>>) -> Filter {
+        Filter::new("eq", MediaType::VIDEO, format!("eq=gamma={}", gamma.into()))
     }
 
     /// 饱和度调节（画质增强）。
-    /// `saturation` 为饱和度倍数（1.0 表示不变，0 为黑白）。
-    pub fn saturation(saturation: f32) -> Filter {
+    /// `saturation` 为饱和度倍数（1.0 表示不变，0 为黑白），也可以是表达式。
+    pub fn saturation<'a>(saturation: impl Into<Expr<'a>>) -> Filter {
         Filter::new(
             "eq",
             MediaType::VIDEO,
-            format!("eq=saturation={saturation}"),
+            format!("eq=saturation={}", saturation.into()),
         )
     }
 
     /// 鲜艳度调节（画质增强）。
     /// `vibrance` 为鲜艳度（-1.0 ~ 1.0，0 表示不变），对应 FFmpeg `vibrance=intensity`。
-    pub fn vibrance(vibrance: f32) -> Filter {
+    pub fn vibrance(vibrance: impl Into<f64>) -> Filter {
         Filter::new(
             "vibrance",
             MediaType::VIDEO,
-            format!("vibrance=intensity={vibrance}"),
+            format!("vibrance=intensity={}", number(vibrance)),
         )
     }
 
@@ -898,8 +1063,12 @@ pub mod video {
 
     /// 高斯模糊。
     /// `sigma`: 高斯标准差（越大越模糊，默认 0.5）。
-    pub fn gblur(sigma: f32) -> Filter {
-        Filter::new("gblur", MediaType::VIDEO, format!("gblur=sigma={sigma}"))
+    pub fn gblur(sigma: impl Into<f64>) -> Filter {
+        Filter::new(
+            "gblur",
+            MediaType::VIDEO,
+            format!("gblur=sigma={}", number(sigma)),
+        )
     }
 
     /// 平均值模糊（boxblur，参数化版本）。
@@ -925,8 +1094,14 @@ pub mod video {
     /// 接进自定义的多输入图——线性滤镜链（`DecoderBuilder::with_filters` 等）
     /// 装不下它，会以「输入 pad 数不匹配」报错。
     /// * `x` / `y` - 叠加层在基底上的偏移（支持表达式，如 `"main_w-overlay_w-10"`）。
+    ///   表达式可含 `,`（如 `"if(eq(t,0),0,W-w)"`），会按滤镜语法转义，
+    ///   直接照写即可，无需自己加反斜杠。
     /// * `opacity` - 叠加层不透明度（0~1）。
-    pub fn overlay(x: &str, y: &str, opacity: Option<f32>) -> Filter {
+    pub fn overlay(x: &str, y: &str, opacity: impl Into<Option<f32>>) -> Filter {
+        let opacity: Option<f32> = opacity.into();
+        // x/y 是表达式，`,` 等字符会被滤镜语法解析吃掉（整条描述先按 `,` 拆分
+        // 滤镜），报出来的错与真实原因无关，因此与其它 `&str` 参数一致地转义。
+        let (x, y) = (escape_filter_option(x), escape_filter_option(y));
         let alpha = match opacity {
             Some(a) => format!(":alpha={a}"),
             None => String::new(),
@@ -940,7 +1115,7 @@ pub mod video {
 
     /// 横向并排（hstack）：把多路视频并成一行。
     ///
-    /// 多输入滤镜，接线方式见 [`Self::overlay`]；要求各路**高度一致**，
+    /// 多输入滤镜，接线方式见 [`overlay`]；要求各路**高度一致**，
     /// 输出宽度为各路宽度之和（[`FilterGraphBuilder::hstack`] 会自动收口到声明的
     /// 输出尺寸）。
     pub fn hstack(inputs: u32) -> Filter {
@@ -988,29 +1163,42 @@ pub mod video {
     /// * `color` - 要抠掉的颜色，如 `"green@0.5"`。
     /// * `similarity` - 颜色相似度阈值（0~0.01，越大越宽松）。
     /// * `blend` - 混合比例（0~1）。
-    pub fn chromakey(color: &str, similarity: f32, blend: f32) -> Filter {
+    pub fn chromakey(color: &str, similarity: impl Into<f64>, blend: impl Into<f64>) -> Filter {
         let color = escape_filter_option(color);
         Filter::new(
             "chromakey",
             MediaType::VIDEO,
-            format!("chromakey=color={color}:similarity={similarity}:blend={blend}"),
+            format!(
+                "chromakey=color={color}:similarity={}:blend={}",
+                number(similarity),
+                number(blend)
+            ),
         )
     }
 
     /// RGB 色键（colorkey），将指定 RGB 颜色转为透明。
     /// `color` - 如 `"black"` 或 `"0x000000"`。
-    pub fn colorkey(color: &str, similarity: f32, blend: f32) -> Filter {
+    pub fn colorkey(color: &str, similarity: impl Into<f64>, blend: impl Into<f64>) -> Filter {
         let color = escape_filter_option(color);
         Filter::new(
             "colorkey",
             MediaType::VIDEO,
-            format!("colorkey=color={color}:similarity={similarity}:blend={blend}"),
+            format!(
+                "colorkey=color={color}:similarity={}:blend={}",
+                number(similarity),
+                number(blend)
+            ),
         )
     }
 
     /// 曲线调节（curves），通过控制点微调 R/G/B 通道色调。
     /// `preset`/`points` 二选一；`points` 形如 `"0/0 0.5/0.5 1/1"`（无需自行转义）。
-    pub fn curves(preset: Option<&str>, points: Option<&str>) -> Filter {
+    pub fn curves<'a>(
+        preset: impl Into<Option<&'a str>>,
+        points: impl Into<Option<&'a str>>,
+    ) -> Filter {
+        let preset: Option<&str> = preset.into();
+        let points: Option<&str> = points.into();
         let spec = match (preset, points) {
             (Some(p), _) => format!("curves=preset={}", escape_filter_option(p)),
             (None, Some(pt)) => format!("curves=all={}", escape_filter_option(pt)),
@@ -1048,13 +1236,14 @@ pub mod video {
     /// ```no_run
     /// use rsmedia::{EncoderBuilder, filter::video};
     /// let encoder = EncoderBuilder::new_video(320, 240)
-    ///     .with_codec_name("gif".to_string())
+    ///     .with_codec_name("gif")
     ///     .with_fps(10.0)
     ///     .with_filters(vec![video::gif_palette(10.0, None)])
     ///     .build()
     ///     .unwrap();
     /// ```
-    pub fn gif_palette(fps: f32, dither: Option<&str>) -> Filter {
+    pub fn gif_palette<'a>(fps: f32, dither: impl Into<Option<&'a str>>) -> Filter {
+        let dither: Option<&str> = dither.into();
         let dither_part = dither
             .map(|d| format!(":dither={}", escape_filter_option(d)))
             .unwrap_or_default();
@@ -1065,15 +1254,73 @@ pub mod video {
         )
         .with_input_format(PixelFormat::RGB24)
     }
+
+    /// LUT 调色（lutyuv）：按亮度/色度查找表逐通道映射，证件照"美白"常用
+    /// 亮度表把中间调整体上提而不压高光。
+    ///
+    /// * `y` / `u` / `v` - 各通道的 LUT 表达式（FFmpeg eval 语法，如
+    ///   `"if(lt(val,100),val,val+20)"`），传 `None` 表示该通道不变。
+    ///   表达式中的逗号会被自动转义。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsmedia::filter::video;
+    /// // 亮度整体 +10（简单提亮美白），色度不动
+    /// let _f = video::lutyuv(Some("val+10"), None, None);
+    /// ```
+    pub fn lutyuv<'a>(
+        y: impl Into<Option<&'a str>>,
+        u: impl Into<Option<&'a str>>,
+        v: impl Into<Option<&'a str>>,
+    ) -> Filter {
+        let y: Option<&str> = y.into();
+        let u: Option<&str> = u.into();
+        let v: Option<&str> = v.into();
+        let mut parts = Vec::new();
+        if let Some(y_expr) = y {
+            parts.push(format!("y={}", escape_filter_option(y_expr)));
+        }
+        if let Some(u) = u {
+            parts.push(format!("u={}", escape_filter_option(u)));
+        }
+        if let Some(v) = v {
+            parts.push(format!("v={}", escape_filter_option(v)));
+        }
+        let spec = if parts.is_empty() {
+            "lutyuv".to_string()
+        } else {
+            format!("lutyuv={}", parts.join(":"))
+        };
+        Filter::new("lutyuv", MediaType::VIDEO, spec)
+    }
+
+    /// 拼版（tile）：把多帧按 `cols x rows` 网格排成一张图，证件照"一张 6 寸
+    /// 相纸排 8 张一寸"即此滤镜。
+    ///
+    /// * `cols` / `rows` - 网格行列数（总格数 = cols*rows，输入帧数不足时
+    ///   最后一格用 `padding` 色填充）。
+    /// * `padding` - 格子间距像素（0~100）。
+    /// * `color` - 背景/填充颜色，如 `"white"`。
+    ///
+    /// 注意：tile 是**攒帧**滤镜——每 cols*rows 帧吐 1 帧，EOF 时输出残余格。
+    pub fn tile(cols: u32, rows: u32, padding: u32, color: &str) -> Filter {
+        let color = escape_filter_option(color);
+        Filter::new(
+            "tile",
+            MediaType::VIDEO,
+            format!("tile={cols}x{rows}:padding={padding}:color={color}"),
+        )
+    }
 }
 
 pub mod audio {
     use super::*;
 
     /// 创建音频重采样过滤器
-    pub fn resample(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
+    pub fn resample(nb_channels: i32, sample_rate: i32, format: SampleFormat) -> Filter {
         // 统一走解析函数以便复用 channel_desc 处理，避免 describe().unwrap() panic
-        let channel_desc = audio_channel_desc(nb_channels as i32);
+        let channel_desc = audio_channel_desc(nb_channels);
 
         // async=1 可能更适合实时场景，避免缓冲问题。
         let spec_str = format!(
@@ -1090,8 +1337,8 @@ pub mod audio {
     /// Converts audio sample format.
     /// `format`: <https://ffmpeg.org/ffmpeg-filters.html#format>
     /// `aformat`: <https://ffmpeg.org/ffmpeg-filters.html#aformat-1>
-    pub fn format(nb_channels: u32, sample_rate: u32, format: SampleFormat) -> Filter {
-        let channel_desc = audio_channel_desc(nb_channels as i32);
+    pub fn format(nb_channels: i32, sample_rate: i32, format: SampleFormat) -> Filter {
+        let channel_desc = audio_channel_desc(nb_channels);
 
         Filter::new(
             "aformat",
@@ -1116,33 +1363,52 @@ pub mod audio {
 
     /// 音量调整
     /// Adjusts audio volume.
-    /// `volume`: Linear multiplier (1.0 is no change) or dB value (e.g., "-3dB").
-    pub fn volume(val: f32) -> Filter {
-        // FFmpeg volume filter can take linear scale or dB. Pass string directly.
-        // Validation could check if it's a number or ends with "dB".
-        Filter::new("volume", MediaType::AUDIO, format!("volume={val}"))
+    ///
+    /// `volume` is an FFmpeg `<string>` option, so all three of its spellings are
+    /// reachable: a linear multiplier (`volume(0.5)`), a **dB** value — which no
+    /// numeric type could carry — (`volume("-6dB")`), and an expression
+    /// (`volume("if(gt(t,10),0,1)")`). See [`Expr`].
+    pub fn volume<'a>(volume: impl Into<Expr<'a>>) -> Filter {
+        Filter::new(
+            "volume",
+            MediaType::AUDIO,
+            format!("volume={}", volume.into()),
+        )
     }
 
     /// loudnorm - EBU R128音量标准化
-    pub fn loudnorm(integrated_loudness: f32) -> Filter {
+    ///
+    /// `loudnorm.I`（整合响度，LUFS）在 FFmpeg 里是 `<double>`。
+    pub fn loudnorm(integrated_loudness: impl Into<f64>) -> Filter {
         Filter::new(
             "loudnorm",
             MediaType::AUDIO,
-            format!("loudnorm=I={integrated_loudness}:TP=-1.5:LRA=11"),
+            format!("loudnorm=I={}:TP=-1.5:LRA=11", number(integrated_loudness)),
         )
     }
 
     /// 单频段均衡器
     /// Applies a single-band peaking equalizer.
-    /// `frequency`: Center frequency in Hz.
-    /// `gain`: Gain in dB.
-    /// `width`: Bandwidth in Hz.
-    pub fn equalizer(frequency: i32, gain: f32, width: u32) -> Filter {
+    ///
+    /// * `frequency` - Center frequency in Hz.
+    /// * `gain` - Gain in dB.
+    /// * `width` - Bandwidth in Hz (`width_type=h`).
+    ///
+    /// 三个参数在 FFmpeg 里都是 `<double>`，所以统一收 `f64`：中心频率与带宽
+    /// 都不是"整数才合理"的量。
+    pub fn equalizer(
+        frequency: impl Into<f64>,
+        gain: impl Into<f64>,
+        width: impl Into<f64>,
+    ) -> Filter {
         Filter::new(
             "equalizer",
             MediaType::AUDIO,
             format!(
-                "equalizer=f={frequency}:width_type=h:width={width}:g={gain}", // width_type=h (Hz)
+                "equalizer=f={}:width_type=h:width={}:g={}", // width_type=h (Hz)
+                number(frequency),
+                number(width),
+                number(gain),
             ),
         )
     }
@@ -1150,29 +1416,47 @@ pub mod audio {
     /// 多频段均衡器 (bass, mid, treble)
     /// Applies a simple 3-band equalizer using firequalizer.
     /// See: <https://ffmpeg.org/ffmpeg-filters.html#firequalizer>
-    pub fn three_band_equalizer(bass_gain: f32, mid_gain: f32, treble_gain: f32) -> Filter {
+    pub fn three_band_equalizer(
+        bass_gain: impl Into<f64>,
+        mid_gain: impl Into<f64>,
+        treble_gain: impl Into<f64>,
+    ) -> Filter {
         Filter::new(
             "firequalizer",
             MediaType::AUDIO,
             format!(
-                "firequalizer=gain='if(lt(f,200),{bass_gain},if(gt(f,5000),{treble_gain},{mid_gain}))':scale=linlog",
+                "firequalizer=gain='if(lt(f,200),{},if(gt(f,5000),{},{}))':scale=linlog",
+                number(bass_gain),
+                number(treble_gain),
+                number(mid_gain),
             ),
         )
     }
 
     /// 压缩器
     /// Applies dynamic range compression.
-    /// `ratio`: Compression ratio (1 - 20).
-    /// `attack`: Attack time in ms (optional, default 20).
-    /// `release`: Release time in ms (optional, default 250).
+    ///
+    /// * `ratio`: Compression ratio (1 - 20).
+    /// * `attack`: Attack time in ms (optional, default 20).
+    /// * `release`: Release time in ms (optional, default 250).
+    ///
+    /// `acompressor` 的 `ratio`/`attack`/`release` 在 FFmpeg 里都是 `<double>`。
+    ///
     /// See: <https://ffmpeg.org/ffmpeg-filters.html#acompressor>
-    pub fn compressor(ratio: f32, attack: Option<f32>, release: Option<f32>) -> Result<Filter> {
+    pub fn compressor(
+        ratio: impl Into<f64>,
+        attack: impl Into<Option<f64>>,
+        release: impl Into<Option<f64>>,
+    ) -> Result<Filter> {
+        let attack: Option<f64> = attack.into();
+        let release: Option<f64> = release.into();
+        let ratio: f64 = ratio.into();
         if ratio < 1.0 {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::invalid_config(format!(
                 "Compressor ratio must be >= 1.0: {ratio}"
             )));
         }
-        let mut spec = format!("acompressor=ratio={ratio}");
+        let mut spec = format!("acompressor=ratio={}", number(ratio));
         if let Some(a) = attack {
             spec.push_str(&format!(":attack={a}"));
         }
@@ -1184,20 +1468,38 @@ pub mod audio {
     }
 
     /// 高通滤波
-    pub fn highpass(freq: u32) -> Filter {
-        Filter::new("highpass", MediaType::AUDIO, format!("highpass=f={freq}"))
+    ///
+    /// `highpass.frequency` 在 FFmpeg 里是 `<double>`。
+    pub fn highpass(freq: impl Into<f64>) -> Filter {
+        Filter::new(
+            "highpass",
+            MediaType::AUDIO,
+            format!("highpass=f={}", number(freq)),
+        )
     }
 
     /// 低通滤波
-    pub fn lowpass(freq: u32) -> Filter {
-        Filter::new("lowpass", MediaType::AUDIO, format!("lowpass=f={freq}"))
+    ///
+    /// `lowpass.frequency` 在 FFmpeg 里是 `<double>`。
+    pub fn lowpass(freq: impl Into<f64>) -> Filter {
+        Filter::new(
+            "lowpass",
+            MediaType::AUDIO,
+            format!("lowpass=f={}", number(freq)),
+        )
     }
 
     /// 音频变速
     /// Changes audio tempo without changing pitch.
     /// * `rate`: Speed multiplier (0.5 to 100.0).
-    pub fn atempo(rate: f32) -> Filter {
-        Filter::new("atempo", MediaType::AUDIO, format!("atempo={rate}"))
+    ///
+    /// `atempo.tempo` 在 FFmpeg 里是 `<double>`。
+    pub fn atempo(rate: impl Into<f64>) -> Filter {
+        Filter::new(
+            "atempo",
+            MediaType::AUDIO,
+            format!("atempo={}", number(rate)),
+        )
     }
 
     /// 延时（ms）
@@ -1216,34 +1518,53 @@ pub mod audio {
 
     /// 创建FFT降噪过滤器
     /// Applies FFT noise reduction (simple).
-    /// `noise_reduction`: Noise reduction factor in dB (e.g., 12).
-    /// `noise_floor`: Noise floor in dB (e.g., -50).
-    pub fn fft_denoise(noise_reduction: i32, noise_floor: i32) -> Filter {
+    /// `noise_reduction`: Noise reduction factor in dB (e.g., 12.5).
+    /// `noise_floor`: Noise floor in dB (e.g., -50.5).
+    ///
+    /// `afftdn.nr` / `nf` 在 FFmpeg 里是 `<float>`：收 `i32` 会把分数 dB 挡在门外。
+    pub fn fft_denoise(noise_reduction: impl Into<f64>, noise_floor: impl Into<f64>) -> Filter {
         Filter::new(
             "afftdn",
             MediaType::AUDIO,
-            format!("afftdn=nr={noise_reduction}:nf={noise_floor}:nt=w"),
+            format!(
+                "afftdn=nr={}:nf={}:nt=w",
+                number(noise_reduction),
+                number(noise_floor)
+            ),
         )
     }
 
     /// 创建高级FFT降噪过滤器
     /// Applies FFT noise reduction (advanced).
-    /// `noise_reduction`: Noise reduction in dB.
-    /// `noise_floor`: Noise floor in dB.
-    /// `noise_type`: 'w', 'v', 'p', 'c', 's'. Default 'w'.
-    /// `time_smoothing`: Temporal smoothing factor. Default 0.
-    pub fn advanced_fft_denoise(
-        noise_reduction: i32,
-        noise_floor: i32,
-        noise_type: Option<&str>,
-        time_smoothing: Option<f32>,
+    ///
+    /// * `noise_reduction`: Noise reduction in dB（`afftdn.nr`，`<float>`）。
+    /// * `noise_floor`: Noise floor in dB（`afftdn.nf`，`<float>`）。
+    /// * `noise_type`: `'w'`/`'v'`/`'p'`/`'c'`/`'s'`，默认 `'w'`。
+    /// * `track_residual`: `afftdn.tr`，FFmpeg 声明为 **`<boolean>`**：跟踪残余噪声
+    ///   （`track_residual`），不是"时间平滑系数"。
+    ///
+    /// 早先这个参数叫 `time_smoothing`、类型是 `Option<f32>`，会被格式化成
+    /// `tr=0.5` 这样的值——而 `tr` 是布尔选项，FFmpeg 直接拒绝整条滤镜链：
+    /// `Unable to parse "tr" option value "0.5" as boolean`。也就是说**只要传入
+    /// 任何非整数，`advanced_fft_denoise` 都会让 `FilterGraph` 建不起来**；
+    /// 名字与类型都指向"一个浮点系数"，掩盖了真实的选项语义。
+    pub fn advanced_fft_denoise<'a>(
+        noise_reduction: impl Into<f64>,
+        noise_floor: impl Into<f64>,
+        noise_type: impl Into<Option<&'a str>>,
+        track_residual: bool,
     ) -> Filter {
+        let noise_type: Option<&str> = noise_type.into();
         let nt = escape_filter_option(noise_type.unwrap_or("w"));
-        let tr = time_smoothing.unwrap_or(0.0);
+        let tr = u8::from(track_residual);
         Filter::new(
             "afftdn",
             MediaType::AUDIO,
-            format!("afftdn=nr={noise_reduction}:nf={noise_floor}:nt={nt}:tr={tr}"),
+            format!(
+                "afftdn=nr={}:nf={}:nt={nt}:tr={tr}",
+                number(noise_reduction),
+                number(noise_floor)
+            ),
         )
     }
 
@@ -1262,10 +1583,13 @@ pub mod audio {
     /// 窗口尺寸（`H = 2*round(pd*sample_rate/1e6)+1`，默认参数 44.1kHz 下为 177）
     /// 的整数倍，或改用 `Filter::fft_denoise` / `Filter::denoise`。
     pub fn anlm_denoise(
-        strength: Option<f32>,
-        patch_size: Option<i32>,
-        search_range: Option<i32>,
+        strength: impl Into<Option<f64>>,
+        patch_size: impl Into<Option<i32>>,
+        search_range: impl Into<Option<i32>>,
     ) -> Filter {
+        let strength: Option<f64> = strength.into();
+        let patch_size: Option<i32> = patch_size.into();
+        let search_range: Option<i32> = search_range.into();
         let mut params = Vec::new();
         if let Some(s) = strength {
             params.push(format!("s={s}"));
@@ -1286,24 +1610,34 @@ pub mod audio {
 
     /// 音频降噪（便捷方法），使用 FFT 降噪并自动估计噪声特征。
     /// `strength` 为降噪强度（dB，建议 10-30）。
-    pub fn denoise(strength: f32) -> Filter {
+    pub fn denoise(strength: impl Into<f64>) -> Filter {
         Filter::new(
             "afftdn",
             MediaType::AUDIO,
-            format!("afftdn=nr={strength}:nt=w"),
+            format!("afftdn=nr={}:nt=w", number(strength)),
         )
     }
 
     /// 音频淡入淡出（afade）。
+    ///
     /// * `fade_type` - `in` 或 `out`。
-    /// * `start` - 起点（秒）。
-    /// * `duration` - 淡变时长（秒）。
-    pub fn afade(fade_type: &str, start: f32, duration: f32) -> Filter {
+    /// * `start` - 起点。
+    /// * `duration` - 淡变时长。
+    ///
+    /// `afade.st` / `d` 在 FFmpeg 里是 **`<duration>`**，不是裸浮点数：它们有自己的
+    /// 量纲（时间），也接受 `"1.5s"`、`"00:00:01.5"` 这样的时长字面量。
+    /// 用 [`Duration`] 表达"这是一段时间"，比 `f32` 秒更贴近语义，也免掉了
+    /// `f32` 在 10⁴ 秒量级上约 1 ms 的 ULP 误差。
+    pub fn afade(fade_type: &str, start: Duration, duration: Duration) -> Filter {
         let fade_type = escape_filter_option(fade_type);
         Filter::new(
             "afade",
             MediaType::AUDIO,
-            format!("afade=t={fade_type}:st={start}:d={duration}"),
+            format!(
+                "afade=t={fade_type}:st={}:d={}",
+                duration_literal(start),
+                duration_literal(duration)
+            ),
         )
     }
 
@@ -1311,12 +1645,21 @@ pub mod audio {
     /// * `in_gain` / `out_gain` - 输入/输出增益。
     /// * `delays` - 延迟序列（ms，如 `"60|30"`）。
     /// * `decays` - 衰减系数（如 `"0.4|0.3"`）。
-    pub fn aecho(in_gain: f32, out_gain: f32, delays: &str, decays: &str) -> Filter {
+    pub fn aecho(
+        in_gain: impl Into<f64>,
+        out_gain: impl Into<f64>,
+        delays: &str,
+        decays: &str,
+    ) -> Filter {
         let (delays, decays) = (escape_filter_option(delays), escape_filter_option(decays));
         Filter::new(
             "aecho",
             MediaType::AUDIO,
-            format!("aecho=in_gain={in_gain}:out_gain={out_gain}:delays={delays}:decays={decays}"),
+            format!(
+                "aecho=in_gain={}:out_gain={}:delays={delays}:decays={decays}",
+                number(in_gain),
+                number(out_gain)
+            ),
         )
     }
 
@@ -1352,37 +1695,49 @@ pub mod audio {
 
     /// 低频增益（bass）。
     /// `freq` - 中心频率，`gain` - 增益（dB）。
-    pub fn bass(freq: u32, gain: f32) -> Filter {
-        Filter::new("bass", MediaType::AUDIO, format!("bass=f={freq}:g={gain}"))
+    ///
+    /// `bass.frequency` / `gain` 在 FFmpeg 里都是 `<double>`。
+    pub fn bass(freq: impl Into<f64>, gain: impl Into<f64>) -> Filter {
+        Filter::new(
+            "bass",
+            MediaType::AUDIO,
+            format!("bass=f={}:g={}", number(freq), number(gain)),
+        )
     }
 
     /// 高频增益（treble）。
     /// `freq` - 中心频率，`gain` - 增益（dB）。
-    pub fn treble(freq: u32, gain: f32) -> Filter {
+    ///
+    /// `treble.frequency` / `gain` 在 FFmpeg 里都是 `<double>`。
+    pub fn treble(freq: impl Into<f64>, gain: impl Into<f64>) -> Filter {
         Filter::new(
             "treble",
             MediaType::AUDIO,
-            format!("treble=f={freq}:g={gain}"),
+            format!("treble=f={}:g={}", number(freq), number(gain)),
         )
     }
 
     /// 低频搁架滤波器（lowshelf）。
     /// `freq` - 转折频率，`gain` - 增益（dB）。
-    pub fn lowshelf(freq: u32, gain: f32) -> Filter {
+    ///
+    /// `lowshelf.frequency` / `gain` 在 FFmpeg 里都是 `<double>`。
+    pub fn lowshelf(freq: impl Into<f64>, gain: impl Into<f64>) -> Filter {
         Filter::new(
             "lowshelf",
             MediaType::AUDIO,
-            format!("lowshelf=f={freq}:g={gain}"),
+            format!("lowshelf=f={}:g={}", number(freq), number(gain)),
         )
     }
 
     /// 高频搁架滤波器（highshelf）。
     /// `freq` - 转折频率，`gain` - 增益（dB）。
-    pub fn highshelf(freq: u32, gain: f32) -> Filter {
+    ///
+    /// `highshelf.frequency` / `gain` 在 FFmpeg 里都是 `<double>`。
+    pub fn highshelf(freq: impl Into<f64>, gain: impl Into<f64>) -> Filter {
         Filter::new(
             "highshelf",
             MediaType::AUDIO,
-            format!("highshelf=f={freq}:g={gain}"),
+            format!("highshelf=f={}:g={}", number(freq), number(gain)),
         )
     }
 }
@@ -1407,9 +1762,24 @@ pub fn setpts(media_type: MediaType, expr: &str) -> Filter {
 }
 
 /// 将视频/音频裁剪到指定的时间范围。
-pub fn trim(media_type: MediaType, start: f32, end: f32) -> Filter {
+///
+/// `trim.start` / `end`（音频侧 `atrim`）在 FFmpeg 里都是 **`<duration>`**，
+/// 所以两端都收 [`Duration`]：裁剪点是一段时间，不是一个裸浮点数。
+///
+/// 选项按名字写（`start=` / `end=`）而不是按位置：`trim` 的选项表里
+/// `start`/`end` 之间还夹着 `starti`/`endi`，位置写法是否稳定取决于 FFmpeg
+/// 版本，而名字写法在任何版本上都只有一个意思。
+pub fn trim(media_type: MediaType, start: Duration, end: Duration) -> Filter {
     let name = audio_or_video_filter_name("atrim", "trim", media_type);
-    Filter::new(name, media_type, format!("{name}={start}:{end}"))
+    Filter::new(
+        name,
+        media_type,
+        format!(
+            "{name}=start={}:end={}",
+            duration_literal(start),
+            duration_literal(end)
+        ),
+    )
 }
 
 /// 过滤器参数配置
@@ -1457,10 +1827,20 @@ impl FilterParams {
     }
 }
 
-/// 视频过滤器参数
+/// Video filter parameters.
+///
+/// The sizes mirror the shape of the corresponding `AVFrame` / `AVCodecContext`
+/// field, which is why they keep FFmpeg's `int` width (`i32`) instead of the
+/// `u32` used by the high-level API ([`EncoderBuilder`](crate::EncoderBuilder),
+/// [`MediaFrame`](crate::MediaFrame)). This mirror layer is the **only** place
+/// in the crate that deliberately keeps `i32` sizes. The rational parameters,
+/// by contrast, are plain [`Rational`] values — FFmpeg's `AVRational` never
+/// appears outside [`crate::time`].
 #[derive(Debug, Clone)]
 pub struct VideoParams {
+    /// Frame width in pixels, mirroring FFmpeg's `int`.
     pub width: i32,
+    /// Frame height in pixels, mirroring FFmpeg's `int`.
     pub height: i32,
     /// 滤镜图**输出**（sink）像素格式：编码器协商格式。
     pub format: PixelFormat,
@@ -1469,9 +1849,12 @@ pub struct VideoParams {
     /// 编码/解码两条流水线都把它设为声明的格式，并在进图前把帧转成同一格式；
     /// src→sink 的格式转换由滤镜图内完成。
     pub src_format: PixelFormat,
-    pub time_base: ffi::AVRational,
-    pub frame_rate: ffi::AVRational,
-    pub pixel_aspect: ffi::AVRational,
+    /// 输入时间基。
+    pub time_base: Rational,
+    /// 帧率。
+    pub frame_rate: Rational,
+    /// 像素宽高比；[`Rational::ZERO`] 表示未知。
+    pub pixel_aspect: Rational,
 }
 
 /// 音频过滤器参数
@@ -1485,7 +1868,8 @@ pub struct AudioParams {
     /// 声明了不同的输入格式（[`Filter::with_input_format`]）时，由编码器/
     /// 解码器侧设置为声明的格式，src→sink 的格式转换由图内滤镜完成。
     pub src_format: SampleFormat,
-    pub time_base: ffi::AVRational,
+    /// 输入时间基（通常为 `1 / sample_rate`）。
+    pub time_base: Rational,
 }
 
 /// 滤镜图端点（`buffer`/`abuffer` 源，或 `buffersink`/`abuffersink` 汇）的格式声明。
@@ -1524,21 +1908,25 @@ impl From<AudioEndpoint> for Endpoint {
     }
 }
 
-/// 视频端点的格式声明。
+/// Format declaration for a video endpoint.
+///
+/// Like [`VideoParams`], the sizes mirror FFmpeg's own field shapes and stay
+/// `i32` (FFmpeg's `int`) while the high-level API uses `u32`; the rational
+/// fields are plain [`Rational`].
 #[derive(Debug, Clone, Copy)]
 pub struct VideoEndpoint {
-    /// 像素宽。
+    /// Width in pixels
     pub width: i32,
-    /// 像素高。
+    /// Height in pixels
     pub height: i32,
     /// 像素格式。
     pub format: PixelFormat,
     /// 时间基。同一张图内各路输入应当一致，否则画面会错位。
-    pub time_base: ffi::AVRational,
+    pub time_base: Rational,
     /// 帧率。
-    pub frame_rate: ffi::AVRational,
+    pub frame_rate: Rational,
     /// 像素宽高比。
-    pub pixel_aspect: ffi::AVRational,
+    pub pixel_aspect: Rational,
 }
 
 impl VideoEndpoint {
@@ -1547,8 +1935,8 @@ impl VideoEndpoint {
         width: i32,
         height: i32,
         format: PixelFormat,
-        time_base: ffi::AVRational,
-        frame_rate: ffi::AVRational,
+        time_base: Rational,
+        frame_rate: Rational,
     ) -> Self {
         Self {
             width,
@@ -1556,12 +1944,12 @@ impl VideoEndpoint {
             format,
             time_base,
             frame_rate,
-            pixel_aspect: ffi::AVRational { num: 1, den: 1 },
+            pixel_aspect: Rational::ONE,
         }
     }
 
     /// 覆盖像素宽高比。
-    pub fn with_pixel_aspect(mut self, pixel_aspect: ffi::AVRational) -> Self {
+    pub fn with_pixel_aspect(mut self, pixel_aspect: Rational) -> Self {
         self.pixel_aspect = pixel_aspect;
         self
     }
@@ -1577,7 +1965,7 @@ pub struct AudioEndpoint {
     /// 采样格式。
     pub format: SampleFormat,
     /// 时间基。
-    pub time_base: ffi::AVRational,
+    pub time_base: Rational,
 }
 
 impl AudioEndpoint {
@@ -1586,7 +1974,7 @@ impl AudioEndpoint {
         nb_channels: i32,
         sample_rate: i32,
         format: SampleFormat,
-        time_base: ffi::AVRational,
+        time_base: Rational,
     ) -> Self {
         Self {
             nb_channels,
@@ -1660,7 +2048,9 @@ fn invalid_label(label: &str) -> RsmediaError {
 fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
     let filter = get_by_name(name)?;
     if filter.is_none() {
-        return Err(RsmediaError::filter_not_found(name));
+        return Err(RsmediaError::unsupported(format!(
+            "filter '{name}' is not available in this FFmpeg build"
+        )));
     }
     let filter = filter.unwrap();
     // SAFETY: `filter` 指向 FFmpeg 的静态滤镜定义，`avfilter_filter_pad_count` 只读
@@ -1682,7 +2072,9 @@ fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
 fn filter_output_pads(name: &str) -> Result<(usize, bool)> {
     let filter = get_by_name(name)?;
     if filter.is_none() {
-        return Err(RsmediaError::filter_not_found(name));
+        return Err(RsmediaError::unsupported(format!(
+            "filter '{name}' is not available in this FFmpeg build"
+        )));
     }
     let filter = filter.unwrap();
     // SAFETY: 同 `filter_input_pads`，`is_output = 1` 取输出侧。
@@ -1767,7 +2159,10 @@ fn describe_endpoint(endpoint: &Endpoint) -> String {
     match endpoint {
         Endpoint::Video(v) => format!(
             "{}x{} {:?} {}fps",
-            v.width, v.height, v.format, v.frame_rate.num
+            v.width,
+            v.height,
+            v.format,
+            v.frame_rate.num()
         ),
         Endpoint::Audio(a) => format!("{}ch {:?} {}Hz", a.nb_channels, a.format, a.sample_rate),
     }
@@ -1829,7 +2224,8 @@ impl FilterGraph {
     /// 建一张已初始化的滤镜图（`new` + [`init`](Self::init) 的合并入口）。
     ///
     /// 解码与编码两条流水线都用它建图，转义、媒体类型校验、滤镜可用性校验
-    /// （缺失滤镜 → [`FilterNotFound`](crate::RsmediaError::FilterNotFound)）
+    /// （本构建没编入该滤镜 → [`Unsupported`](crate::RsmediaError::Unsupported)，
+    /// 媒体类型不符 → [`InvalidConfig`](crate::RsmediaError::InvalidConfig)）
     /// 因此只有 [`init`](Self::init) 一处实现——调用方不需要在门外再抄一遍这些
     /// 检查，两份检查只会随 FFmpeg 版本漂移。
     pub(crate) fn build(params: &FilterParams, filters: &[Filter]) -> Result<FilterGraph> {
@@ -1840,7 +2236,11 @@ impl FilterGraph {
         Ok(graph)
     }
 
-    /// 主输出（下标 0）是否已 drain（`av_buffersink_get_frame` 返回 `EAGAIN`）。
+    /// 主输出（下标 0）是否正在排空（EOF 已送出，图里还有缓冲帧要出）。
+    ///
+    /// 判据是"EOF 已送到每一路输入"，**不是** `av_buffersink_get_frame` 返回过
+    /// `EAGAIN`：流中段的 `EAGAIN`（还在等其它输入、滤镜缓冲未攒够）不改变状态，
+    /// 否则它在流中段就永久为真（契约见 `state::ProcessState`）。
     pub fn is_drained(&self) -> bool {
         self.is_drained_at(0)
     }
@@ -1865,9 +2265,22 @@ impl FilterGraph {
     /// 滤镜之间靠 `,` 顺序串联，由 FFmpeg 自动接线，因此这一路只接受单输入 /
     /// 单输出滤镜；需要 `overlay` / `amix` 这类多输入滤镜时改用
     /// [`FilterGraphBuilder`]。
+    ///
+    /// `filters` 至少要有**一个**元素：空切片会拼出空描述串，走到 FFmpeg 那里
+    /// 只会得到一句无法定位的解析错误。想要"什么都不做"请显式传一个 `null` 滤镜。
     pub fn init(&mut self, params: &FilterParams, filters: &[Filter]) -> Result<()> {
         if self.is_initialized() {
-            return Err(RsmediaError::msg("Filter graph already initialized"));
+            return Err(RsmediaError::invalid_config(
+                "Filter graph already initialized",
+            ));
+        }
+        if filters.is_empty() {
+            // 空描述串不是"直通"，而是一串解析失败；调用方改传一个滤镜即可 ⇒
+            // 调用方配置问题。
+            return Err(RsmediaError::invalid_config(
+                "filter graph has no filter: init needs at least one, \
+                 pass a `null` filter for a passthrough",
+            ));
         }
         for filter in filters {
             Self::check_filter(filter, params.media_type())?;
@@ -1904,12 +2317,17 @@ impl FilterGraph {
     /// 校验单个滤镜：是否存在于本次构建、媒体类型是否与图一致。
     fn check_filter(filter: &Filter, media_type: MediaType) -> Result<()> {
         // 名字必须是本 FFmpeg 构建里真实存在的滤镜：缺失时在此前置报错，
-        // 而不是等到 parse 阶段返回一句难以定位的字符串错误。
+        // 而不是等到 parse 阶段返回一句难以定位的字符串错误。"这个构建没编入它"
+        // （如 `drawtext` 需要 libfreetype、`subtitles` 需要 libass）是**本构建
+        // 缺能力**而不是调用方配置错 ⇒ `Unsupported`，调用方据此跳过或降级。
         if get_by_name(filter.name())?.is_none() {
-            return Err(RsmediaError::filter_not_found(filter.name()));
+            return Err(RsmediaError::unsupported(format!(
+                "filter '{}' is not available in this FFmpeg build",
+                filter.name()
+            )));
         }
         if filter.media_type() != media_type {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::invalid_config(format!(
                 "Filter '{}' media type mismatch: expected {:?}, got {:?}",
                 filter.name(),
                 media_type,
@@ -1934,15 +2352,17 @@ impl FilterGraph {
             endpoint.width,
             endpoint.height,
             endpoint.format.get_pix_fmt_name(),
-            endpoint.time_base.num,
-            endpoint.time_base.den,
-            endpoint.frame_rate.num,
-            endpoint.frame_rate.den,
-            endpoint.pixel_aspect.num,
-            endpoint.pixel_aspect.den,
+            endpoint.time_base.num(),
+            endpoint.time_base.den(),
+            endpoint.frame_rate.num(),
+            endpoint.frame_rate.den(),
+            endpoint.pixel_aspect.num(),
+            endpoint.pixel_aspect.den(),
         ))?;
 
-        let buffersrc = get_by_name("buffer")?.context("Failed to get video filter 'buffer'.")?;
+        let buffersrc = get_by_name("buffer")?.ok_or_else(|| {
+            RsmediaError::unsupported("filter 'buffer' is not available in this FFmpeg build")
+        })?;
         self.graph
             .create_filter_context(&buffersrc, name, Some(&args))
             .context("Failed to create video buffer source")
@@ -1956,8 +2376,9 @@ impl FilterGraph {
         name: &CStr,
         format: PixelFormat,
     ) -> Result<AVFilterContextMut<'_>> {
-        let buffersink =
-            get_by_name("buffersink")?.context("Failed to get video filter 'buffersink'.")?;
+        let buffersink = get_by_name("buffersink")?.ok_or_else(|| {
+            RsmediaError::unsupported("filter 'buffersink' is not available in this FFmpeg build")
+        })?;
 
         let mut sink_ctx = self
             .graph
@@ -1999,15 +2420,16 @@ impl FilterGraph {
 
         let args = CString::new(format!(
             "time_base={}/{}:sample_rate={}:sample_fmt={}:channel_layout={}",
-            endpoint.time_base.num,
-            endpoint.time_base.den,
+            endpoint.time_base.num(),
+            endpoint.time_base.den(),
             endpoint.sample_rate,
             endpoint.format.get_sample_fmt_name(),
             channel_desc,
         ))?;
 
-        let buffersrc =
-            get_by_name("abuffer")?.context("Failed to get audio filter buffer 'abuffer'.")?;
+        let buffersrc = get_by_name("abuffer")?.ok_or_else(|| {
+            RsmediaError::unsupported("filter 'abuffer' is not available in this FFmpeg build")
+        })?;
         self.graph
             .create_filter_context(&buffersrc, name, Some(&args))
             .context("Failed to create audio buffer source")
@@ -2022,8 +2444,9 @@ impl FilterGraph {
         name: &CStr,
         endpoint: &AudioEndpoint,
     ) -> Result<AVFilterContextMut<'_>> {
-        let buffersink = get_by_name("abuffersink")?
-            .context("Failed to get audio filter buffer 'abuffersink'.")?;
+        let buffersink = get_by_name("abuffersink")?.ok_or_else(|| {
+            RsmediaError::unsupported("filter 'abuffersink' is not available in this FFmpeg build")
+        })?;
 
         let mut sink_ctx = self
             .graph
@@ -2163,7 +2586,7 @@ impl FilterGraph {
     /// `AVERROR_EOF`，所以第二次起直接返回 `Ok(())`。
     pub fn push_frame_to(&mut self, input: usize, frame: Option<AVFrame>) -> Result<()> {
         if !self.is_initialized() {
-            return Err(RsmediaError::msg("Filter graph not initialized"));
+            return Err(RsmediaError::invalid_config("Filter graph not initialized"));
         }
         if input >= self.eof_sent.len() {
             return Err(RsmediaError::invalid_config(format!(
@@ -2185,8 +2608,9 @@ impl FilterGraph {
             .context("Error submitting the frame to the filter graph.")
     }
 
-    /// 从第 `output` 路输出取一帧：`Ok(Some)` 是产出帧，`Ok(None)` 表示暂时无帧
-    /// （图被 drain，该路状态置为 `Drained`）或已到流末尾（状态置为 `Flushed`）。
+    /// 从第 `output` 路输出取一帧：`Ok(Some)` 是产出帧，`Ok(None)` 表示这一刻没有帧
+    /// ——要么图还需要更多输入（`EAGAIN`，状态保持在 `Normal`），要么正在排空
+    /// （EOF 已送出，状态置为 `Drained`）或已到流末尾（状态置为 `Flushed`）。
     pub fn receive_frame_from(&mut self, output: usize) -> Result<Option<AVFrame>> {
         if output >= self.states.len() {
             return Err(RsmediaError::invalid_config(format!(
@@ -2205,8 +2629,18 @@ impl FilterGraph {
         match filter_result {
             Ok(frame) => Ok(Some(frame)),
             Err(rsmpeg::error::RsmpegError::BufferSinkDrainError) => {
-                tracing::debug!("filter graph: buffer sink drain error");
-                self.states[output] = ProcessState::Drained;
+                // `EAGAIN` 只说明**这一刻**没有帧：流中段同样会出现（帧同步类滤镜
+                // 还在等其它输入、滤镜自身的缓冲未攒够），并不等于已经在排空。
+                // 因此只有"EOF 已送到每一路输入"时才推进到 `Drained`——否则多输入图
+                // 里只喂了一路的一次 `EAGAIN` 就会让 `is_drained()` 在流中段永久为真
+                // （契约见 `state::ProcessState`）。
+                if self.eof_sent.iter().all(|sent| *sent) {
+                    self.states[output] = ProcessState::Drained;
+                }
+                tracing::debug!(
+                    "filter graph: output {output} has no frame available (EAGAIN, eof sent: {})",
+                    self.eof_sent.iter().all(|sent| *sent)
+                );
                 Ok(None)
             }
             Err(rsmpeg::error::RsmpegError::BufferSinkEofError) => {
@@ -2236,7 +2670,7 @@ impl FilterGraph {
     /// 给所有输入推 EOF，然后把第 `output` 路输出里缓存的帧全部取出。
     pub fn drain_output(&mut self, output: usize) -> Result<Vec<AVFrame>> {
         if !self.is_initialized() {
-            return Err(RsmediaError::msg("Filter graph not initialized"));
+            return Err(RsmediaError::invalid_config("Filter graph not initialized"));
         }
         if output >= self.states.len() {
             return Err(RsmediaError::invalid_config(format!(
@@ -2343,25 +2777,25 @@ impl FilterGraph {
     }
 
     /// 主输出链路的帧率（`av_buffersink_get_frame_rate`），无滤镜或不可用时返回 `None`。
-    pub fn output_frame_rate(&mut self) -> Option<ffi::AVRational> {
+    pub fn output_frame_rate(&mut self) -> Option<Rational> {
         self.output_frame_rate_at(0)
     }
 
     /// 第 `output` 路输出链路的帧率。
-    pub fn output_frame_rate_at(&mut self, output: usize) -> Option<ffi::AVRational> {
+    pub fn output_frame_rate_at(&mut self, output: usize) -> Option<Rational> {
         let sink = self.get_sink_context(output).ok()?;
-        Some(sink.get_frame_rate())
+        Some(sink.get_frame_rate().into())
     }
 
     /// 主输出链路的时间基（`av_buffersink_get_time_base`），无滤镜或不可用时返回 `None`。
-    pub fn output_time_base(&mut self) -> Option<ffi::AVRational> {
+    pub fn output_time_base(&mut self) -> Option<Rational> {
         self.output_time_base_at(0)
     }
 
     /// 第 `output` 路输出链路的时间基。
-    pub fn output_time_base_at(&mut self, output: usize) -> Option<ffi::AVRational> {
+    pub fn output_time_base_at(&mut self, output: usize) -> Option<Rational> {
         let sink = self.get_sink_context(output).ok()?;
-        Some(sink.get_time_base())
+        Some(sink.get_time_base().into())
     }
 
     /// 主输出链路的尺寸 `(width, height)`（`av_buffersink_get_w/h`），无滤镜或不可用时返回 `None`。
@@ -2373,6 +2807,73 @@ impl FilterGraph {
     pub fn output_size_at(&mut self, output: usize) -> Option<(i32, i32)> {
         let sink = self.get_sink_context(output).ok()?;
         Some((sink.get_w(), sink.get_h()))
+    }
+
+    /// 运行时给图里的滤镜发一条命令（`avfilter_graph_send_command`）。
+    ///
+    /// 图一旦 `build()`，各滤镜的选项就被冻结了；要改一个参数，要么整张图重建
+    /// （断流重连，直播/交互场景不可接受），要么走这条路径。支持 `cmd` 的滤镜会
+    /// 在**处理下一帧时**应用新参数，因此适合调音量、转角度、改文字这类在线调整。
+    ///
+    /// - `target`  —— `"all"` 发给所有滤镜；否则按滤镜名（如 `"volume"`）或滤镜
+    ///   实例名匹配，命中多个就都发。
+    /// - `command` —— 命令名，只能是字母数字（FFmpeg 的硬性要求，见
+    ///   `ffmpeg -h filter=<name>` 的 "Commands" 段）。
+    /// - `arg`     —— 命令参数，语法由滤镜自己定义（如 `volume` 的 `"0.5"`）。
+    ///
+    /// 成功时返回滤镜写回的响应文本（多数滤镜不写，返回空串）。滤镜不认识该命令
+    /// 时 FFmpeg 报 `AVERROR(ENOSYS)`，此处映射为 [`RsmediaError::Unsupported`]；
+    /// 其余失败（target 不存在、参数被拒）保留原始 FFmpeg 错误码。
+    ///
+    /// # Errors
+    ///
+    /// 图尚未 `build()`、`target`/`command`/`arg` 含内部 NUL，或滤镜拒绝了这条
+    /// 命令。
+    pub fn send_command(&mut self, target: &str, command: &str, arg: &str) -> Result<String> {
+        if !self.is_initialized() {
+            return Err(RsmediaError::invalid_config(
+                "Filter graph not initialized; send_command needs a built graph",
+            ));
+        }
+
+        let target_c = strutils::str_to_cstring(target)?;
+        let command_c = strutils::str_to_cstring(command)?;
+        let arg_c = strutils::str_to_cstring(arg)?;
+
+        // FFmpeg 用 av_strlcpy 往 res 里写响应，保证 NUL 结尾；给足 256 字节。
+        // 元素类型跟随平台的 `c_char`（aarch64-linux 是 u8、macOS 与 x86_64 是 i8），
+        // 写死任一种都会在另一种平台上编译不过——binding 的签名就是 `c_char`。
+        let mut res = [0 as std::ffi::c_char; 256];
+        let ret = unsafe {
+            ffi::avfilter_graph_send_command(
+                self.graph.as_mut_ptr(),
+                target_c.as_ptr(),
+                command_c.as_ptr(),
+                arg_c.as_ptr(),
+                res.as_mut_ptr(),
+                res.len() as i32,
+                0,
+            )
+        };
+
+        if ret < 0 {
+            // FFmpeg 文档明确：命令不被支持时返回 AVERROR(ENOSYS)。
+            if ret == -(ffi::ENOSYS as i32) {
+                return Err(RsmediaError::unsupported(format!(
+                    "Filter {target:?} does not implement the command {command:?}; \
+                     see `ffmpeg -h filter=<name>` for the commands it accepts"
+                )));
+            }
+            return Err(RsmediaError::av_error(ret).with_context(format!(
+                "Failed to send command {command:?} to filter {target:?} \
+                 (unknown target, or the filter rejected the argument {arg:?})"
+            )));
+        }
+
+        // res 由 FFmpeg 用 av_strlcpy 写入，保证 NUL 结尾。
+        Ok(strutils::cstr_to_string_lossy(unsafe {
+            CStr::from_ptr(res.as_ptr())
+        }))
     }
 }
 
@@ -2427,13 +2928,13 @@ impl std::fmt::Debug for FilterGraph {
 /// 画中画：主画面 + 右下角小图，输出仍是主画面尺寸。
 ///
 /// ```no_run
-/// use rsmedia::ffmpeg::ffi::AVRational;
+/// use rsmedia::Rational;
 /// use rsmedia::filter::{FilterGraphBuilder, VideoEndpoint};
 /// use rsmedia::PixelFormat;
 ///
 /// # fn main() -> rsmedia::Result<()> {
-/// let tb = AVRational { num: 1, den: 25 };
-/// let fps = AVRational { num: 25, den: 1 };
+/// let tb = Rational::new(1, 25).unwrap();
+/// let fps = Rational::new(25, 1).unwrap();
 /// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps);
 /// // 叠加层不必与主画面同尺寸、同像素格式：FFmpeg 会自动插 scale。
 /// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA, tb, fps);
@@ -2822,12 +3323,12 @@ impl FilterGraphBuilder {
     /// 图输入 0 是基底（`base`）、图输入 1 是叠加层（`over`），唯一的输出是合成结果。
     ///
     /// ```no_run
-    /// # use rsmedia::ffmpeg::ffi::AVRational;
+    /// # use rsmedia::Rational;
     /// # use rsmedia::filter::{FilterGraphBuilder, VideoEndpoint};
     /// # use rsmedia::PixelFormat;
     /// # fn main() -> rsmedia::Result<()> {
-    /// let tb = AVRational { num: 1, den: 25 };
-    /// let fps = AVRational { num: 25, den: 1 };
+    /// let tb = Rational::new(1, 25).unwrap();
+    /// let fps = Rational::new(25, 1).unwrap();
     /// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps);
     /// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA, tb, fps);
     /// let mut graph = FilterGraphBuilder::overlay(main, logo, "W-w-20", "H-h-20", main)?;
@@ -2858,12 +3359,12 @@ impl FilterGraphBuilder {
     /// 是各路宽度之和，`output` 声明的尺寸不同时自动补一个 `scale` 收口。
     ///
     /// ```no_run
-    /// # use rsmedia::ffmpeg::ffi::AVRational;
+    /// # use rsmedia::Rational;
     /// # use rsmedia::filter::{FilterGraphBuilder, VideoEndpoint};
     /// # use rsmedia::PixelFormat;
     /// # fn main() -> rsmedia::Result<()> {
-    /// let tb = AVRational { num: 1, den: 25 };
-    /// let fps = AVRational { num: 25, den: 1 };
+    /// let tb = Rational::new(1, 25).unwrap();
+    /// let fps = Rational::new(25, 1).unwrap();
     /// let left = VideoEndpoint::new(640, 720, PixelFormat::YUV420P, tb, fps);
     /// let right = VideoEndpoint::new(640, 720, PixelFormat::YUV420P, tb, fps);
     /// // 图输入 0 / 1 分别对应 left / right，输出是 1280x720。
@@ -2928,11 +3429,11 @@ impl FilterGraphBuilder {
     /// `duration` 取 `longest`（以最长的一路为准，最常用）、`shortest` 或 `first`。
     ///
     /// ```no_run
-    /// # use rsmedia::ffmpeg::ffi::AVRational;
+    /// # use rsmedia::Rational;
     /// # use rsmedia::filter::{AudioEndpoint, FilterGraphBuilder};
     /// # use rsmedia::SampleFormat;
     /// # fn main() -> rsmedia::Result<()> {
-    /// let tb = AVRational { num: 1, den: 48000 };
+    /// let tb = Rational::new(1, 48000).unwrap();
     /// let voice = AudioEndpoint::new(2, 48000, SampleFormat::FLTP, tb);
     /// let music = AudioEndpoint::new(2, 48000, SampleFormat::FLTP, tb);
     /// let mut graph = FilterGraphBuilder::amix(&[voice, music], "longest", voice)?;
@@ -3073,6 +3574,124 @@ impl FilterGraphBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用的有理数构造：字面量都是常量，失败即写错，直接 `unwrap`。
+    fn rat(num: i32, den: i32) -> Rational {
+        Rational::new(num, den).unwrap()
+    }
+
+    /// D6：可选参数统一为 `impl Into<Option<T>>` 后，"传值"与"不传"两种写法都直接
+    /// 可用 —— 值不需要包 `Some`，`None` 也仍能被推断出正确的类型。这里逐个钉住
+    /// 那些把 `Option<T>` 收窄成 `impl Into<Option<T>>` 的构造器，避免以后有人
+    /// "顺手"改回去。
+    #[test]
+    fn test_optional_arguments_accept_bare_values() {
+        // 值直接传（不用 `Some(...)`）
+        assert!(
+            video::scale(64, 64, "neighbor")
+                .spec()
+                .contains("flags=neighbor")
+        );
+        assert!(
+            video::overlay("0", "0", 0.5f32)
+                .spec()
+                .contains("alpha=0.5")
+        );
+        assert!(
+            video::gif_palette(10.0, "bayer")
+                .spec()
+                .contains("dither=bayer")
+        );
+        assert!(
+            video::curves("color_negative", None::<&str>)
+                .spec()
+                .contains("preset=color_negative")
+        );
+        assert!(
+            video::lutyuv("val+10", None, None)
+                .spec()
+                .contains("y=val+10")
+        );
+        assert!(
+            audio::compressor(4.0, 10.0, 100.0)
+                .unwrap()
+                .spec()
+                .contains("attack=10")
+        );
+        assert!(
+            audio::advanced_fft_denoise(12, -50, "v", true)
+                .spec()
+                .contains("nt=v")
+        );
+        assert!(audio::anlm_denoise(0.001, 7, 15).spec().contains("p=7"));
+        assert!(video::zoompan("1.5", "0", "0", 25).spec().contains("d=25"));
+
+        // 不传值仍然可用
+        assert!(video::scale(64, 64, None).spec().contains("flags=bicubic"));
+        assert_eq!(video::overlay("0", "0", None).spec(), "overlay=x=0:y=0");
+        assert_eq!(video::lutyuv(None, None, None).spec(), "lutyuv");
+        assert_eq!(audio::anlm_denoise(None, None, None).spec(), "anlmdn");
+    }
+
+    /// 批 4：滤镜参数按 `ffmpeg -h filter=<name>` 声明的类型对齐后，**以前写不出来
+    /// 的值现在能写出来**。每条断言都对应一个 FFmpeg 实际接受的域，而不是风格。
+    #[test]
+    fn test_filter_arguments_cover_the_domain_ffmpeg_declares() {
+        // `eq` 的 `brightness`/`contrast` 是 `<string>`（FFmpeg 要求值）：表达式
+        // 可达，不再是"只能传常量"。
+        assert_eq!(
+            video::eq("sin(t)", "1+0.2*sin(t)").spec(),
+            "eq=brightness=sin(t):contrast=1+0.2*sin(t)"
+        );
+        // 常量写法不变，且整数/浮点字面量都能直接传
+        assert_eq!(video::eq(0, 1.0).spec(), "eq=brightness=0:contrast=1");
+
+        // `volume` 的 `<string>` 允许 dB —— 没有哪个数值类型能表达 `"-6dB"`
+        assert_eq!(audio::volume("-6dB").spec(), "volume=-6dB");
+        assert_eq!(audio::volume(0.5).spec(), "volume=0.5");
+
+        // `fps` 的 `<string>` 允许精确有理数：`f32` 表示不出 30000/1001
+        assert_eq!(video::fps("30000/1001").spec(), "fps=30000/1001");
+
+        // `<double>` 选项的分数值：31.5 Hz 是标准 1/3 倍频程中心频率
+        assert_eq!(audio::highpass(31.5).spec(), "highpass=f=31.5");
+        assert_eq!(audio::bass(100, 2.5).spec(), "bass=f=100:g=2.5");
+        // 分数 dB 曾被 `fft_denoise(i32, i32)` 挡在门外
+        assert_eq!(
+            audio::fft_denoise(12.5, -50.5).spec(),
+            "afftdn=nr=12.5:nf=-50.5:nt=w"
+        );
+
+        // `<duration>` 用 `Duration` 表达，与 `f32` 秒的区别是"这是一段时间"
+        assert_eq!(
+            audio::afade("in", Duration::from_millis(1500), Duration::from_secs(1)).spec(),
+            "afade=t=in:st=1.5:d=1"
+        );
+        assert_eq!(
+            trim(
+                MediaType::AUDIO,
+                Duration::from_millis(500),
+                Duration::from_millis(2500)
+            )
+            .spec(),
+            "atrim=start=0.5:end=2.5"
+        );
+    }
+
+    /// 批 4 的 bug 修复：`afftdn.tr` 是 **布尔**（`track_residual`），不是浮点
+    /// 平滑系数。旧实现把 `Option<f32>` 直接格式化成 `tr=0.5`，FFmpeg 会拒绝整条
+    /// 滤镜链（`Unable to parse "tr" option value "0.5" as boolean`）——也就是说
+    /// 只要传了非整数，`advanced_fft_denoise` 就让 `FilterGraph` 建不起来。
+    /// 这里钉住新的输出形态，避免退回"名字像浮点、选项是布尔"的老样子。
+    #[test]
+    fn test_advanced_fft_denoise_emits_a_boolean_for_tr() {
+        let spec = audio::advanced_fft_denoise(12, -50, "v", true).spec();
+        assert!(spec.ends_with(":tr=1"), "{spec}");
+        let spec = audio::advanced_fft_denoise(12, -50, None, false).spec();
+        assert!(spec.ends_with(":tr=0"), "{spec}");
+        // 默认噪声类型仍是 `w`
+        assert!(spec.contains("nt=w"), "{spec}");
+    }
 
     #[test]
     fn test_escape_filter_str() {
@@ -3525,9 +4144,9 @@ mod tests {
             height: h,
             format: PixelFormat::GRAY8,
             src_format: PixelFormat::GRAY8,
-            time_base: ffi::AVRational { num: 1, den: 25 },
-            frame_rate: ffi::AVRational { num: 25, den: 1 },
-            pixel_aspect: ffi::AVRational { num: 1, den: 1 },
+            time_base: rat(1, 25),
+            frame_rate: rat(25, 1),
+            pixel_aspect: Rational::ONE,
         });
         let filter = video::hflip();
 
@@ -3591,18 +4210,14 @@ mod tests {
             sample_rate,
             format: SampleFormat::S16,
             src_format: SampleFormat::FLTP,
-            time_base: ffi::AVRational { num: 1, den: 44100 },
+            time_base: rat(1, 44100),
         });
 
         // aformat 把输入转为 S16（与 sink 约束一致）。
         let mut graph = FilterGraph::new();
         graph.init(
             &params,
-            &[audio::format(
-                channels as u32,
-                sample_rate as u32,
-                SampleFormat::S16,
-            )],
+            &[audio::format(channels, sample_rate, SampleFormat::S16)],
         )?;
 
         let mut frame = AVFrame::new();
@@ -3719,14 +4334,13 @@ mod tests {
         frame
     }
 
+    /// 读 FLTP 帧第 `index` 个采样（单声道，取平面 0）。
+    fn fltp_sample_at(frame: &AVFrame, index: usize) -> f32 {
+        unsafe { *frame.data[0].cast::<f32>().add(index) }
+    }
+
     fn video_endpoint(width: i32, height: i32) -> VideoEndpoint {
-        VideoEndpoint::new(
-            width,
-            height,
-            PixelFormat::YUV420P,
-            ffi::AVRational { num: 1, den: 25 },
-            ffi::AVRational { num: 25, den: 1 },
-        )
+        VideoEndpoint::new(width, height, PixelFormat::YUV420P, rat(1, 25), rat(25, 1))
     }
 
     fn audio_endpoint(sample_rate: i32) -> AudioEndpoint {
@@ -3734,10 +4348,7 @@ mod tests {
             1,
             sample_rate,
             SampleFormat::FLTP,
-            ffi::AVRational {
-                num: 1,
-                den: sample_rate,
-            },
+            Rational::new(1, sample_rate).unwrap(),
         )
     }
 
@@ -3845,6 +4456,89 @@ mod tests {
         Ok(())
     }
 
+    /// `overlay` 的 x/y 是表达式，可能含 `,`（如 `if(eq(a,b),c,d)`）。不转义时
+    /// 这个 `,` 会被图级解析当成滤镜分隔符，报出来的错与真实原因无关；转义后
+    /// 整图必须配置成功，且表达式仍按原意求值。
+    #[test]
+    fn test_overlay_expression_with_comma_is_escaped_and_runs() -> Result<()> {
+        // 基底高 4 → x 取 2，叠加层落在 (2,0)-(3,1)。
+        let expr = "if(eq(main_h,4),2,0)";
+
+        let spec = video::overlay(expr, "0", None).spec();
+        assert!(
+            spec.contains(r"\,"),
+            "comma must stay escaped for the graph-level parse: {spec}"
+        );
+
+        let mut graph = FilterGraphBuilder::overlay(
+            video_endpoint(4, 4),
+            video_endpoint(2, 2),
+            expr,
+            "0",
+            video_endpoint(4, 4),
+        )?;
+        graph.push_frame_to(0, Some(make_yuv420p_frame(4, 4, 0)))?;
+        graph.push_frame_to(1, Some(make_yuv420p_frame(2, 2, 255)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .expect("overlay emits a frame once both inputs have one");
+        for y in 0..4 {
+            for x in 0..4 {
+                let inside = (2..4).contains(&x) && (0..2).contains(&y);
+                assert_eq!(
+                    luma_at(&out, x, y),
+                    if inside { 255 } else { 0 },
+                    "overlay mismatch at ({x},{y}), spec: {spec}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `EAGAIN` 只是"这一刻没帧可取"，不等于已经在排空：`Drained` 的判据是
+    /// **EOF 已送到每一路输入**（见 `state::ProcessState`）。多输入图里只喂了
+    /// 一路时的 `EAGAIN` 若被记成 `Drained`，`is_drained()` 会在流中段永久为真。
+    #[test]
+    fn test_filter_graph_eagain_midstream_is_not_drained() -> Result<()> {
+        let mut graph = FilterGraphBuilder::overlay(
+            video_endpoint(4, 4),
+            video_endpoint(2, 2),
+            "2",
+            "2",
+            video_endpoint(4, 4),
+        )?;
+
+        // 只喂基底：overlay 还在等叠加层，取帧必得 EAGAIN，但这仍是流中段。
+        graph.push_frame_to(0, Some(make_yuv420p_frame(4, 4, 0)))?;
+        assert!(
+            graph.receive_frame_from(0)?.is_none(),
+            "overlay must wait for its second input"
+        );
+        assert!(
+            !graph.is_drained(),
+            "EAGAIN with input still to come is not draining: {graph:?}"
+        );
+        assert!(!graph.is_flushed());
+
+        // 补齐叠加层后必须能出帧——证明上一步只是"暂时没帧"，图仍能继续接收输入。
+        graph.push_frame_to(1, Some(make_yuv420p_frame(2, 2, 255)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .expect("overlay emits a frame once both inputs have one");
+        assert_eq!(luma_at(&out, 2, 2), 255);
+        assert!(!graph.is_drained(), "still mid-stream: {graph:?}");
+
+        // 推完 EOF 才真正进入排空，直至流末尾。
+        graph.push_frame_to(0, None)?;
+        graph.push_frame_to(1, None)?;
+        graph.drain_output(0)?;
+        assert!(
+            graph.is_flushed(),
+            "after EOF the graph must end up flushed: {graph:?}"
+        );
+        Ok(())
+    }
+
     /// `concat`：按输入顺序首尾相接——前两帧来自输入 0、后两帧来自输入 1。
     #[test]
     fn test_filter_graph_builder_concat_order() -> Result<()> {
@@ -3901,6 +4595,76 @@ mod tests {
             frames.iter().all(|frame| frame.sample_rate == 48000),
             "sample rate preserved"
         );
+        Ok(())
+    }
+
+    /// `send_command`：图一旦建成，滤镜选项就被冻结，运行时调参只能走命令通道。
+    ///
+    /// `volume` 的 `volume` 命令改的是增益表达式，而表达式要**逐帧求值**才会作用到
+    /// 后续帧（`eval=frame`）——默认 `eval=once` 只在初始化时算一次，改了表达式也
+    /// 不会重算。这里显式带上 `eval=frame`，用幅度 0.5 的帧验证 1.0 → 0.1 的衰减。
+    #[test]
+    fn test_filter_graph_send_command_changes_volume() -> Result<()> {
+        let endpoint = audio_endpoint(48000);
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("src", endpoint);
+        builder.add_node(FilterNode::new(Filter::new(
+            "volume",
+            MediaType::AUDIO,
+            "volume=1.0:eval=frame".to_string(),
+        )));
+        builder.add_output_tail(endpoint);
+        let mut graph = builder.build()?;
+
+        // 增益 1.0：输出与输入同幅。
+        graph.push_frame_to(0, Some(make_fltp_frame(48000, 512, 0.5)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .context("volume passes the first frame through")?;
+        let before = fltp_sample_at(&out, 0);
+        assert!(
+            (before - 0.5).abs() < 1e-3,
+            "gain 1.0 must leave the amplitude alone, got {before}"
+        );
+
+        // 运行时把增益改成 0.1，无需重建图。
+        let response = graph.send_command("volume", "volume", "0.1")?;
+        assert!(
+            response.is_empty(),
+            "volume writes no response, got {response:?}"
+        );
+
+        graph.push_frame_to(0, Some(make_fltp_frame(48000, 512, 0.5)))?;
+        let out = graph
+            .receive_frame_from(0)?
+            .context("volume passes the second frame through")?;
+        let after = fltp_sample_at(&out, 0);
+        assert!(
+            (after - 0.05).abs() < 1e-3,
+            "gain 0.1 must attenuate the amplitude to 0.05, got {after}"
+        );
+        Ok(())
+    }
+
+    /// `send_command` 遇到滤镜不认识的命令要报 `Unsupported`（FFmpeg 的 ENOSYS），
+    /// 而不是当作普通 FFmpeg 错误码糊过去——调用方可据此换滤镜或放弃该能力。
+    #[test]
+    fn test_filter_graph_send_command_unknown_command_is_unsupported() -> Result<()> {
+        let endpoint = audio_endpoint(48000);
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("src", endpoint);
+        builder.add_node(FilterNode::new(Filter::new(
+            "volume",
+            MediaType::AUDIO,
+            "volume=1.0:eval=frame".to_string(),
+        )));
+        builder.add_output_tail(endpoint);
+        let mut graph = builder.build()?;
+
+        let err = graph
+            .send_command("volume", "definitelynotacommand", "1")
+            .expect_err("volume does not implement this command");
+        assert!(err.is_unsupported(), "{err}");
         Ok(())
     }
 
@@ -4030,7 +4794,7 @@ mod tests {
             .output_time_base_at(1)
             .expect("output 1 is the audio sink");
         assert_eq!(
-            (audio_tb.num, audio_tb.den),
+            (audio_tb.num(), audio_tb.den()),
             (1, 48000),
             "output 1 must be the audio sink"
         );
@@ -4047,6 +4811,78 @@ mod tests {
             .expect("filtered audio frame from output 1");
         assert_eq!(audio_out.sample_rate, 48000);
         assert_eq!(audio_out.nb_samples, 512);
+        Ok(())
+    }
+
+    /// 缺失的滤镜名报 [`RsmediaError::Unsupported`]（本构建没编入它，如
+    /// `drawtext` 需要 libfreetype ⇒ 调用方只能换构建或换滤镜，跳过/降级即可），
+    /// 且加了 context 之后仍能按变体识别。
+    #[test]
+    fn test_missing_filter_reports_unsupported() -> Result<()> {
+        let params = FilterParams::Video(VideoParams {
+            width: 8,
+            height: 4,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: rat(1, 25),
+            frame_rate: rat(25, 1),
+            pixel_aspect: Rational::ONE,
+        });
+        let filters = vec![Filter::new(
+            "rsmedia_no_such_filter",
+            MediaType::VIDEO,
+            "rsmedia_no_such_filter".to_string(),
+        )];
+
+        let err = FilterGraph::build(&params, &filters).unwrap_err();
+        assert!(
+            err.is_unsupported(),
+            "a filter this build does not have is a capability gap: {err}"
+        );
+        assert!(!err.is_invalid_config(), "{err}");
+        assert!(
+            err.to_string().contains("rsmedia_no_such_filter"),
+            "the message must name the missing filter: {err}"
+        );
+        Ok(())
+    }
+
+    /// 空滤镜列表是**调用方配置错**：拼出的描述串为空，FFmpeg 只会回一句无法定位的
+    /// 解析错误，所以在触到 FFmpeg 之前就报 [`RsmediaError::InvalidConfig`]。
+    /// 同时验证文档给的替代方案——显式传一个 `null` 滤镜做直通——确实建得起图。
+    #[test]
+    fn test_empty_filter_list_is_invalid_config() -> Result<()> {
+        let (w, h) = (8, 4);
+        let params = FilterParams::Video(VideoParams {
+            width: w,
+            height: h,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: rat(1, 25),
+            frame_rate: rat(25, 1),
+            pixel_aspect: Rational::ONE,
+        });
+
+        let err = FilterGraph::build(&params, &[]).unwrap_err();
+        assert!(
+            err.is_invalid_config(),
+            "an empty filter list is the caller's own mistake: {err}"
+        );
+        assert!(!err.is_unsupported(), "{err}");
+        assert!(
+            err.to_string().contains("no filter"),
+            "the message must say what is missing: {err}"
+        );
+
+        // 承诺的替代方案必须真的能用：`null` 直通建图，并原样放行一帧。
+        let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
+        let mut graph = FilterGraph::build(&params, &[null])?;
+        let out = graph
+            .process_frame(Some(make_gray8_frame(w, h)))?
+            .expect("a passthrough yields one frame per input frame");
+        assert_eq!((out.width, out.height), (w, h));
+        assert!(graph.process_frame(None)?.is_none());
+
         Ok(())
     }
 

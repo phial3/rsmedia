@@ -44,6 +44,41 @@ fn set_hwframe_ctx(
     Ok(())
 }
 
+/// Writes `frames` frames of synthetic NV12 (luma ramp + neutral chroma) as raw
+/// planes — the exact layout [`hw_encode`] reads back.
+///
+/// The upstream example consumes a checked-in `bear.yuv`, which this repo does
+/// not ship; the resulting `ENOENT` made all three hardware tests unrunnable
+/// even on a machine that has the device. Generating the input instead keeps
+/// the tests faithful to the example while depending on nothing but a device.
+fn write_nv12_input(path: &Path, width: i32, height: i32, frames: usize) -> Result<()> {
+    let (w, h) = (width as usize, height as usize);
+    let mut file = File::create(path).context("Fail to create input file")?;
+    let uv = vec![128u8; w * h / 2];
+    for frame in 0..frames {
+        let mut y = vec![0u8; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                // Diagonal ramp that shifts per frame, so no two frames are equal.
+                y[row * w + col] = ((col + row + frame * 8) % 256) as u8;
+            }
+        }
+        file.write_all(&y).context("Write Y failed.")?;
+        file.write_all(&uv).context("Write UV failed.")?;
+    }
+    Ok(())
+}
+
+/// The output of a hardware encode must actually be there: without this the tests
+/// only prove the calls did not error — the "writes it, never checks it" pattern
+/// that let the missing input asset go unnoticed.
+fn assert_output_non_empty(path: &Path) {
+    let len = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("no output at {path:?}: {e}"))
+        .len();
+    assert!(len > 0, "encoder produced an empty file: {path:?}");
+}
+
 fn encode_write(
     avctx: &mut AVCodecContext,
     frame: Option<&AVFrame>,
@@ -151,21 +186,24 @@ fn hw_encode(config: &HwEncodeConfig<'_>) -> Result<()> {
 }
 
 #[test]
-#[ignore = "Github actions doesn't have vaapi device"]
+#[ignore = "requires a real VAAPI device (CI runners have none)"]
 fn vaapi_encode_test_vaapi() {
-    // Produced by ffmpeg -i assets/mp4.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
+    let (width, height) = (320, 180);
+    let input = test_output_path("vaapi_encode", "input.yuv");
+    write_nv12_input(&input, width, height, 8).unwrap();
     let output_path = test_output_path("vaapi_encode", "vaapi_encode_test_vaapi.h264");
     hw_encode(&HwEncodeConfig {
-        input: Path::new("tests/assets/vids/bear.yuv"),
+        input: &input,
         output: &output_path,
-        width: 320,
-        height: 180,
+        width,
+        height,
         encode_codec: c"h264_vaapi",
         device_type: AV_HWDEVICE_TYPE_VAAPI,
         hw_format: AV_PIX_FMT_VAAPI,
         sw_format: AV_PIX_FMT_NV12,
     })
     .unwrap();
+    assert_output_non_empty(&output_path);
 }
 
 /// You should test this with nvenc enabled in compilation(e.g. utils/linux_ffmpeg.rs) https://trac.ffmpeg.org/wiki/HWAccelIntro#NVENC
@@ -177,37 +215,43 @@ fn vaapi_encode_test_vaapi() {
 /// - device_type:  AV_HWDEVICE_TYPE_CUDA for nvenc,    AV_HWDEVICE_TYPE_VAAPI for vaapi
 /// - hw_format:    AV_PIX_FMT_CUDA for nvenc,          AV_PIX_FMT_VAAPI for vaapi
 #[test]
-#[ignore = "Github actions doesn't have nvdia graphics card"]
+#[ignore = "requires an NVIDIA GPU (CI runners have none)"]
 fn nvenc_encode_test_nvenc() {
-    // Produced by ffmpeg -i assets/mp4.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
+    let (width, height) = (320, 180);
+    let input = test_output_path("nvenc_encode", "input.yuv");
+    write_nv12_input(&input, width, height, 8).unwrap();
     let output_path = test_output_path("nvenc_encode", "nvenc_encode_test_nvenc.h264");
     hw_encode(&HwEncodeConfig {
-        input: Path::new("tests/assets/vids/bear.yuv"),
+        input: &input,
         output: &output_path,
-        width: 320,
-        height: 180,
+        width,
+        height,
         encode_codec: c"h264_nvenc",
         device_type: AV_HWDEVICE_TYPE_CUDA,
         hw_format: AV_PIX_FMT_CUDA,
         sw_format: AV_PIX_FMT_NV12,
     })
     .unwrap();
+    assert_output_non_empty(&output_path);
 }
 
 #[test]
-#[ignore = "Github actions doesn't have macOS videotoolbox graphics card"]
+#[ignore = "requires a machine with working VideoToolbox (CI runners have none)"]
 fn toolbox_encode_test_videotoolbox() {
-    // Produced by ffmpeg -i assets/mp4.mp4 -pix_fmt nv12 tests/assets/vids/bear.yuv
+    let (width, height) = (320, 180);
+    let input = test_output_path("toolbox_encode", "input.yuv");
+    write_nv12_input(&input, width, height, 8).unwrap();
     let output_path = test_output_path("toolbox_encode", "toolbox_encode_test_h264.h264");
     hw_encode(&HwEncodeConfig {
-        input: Path::new("tests/assets/vids/bear.yuv"),
+        input: &input,
         output: &output_path,
-        width: 320,
-        height: 180,
+        width,
+        height,
         encode_codec: c"h264_videotoolbox",
         device_type: AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
         hw_format: AV_PIX_FMT_VIDEOTOOLBOX,
         sw_format: AV_PIX_FMT_NV12,
     })
     .unwrap();
+    assert_output_non_empty(&output_path);
 }

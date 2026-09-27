@@ -98,6 +98,6 @@ mod tests {
 
     #[test]
     fn tutorial01_test() {
-        dump_frame(c"assets/mp4.mp4", "tests/output/tutorial01/mp4").unwrap();
+        dump_frame(c"assets/mp4.mp4", "output/tutorial01/mp4").unwrap();
     }
 }

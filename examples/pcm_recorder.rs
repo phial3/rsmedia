@@ -11,7 +11,7 @@
 //!
 //! 用法：
 //! ```text
-//! cargo run --example pcm_recorder                    # 录 10s -> tests/output/pcm/cpal_recording.m4a
+//! cargo run --example pcm_recorder                    # 录 10s -> output/pcm/cpal_recording.m4a
 //! cargo run --example pcm_recorder -- out.m4a 30      # 指定输出文件与最长秒数
 //! ```
 //!
@@ -64,7 +64,7 @@ fn main() -> Result<()> {
     let output = args
         .next()
         .map(PathBuf::from)
-        .unwrap_or_else(default_output);
+        .unwrap_or_else(|| PathBuf::from("output/pcm/cpal_recording.m4a"));
     let seconds: u64 = args.next().map(|s| s.parse()).transpose()?.unwrap_or(10);
 
     if let Some(dir) = output.parent() {
@@ -89,7 +89,11 @@ fn main() -> Result<()> {
     let encoder = Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
     let mut muxer = Muxer::new(&output)?;
     let audio_index = muxer.add_encoder(encoder)?;
-    let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels))?;
+    let mut sink = PcmSink::new(
+        muxer,
+        audio_index,
+        PcmSpec::new(rate as i32, channels as i32),
+    )?;
 
     // ---- cpal 侧：音频回调线程 --mpsc--> 主线程（PcmSink 非线程安全，留在主线程）----
     let (chunk_tx, chunk_rx) = mpsc::channel::<Chunk>();
@@ -199,10 +203,6 @@ where
     )?)
 }
 
-fn default_output() -> PathBuf {
-    PathBuf::from("tests/output/pcm/cpal_recording.m4a")
-}
-
 fn playback(path: &Path) -> Result<()> {
     let device_sink = rodio::DeviceSinkBuilder::open_default_sink()?;
     let player = rodio::Player::connect_new(device_sink.mixer());
@@ -230,7 +230,7 @@ mod tests {
     /// 无需麦克风 —— 用合成正弦 PCM 代替录音输入。
     #[test]
     fn test_recorded_m4a_recognized_by_rodio() -> Result<()> {
-        let output = PathBuf::from("tests/output/pcm/rodio_check.m4a");
+        let output = PathBuf::from("output/pcm/rodio_check.m4a");
         std::fs::create_dir_all(output.parent().unwrap())?;
         let _ = std::fs::remove_file(&output);
 
@@ -239,7 +239,11 @@ mod tests {
             Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
         let mut muxer = Muxer::new(&output)?;
         let audio_index = muxer.add_encoder(encoder)?;
-        let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels))?;
+        let mut sink = PcmSink::new(
+            muxer,
+            audio_index,
+            PcmSpec::new(rate as i32, channels as i32),
+        )?;
 
         // 1 秒 440Hz 正弦，模拟 cpal 回调块粒度
         let total = rate as usize;

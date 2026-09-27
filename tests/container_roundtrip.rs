@@ -15,6 +15,12 @@
 //! platform; at least one container must round-trip, so an environment where
 //! nothing works cannot pass silently.
 //!
+//! Every row is written **and** read back — a container that is only encoded
+//! proves nothing about the round trip, so there is no "write-only" row: the
+//! extension a caller would use (`.wmv`, `.m4v`, `.m4p`, …) is what gets
+//! exercised, with no explicit format unless FFmpeg cannot guess the container
+//! from the extension at all (see [`ContainerSpec::format`]).
+//!
 //! Requires the `ndarray` feature (frames come from the high-level API).
 
 mod common;
@@ -24,14 +30,15 @@ use std::path::Path;
 use rsmedia::strutils;
 use rsmedia::{
     CodecConfig, DecoderBuilder, ElementType, EncoderBuilder, MediaType, Muxer, Reader, Result,
-    RsmediaError, SampleFormat, StreamReader, SubtitleSegment,
+    RsmediaError, SampleFormat, StreamReader, StreamReaderBuilder, StreamWriter,
+    StreamWriterBuilder, SubtitleSegment,
 };
 use rsmpeg::avcodec::AVCodec;
 use rsmpeg::avutil::AVMediaType;
 use rsmpeg::ffi;
 
-const WIDTH: usize = 320;
-const HEIGHT: usize = 240;
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 240;
 const FPS: f32 = 25.0;
 /// 0.4 s of video — long enough to decode a real sequence, short enough to keep
 /// the whole matrix fast.
@@ -40,7 +47,7 @@ const VIDEO_FRAMES: i64 = 10;
 /// lot (AAC 1024 samples, FLAC 4608), so counting frames would give a 0.23 s
 /// file for one container and a 1.05 s file for the next.
 const AUDIO_SECONDS: f64 = 0.4;
-const CHANNELS: u32 = 2;
+const CHANNELS: i32 = 2;
 /// Both cues live inside the video's duration.
 const CUES: [(i64, i64, &str); 2] = [
     (0, 150, "first cue"),
@@ -53,12 +60,21 @@ const SUBTITLE_HEADER: &str = "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]
 struct ContainerSpec {
     /// Extension, which also picks the muxer.
     name: &'static str,
+    /// Muxer/demuxer name to pin when the extension alone is not enough.
+    ///
+    /// FFmpeg guesses the container from the extension, and one extension this
+    /// matrix covers is registered with no muxer at all: `.m4p` (Apple's
+    /// audio-typed MPEG-4) is only a *suffix* of the `mov,mp4,…` format, so
+    /// `Muxer::new("x.m4p")` finds nothing to write with. Spelling the format
+    /// out on both sides — the same `with_format` the streaming builders expose
+    /// — is what a caller has to do for it, so the matrix does it too.
+    format: Option<&'static str>,
     /// Encoder names; `None` = the container cannot carry that stream kind.
     video: Option<&'static str>,
     audio: Option<&'static str>,
     subtitle: Option<&'static str>,
     /// Audio sample rate: the Opus and AC-3 families are fixed at 48 kHz.
-    sample_rate: u32,
+    sample_rate: i32,
     /// Raw elementary stream: the output format has no global-header concept, so
     /// the encoder must keep its parameter sets in-band. The builder *guesses*
     /// `AV_CODEC_FLAG_GLOBAL_HEADER` by default (right for containers, wrong
@@ -71,10 +87,11 @@ const fn spec(
     video: Option<&'static str>,
     audio: Option<&'static str>,
     subtitle: Option<&'static str>,
-    sample_rate: u32,
+    sample_rate: i32,
 ) -> ContainerSpec {
     ContainerSpec {
         name,
+        format: None,
         video,
         audio,
         subtitle,
@@ -83,10 +100,51 @@ const fn spec(
     }
 }
 
+/// A container FFmpeg cannot guess from its extension: `format` names the
+/// muxer/demuxer explicitly (see [`ContainerSpec::format`]).
+const fn spec_as(
+    name: &'static str,
+    format: &'static str,
+    video: Option<&'static str>,
+    audio: Option<&'static str>,
+    subtitle: Option<&'static str>,
+    sample_rate: i32,
+) -> ContainerSpec {
+    ContainerSpec {
+        name,
+        format: Some(format),
+        video,
+        audio,
+        subtitle,
+        sample_rate,
+        raw: false,
+    }
+}
+
+impl ContainerSpec {
+    /// Opens `path` for reading, pinning the format when the extension is not
+    /// enough for FFmpeg to guess it.
+    fn reader(&self, path: &Path) -> Result<StreamReader> {
+        match self.format {
+            Some(format) => StreamReaderBuilder::new(path).with_format(format).build(),
+            None => StreamReader::new(path),
+        }
+    }
+
+    /// Opens `path` for writing, same rule as [`Self::reader`].
+    fn writer(&self, path: &Path) -> Result<StreamWriter> {
+        match self.format {
+            Some(format) => StreamWriterBuilder::new(path).with_format(format).build(),
+            None => StreamWriter::new(path),
+        }
+    }
+}
+
 /// A bare elementary stream (`.h264`, `.h265`): video only, no global header.
 const fn raw_spec(name: &'static str, video: &'static str) -> ContainerSpec {
     ContainerSpec {
         name,
+        format: None,
         video: Some(video),
         audio: None,
         subtitle: None,
@@ -118,9 +176,19 @@ const CONTAINERS: &[ContainerSpec] = &[
     spec("ts", Some("libx264"), Some("aac"), None, 44_100),
     spec("flv", Some("libx264"), Some("aac"), None, 44_100),
     spec("avi", Some("libx264"), Some("aac"), None, 44_100),
+    // `.m4v` is not registered with the raw MPEG-4 muxer (that one takes
+    // `mpeg4` video only) — FFmpeg guesses it into the MP4 family, so it
+    // carries the same stream set as `.mp4`.
+    spec("m4v", Some("libx264"), Some("aac"), None, 44_100),
+    // Windows Media: the extensions that name the container outright, rather
+    // than only its audio half (`.wma`).
+    spec("wmv", Some("wmv2"), Some("wmav2"), None, 44_100),
     // MPEG-PS (VCD/DVD-era): mpeg2video + mp2 is its native pairing -- it only
     // accepts mp1/mp2/mp3/pcm_dvd/pcm_s16be/ac3/dts audio.
     spec("mpg", Some("mpeg2video"), Some("mp2"), None, 44_100),
+    // Same muxer as `.mpg`, covered separately because the extension is what
+    // gets guessed here.
+    spec("mpeg", Some("mpeg2video"), Some("mp2"), None, 44_100),
     spec("3gp", Some("libx264"), Some("aac"), None, 44_100),
     // Video only: animation, the lossless intermediate, and raw elementary
     // streams (no container at all -- their `codecpar` carries no pixel format,
@@ -131,6 +199,9 @@ const CONTAINERS: &[ContainerSpec] = &[
     raw_spec("h265", "libx265"),
     // Audio only: lossy, lossless, and uncompressed PCM.
     spec("m4a", None, Some("aac"), None, 44_100),
+    // `.m4p` is the same MPEG-4 audio family as `.m4a`, but FFmpeg registers no
+    // container for the extension, so both directions need `format` pinned.
+    spec_as("m4p", "ipod", None, Some("aac"), None, 44_100),
     spec("aac", None, Some("aac"), None, 44_100),
     spec("mp3", None, Some("libmp3lame"), None, 44_100),
     spec("ogg", None, Some("libopus"), None, 48_000),
@@ -158,6 +229,7 @@ fn codec_id(encoder: &str) -> ffi::AVCodecID {
         "libopus" => ffi::AV_CODEC_ID_OPUS,
         "ac3" => ffi::AV_CODEC_ID_AC3,
         "wmav2" => ffi::AV_CODEC_ID_WMAV2,
+        "wmv2" => ffi::AV_CODEC_ID_WMV2,
         "flac" => ffi::AV_CODEC_ID_FLAC,
         "pcm_s16le" => ffi::AV_CODEC_ID_PCM_S16LE,
         "mov_text" => ffi::AV_CODEC_ID_MOV_TEXT,
@@ -173,10 +245,10 @@ fn codec_id(encoder: &str) -> ffi::AVCodecID {
 /// encoder converts them, but its own format has to be requested correctly or
 /// the builder rejects the configuration. The rate prefers the one the matrix
 /// asks for and falls back to the codec's list (Opus is fixed at 48 kHz).
-fn negotiate_audio(codec: &str, preferred_rate: u32) -> Result<(SampleFormat, u32)> {
+fn negotiate_audio(codec: &str, preferred_rate: i32) -> Result<(SampleFormat, i32)> {
     let Some(encoder) = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(codec)?) else {
-        return Err(RsmediaError::codec_not_found(format!(
-            "encoder {codec} not available in this FFmpeg build"
+        return Err(RsmediaError::unsupported(format!(
+            "encoder '{codec}' is not available in this FFmpeg build"
         )));
     };
     let config = CodecConfig::from_codec(encoder);
@@ -190,9 +262,7 @@ fn negotiate_audio(codec: &str, preferred_rate: u32) -> Result<(SampleFormat, u3
         })?;
 
     let sample_rate = match config.supported_sample_rates()? {
-        Some(rates) if !rates.is_empty() && !rates.contains(&(preferred_rate as i32)) => {
-            rates[0] as u32
-        }
+        Some(rates) if !rates.is_empty() && !rates.contains(&preferred_rate) => rates[0],
         _ => preferred_rate,
     };
 
@@ -205,8 +275,8 @@ struct Written {
     /// codecs re-chunk; lossy ones add padding, hence the tolerance below).
     frame_samples: u32,
     audio_samples: u64,
-    sample_rate: u32,
-    channels: u32,
+    sample_rate: i32,
+    channels: i32,
 }
 
 /// Decodes the audio stream into its **native** element type, returning
@@ -217,8 +287,8 @@ struct Written {
 /// `codecpar().format` announces: AAC and AC-3 come out as `fltp`, MP2 as
 /// `s16p`. [`audio_summary_unified`] covers the other route — asking the decoder
 /// to unify the output, like `with_pix_fmt` does for video.
-fn audio_summary(path: &Path, written: &Written) -> Result<(u64, f32)> {
-    let reader = StreamReader::new(path)?;
+fn audio_summary(path: &Path, spec: &ContainerSpec, written: &Written) -> Result<(u64, f32)> {
+    let reader = spec.reader(path)?;
     let native = reader
         .input()
         .streams()
@@ -228,14 +298,14 @@ fn audio_summary(path: &Path, written: &Written) -> Result<(u64, f32)> {
         .expect("the audio stream was verified present");
 
     match native {
-        SampleFormat::U8 | SampleFormat::U8P => summarize::<u8>(path, written, 128.0, None),
+        SampleFormat::U8 | SampleFormat::U8P => summarize::<u8>(path, spec, written, 128.0, None),
         SampleFormat::S16 | SampleFormat::S16P => {
-            summarize::<i16>(path, written, i16::MAX as f32, None)
+            summarize::<i16>(path, spec, written, i16::MAX as f32, None)
         }
         SampleFormat::S32 | SampleFormat::S32P => {
-            summarize::<i32>(path, written, i32::MAX as f32, None)
+            summarize::<i32>(path, spec, written, i32::MAX as f32, None)
         }
-        SampleFormat::FLT | SampleFormat::FLTP => summarize::<f32>(path, written, 1.0, None),
+        SampleFormat::FLT | SampleFormat::FLTP => summarize::<f32>(path, spec, written, 1.0, None),
         other => Err(RsmediaError::msg(format!(
             "the matrix has no element type for decoded audio format {other:?}"
         ))),
@@ -247,18 +317,23 @@ fn audio_summary(path: &Path, written: &Written) -> Result<(u64, f32)> {
 /// Whatever the codec decodes to natively, `with_sample_fmt` makes the frames
 /// come out as `FLTP`, so `decode::<f32>` works without inspecting
 /// `codecpar().format` first — that is the point of the option.
-fn audio_summary_unified(path: &Path, written: &Written) -> Result<(u64, f32)> {
-    summarize::<f32>(path, written, 1.0, Some(SampleFormat::FLTP))
+fn audio_summary_unified(
+    path: &Path,
+    spec: &ContainerSpec,
+    written: &Written,
+) -> Result<(u64, f32)> {
+    summarize::<f32>(path, spec, written, 1.0, Some(SampleFormat::FLTP))
 }
 
 /// Decodes with `element`, optionally asking the decoder for `sample_fmt`.
 fn summarize<T: ElementType>(
     path: &Path,
+    spec: &ContainerSpec,
     written: &Written,
     full_scale: f32,
     sample_fmt: Option<SampleFormat>,
 ) -> Result<(u64, f32)> {
-    let mut reader = StreamReader::new(path)?;
+    let mut reader = spec.reader(path)?;
     let mut builder = DecoderBuilder::new(MediaType::AUDIO);
     if let Some(sample_fmt) = sample_fmt {
         builder = builder.with_sample_fmt(sample_fmt);
@@ -291,7 +366,7 @@ fn summarize<T: ElementType>(
 
 /// Encodes the stream set `spec` supports into `path`.
 fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
-    let mut muxer = Muxer::new(path)?;
+    let mut muxer = Muxer::new_from_writer(spec.writer(path)?);
 
     let video_index = match spec.video {
         Some(codec) => {
@@ -303,7 +378,7 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
             if spec.raw {
                 builder = builder.with_global_header(false);
             }
-            let encoder = builder.with_codec_name(Some(codec.to_string())).build()?;
+            let encoder = builder.with_codec_name(codec).build()?;
             Some(muxer.add_encoder(encoder)?)
         }
         None => None,
@@ -312,14 +387,9 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
     let (audio_index, frame_samples, sample_rate) = match spec.audio {
         Some(codec) => {
             let (sample_format, sample_rate) = negotiate_audio(codec, spec.sample_rate)?;
-            let encoder = EncoderBuilder::new_audio(
-                128_000,
-                CHANNELS as i32,
-                sample_rate as i32,
-                sample_format,
-            )
-            .with_codec_name(Some(codec.to_string()))
-            .build()?;
+            let encoder = EncoderBuilder::new_audio(128_000, CHANNELS, sample_rate, sample_format)
+                .with_codec_name(codec)
+                .build()?;
             // Fixed-frame-size codecs (AAC 1024, Opus 960, MP3 1152) want exactly
             // this many samples per frame; the rest take whole frames as they come.
             let frame_size = encoder.frame_size();
@@ -340,7 +410,7 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
     let subtitle_index = match spec.subtitle {
         Some(codec) => {
             let encoder = EncoderBuilder::new_subtitle()
-                .with_codec_name(Some(codec.to_string()))
+                .with_codec_name(codec)
                 .with_subtitle_header(SUBTITLE_HEADER)
                 .build()?;
             Some(muxer.add_encoder(encoder)?)
@@ -403,7 +473,7 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
 /// Reads `path` back and asserts it matches `spec` / `written`.
 fn verify_container(path: &Path, spec: &ContainerSpec, written: &Written) -> Result<()> {
     // ---- structure: the container carries exactly the streams that were written ----
-    let reader = StreamReader::new(path)?;
+    let reader = spec.reader(path)?;
     let streams = reader.input().streams();
     let of_type = |is_kind: fn(&AVMediaType) -> bool| {
         streams
@@ -454,7 +524,7 @@ fn verify_container(path: &Path, spec: &ContainerSpec, written: &Written) -> Res
 
     // ---- video: every frame comes back, at the right size, with real pixels ----
     if spec.video.is_some() {
-        let mut reader = StreamReader::new(path)?;
+        let mut reader = spec.reader(path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
         let mut decoded = 0i64;
         while let Some(frame) = decoder.decode_frame(&mut reader)? {
@@ -476,7 +546,7 @@ fn verify_container(path: &Path, spec: &ContainerSpec, written: &Written) -> Res
 
     // ---- audio: rate and channels survive; the samples are really there ----
     if spec.audio.is_some() {
-        let (samples, peak) = audio_summary(path, written)?;
+        let (samples, peak) = audio_summary(path, spec, written)?;
         assert!(
             peak > 0.1,
             "decoded audio looks silent: normalised peak={peak}"
@@ -501,7 +571,7 @@ fn verify_container(path: &Path, spec: &ContainerSpec, written: &Written) -> Res
         // the sample format is converted (FLTP here), so rate, channel count and
         // sample total stay the codec's, and the peak matches up to the scaling
         // factor swr uses (1/32768 rather than 1/i16::MAX).
-        let (unified_samples, unified_peak) = audio_summary_unified(path, written)?;
+        let (unified_samples, unified_peak) = audio_summary_unified(path, spec, written)?;
         assert_eq!(
             unified_samples, samples,
             "unified output changed the decoded sample count"
@@ -514,9 +584,9 @@ fn verify_container(path: &Path, spec: &ContainerSpec, written: &Written) -> Res
 
     // ---- subtitles: text and timing are lossless ----
     if let Some(codec) = spec.subtitle {
-        let mut reader = StreamReader::new(path)?;
+        let mut reader = spec.reader(path)?;
         let mut decoder = DecoderBuilder::new(MediaType::SUBTITLE)
-            .with_codec_name(Some(codec.to_string()))
+            .with_codec_name(codec)
             .build_from_reader(&reader)?;
         let mut decoded = Vec::new();
         while let Some(segment) = decoder.decode_subtitle_segment(&mut reader)? {
@@ -544,21 +614,19 @@ fn roundtrip(spec: &ContainerSpec) -> Result<()> {
     Ok(())
 }
 
-/// A codec missing from the linked FFmpeg build surfaces as `CodecNotFound` —
-/// possibly wrapped in context layers — which is the only condition under
-/// which a container is skipped rather than failed.
-fn is_encoder_unavailable(error: &RsmediaError) -> bool {
-    let mut source: Option<&dyn std::error::Error> = Some(error);
-    while let Some(err) = source {
-        if matches!(
-            err.downcast_ref::<RsmediaError>(),
-            Some(RsmediaError::CodecNotFound(_))
-        ) {
-            return true;
-        }
-        source = err.source();
-    }
-    false
+/// 本构建是否提供该编码器（`negotiate_audio` 与容器遍历据此决定跳过还是失败）。
+fn encoder_available(name: &str) -> bool {
+    std::ffi::CString::new(name)
+        .ok()
+        .is_some_and(|name| AVCodec::find_encoder_by_name(&name).is_some())
+}
+
+/// 本构建是否提供该容器需要的**全部**编码器（缺任一 ⇒ 该容器跳过）。
+fn container_codecs_available(spec: &ContainerSpec) -> bool {
+    [spec.video, spec.audio, spec.subtitle]
+        .into_iter()
+        .flatten()
+        .all(encoder_available)
 }
 
 /// Walks the matrix; a codec missing from this FFmpeg build skips its container,
@@ -570,14 +638,16 @@ fn test_common_containers_roundtrip() {
     let mut failed = Vec::new();
 
     for spec in CONTAINERS {
+        // 本构建缺这个容器需要的编码器 ⇒ 跳过（先探测可用性，而不是靠错误变体判断）。
+        if !container_codecs_available(spec) {
+            println!("SKIP {}: an encoder is not in this FFmpeg build", spec.name);
+            skipped.push(spec.name);
+            continue;
+        }
         match roundtrip(spec) {
             Ok(()) => {
                 println!("{} ok", spec.name);
                 passed.push(spec.name);
-            }
-            Err(error) if is_encoder_unavailable(&error) => {
-                println!("SKIP {}: {error:#}", spec.name);
-                skipped.push(spec.name);
             }
             Err(error) => {
                 println!("FAIL {}: {error:#}", spec.name);

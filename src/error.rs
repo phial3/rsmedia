@@ -8,7 +8,8 @@
 //!
 //! fn handle(res: Result<()>) {
 //!     match res {
-//!         Err(RsmediaError::CodecNotFound(name)) => eprintln!("codec unavailable: {name}"),
+//!         Err(e) if e.is_invalid_config() => eprintln!("fix the call: {e}"),
+//!         Err(e) if e.is_unsupported() => eprintln!("this build cannot do it: {e}"),
 //!         Err(e) => eprintln!("error: {e}"),
 //!         Ok(()) => {}
 //!     }
@@ -26,28 +27,45 @@ pub enum RsmediaError {
     /// Underlying FFmpeg (rsmpeg) error.
     #[error("FFmpeg error: {0}")]
     FFmpeg(#[from] RsmpegError),
-    /// I/O error, typically from custom AVIO callbacks or file access.
+
+    /// An I/O error from the caller's own file/stream code (including this crate's
+    /// tests), so `?` on a [`std::io::Result`] inside a function returning
+    /// [`Result`] just works.
+    ///
+    /// rsmedia's custom AVIO callbacks do **not** produce this: they translate
+    /// backend failures into the FFmpeg error code `AVERROR(EIO)` and log the
+    /// original error (see `io.rs`), so failures while reading/writing media
+    /// surface as [`RsmediaError::FFmpeg`].
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// The requested codec/encoder/decoder does not exist in this FFmpeg build.
-    #[error("codec not found in this FFmpeg build: '{0}'")]
-    CodecNotFound(String),
-    /// The requested container format does not exist in this FFmpeg build.
-    #[error("format not found in this FFmpeg build: '{0}'")]
-    FormatNotFound(String),
-    /// The requested filter does not exist in this FFmpeg build (e.g. `drawtext`
-    /// needs libfreetype, `subtitles` needs libass).
-    #[error("filter not found in this FFmpeg build: '{0}'")]
-    FilterNotFound(String),
-    /// The operation is not supported on this platform, build or codec.
+
+    /// The requested operation cannot be carried out here — because of this build
+    /// (a codec, filter or bitstream filter it was not compiled with), this
+    /// platform (no usable hardware device), or data this crate does not handle
+    /// (a decoded frame in an unmodelled pixel/sample format).
+    ///
+    /// Distinguishing this from [`RsmediaError::InvalidConfig`] matters: an
+    /// unsupported request is not the caller's mistake, so it can be handled by
+    /// skipping or degrading gracefully (see [`Self::is_unsupported`]) — a missing
+    /// encoder is exactly the case a test matrix wants to skip, not to fail on.
+    /// Build these with [`Self::unsupported`], which documents the shared wording.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
-    /// Invalid or contradictory configuration.
+
+    /// Invalid or contradictory configuration, or an API used in the wrong order
+    /// (writing after the trailer, adding a stream after the header was written,
+    /// two sources for the same setting, …). Always a caller-side mistake: the
+    /// call itself has to change.
+    ///
+    /// A requested codec/filter name this FFmpeg build was **not compiled with**
+    /// is *not* this variant — see [`RsmediaError::Unsupported`].
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+
     /// Any other error with a human readable message.
     #[error("{0}")]
     Other(String),
+
     /// An opaque error bubbled up from a third-party dependency (ndarray,
     /// yuv, …) with its original source preserved.
     ///
@@ -56,6 +74,7 @@ pub enum RsmediaError {
     /// eyre users.
     #[error("{0}")]
     External(#[source] Box<dyn StdError + Send + Sync + 'static>),
+
     /// An error with additional context attached (produced by [`Context`]).
     #[error("{context}: {source}")]
     Context {
@@ -85,27 +104,54 @@ impl RsmediaError {
         }
     }
 
-    /// Build an [`RsmediaError::Other`] from any displayable value.
+    /// Build an [`RsmediaError::Other`] from a human-readable message.
     pub fn msg(msg: impl Into<String>) -> Self {
         RsmediaError::Other(msg.into())
     }
 
-    /// Build an [`RsmediaError::CodecNotFound`].
-    pub fn codec_not_found(name: impl Into<String>) -> Self {
-        RsmediaError::CodecNotFound(name.into())
+    /// Build an [`RsmediaError::FFmpeg`] from a raw FFmpeg return code.
+    ///
+    /// FFmpeg APIs report failure as a negative `AVERROR(...)` code, and that
+    /// code carries more information than any hand-written message: its
+    /// `Display` renders the code **and** `av_strerror`'s text, e.g.
+    /// `AVERROR(-22): 'Invalid argument'`.
+    ///
+    /// Prefer this over splicing the number into a string
+    /// (`msg(format!("... failed: {ret}"))`), which leaves the caller with a
+    /// bare `-22` and no type. Attach what failed with
+    /// [`RsmediaError::with_context`], which keeps the code reachable:
+    ///
+    /// ```
+    /// use rsmedia::RsmediaError;
+    /// let err = RsmediaError::av_error(-22).with_context("Failed to fill plane sizes");
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "Failed to fill plane sizes: FFmpeg error: AVERROR(-22): `Invalid argument`"
+    /// );
+    /// ```
+    pub fn av_error(code: std::os::raw::c_int) -> Self {
+        RsmediaError::FFmpeg(RsmpegError::AVError(code))
     }
 
-    /// Build an [`RsmediaError::FormatNotFound`].
-    pub fn format_not_found(name: impl Into<String>) -> Self {
-        RsmediaError::FormatNotFound(name.into())
-    }
-
-    /// Build an [`RsmediaError::FilterNotFound`].
-    pub fn filter_not_found(name: impl Into<String>) -> Self {
-        RsmediaError::FilterNotFound(name.into())
-    }
-
-    /// Build an [`RsmediaError::Unsupported`].
+    /// Build an [`RsmediaError::Unsupported`] — the operation cannot be carried
+    /// out *here* (this build, this platform, or data this crate does not model),
+    /// unlike [`RsmediaError::invalid_config`], where the call itself has to change.
+    /// ```
+    /// use rsmedia::RsmediaError;
+    ///
+    /// let err = RsmediaError::unsupported(format!(
+    ///     "encoder 'libwebp' is not available in this FFmpeg build"
+    /// ));
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "unsupported operation: encoder 'libwebp' is not available in this FFmpeg build"
+    /// );
+    /// assert!(err.is_unsupported());
+    /// ```
+    ///
+    /// The caller cannot make `find_encoder_by_name("libwebp")` succeed by
+    /// rearranging their own call; only a different build (or a different codec)
+    /// can, which is what [`Self::is_unsupported`] lets them react to.
     pub fn unsupported(reason: impl Into<String>) -> Self {
         RsmediaError::Unsupported(reason.into())
     }
@@ -118,7 +164,7 @@ impl RsmediaError {
     /// Peel off all [`Context`] wrappers and return the root error, so callers
     /// can match on the originating variant even when the error passed through
     /// several `context(...)` layers.
-    pub fn root(&self) -> &Self {
+    pub(crate) fn root(&self) -> &Self {
         let mut current = self;
         while let RsmediaError::Context { source, .. } = current {
             current = source;
@@ -126,37 +172,18 @@ impl RsmediaError {
         current
     }
 
-    /// Whether the root cause is a codec/encoder/decoder missing from this
-    /// FFmpeg build ([`RsmediaError::CodecNotFound`]) — e.g. a distro build
-    /// without libx264. Use this to skip gracefully instead of matching
-    /// error strings.
-    pub fn is_codec_not_found(&self) -> bool {
-        matches!(self.root(), RsmediaError::CodecNotFound(_))
-    }
-
-    /// Whether the root cause is a container format missing from this FFmpeg
-    /// build ([`RsmediaError::FormatNotFound`]).
-    pub fn is_format_not_found(&self) -> bool {
-        matches!(self.root(), RsmediaError::FormatNotFound(_))
-    }
-
-    /// Whether the root cause is an FFmpeg filter missing from this FFmpeg build
-    /// ([`RsmediaError::FilterNotFound`]) — e.g. a build without libfreetype
-    /// (`drawtext`) or without libass (`subtitles`). Use this to skip gracefully
-    /// instead of matching error strings.
-    pub fn is_filter_not_found(&self) -> bool {
-        matches!(self.root(), RsmediaError::FilterNotFound(_))
-    }
-
-    /// Whether the root cause is an operation unsupported on this platform,
-    /// build or environment ([`RsmediaError::Unsupported`]) — e.g. no GPU
-    /// device is available.
+    /// Whether the root cause is an unsupported request — this build, platform or
+    /// the input data cannot do what was asked ([`RsmediaError::Unsupported`]),
+    /// e.g. an encoder this FFmpeg build was not compiled with, no usable hardware
+    /// device, or a decoded frame in an unmodelled format.
+    /// Use this to skip or degrade gracefully instead of matching error strings.
     pub fn is_unsupported(&self) -> bool {
         matches!(self.root(), RsmediaError::Unsupported(_))
     }
 
-    /// Whether the root cause is an invalid or contradictory configuration
-    /// ([`RsmediaError::InvalidConfig`]).
+    /// Whether the root cause is invalid configuration or an API used in the
+    /// wrong order ([`RsmediaError::InvalidConfig`]) — i.e. the caller has to fix
+    /// the call, retrying unchanged will not help.
     pub fn is_invalid_config(&self) -> bool {
         matches!(self.root(), RsmediaError::InvalidConfig(_))
     }
@@ -198,15 +225,6 @@ impl From<image::ImageError> for RsmediaError {
 /// Library-level `Result` alias used by all public APIs.
 pub type Result<T> = std::result::Result<T, RsmediaError>;
 
-/// Internal convenience macro: build an [`RsmediaError::Other`] with
-/// `format!`-style arguments (migrates `anyhow!` call sites).
-macro_rules! format_err {
-    ($($arg:tt)*) => {
-        $crate::error::RsmediaError::Other(format!($($arg)*))
-    };
-}
-pub(crate) use format_err;
-
 /// A drop-in replacement for `anyhow::Context`, implemented for `Option` and
 /// `Result` whose error converts into [`RsmediaError`].
 pub trait Context<T> {
@@ -247,21 +265,35 @@ mod tests {
     #[test]
     fn test_display_variants() {
         assert_eq!(
-            RsmediaError::codec_not_found("libx265").to_string(),
-            "codec not found in this FFmpeg build: 'libx265'"
-        );
-        assert_eq!(
-            RsmediaError::format_not_found("mkv").to_string(),
-            "format not found in this FFmpeg build: 'mkv'"
-        );
-        assert_eq!(
-            RsmediaError::filter_not_found("drawtext").to_string(),
-            "filter not found in this FFmpeg build: 'drawtext'"
-        );
-        assert_eq!(
             RsmediaError::unsupported("qsv on this platform").to_string(),
             "unsupported operation: qsv on this platform"
         );
+        assert_eq!(
+            RsmediaError::invalid_config("trailer already written").to_string(),
+            "invalid configuration: trailer already written"
+        );
+        assert_eq!(RsmediaError::msg("boom").to_string(), "boom");
+    }
+
+    /// `av_error` 必须同时保住**返回码本身**和 `av_strerror` 的文本——这正是它
+    /// 相对「把返回码拼进消息字符串」的价值，也是本 crate 里 FFmpeg 调用失败的
+    /// 唯一上报方式。加了 context 之后根因仍须是 `FFmpeg(AVError)`。
+    #[test]
+    fn test_av_error_keeps_code_and_text() {
+        let err = RsmediaError::av_error(-22).with_context("Failed to fill plane sizes");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("Failed to fill plane sizes: FFmpeg error: AVERROR(-22)"),
+            "the failing call must be named and the code kept: {rendered}"
+        );
+        assert!(
+            rendered.contains("Invalid argument"),
+            "the code must be rendered through av_strerror, not left as a bare number: {rendered}"
+        );
+        match err.root() {
+            RsmediaError::FFmpeg(RsmpegError::AVError(code)) => assert_eq!(*code, -22),
+            other => panic!("root must stay FFmpeg(AVError), got {other:?}"),
+        }
     }
 
     #[test]
@@ -296,23 +328,9 @@ mod tests {
         assert_eq!(wrapped.to_string(), "outermost: outer: inner failure");
     }
 
-    /// 每个 `is_*` 谓词都要认出自己的变体，且**穿透 context 链**识别根因——
-    /// 新增变体时这张表会跟着漏掉，所以逐条对着变体列出来。
     #[test]
     fn test_is_predicates_track_their_variants() {
         for (error, test) in [
-            (
-                RsmediaError::format_not_found("nope"),
-                RsmediaError::is_format_not_found as fn(&RsmediaError) -> bool,
-            ),
-            (
-                RsmediaError::codec_not_found("nope"),
-                RsmediaError::is_codec_not_found as fn(&RsmediaError) -> bool,
-            ),
-            (
-                RsmediaError::filter_not_found("nope"),
-                RsmediaError::is_filter_not_found as fn(&RsmediaError) -> bool,
-            ),
             (
                 RsmediaError::unsupported("nope"),
                 RsmediaError::is_unsupported as fn(&RsmediaError) -> bool,

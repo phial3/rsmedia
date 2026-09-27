@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Error, Result, anyhow};
 use image::DynamicImage;
-use rsmedia::{PixelFormat, scale};
+use rsmedia::{PixelFormat, Rational, scale};
 
 use super::av_convert;
 use rsmedia::codec::CodecConfig;
@@ -17,7 +17,7 @@ use rsmpeg::{
     avformat::{
         AVFormatContextInput, AVFormatContextOutput, AVIOContextContainer, AVIOContextCustom,
     },
-    avutil::{self, AVFrame, AVMem, AVRational},
+    avutil::{self, AVFrame, AVMem},
 };
 
 /// multimedia file input decoding
@@ -225,15 +225,15 @@ pub fn open_output_file(
 /// filename (&CStr): 这是一个指向 C 字符串的指针，表示输出视频文件的名称
 /// width (i32): 输出视频的宽度，以像素为单位。
 /// height (i32): 输出视频的高度，以像素为单位。
-/// ratio (AVRational): 输出视频的纵横比，表示为一个分数
-/// framerate (AVRational): 输出视频的帧率，表示为每秒帧数 (fps)
+/// ratio ([`Rational`]): 输出视频的纵横比，表示为一个分数
+/// framerate ([`Rational`]): 输出视频的帧率，表示为每秒帧数 (fps)
 /// ticks_per_frame (i32): 每帧的时间戳增量。
 pub fn open_output_file_custom(
     filename: &CStr,
     width: i32,
     height: i32,
-    ratio: AVRational,
-    framerate: AVRational,
+    ratio: Rational,
+    framerate: Rational,
     ticks_per_frame: i32,
 ) -> anyhow::Result<(AVFormatContextOutput, AVCodecContext)> {
     let buffer = Arc::new(Mutex::new(File::create(filename.to_str()?)?));
@@ -283,7 +283,7 @@ pub fn open_output_file_custom(
 
     encode_context.set_width(width);
     encode_context.set_height(height);
-    encode_context.set_sample_aspect_ratio(ratio);
+    encode_context.set_sample_aspect_ratio(ratio.into());
     encode_context.set_pix_fmt(
         if let Some(pix_fmts) = codec_config.supported_pixel_formats()? {
             pix_fmts[0]
@@ -293,11 +293,8 @@ pub fn open_output_file_custom(
     );
 
     encode_context.set_time_base(avutil::av_inv_q(avutil::av_mul_q(
-        framerate,
-        AVRational {
-            num: ticks_per_frame,
-            den: 1,
-        },
+        framerate.into(),
+        Rational::integer(ticks_per_frame).into(),
     )));
 
     // Some formats want stream headers to be separate.

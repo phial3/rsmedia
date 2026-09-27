@@ -10,7 +10,7 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tokio::task;
 
-const OUTPUT_DIR: &str = "output";
+const OUTPUT_DIR: &str = "output/decoding";
 static FRAME_COUNT: Lazy<Mutex<u32>> = Lazy::new(|| Mutex::new(0));
 static SAVE_TASKS: Lazy<Mutex<Vec<task::JoinHandle<()>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
         // decoder with CUDA acceleration
         .with_hardware_device(Some(HWDeviceConfig::auto_platform()?))
         // h264_cuvid decoder name
-        // .with_codec_name("h264_cuvid".to_string())
+        // .with_codec_name("h264_cuvid")
         .with_filters(filters)
         .build_from_reader(&reader)
         .context("failed to create decoder")?;
@@ -104,8 +104,8 @@ fn process_frame(yuv_frame: MediaFrame<u8>) -> Result<()> {
     let rgb_frame = yuv_frame.convert_yuv420p_to_rgb24()?;
 
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(
-        yuv_frame.width as u32,
-        yuv_frame.height as u32,
+        yuv_frame.width,
+        yuv_frame.height,
         rgb_frame
             .data
             .as_packed()

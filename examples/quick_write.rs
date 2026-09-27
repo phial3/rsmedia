@@ -9,7 +9,7 @@ use rsmedia::{EncoderBuilder, PixelFormat, frame::MediaFrame, mux::Muxer};
 fn main() -> anyhow::Result<()> {
     rsmedia::init()?;
 
-    let (width, height) = (320, 240);
+    let (width, height) = (320u32, 240u32);
     let fps = 30f32;
 
     // 一键预设 + 逐帧快速写入
@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
         let mut av = frame.to_avframe()?;
         // 编码器 time_base = 1/fps，帧索引即 pts（每帧 1 tick = 1/fps 秒）
         av.set_pts(i as i64);
-        av.set_time_base(enc_tb);
+        av.set_time_base(enc_tb.into());
         muxer.mux(av, v_idx)?;
     }
 
@@ -37,13 +37,15 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rainbow_frame(width: usize, height: usize, p: f32) -> MediaFrame<u8> {
+fn rainbow_frame(width: u32, height: u32, p: f32) -> MediaFrame<u8> {
     let rgb = rsmedia::colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
     let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24).unwrap();
     let samples = frame
         .data
         .as_packed_mut()
         .expect("RGB24 frames are interleaved");
+    let width = width as usize;
+    let height = height as usize;
     for y in 0..height {
         for x in 0..width {
             samples[[y, x, 0]] = rgb[0];

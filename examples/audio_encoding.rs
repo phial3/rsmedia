@@ -13,8 +13,8 @@ use rsmedia::{FrameFormat, MediaFrame, MediaType, SampleFormat, StreamReader};
 
 use anyhow::Result;
 
-const SAMPLE_RATE: u32 = 44_100;
-const CHANNELS: u32 = 2;
+const SAMPLE_RATE: i32 = 44_100;
+const CHANNELS: i32 = 2;
 const NB_SAMPLES: u32 = 1024;
 /// 编码时长（秒），>10s 便于用播放器/ffprobe 验证。
 const DURATION_SEC: u32 = 12;
@@ -39,25 +39,20 @@ fn main() -> Result<()> {
 /// 使用裸 `Encoder` + `Muxer`，pts 以样本数为单位按帧大小递增（音频的
 /// 时间基为 `1/sample_rate`）。
 fn encode_audio(output: &'static str) -> Result<()> {
-    let encoder = EncoderBuilder::new_audio(
-        128_000,
-        CHANNELS as i32,
-        SAMPLE_RATE as i32,
-        SampleFormat::FLTP,
-    )
-    .build()?;
+    let encoder =
+        EncoderBuilder::new_audio(128_000, CHANNELS, SAMPLE_RATE, SampleFormat::FLTP).build()?;
     let enc_tb = encoder.time_base();
     let mut muxer = Muxer::new(output)?;
     let a_idx = muxer.add_encoder(encoder)?;
 
-    let total_frames = SAMPLE_RATE * DURATION_SEC / NB_SAMPLES;
+    let total_frames = SAMPLE_RATE as u32 * DURATION_SEC / NB_SAMPLES;
     let mut total_pts: i64 = 0;
     for _ in 0..total_frames {
         let frame = sine_frame(total_pts as f32 / SAMPLE_RATE as f32)?;
         let mut av = frame.to_avframe()?;
         // 手动以样本数递增 pts（音频时间基为 1/sample_rate）
         av.set_pts(total_pts);
-        av.set_time_base(enc_tb);
+        av.set_time_base(enc_tb.into());
         total_pts += NB_SAMPLES as i64;
         muxer.mux(av, a_idx)?;
     }

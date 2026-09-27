@@ -21,6 +21,7 @@
 //! discoverable without any extra FFI on the caller's side.
 
 use crate::error::{Result, RsmediaError};
+use crate::flags::FlagSet;
 use crate::io::init_logging;
 
 use once_cell::sync::OnceCell;
@@ -36,7 +37,13 @@ impl Default for AVLogLevel {
 }
 
 impl Default for AVLogFlag {
-    /// FFmpeg 自身的默认行为：跳过重复的日志行。
+    /// The crate's default logging *policy*: skip repeated log lines, matching FFmpeg's own
+    /// out-of-the-box behaviour.
+    ///
+    /// Note this is a policy for one specific flag, not "the empty set" — a freshly created
+    /// [`FlagSet<AVLogFlag>`](crate::FlagSet) is empty by [`Default`] as any set would be, and
+    /// is therefore *not* the same value. Use this impl when you want FFmpeg's default
+    /// behaviour; use [`FlagSet::EMPTY`](crate::FlagSet::EMPTY) when you want no flags at all.
     fn default() -> Self {
         Self::SKIP_REPEATED
     }
@@ -73,8 +80,12 @@ pub fn init_with_level(level: AVLogLevel) -> Result<()> {
 /// Initialize with full control over level and flags; the environment is not
 /// consulted. Idempotent — the first call wins.
 ///
+/// 位集按 [`FlagSet<AVLogFlag>`](crate::FlagSet) 给出：单个标志
+/// （[`AVLogFlag::SKIP_REPEATED`]）或用 `|` 组合出的位集
+/// （`AVLogFlag::SKIP_REPEATED | AVLogFlag::PRINT_LEVEL`）都能直接传。
+///
 /// Also registers all libavdevice devices (see the [module docs](self)).
-pub fn init_with(level: AVLogLevel, flag: AVLogFlag) -> Result<()> {
+pub fn init_with(level: AVLogLevel, flag: impl Into<FlagSet<AVLogFlag>>) -> Result<()> {
     INIT.get_or_try_init(|| {
         // 1. Register all libavdevice devices.
         //    The call itself is idempotent and thread-safe on the FFmpeg side

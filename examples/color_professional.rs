@@ -19,15 +19,15 @@ fn main() -> anyhow::Result<()> {
     );
 
     // 2. Explicit RGB -> YUV color matrices
-    const W: usize = 320;
-    const H: usize = 180;
+    const W: u32 = 320;
+    const H: u32 = 180;
     let mut rgb = MediaFrame::<u8>::new_video_frame(W, H, PixelFormat::RGB24)?;
     let samples = rgb
         .data
         .as_packed_mut()
         .expect("RGB24 frames are interleaved");
-    for y in 0..H {
-        for x in 0..W {
+    for y in 0..H as usize {
+        for x in 0..W as usize {
             let t = (x as f32 / W as f32 * 255.0) as u8;
             samples[[y, x, 0]] = t;
             samples[[y, x, 1]] = 128;

@@ -138,11 +138,11 @@ mod tests {
 
     #[test]
     fn thumbnail_test0() {
-        std::fs::create_dir_all("tests/output/thumbnail").unwrap();
+        std::fs::create_dir_all("output/thumbnail").unwrap();
 
         thumbnail(
             c"assets/mp4.mp4",
-            c"tests/output/thumbnail/mp4.jpg",
+            c"output/thumbnail/mp4.jpg",
             Some(192),
             Some(108),
         )
@@ -151,11 +151,11 @@ mod tests {
 
     #[test]
     fn thumbnail_test1() {
-        std::fs::create_dir_all("tests/output/thumbnail").unwrap();
+        std::fs::create_dir_all("output/thumbnail").unwrap();
 
         thumbnail(
             c"assets/cat.jpg",
-            c"tests/output/thumbnail/cat.jpg",
+            c"output/thumbnail/cat.jpg",
             Some(280),
             Some(240),
         )
@@ -165,11 +165,11 @@ mod tests {
     #[test]
     #[ignore = "depends on an unreachable internal network stream (127.0.0.1)"]
     fn thumbnail_test2() {
-        std::fs::create_dir_all("tests/output/thumbnail").unwrap();
+        std::fs::create_dir_all("output/thumbnail").unwrap();
 
         thumbnail(
             c"http://127.0.0.1:8080/video/final_134_raw.mp4",
-            c"tests/output/thumbnail/test2_video.jpg",
+            c"output/thumbnail/test2_video.jpg",
             Some(900),
             Some(600),
         )

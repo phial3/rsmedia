@@ -15,7 +15,7 @@ pub fn avio_reading(file_path: &CStr) -> Result<()> {
         avio::open_input_file(file_path)?;
 
     let frame_index = AtomicI32::new(0);
-    let output_dir = std::path::PathBuf::from("tests/output/avio_reading");
+    let output_dir = std::path::PathBuf::from("output/avio_reading");
     std::fs::create_dir_all(&output_dir)?;
 
     loop {

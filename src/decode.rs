@@ -1,6 +1,7 @@
-use crate::codec::AVCodecFlag;
+use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType, impl_codec_builder_setters};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
+use crate::flags::FlagSet;
 use crate::fmt::FrameFormat;
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
@@ -13,6 +14,7 @@ use crate::state::ProcessState;
 use crate::stream::StreamInfo;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
+use crate::time::Rational;
 use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket, AVSubtitle};
@@ -20,6 +22,7 @@ use rsmpeg::avformat::AVStream;
 use rsmpeg::avutil::{self, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 ffi_enum_wrap_from!(
@@ -58,8 +61,10 @@ ffi_enum!(
     /// 成错帧/糊帧继续输出；要"宁可失败也不出错帧"就加上
     /// [`EXPLODE`](Self::EXPLODE)，解码 API 会以 `Err` 报告而不是静默继续。
     ///
-    /// 位可组合（`ErrRecognition::BUFFER | ErrRecognition::EXPLODE`，结果为原始
-    /// `i32` 掩码）；[`IGNORE_ERR`](Self::IGNORE_ERR) 与
+    /// 位可组合（`ErrRecognition::BUFFER | ErrRecognition::EXPLODE`，结果为
+    /// [`FlagSet<ErrRecognition>`](crate::FlagSet)，可直接传给
+    /// [`DecoderBuilder::with_err_recognition`]）；
+    /// [`IGNORE_ERR`](Self::IGNORE_ERR) 与
     /// [`EXPLODE`](Self::EXPLODE) 语义相反，FFmpeg 按位判断，同时置位时行为由
     /// FFmpeg 内部顺序决定，调用方不应同时给出。
     #[allow(non_camel_case_types)]
@@ -86,22 +91,29 @@ ffi_enum!(
 /// Builds a [`Decoder`].
 #[derive(Debug)]
 pub struct DecoderBuilder {
-    /// `None` = 未显式设置，构建时取 [`AVCodecFlag::LOW_DELAY`]。
-    flags: Option<AVCodecFlag>,
-    /// `None` = 未显式设置，构建时取 [`num_cpus::get`]；`Some(n)` 表示调用方指定过
-    /// —— 该"显式"信息被 [`Self::owned_option_keys`] 用来判定配置冲突。
-    thread_count: Option<usize>,
+    /// `None` = 未显式设置，构建时取 `AVCodecFlag::LOW_DELAY`。存的是调用方显式给出的
+    /// `AV_CODEC_FLAG_*` 位集。
+    flags: Option<FlagSet<AVCodecFlag>>,
+    /// `AVCodecContext.flags2`（`AV_CODEC_FLAG2_*`）。`None` = FFmpeg 默认。
+    flags2: Option<FlagSet<AVCodecFlag2>>,
+    /// `AVCodecContext.thread_type`（`FF_THREAD_*`）。`None` = FFmpeg 默认。
+    thread_type: Option<FlagSet<ThreadType>>,
+    /// `None` = 未显式设置，构建时取 [`num_cpus::get`]。
+    thread_count: Option<i32>,
     media_type: MediaType,
     codec_name: Option<String>,
     codec_opts: Option<Options>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
+    /// 硬件帧池的预分配表面数（`None` = [`crate::hwaccel::DEFAULT_HW_POOL_SIZE`]）。
+    hw_pool_size: Option<u32>,
     /// 缩放核选择（互斥，只取一个算法位）
     scale_algorithm: ScaleAlgorithm,
-    /// 缩放质量位（可多位，见 [`ScaleQuality`]）；构建 `Scaler` 时由 [`ScaleQuality::mask`] 合成为掩码
-    scale_quality: Vec<ScaleQuality>,
+    /// 缩放质量位（可多位，见 [`ScaleQuality`]）。
+    scale_quality: FlagSet<ScaleQuality>,
     /// 是否用 `AVBufferPool` 池化缩放输出的帧缓冲（默认关闭）。
     scale_pool: bool,
+    /// 视频像素宽*高设置
     resize: Option<Resize>,
     /// 解码输出目标像素格式（仅视频），默认 [`PixelFormat::YUV420P`]。
     pix_fmt: Option<PixelFormat>,
@@ -109,8 +121,8 @@ pub struct DecoderBuilder {
     sample_fmt: Option<SampleFormat>,
     /// 帧丢弃粒度（`AVCodecContext.skip_frame`）。`None` = FFmpeg 默认（不丢弃）。
     skip_frame: Option<SkipFrame>,
-    /// 错误识别掩码（`AVCodecContext.err_recognition`）。`None` = FFmpeg 默认。
-    err_recognition: Option<i32>,
+    /// 错误识别位集（`AVCodecContext.err_recognition`）。`None` = FFmpeg 默认。
+    err_recognition: Option<FlagSet<ErrRecognition>>,
 }
 
 impl DecoderBuilder {
@@ -126,10 +138,13 @@ impl DecoderBuilder {
             codec_name: None,
             codec_opts: None,
             hw_device_config: None,
+            hw_pool_size: None,
             thread_count: None,
             flags: None,
+            flags2: None,
+            thread_type: None,
             scale_algorithm: ScaleAlgorithm::default(),
-            scale_quality: ScaleQuality::default_quality().to_vec(),
+            scale_quality: ScaleQuality::default_mask(),
             scale_pool: false,
             resize: None,
             pix_fmt: None,
@@ -139,90 +154,9 @@ impl DecoderBuilder {
         }
     }
 
-    /// Set decoding flags.
-    pub fn with_flags(mut self, flags: AVCodecFlag) -> Self {
-        self.flags = Some(flags);
-        self
-    }
-
-    /// Set the codec name to use for decoding.
-    /// If not set, the decoder will try to guess the codec based on the input.
-    pub fn with_codec_name(mut self, codec_name: impl Into<Option<String>>) -> Self {
-        self.codec_name = codec_name.into();
-        self
-    }
-
-    /// codec options to use for decoding.
-    ///
-    /// 只用于 builder 未建模的**编解码器私有参数**。builder 有 typed setter 的项
-    /// （`with_thread_count`、`with_flags`）若同时出现在这里，构建时报
-    /// [`RsmediaError::InvalidConfig`]：同一项有两个配置源时无法判断以谁为准。
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.codec_opts = options.into();
-        self
-    }
-
-    /// set the thread count.
-    ///
-    /// 与 `with_options("threads")` 互斥：两者同时指定会在构建时报错（同一项
-    /// 只能有一个配置源）。
-    pub fn with_thread_count(mut self, thread_count: usize) -> Self {
-        self.thread_count = Some(thread_count);
-        self
-    }
-
-    /// set the filters to apply to decoded frames.
-    pub fn with_filters(mut self, filters: impl Into<Option<Vec<Filter>>>) -> Self {
-        self.filters = filters.into();
-        self
-    }
-
-    /// Enable hardware acceleration with the specified device type.
-    ///
-    /// * `device_config` - Device to use for hardware acceleration.
-    pub fn with_hardware_device(mut self, device_config: Option<HWDeviceConfig>) -> Self {
-        self.hw_device_config = device_config;
-        self
-    }
-
-    /// Set the scaling algorithm used when converting decoded frames to the
-    /// output pixel format (and, with [`Self::with_resize`], to the output size).
-    ///
-    /// The algorithm picks the scaling kernel and is **mutually exclusive** —
-    /// FFmpeg's header states *"Scaler selection options. Only one may be active
-    /// at a time."* Defaults to [`ScaleAlgorithm::BICUBIC`]; use
-    /// [`ScaleAlgorithm::BILINEAR`] for output consistent with FFmpeg's command
-    /// line default, or [`ScaleAlgorithm::AREA`] when downscaling. The
-    /// quality/behaviour bits are set separately with [`Self::with_scale_quality`].
-    pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
-        self.scale_algorithm = algorithm;
-        self
-    }
-
-    /// Set the scaling quality/behaviour bits used when converting decoded frames.
-    ///
-    /// Unlike the algorithm (exactly one bit), the quality flags are a set: pass the
-    /// bits themselves as a list — `[ScaleQuality::BITEXACT]`,
-    /// `[ScaleQuality::FULL_CHR_H_INT, ScaleQuality::ACCURATE_RND]`, … — and they are
-    /// combined into the mask handed to FFmpeg. Taking a list of [`ScaleQuality`]
-    /// values rather than a raw `u32` means an invalid flag cannot be passed.
-    /// Defaults to [`ScaleQuality::default_mask`].
-    pub fn with_scale_quality(mut self, quality: impl AsRef<[ScaleQuality]>) -> Self {
-        self.scale_quality = quality.as_ref().to_vec();
-        self
-    }
-
-    /// Enable (`true`) or disable (`false`) pooled allocation of the scaler's
-    /// destination frames (see [`Scaler::with_buffer_pool`]).
-    ///
-    /// Off by default. With it on, frames this decoder scales are allocated from an
-    /// internal `AVBufferPool` instead of being freshly allocated per frame, so a
-    /// steady stream of same-geometry conversions stops allocating after a couple
-    /// of frames; buffers are zero-filled before use, matching `alloc_buffer`.
-    pub fn with_scale_pool(mut self, enabled: bool) -> Self {
-        self.scale_pool = enabled;
-        self
-    }
+    // 与 EncoderBuilder 共有的那批 setter：定义与文档在 `codec.rs` 的宏里，
+    // 改一次两端同时生效（见 `impl_codec_builder_setters` 的说明）。
+    impl_codec_builder_setters!();
 
     /// Set the resize strategy applied to decoded video frames.
     ///
@@ -329,7 +263,7 @@ impl DecoderBuilder {
     /// [`ErrRecognition::EXPLODE`] 加进来，解码 API 就会以 `Err` 报告损坏，
     /// 由调用方决定重试/跳过/中止。
     ///
-    /// 可传单个位，也可传组合出的原始掩码（见 [`ErrRecognition`]）。
+    /// 可传单个位，也可传 `|` 组合出的位集（见 [`ErrRecognition`]）——两者是同一个参数。
     ///
     /// ```no_run
     /// use rsmedia::{DecoderBuilder, MediaType, ErrRecognition};
@@ -343,16 +277,19 @@ impl DecoderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn with_err_recognition(mut self, err_recognition: impl Into<u32>) -> Self {
-        self.err_recognition = Some(err_recognition.into() as i32);
+    pub fn with_err_recognition(
+        mut self,
+        err_recognition: impl Into<FlagSet<ErrRecognition>>,
+    ) -> Self {
+        self.err_recognition = Some(err_recognition.into());
         self
     }
 
     /// 校验像素格式能否以数据平面承载（非位流/调色板/硬件格式）。
     fn ensure_pix_fmt_storable(fmt: PixelFormat) -> Result<()> {
         if !fmt.is_plane_storable() {
-            return Err(RsmediaError::msg(format!(
-                "Unsupported output pixel format: {fmt:?}; it cannot be stored as sample planes \
+            return Err(RsmediaError::invalid_config(format!(
+                "with_pix_fmt({fmt:?}): the format cannot be stored as sample planes \
                  (bitstream, paletted and hardware formats are not supported)"
             )));
         }
@@ -360,8 +297,11 @@ impl DecoderBuilder {
     }
 
     /// 某个仅对视频解码器生效的配置项被用于其它媒体类型时构造的错误。
+    ///
+    /// 属于调用方错误（用了只对某类解码器生效的 setter），因此报 `InvalidConfig`，
+    /// 而不是落到笼统的 `Other`。
     fn option_only_for(opt: &'static str, value: String, media_type: MediaType) -> RsmediaError {
-        RsmediaError::msg(format!(
+        RsmediaError::invalid_config(format!(
             "{opt}({value}) is only valid for {} decoders, got media type: {media_type:?}",
             media_type.get_media_name()
         ))
@@ -370,21 +310,36 @@ impl DecoderBuilder {
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
-            return Err(RsmediaError::msg(format!(
-                "Decoder codec type not supported: {:?} vs. {:?}",
-                media_type, decoder.codec_type
+            return Err(RsmediaError::invalid_config(format!(
+                "decoder was built for media type {media_type:?}, but the codec of the given \
+                 stream is {:?}",
+                decoder.codec_type
             )));
         }
 
         decoder.apply_codecpar(&input.codecpar())?;
-        decoder.set_flags(self.flags.unwrap_or(AVCodecFlag::LOW_DELAY) as i32);
+        decoder.set_flags(
+            self.flags
+                .unwrap_or_else(|| AVCodecFlag::LOW_DELAY.into())
+                .bits() as i32,
+        );
+        if let Some(flags2) = self.flags2 {
+            crate::codec::set_flags2(decoder, flags2.bits() as i32);
+        }
+        if let Some(thread_type) = self.thread_type {
+            crate::codec::set_thread_type(decoder, thread_type.bits() as i32);
+        }
         decoder.set_time_base(input.time_base);
         decoder.set_pkt_timebase(input.time_base);
         if let Some(framerate) = input.guess_framerate() {
             decoder.set_framerate(framerate);
         }
 
-        crate::codec::set_thread_count(decoder, self.thread_count.unwrap_or_else(num_cpus::get));
+        // 未显式设置时取本机 CPU 数；`0`（自行推导）与负数跳过
+        crate::codec::set_thread_count(
+            decoder,
+            self.thread_count.unwrap_or_else(|| num_cpus::get() as i32),
+        );
 
         // 稳定性策略：rsmpeg 未生成 skip_frame / err_recognition 访问器，直接写字段
         // （encode.rs 写 rc_max_rate 同例）。两项都必须在 `avcodec_open2` 之前生效，
@@ -395,33 +350,11 @@ impl DecoderBuilder {
                 (*raw).skip_frame = skip_frame.into();
             }
             if let Some(err_recognition) = self.err_recognition {
-                (*raw).err_recognition = err_recognition;
+                (*raw).err_recognition = err_recognition.bits() as i32;
             }
         }
 
         Ok(())
-    }
-
-    /// 解码器 AVOption 里由 builder typed setter 独占的键，`(option key, setter)`。
-    ///
-    /// 只列出**调用方显式设置过**的项（默认值不算配置过），规则见
-    /// [`options::ensure_single_source`](crate::options)。
-    fn owned_option_keys(&self) -> Vec<(&'static str, &'static str)> {
-        let mut owned = Vec::new();
-        if self.thread_count.is_some() {
-            owned.push(("threads", "with_thread_count"));
-        }
-        if self.flags.is_some() {
-            owned.push(("flags", "with_flags"));
-        }
-        if self.skip_frame.is_some() {
-            owned.push(("skip_frame", "with_skip_frame"));
-        }
-        if self.err_recognition.is_some() {
-            // AVOption 名是 `err_detect`（`err_recognition` 字段的选项拼写）。
-            owned.push(("err_detect", "with_err_recognition"));
-        }
-        owned
     }
 
     /// 构建一个**裸** [`Decoder`]（不持有 reader）。
@@ -440,25 +373,28 @@ impl DecoderBuilder {
     /// reader，且不支持 seek。
     pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
-        // 单一配置源：typed setter 与 `with_options` 不得同时配置同一项。
-        crate::options::ensure_single_source(self.codec_opts.as_ref(), &self.owned_option_keys())?;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
-        let input_stream = reader
-            .input()
-            .streams()
-            .get(stream_index)
-            .ok_or(RsmediaError::msg(format!(
-                "stream: {stream_index} not found!"
-            )))?;
+        let input_stream =
+            reader
+                .input()
+                .streams()
+                .get(stream_index)
+                .ok_or(RsmediaError::invalid_config(format!(
+                    "stream: {stream_index} not found!"
+                )))?;
 
         // 优先用调用方指定的解码器名，否则用流自带的名字（`find_best_stream`
         // 的返回值）。这两个名字来自不同来源，不要写在同名绑定里——那样两个分支
         // 看起来一模一样，实际解析到不同的变量。
         let codec_name = self.codec_name.as_deref().unwrap_or(&codec_name);
         let codec = AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name)?)
-            .context(format!("Failed to find decoder by name: '{codec_name}'"))?;
+            .ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "decoder '{codec_name}' is not available in this FFmpeg build"
+                ))
+            })?;
 
-        let duration = Time::new(Some(input_stream.duration), input_stream.time_base);
+        let duration = Time::new(Some(input_stream.duration), input_stream.time_base.into());
         let nb_frames = input_stream.nb_frames;
         let frame_rate = (
             avutil::av_q2d(input_stream.r_frame_rate) as f32,
@@ -488,8 +424,8 @@ impl DecoderBuilder {
                         // 拿不到合法字符串并不改变"不支持"这一结论。
                         let codec_name = strutils::cstr_to_string(codec.name())
                             .unwrap_or_else(|_| "unknown".to_owned());
-                        RsmediaError::msg(format!(
-                            "Decoder with HW acceleration is not supported for codec: {codec_name}"
+                        RsmediaError::unsupported(format!(
+                            "hardware decoding is not available for codec: {codec_name}"
                         ))
                     })?;
 
@@ -497,8 +433,8 @@ impl DecoderBuilder {
                 // 分配，配置里的值若与编解码器声明不符，会得到错误的输出格式。
                 // 未知格式（绑定/FFmpeg 版本不匹配）报错而不是 panic。
                 cfg.hw_pixel_format = PixelFormat::from_ffi_checked(hw_pixel).ok_or_else(|| {
-                    RsmediaError::msg(format!(
-                        "Codec {} reports an unknown hardware pixel format: {hw_pixel}",
+                    RsmediaError::unsupported(format!(
+                        "codec {} selected hardware pixel format {hw_pixel}, which rsmedia does not model",
                         strutils::cstr_to_string_lossy(codec.name())
                     ))
                 })?;
@@ -514,7 +450,13 @@ impl DecoderBuilder {
                 HWContext::new(cfg)
                     .and_then(|ctx| {
                         // 注意：setup_decoder_frames 可能会改变 decode_ctx.pix_fmt
-                        ctx.setup_decoder_frames(&mut decode_ctx, init_width, init_height)?;
+                        ctx.setup_decoder_frames(
+                            &mut decode_ctx,
+                            init_width,
+                            init_height,
+                            self.hw_pool_size
+                                .unwrap_or(crate::hwaccel::DEFAULT_HW_POOL_SIZE),
+                        )?;
                         Ok(ctx)
                     })
                     .context("Hardware acceleration context initialization failed")
@@ -556,8 +498,8 @@ impl DecoderBuilder {
             (MediaType::AUDIO, None) => None,
             (MediaType::AUDIO, Some(fmt)) if fmt != SampleFormat::NONE => Some(fmt),
             (MediaType::AUDIO, Some(fmt)) => {
-                return Err(RsmediaError::msg(format!(
-                    "Unsupported output sample format: {fmt:?}"
+                return Err(RsmediaError::invalid_config(format!(
+                    "with_sample_fmt({fmt:?}): not a usable output sample format"
                 )));
             }
             (media_type, Some(fmt)) => {
@@ -590,9 +532,9 @@ impl DecoderBuilder {
                     // sink 格式 = 解码输出格式：图内负责把链的输出转回来，
                     // `MediaFrame` 因此拿到的仍是 `with_pix_fmt` 承诺的格式。
                     format: output_pix_fmt,
-                    time_base: decode_ctx.time_base,
-                    frame_rate: decode_ctx.framerate,
-                    pixel_aspect: decode_ctx.sample_aspect_ratio,
+                    time_base: decode_ctx.time_base.into(),
+                    frame_rate: decode_ctx.framerate.into(),
+                    pixel_aspect: decode_ctx.sample_aspect_ratio.into(),
                 }),
                 MediaType::AUDIO => FilterParams::Audio(AudioParams {
                     nb_channels: decode_ctx.ch_layout.nb_channels,
@@ -604,17 +546,16 @@ impl DecoderBuilder {
                         .unwrap_or(
                             output_sample_fmt.unwrap_or(SampleFormat::from(decode_ctx.sample_fmt)),
                         ),
-                    time_base: decode_ctx.time_base,
+                    time_base: decode_ctx.time_base.into(),
                 }),
                 _ => {
-                    return Err(RsmediaError::msg(format!(
-                        "Unsupported filter for media type: {media_type:?}"
+                    return Err(RsmediaError::invalid_config(format!(
+                        "a {media_type:?} filter cannot be used on this stream"
                     )));
                 }
             };
 
-            // 滤镜链的媒体类型与可用性校验都在 `init` 内（缺失滤镜 →
-            // `FilterNotFound`），这里不再重复一遍。
+            // 滤镜链的媒体类型与可用性校验都在 `init` 内（缺失滤镜 → `InvalidConfig`）
             let graph = FilterGraph::build(&filter_params, filters.as_slice())?;
 
             // 参数随图一起留下：重启流水线时必须重建一张新图。
@@ -644,6 +585,7 @@ impl DecoderBuilder {
             output_sample_fmt,
             filter_input_format,
             audio_converter: resample::StreamingConverter::new(),
+            pending_frames: VecDeque::new(),
         })
     }
 }
@@ -693,6 +635,15 @@ pub struct Decoder {
     filter_input_format: Option<FrameFormat>,
     /// 音频输出格式转换器；跨帧复用同一个 `SwrContext`，避免逐帧重建丢掉重采样延迟。
     audio_converter: resample::StreamingConverter,
+    /// 解码器已经吐出、但还没交出去的帧（**未经归一化**：还没做 HW 下载、缩放与滤镜）
+    ///
+    /// 一个包可以解出**多帧**（H.264 场编码、MPEG-2 field picture…），而
+    /// [`decode_raw_packet`](Self::decode_raw_packet) 一次只交一帧。当解码器输入
+    /// 缓冲已满（`avcodec_send_packet` 返回 EAGAIN）而输出队列里还压着帧时，必须先
+    /// 把这些帧取出来腾地方，否则新包送不进去。取出来的帧暂存在这里，按 FIFO 交
+    /// 给调用方，保证交付顺序与解码顺序一致（`decode.` 侧的 `pending_packets` 是
+    /// 同一件事的镜像）。
+    pending_frames: VecDeque<AVFrame>,
 }
 
 impl Decoder {
@@ -729,16 +680,57 @@ impl Decoder {
         DecoderBuilder::new(MediaType::SUBTITLE).build(source)
     }
 
-    /// Get the decoders input size width
+    /// Width of the decoder's input video frame, in pixels.
+    ///
+    /// A width is non-negative by nature, so this is returned as `u32`, matching
+    /// [`Encoder::width`](crate::Encoder::width). The underlying
+    /// `AVCodecContext.width` field is an FFmpeg `int`; the conversion here can
+    /// never see a negative value.
     #[inline(always)]
-    pub fn width(&self) -> i32 {
-        self.context.width
+    pub fn width(&self) -> u32 {
+        self.context.width as u32
     }
 
-    /// Get the decoders input size height
+    /// Height of the decoder's input video frame, in pixels.
+    ///
+    /// Returned as `u32` for the same reason as [`Self::width`].
     #[inline(always)]
-    pub fn height(&self) -> i32 {
-        self.context.height
+    pub fn height(&self) -> u32 {
+        self.context.height as u32
+    }
+
+    /// `AVCodecContext.flags` 位集（`AV_CODEC_FLAG_*`，取值见 [`AVCodecFlag`]）。
+    ///
+    /// 读的是 `avcodec_open2` **之后**的实际值（未设置时即 rsmedia 的解码默认值
+    /// `LOW_DELAY`），编解码器自行调整过的位同样会反映出来。查询用
+    /// [`FlagSet::contains`]，需要原始整数时用 [`FlagSet::bits`]。
+    #[inline]
+    pub fn flags(&self) -> FlagSet<AVCodecFlag> {
+        FlagSet::from_bits(self.context.flags as u32)
+    }
+
+    /// `AVCodecContext.flags2` 位集（`AV_CODEC_FLAG2_*`，取值见
+    /// [`AVCodecFlag2`]）。
+    #[inline]
+    pub fn flags2(&self) -> FlagSet<AVCodecFlag2> {
+        FlagSet::from_bits(self.context.flags2 as u32)
+    }
+
+    /// `AVCodecContext.thread_type` 位集（`FF_THREAD_*`，取值见
+    /// [`ThreadType`]）。
+    #[inline]
+    pub fn thread_type(&self) -> FlagSet<ThreadType> {
+        FlagSet::from_bits(self.context.thread_type as u32)
+    }
+
+    /// `AVCodecContext.thread_count`（0 = 自动）。
+    ///
+    /// 读的是 `avcodec_open2` **之后**的实际值：帧级线程的编解码器会在
+    /// `thread_count == 0` 时把它改写成自动推导出的线程数（见 FFmpeg
+    /// `ff_frame_thread_init`），非 0 的调用方设置则原样保留。
+    #[inline]
+    pub fn thread_count(&self) -> i32 {
+        self.context.thread_count
     }
 
     /// The pixel format of the frames this decoder **yields**.
@@ -752,6 +744,10 @@ impl Decoder {
         self.output_pix_fmt
     }
 
+    /// Audio samples per second.
+    ///
+    /// Returned as `i32`, the width of the underlying `AVCodecContext.sample_rate`
+    /// field, matching [`Encoder::sample_rate`](crate::Encoder::sample_rate).
     #[inline]
     pub fn sample_rate(&self) -> i32 {
         self.context.sample_rate
@@ -783,7 +779,7 @@ impl Decoder {
 
     /// Get decoder time base.
     #[inline(always)]
-    pub fn time_base(&self) -> ffi::AVRational {
+    pub fn time_base(&self) -> Rational {
         self.duration.time_base
     }
 
@@ -975,7 +971,7 @@ impl Decoder {
         R: Reader,
     {
         if self.media_type != MediaType::SUBTITLE {
-            return Err(RsmediaError::msg(format!(
+            return Err(RsmediaError::unsupported(format!(
                 "decode_subtitle_segment requires a subtitle decoder, got media type: {:?}",
                 self.media_type
             )));
@@ -1055,10 +1051,17 @@ impl Decoder {
     /// Feeds the packet to the decoder and returns a frame if there is one available. The caller
     /// should keep feeding packets until the decoder returns a frame.
     ///
+    /// A packet may decode into **several** frames (H.264 field coding, MPEG-2 field
+    /// pictures). Anything beyond the frame returned here is queued internally and handed
+    /// out by the following calls, in decode order, so no frame is lost when the caller
+    /// moves on to the next packet.
+    ///
     /// # Errors
     ///
     /// Returns an error once the decoder has been flushed (`reset` is required before
-    /// decoding again) or when the decoder itself fails.
+    /// decoding again) or when the decoder itself fails. A full decoder input buffer is
+    /// **not** an error: the frames that are ready are taken out first and the packet is
+    /// sent again.
     ///
     /// # Return value
     ///
@@ -1067,8 +1070,61 @@ impl Decoder {
         // 与 `decode`/`decode_raw` 同一阶段守卫：`drain_raw` 之后解码器已收到 EOS，
         // 再送包会被 FFmpeg 拒绝（EINVAL），必须在 `reset()` 之后才能复用。
         self.ensure_normal()?;
-        self.send_packet_to_decoder(Some(packet))?;
+        self.send_packet_with_retry(Some(packet))?;
         self.receive_normalized_frame()
+    }
+
+    /// 把一个包（`None` = EOS）送进解码器；解码器输入缓冲满（EAGAIN）时先腾地方再重试。
+    ///
+    /// 这是解码器**唯一**的送包入口，正常送包与送 EOS 都走这里。
+    ///
+    /// 与编码侧的 `send_frame_with_retry` 是同一件事：`avcodec_send_packet` 返回
+    /// EAGAIN 表示"输入缓冲满了，先把已就绪的输出取走"。一个包能解出多帧的流
+    /// （H.264 场编码、MPEG-2 field picture）很容易走到这里，而 rsmpeg 把 EAGAIN
+    /// 映射成 [`RsmpegError::DecoderFullError`]，不重试就会把"还没收完帧"报成失败。
+    ///
+    /// 取出的帧进 [`pending_frames`](Self::pending_frames)（FIFO），由
+    /// `receive_normalized_frame` 按顺序交付，因此重试不会改变输出顺序，也不丢帧。
+    ///
+    /// 时间戳换算不在这里做：进入解码器的包带参流时间基，解码器按 `pkt_timebase`
+    /// 解释（见 `DecoderBuilder::setup_codec_context`）。
+    fn send_packet_with_retry(&mut self, packet: Option<&AVPacket>) -> Result<()> {
+        let mut retries = 0usize;
+        loop {
+            match self.context.send_packet(packet) {
+                Ok(()) => return Ok(()),
+                Err(rsmpeg::error::RsmpegError::DecoderFullError) => {
+                    retries += 1;
+                    if retries > crate::MAX_DRAIN_ITERATIONS {
+                        return Err(RsmediaError::msg(format!(
+                            "Decoder keeps returning EAGAIN after {} retries (eof: {}); aborting",
+                            crate::MAX_DRAIN_ITERATIONS,
+                            packet.is_none()
+                        )));
+                    }
+                    tracing::debug!(
+                        "Decoder input buffer full (EAGAIN), draining ready frames first."
+                    );
+                    self.drain_decoder_frames()?;
+                }
+                Err(e) => return Err(RsmediaError::FFmpeg(e)),
+            }
+        }
+    }
+
+    /// 把解码器此刻已经就绪的帧全部取进 [`pending_frames`](Self::pending_frames)。
+    ///
+    /// 只搬运、不归一化：归一化（HW 下载 / 缩放 / 滤镜）严格按交付顺序逐帧做，
+    /// 否则滤镜图会看到乱序的输入。
+    fn drain_decoder_frames(&mut self) -> Result<()> {
+        loop {
+            match self.decoder_receive_frame() {
+                Ok(Some(frame)) => self.pending_frames.push_back(frame),
+                // EAGAIN / EOF：此刻再没有可取的帧。
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Drain one frame from the decoder.
@@ -1096,6 +1152,9 @@ impl Decoder {
     /// afterwards the normal decode path returns an error until
     /// [`reset`](Self::reset) is called.
     ///
+    /// Frames a previous [`decode_raw_packet`](Self::decode_raw_packet) left queued are
+    /// handed out **before** end-of-stream is sent, so draining never strands them.
+    ///
     /// # Return value
     ///
     /// The decoded raw frame as [`AVFrame`] if the decoder has a frame available, [`None`] if not.
@@ -1104,8 +1163,12 @@ impl Decoder {
     /// 使用，可逐 packet 送入解码器并排空缓冲帧。需要 [`MediaFrame`] 的高级调用请使用
     /// [`drain`](Self::drain)。
     pub fn drain_raw(&mut self) -> Result<Option<AVFrame>> {
-        if self.state.is_normal() {
-            self.send_packet_to_decoder(None)?;
+        // 队列里还有帧时先不送 EOS：那些帧属于"正常读阶段"的产物，交完再进
+        // draining 模式，状态机与交付顺序都不会被 EOS 抢跑。
+        if self.pending_frames.is_empty() && self.state.is_normal() {
+            // 送 EOS 同样是"送一个包"：输出队列还压着帧时 FFmpeg 一样会回 EAGAIN，
+            // 因此走同一个重试入口。
+            self.send_packet_with_retry(None)?;
             // 已发送 EOS，进入 draining 模式。此后 EAGAIN 表示"仍在 drain"，
             // 而非 read 阶段缺包，因此在此处显式置位。
             self.state = ProcessState::Drained;
@@ -1139,10 +1202,15 @@ impl Decoder {
     /// stays inside the graph). `avcodec_flush_buffers` knows nothing about it, so
     /// this rebuilds the graph as well; without that, frames from **before** the
     /// seek would be emitted after it.
+    ///
+    /// `pending_frames` is part of the pipeline for the same
+    /// reason: those frames were already decoded, so dropping the codec's buffers
+    /// without dropping them would deliver pre-seek pictures after the seek.
     pub fn flush_buffers(&mut self) -> Result<()> {
         unsafe {
             ffi::avcodec_flush_buffers(self.context.as_mut_ptr());
         }
+        self.pending_frames.clear();
         self.rebuild_filter_graph()
     }
 
@@ -1165,16 +1233,6 @@ impl Decoder {
             .context("Failed to rebuild the filter graph")
     }
 
-    /// 把一个包（`None` = EOS）送进解码器。
-    ///
-    /// 时间戳换算不在这里做：进入解码器的包带参流时间基，解码器按 `pkt_timebase`
-    /// 解释（见 `DecoderBuilder::setup_codec_context`）。
-    fn send_packet_to_decoder(&mut self, packet: Option<&AVPacket>) -> Result<()> {
-        self.context
-            .send_packet(packet)
-            .context("Failed to send packet to decoder")
-    }
-
     /// Pulls one frame out of the decoder and returns it in a uniform shape.
     ///
     /// This is the single place where a decoded frame is normalised, in this
@@ -1183,39 +1241,42 @@ impl Decoder {
     /// swresample, and finally run the result through the filter graph (when one
     /// is configured). Callers above see only the resulting software frame.
     fn receive_normalized_frame(&mut self) -> Result<Option<AVFrame>> {
-        // 1. 从解码器获取原始帧
-        let decoded_frame = match self.decoder_receive_frame() {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                // 解码器当前无帧可出。按状态区分是"仍需更多输入"还是"已到 EOF"：
-                // - Normal / Drained：读阶段或 drain 阶段的 EAGAIN，需要继续喂包，
-                //   此时绝不能刷新 filter（否则会给 buffersrc 发 EOF，后续真实帧
-                //   提交会得到 AVERROR_EOF）。
-                // - Flushed：解码器到达 EOF，此时驱动 filter graph 冲刷内部缓冲帧
-                //   （如 fps/setpts 等带延迟滤镜）。逐帧调用 `process_frame(None)`，
-                //   每帧返回一帧，直到 graph 进入 Flushed 状态。
-                return match self.state {
-                    ProcessState::Normal | ProcessState::Drained => Ok(None),
-                    ProcessState::Flushed => {
-                        if let Some(chain) = self.filter_graph.as_mut()
-                            && !chain.graph.is_flushed()
-                        {
-                            match chain.graph.process_frame(None)? {
-                                Some(frame) => return Ok(Some(frame)),
-                                None => {
-                                    // 已无更多缓冲帧（graph 此时已 Flushed）
-                                    debug_assert!(chain.graph.is_flushed());
+        // 0. 解码器在重试路径上腾出来的帧（一个包解出多帧时）优先交付，保证顺序。
+        let decoded_frame = match self.pending_frames.pop_front() {
+            Some(frame) => frame,
+            None => match self.decoder_receive_frame() {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    // 解码器当前无帧可出。按状态区分是"仍需更多输入"还是"已到 EOF"：
+                    // - Normal / Drained：读阶段或 drain 阶段的 EAGAIN，需要继续喂包，
+                    //   此时绝不能刷新 filter（否则会给 buffersrc 发 EOF，后续真实帧
+                    //   提交会得到 AVERROR_EOF）。
+                    // - Flushed：解码器到达 EOF，此时驱动 filter graph 冲刷内部缓冲帧
+                    //   （如 fps/setpts 等带延迟滤镜）。逐帧调用 `process_frame(None)`，
+                    //   每帧返回一帧，直到 graph 进入 Flushed 状态。
+                    return match self.state {
+                        ProcessState::Normal | ProcessState::Drained => Ok(None),
+                        ProcessState::Flushed => {
+                            if let Some(chain) = self.filter_graph.as_mut()
+                                && !chain.graph.is_flushed()
+                            {
+                                match chain.graph.process_frame(None)? {
+                                    Some(frame) => return Ok(Some(frame)),
+                                    None => {
+                                        // 已无更多缓冲帧（graph 此时已 Flushed）
+                                        debug_assert!(chain.graph.is_flushed());
+                                    }
                                 }
                             }
+                            Ok(None)
                         }
-                        Ok(None)
-                    }
-                };
-            }
-            Err(e) => return Err(e),
+                    };
+                }
+                Err(e) => return Err(e),
+            },
         };
 
-        // 2. 处理硬件加速帧下载,
+        // 1. 处理硬件加速帧下载,
         let sw_frame = match &self.hw_context {
             Some(hw_ctx) if hw_ctx.is_hw_frame(&decoded_frame) => {
                 // hw_frame -> sw_frame
@@ -1229,7 +1290,7 @@ impl Decoder {
             }
         };
 
-        // 3. 统一视频输出格式（如 YUV420P / RGB24，由 `with_pix_fmt` 配置）
+        // 2. 统一视频输出格式（如 YUV420P / RGB24，由 `with_pix_fmt` 配置）
         // 例如：
         // 无硬件加速，默认解码格式 YUV420P
         // 存在硬件加速帧，则转换 NV12 -> 目标格式
@@ -1251,8 +1312,9 @@ impl Decoder {
                         .compute_for((sw_frame.width as u32, sw_frame.height as u32))
                         .ok_or_else(|| {
                             let (w, h) = (sw_frame.width, sw_frame.height);
-                            RsmediaError::msg(format!(
-                                "Cannot resize frame {w}x{h} into {resize:?}"
+                            // `with_resize` 里配置的策略算不出可用尺寸 ⇒ 调用方改配置即可。
+                            RsmediaError::invalid_config(format!(
+                                "the resize configuration {resize:?} yields no valid size for a {w}x{h} frame"
                             ))
                         })?,
                     None => (sw_frame.width as u32, sw_frame.height as u32),
@@ -1294,14 +1356,14 @@ impl Decoder {
             }
         };
 
-        // 4. 应用 Filter Graph
+        // 3. 应用 Filter Graph
         if let Some(chain) = self.filter_graph.as_mut() {
             // filter process
             match chain.graph.process_frame(Some(raw_frame))? {
                 Some(filtered_frame) => Ok(Some(filtered_frame)),
-                // `process_frame` 只在把图置为 `Drained`（还要更多输入）或
-                // `Flushed`（EOF）之后才返回 `None`，因此这里没有第三种情况：
-                // 返回 `None` 让外层循环继续驱动解码器，或就此收尾。
+                // `process_frame` 返回 `None` 有两种来源：图还需要更多输入（`EAGAIN`，状态
+                // 仍是 `Normal`——上一帧已被图吸收但还没攒够帧），或已经排空完毕
+                // （EOF）。两种都让外层循环继续驱动解码器，无需区分。
                 None => {
                     tracing::debug!(
                         "Filter graph produced no frame (drained: {}, flushed: {})",
@@ -1443,7 +1505,7 @@ impl Drop for Decoder {
         //    - `Flushed`：已无帧可排，整个步骤跳过。
         if !self.state.is_flushed() {
             let eos_sent = if self.state.is_normal() {
-                match self.send_packet_to_decoder(None) {
+                match self.send_packet_with_retry(None) {
                     Ok(()) => true,
                     Err(e) => {
                         tracing::warn!(
@@ -1548,6 +1610,67 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// `with_flags`/`with_flags2`/`with_thread_type` 的位集参数落到 `AVCodecContext`
+    /// 的对应字段（单个标志与 `|` 组合都原样保留），读数走
+    /// [`Decoder`] 的 getter（与外部调用方看到的一致）。
+    #[test]
+    fn test_builder_codec_flags_reach_decoder_context() -> Result<()> {
+        use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType};
+
+        let reader = StreamReader::new("assets/mp4.mp4")?;
+        let decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_flags(AVCodecFlag::OUTPUT_CORRUPT | AVCodecFlag::BITEXACT)
+            .with_flags2(AVCodecFlag2::FAST)
+            .with_thread_type(ThreadType::FRAME | ThreadType::SLICE)
+            .build_from_reader(&reader)?;
+
+        let want = AVCodecFlag::OUTPUT_CORRUPT.as_raw() | AVCodecFlag::BITEXACT.as_raw();
+        assert_eq!(
+            decoder.flags().bits() & want,
+            want,
+            "combined flags must not be truncated to a single bit"
+        );
+        assert_eq!(decoder.flags2(), AVCodecFlag2::FAST.into());
+        assert!(decoder.flags2().contains(AVCodecFlag2::FAST));
+        assert_eq!(decoder.thread_type(), ThreadType::FRAME | ThreadType::SLICE);
+        assert_eq!(decoder.thread_count(), num_cpus::get() as i32);
+        Ok(())
+    }
+
+    /// 未设置 `with_flags` 时落到 rsmedia 的解码默认值 `LOW_DELAY`；显式正数
+    /// `thread_count` 原样落入上下文；`0`（自行推导）与负数没有合法语义，
+    /// [`crate::codec::set_thread_count`] 不写该字段 ⇒ 上下文保持 `0`，
+    /// `avcodec_open2` 会把它定成解码器的默认 `1`。
+    #[test]
+    fn test_builder_codec_flags_default_and_thread_count() -> Result<()> {
+        use crate::codec::AVCodecFlag;
+
+        let reader = StreamReader::new("assets/mp4.mp4")?;
+        let default = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        assert!(
+            default.flags().contains(AVCodecFlag::LOW_DELAY),
+            "unset flags must fall back to the decoder default LOW_DELAY"
+        );
+
+        let explicit = DecoderBuilder::new(MediaType::VIDEO)
+            .with_thread_count(2)
+            .build_from_reader(&reader)?;
+        assert_eq!(explicit.thread_count(), 2);
+
+        for ignored in [0, -1] {
+            let non_positive = DecoderBuilder::new(MediaType::VIDEO)
+                .with_thread_count(ignored)
+                .build_from_reader(&reader)?;
+            assert_eq!(
+                non_positive.thread_count(),
+                1,
+                "a non-positive thread_count ({ignored}) must be ignored, \
+                 leaving FFmpeg's default"
+            );
+        }
         Ok(())
     }
 
@@ -1685,19 +1808,27 @@ mod tests {
     }
 
     /// `with_pix_fmt` 只拒绝无法表示为数据平面的格式（位流 / 调色板 / 硬件），
-    /// 且在构建时返回错误而非 panic。
+    /// 且在构建时以 `InvalidConfig` 返回错误（而不是 panic，也不是笼统的 `Other`）——
+    /// 换一个格式就能成功，所以这是调用方需要改的配置。
     #[test]
-    fn test_decode_video_with_pix_fmt_unsupported() {
+    fn test_decode_video_with_pix_fmt_not_storable() {
         for fmt in [
             PixelFormat::MONOWHITE, // 位流：分量不足一字节
             PixelFormat::PAL8,      // 调色板格式：样本指向独立调色板
             PixelFormat::VAAPI,     // 硬件格式：没有主机端样本
         ] {
             let reader = StreamReader::new("assets/mp4.mp4").unwrap();
-            let result = DecoderBuilder::new(MediaType::VIDEO)
+            let err = match DecoderBuilder::new(MediaType::VIDEO)
                 .with_pix_fmt(fmt)
-                .build_from_reader(&reader);
-            assert!(result.is_err(), "{fmt:?} should be rejected");
+                .build_from_reader(&reader)
+            {
+                Ok(_) => panic!("{fmt:?} must be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.is_invalid_config(),
+                "{fmt:?} must be reported as invalid configuration: {err}"
+            );
         }
     }
 
@@ -1918,7 +2049,7 @@ mod tests {
 
         let mut reader = StreamReader::new(&path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(vec![crate::filter::video::fps(FILTER_FPS as f32)])
+            .with_filters(vec![crate::filter::video::fps(FILTER_FPS)])
             .build_from_reader(&reader)?;
 
         // 从头解几帧，让滤镜图里真正开始有缓冲
@@ -1982,6 +2113,98 @@ mod tests {
         Ok(())
     }
 
+    /// 解码器输入缓冲满（`avcodec_send_packet` 返回 EAGAIN）时必须先取走已就绪的帧
+    /// 再重试，而不是把 `DecoderFullError` 抛给调用方。
+    ///
+    /// 触发条件是"连续送包而不取帧"——正是 [`decode_raw_packet`](Self::decode_raw_packet)
+    /// 返回 `None`（解码器还在缓冲，没到出帧的时候）时调用方的下一步动作。对
+    /// `assets/mp4.mp4` 实测第 3 次发送必然 EAGAIN。
+    #[test]
+    fn test_send_packet_with_retry_recovers_from_a_full_decoder() -> Result<()> {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+        let reader = StreamReader::new(video_path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        let mut source = StreamReader::new(video_path)?;
+
+        // 连送 4 个包，中途一次也不取帧。
+        let mut packets = 0usize;
+        while packets < 4 {
+            let Some((index, packet)) = source.read_packet()? else {
+                break;
+            };
+            if index != decoder.stream_index() {
+                continue;
+            }
+            decoder
+                .send_packet_with_retry(Some(&packet))
+                .unwrap_or_else(|e| {
+                    panic!("send #{} must survive a full decoder: {e}", packets + 1)
+                });
+            packets += 1;
+        }
+        assert_eq!(packets, 4, "the asset must have at least 4 packets");
+
+        // 重试路径取出的帧进了队列，按 FIFO 交付：先到的帧先出来。
+        let mut manual = Vec::new();
+        while let Some(frame) = decoder.receive_normalized_frame()? {
+            manual.push(frame.pts);
+        }
+        assert!(
+            !manual.is_empty(),
+            "the buffered frames must still be delivered"
+        );
+
+        // 与常规整段解码的前若干帧逐一相同：重试没有丢帧，也没打乱顺序。
+        let expected = decode_all_pts(video_path, false)?;
+        assert!(expected.len() >= manual.len(), "sanity: prefix must fit");
+        assert_eq!(
+            manual,
+            expected[..manual.len()],
+            "frames surfaced by the retry path must be the same prefix, in the same order"
+        );
+        Ok(())
+    }
+
+    /// 手动逐包解码与常规 `decode_frame` 通道必须给出**逐帧相同**的结果。
+    ///
+    /// 这条锁的是 `receive_normalized_frame` 的交付顺序（B2 的重构动了它的入口）：
+    /// 队列与解码器两处来源合起来仍要按解码顺序输出，既不丢帧也不乱序。
+    #[test]
+    fn test_decode_raw_packet_recovers_from_a_full_decoder() -> Result<()> {
+        let video_path = std::path::Path::new("assets/mp4.mp4");
+
+        let reader = StreamReader::new(video_path)?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        let mut source = StreamReader::new(video_path)?;
+
+        // 逐包手动解码，全程不得报错（旧行为会在第 3 个包上失败）。
+        let mut manual = Vec::new();
+        while let Some((index, packet)) = source.read_packet()? {
+            if index != decoder.stream_index() {
+                continue;
+            }
+            if let Some(frame) = decoder.decode_raw_packet(&packet)? {
+                manual.push(frame.pts);
+            }
+        }
+        while let Some(frame) = decoder.drain_raw()? {
+            manual.push(frame.pts);
+        }
+
+        // 与常规 `decode_frame` 路径逐帧一致：既没丢帧，也没乱序。
+        let expected = decode_all_pts(video_path, false)?;
+        assert!(
+            expected.len() > 2,
+            "the asset must have several frames, got {}",
+            expected.len()
+        );
+        assert_eq!(
+            manual, expected,
+            "manual packet decoding must deliver exactly the same frames in the same order"
+        );
+        Ok(())
+    }
+
     /// 造一段可预测的视频：`content` 为 `true` 时逐像素填噪声（损坏实验用，
     /// 噪声让码流对字节翻转更敏感），否则留空（静态画面）。
     fn write_test_clip(path: &std::path::Path, frames: i64, gop: i32, noise: bool) -> Result<()> {
@@ -2023,9 +2246,14 @@ mod tests {
     }
 
     /// 解出全部帧的 pts；遇到错误时返回 `Err`（附带已解出的帧数）。
+    ///
+    /// 固定单线程解码：**损坏码流在多个解码线程下没有可复现的结果**——错误恢复
+    /// 走哪条路径取决于线程调度，同一份损坏文件可能这次被容错掩盖、下次直接
+    /// 报错。这个测试的全部意义就是"同一份损坏必得同一个结论"，所以线程数必须
+    /// 钉住（编码侧本来就是逐字节确定的，见 `test_err_recognition` 的文件哈希）。
     fn decode_all_pts(path: &std::path::Path, strict: bool) -> Result<Vec<i64>> {
         let mut reader = StreamReader::new(path)?;
-        let builder = DecoderBuilder::new(MediaType::VIDEO);
+        let builder = DecoderBuilder::new(MediaType::VIDEO).with_thread_count(1);
         let builder = if strict {
             builder.with_err_recognition(ErrRecognition::BUFFER | ErrRecognition::EXPLODE)
         } else {

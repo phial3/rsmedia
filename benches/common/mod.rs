@@ -21,16 +21,16 @@ use std::thread;
 
 /// Video job: 2 s of 320x240 @ 30 fps (60 frames, pts left unset so the
 /// encoder's automatic numbering is exercised).
-pub const WIDTH: usize = 320;
-pub const HEIGHT: usize = 240;
+pub const WIDTH: u32 = 320;
+pub const HEIGHT: u32 = 240;
 pub const FPS: f32 = 30.0;
 pub const VIDEO_FRAMES: usize = 60;
 pub const VIDEO_MEDIA_SECS: f64 = 2.0;
 
 /// Audio job: ~3 s of 44.1 kHz stereo AAC with variable input frame sizes, so
 /// the encoder's sample FIFO has to split and merge.
-pub const SAMPLE_RATE: u32 = 44_100;
-pub const CHANNELS: u32 = 2;
+pub const SAMPLE_RATE: i32 = 44_100;
+pub const CHANNELS: i32 = 2;
 pub const AUDIO_FRAMES: usize = 100;
 pub const AUDIO_SAMPLES_MAX: u32 = 1200;
 pub const AUDIO_MEDIA_SECS: f64 = 3.0;
@@ -94,7 +94,7 @@ pub fn remove_file(path: &Path) {
 
 /// One encode job of `kind` written to `path`; `enc_threads` is forwarded to
 /// [`EncoderBuilder::with_thread_count`].
-pub fn run_job(kind: MediaType, path: &Path, enc_threads: usize) -> Result<()> {
+pub fn run_job(kind: MediaType, path: &Path, enc_threads: i32) -> Result<()> {
     match kind {
         MediaType::VIDEO => encode_video(path, enc_threads),
         MediaType::AUDIO => encode_audio(path, enc_threads),
@@ -106,7 +106,7 @@ pub fn run_job(kind: MediaType, path: &Path, enc_threads: usize) -> Result<()> {
 /// Drain `jobs` through a fixed pool of `workers` threads, every encoder
 /// running with `enc_threads` threads. The two knobs trade off against each
 /// other: their product must not exceed the core count.
-pub fn run_pool(jobs: &[(MediaType, PathBuf)], workers: usize, enc_threads: usize) -> Result<()> {
+pub fn run_pool(jobs: &[(MediaType, PathBuf)], workers: usize, enc_threads: i32) -> Result<()> {
     let queue = Mutex::new(jobs.iter());
     let error = Mutex::new(None);
 
@@ -134,7 +134,7 @@ pub fn run_pool(jobs: &[(MediaType, PathBuf)], workers: usize, enc_threads: usiz
     }
 }
 
-pub fn encode_video(path: &Path, enc_threads: usize) -> Result<()> {
+pub fn encode_video(path: &Path, enc_threads: i32) -> Result<()> {
     let encoder = EncoderBuilder::new_video(WIDTH, HEIGHT)
         .with_fps(FPS)
         .with_thread_count(enc_threads)
@@ -151,15 +151,10 @@ pub fn encode_video(path: &Path, enc_threads: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn encode_audio(path: &Path, enc_threads: usize) -> Result<()> {
-    let encoder = EncoderBuilder::new_audio(
-        128_000,
-        CHANNELS as i32,
-        SAMPLE_RATE as i32,
-        SampleFormat::FLTP,
-    )
-    .with_thread_count(enc_threads)
-    .build()?;
+pub fn encode_audio(path: &Path, enc_threads: i32) -> Result<()> {
+    let encoder = EncoderBuilder::new_audio(128_000, CHANNELS, SAMPLE_RATE, SampleFormat::FLTP)
+        .with_thread_count(enc_threads)
+        .build()?;
     let mut muxer = Muxer::new(path)?;
     let a_idx = muxer.add_encoder(encoder)?;
 
@@ -174,12 +169,12 @@ pub fn encode_audio(path: &Path, enc_threads: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn encode_subtitle(path: &Path, enc_threads: usize) -> Result<()> {
+pub fn encode_subtitle(path: &Path, enc_threads: i32) -> Result<()> {
     // Subtitle encoding is a synchronous API without internal buffering, so the
     // thread count cannot parallelize a single job; it is set anyway for
     // uniformity, and job-level parallelism comes from the worker pool.
     let mut encoder = EncoderBuilder::new_subtitle()
-        .with_codec_name(Some("mov_text".to_string()))
+        .with_codec_name("mov_text")
         .with_subtitle_header(ASS_HEADER)
         .with_thread_count(enc_threads)
         .build()?;
@@ -208,9 +203,11 @@ fn rainbow_frame(p: f32) -> MediaFrame<u8> {
         .expect("RGB24 frames are interleaved");
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
-            samples[[y, x, 0]] = rgb[0];
-            samples[[y, x, 1]] = rgb[1];
-            samples[[y, x, 2]] = rgb[2];
+            let ys = y as usize;
+            let xs = x as usize;
+            samples[[ys, xs, 0]] = rgb[0];
+            samples[[ys, xs, 1]] = rgb[1];
+            samples[[ys, xs, 2]] = rgb[2];
         }
     }
     frame

@@ -118,8 +118,8 @@ fn main() -> Result<()> {
 fn save_frame(frame: &MediaFrame<u8>, index: usize) -> Result<()> {
     let rgb = frame.convert_yuv420p_to_rgb24()?;
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(
-        frame.width as u32,
-        frame.height as u32,
+        frame.width,
+        frame.height,
         rgb.data
             .as_packed()
             .expect("RGB24 frames are interleaved")

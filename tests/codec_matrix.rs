@@ -19,12 +19,12 @@ use rsmedia::{DecoderBuilder, EncoderBuilder, MediaType, Options, Quality};
 use std::ffi::CString;
 use std::time::Instant;
 
-const WIDTH: usize = 96;
-const HEIGHT: usize = 64;
+const WIDTH: u32 = 96;
+const HEIGHT: u32 = 64;
 const FRAMES: usize = 10;
 const FPS: f32 = 25.0;
-const SAMPLE_RATE: u32 = 44_100;
-const CHANNELS: u32 = 2;
+const SAMPLE_RATE: i32 = 44_100;
+const CHANNELS: i32 = 2;
 const AUDIO_FRAMES: usize = 10;
 
 /// Returns true when `name` is a usable **encoder** in this FFmpeg build.
@@ -53,7 +53,7 @@ fn video_roundtrip(
 
     let mut builder = EncoderBuilder::new_video(WIDTH, HEIGHT)
         .with_fps(FPS)
-        .with_codec_name(codec_name.to_string());
+        .with_codec_name(codec_name);
     if let Some(quality) = quality {
         builder = builder.with_quality(quality);
     }
@@ -78,7 +78,7 @@ fn video_roundtrip(
             .map_err(|e| anyhow::anyhow!("{label}: to_avframe {i} failed: {e}"))?;
         // 编码器 time_base = 1/FPS，帧索引即 pts（每帧 1 tick = 1/FPS 秒）
         av.set_pts(i as i64);
-        av.set_time_base(enc_tb);
+        av.set_time_base(enc_tb.into());
         muxer
             .mux(av, v_idx)
             .map_err(|e| anyhow::anyhow!("{label}: mux {i} failed: {e}"))?;
@@ -125,7 +125,7 @@ fn audio_roundtrip(
     label: &str,
     codec_name: &str,
     container: &str,
-    sample_rate: u32,
+    sample_rate: i32,
     nb_samples: u32,
     quality: Option<Quality>,
 ) -> anyhow::Result<()> {
@@ -139,9 +139,9 @@ fn audio_roundtrip(
 
     let mut builder = EncoderBuilder::default()
         .with_media_type(MediaType::AUDIO)
-        .with_nb_channels(CHANNELS as i32)
-        .with_sample_rate(sample_rate as i32)
-        .with_codec_name(codec_name.to_string());
+        .with_nb_channels(CHANNELS)
+        .with_sample_rate(sample_rate)
+        .with_codec_name(codec_name);
     if let Some(quality) = quality {
         builder = builder.with_quality(quality);
     }
@@ -161,7 +161,7 @@ fn audio_roundtrip(
             .to_avframe()
             .map_err(|e| anyhow::anyhow!("{label}: to_avframe {i} failed: {e}"))?;
         av.set_pts(total_pts);
-        av.set_time_base(enc_tb);
+        av.set_time_base(enc_tb.into());
         total_pts += nb_samples as i64;
         muxer
             .mux(av, a_idx)
@@ -186,7 +186,7 @@ fn audio_roundtrip(
         .map_err(|e| anyhow::anyhow!("{label}: decode failed: {e}"))?
     {
         assert_eq!(
-            frame.sample_rate, sample_rate as i32,
+            frame.sample_rate, sample_rate,
             "{label}: decoded sample rate mismatch"
         );
         assert!(frame.nb_samples > 0, "{label}: decoded empty audio frame");
@@ -243,7 +243,7 @@ fn matrix_video_mpeg4() -> anyhow::Result<()> {
 #[test]
 fn matrix_video_vp9() -> anyhow::Result<()> {
     let mut opts = Options::new();
-    opts.insert("cpu-used", "8").insert("row-mt", "1");
+    opts.set("cpu-used", "8").set("row-mt", "1");
     video_roundtrip(
         "vp9",
         "libvpx-vp9",

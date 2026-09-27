@@ -3,7 +3,6 @@
 /debug
 /target
 /output
-/tests/output
 /build
 **/*/target/
 
@@ -18,4 +17,5 @@ Cargo.lock
 .vscode/
 .idea/
 .trae/
+.zcode/
 .workbuddy/
