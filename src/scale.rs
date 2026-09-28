@@ -330,8 +330,7 @@ fn fix_output_color_metadata(dst_frame: &mut AVFrame, dst_pix_fmt: PixelFormat) 
     if !dst_pix_fmt.is_full_range() {
         return;
     }
-    // Safety: dst_frame 由本模块新建/持有（引用计数为 1）；rsmpeg 的 wrap 不实现
-    // DerefMut，字段写入经裸指针完成。
+    // Safety: dst_frame 由本模块新建/持有（引用计数为 1）
     unsafe {
         let raw = dst_frame.as_mut_ptr();
         (*raw).color_range = ffi::AVCOL_RANGE_JPEG;
@@ -760,33 +759,56 @@ impl std::fmt::Debug for Scaler {
     }
 }
 
-/// 池化帧的 stride 对齐（字节）。与 FFmpeg `#define ALIGN` 的**非 SIMD64** 取值
-/// 一致（`HAVE_SIMD_ALIGN_64` 打开时 FFmpeg 自己用 64，见 `libavutil/frame.c`）；
-/// 编码器内部的 SIMD 读取路径按此假设优化，32 也在所有平台上都被 FFmpeg 接受。
-const POOL_ALIGN: i32 = 32;
-
-/// 池化帧缓冲的额外留白（字节）。`av_image_fill_arrays` 只要求
-/// `av_image_get_buffer_size(align)` 的精确尺寸，多留一点以覆盖
-/// `av_frame_get_buffer` 同样会加的 padding 余量，防御 SIMD 越界读。
+/// 池化帧缓冲的额外留白（字节）。需同时覆盖两种超出可见像素的部分：
+/// `av_image_get_buffer_size` 之外的行/尾部对齐余量，以及 [`pool_align`]
+/// 的那次 data 对齐偏移（最多 `align - 1` 字节）。
+///
+/// 64 是 [`ffi::av_cpu_max_align`] 在**任何**架构上的上界（`ff_get_cpu_max_align_x86`
+/// 的 AVX-512 分支封顶），因此足以覆盖那次偏移。
 const POOL_PADDING: usize = 64;
+
+/// 池化帧 stride 的对齐（字节）—— FFmpeg 自己给、FFmpeg 自己用。
+///
+/// 必须是 [`ffi::av_cpu_max_align`] 而不是一个常量：`av_frame_get_buffer(frame, 0)`
+/// 默认用它，而**这个值随 CPU 变化** —— `ff_get_cpu_max_align_x86` 在无 AVX 时给
+/// 8/16，AVX 给 32，AVX-512 给 **64**；aarch64 上则是 NEON 的 16。写死 32 会在
+/// AVX-512 机器上把平面指针放在比 swscale / 编码器的 SIMD 读取路径所要求的
+/// 更低的位置。
+///
+/// 返回值只做 `usize → i32` 这一次转换（`av_image_*` 那组 `int align` 参数要的
+/// 就是这个宽度）；不加范围判断：FFmpeg 的返回值上限是 64，而能被喂回 FFmpeg 的
+/// 值域本就是 `int`。
+fn pool_align() -> i32 {
+    // SAFETY: `av_cpu_max_align` 是无副作用的 CPU 能力查询（纯读静态标志）
+    unsafe { ffi::av_cpu_max_align() as i32 }
+}
+
+/// 池化帧缓冲相对 `av_image_get_buffer_size` 的额外字节数。
+///
+/// 至少要有 [`pool_align`]，否则那次 data 对齐偏移（最多 `align - 1`）会落在
+/// 缓冲之外 —— 这是对历史上"`POOL_PADDING` 恰好够用"这条隐含假设的解耦。
+fn pool_frame_padding() -> usize {
+    POOL_PADDING.max(pool_align() as usize)
+}
 
 /// 计算池化帧缓冲所需尺寸：`av_image_get_buffer_size`（与
 /// [`alloc_pooled_frame`] 使用的 `av_image_fill_arrays` 同一 `align`，
 /// 两者互为镜像）加上安全留白。
 fn pooled_frame_buffer_size(fmt: PixelFormat, width: i32, height: i32) -> Result<usize> {
-    let size = unsafe { ffi::av_image_get_buffer_size(fmt.into(), width, height, POOL_ALIGN) };
+    let align = pool_align();
+    let size = unsafe { ffi::av_image_get_buffer_size(fmt.into(), width, height, align) };
     if size < 0 {
         return Err(RsmediaError::invalid_config(format!(
             "cannot size a pooled frame buffer for {fmt:?} {width}x{height}: \
              av_image_get_buffer_size returned {size}"
         )));
     }
-    Ok(size as usize + POOL_PADDING)
+    Ok(size as usize + pool_frame_padding())
 }
 
 /// 从池中取缓冲并组装一个可写入的目标帧。
 ///
-/// 帧的所有平面指针由 `av_image_fill_arrays` 按 `POOL_ALIGN` 对齐指向池缓冲
+/// 帧的所有平面指针由 `av_image_fill_arrays` 按 [`pool_align`] 对齐指向池缓冲
 /// 内部；缓冲所有权移交给 `frame.buf[0]`——帧被 unref（或引用计数归零）时，
 /// 缓冲自动归还池（池已析构则直接释放）。
 ///
@@ -812,15 +834,17 @@ fn alloc_pooled_frame(
         .context("Failed to get a buffer from the frame pool")?;
 
     // 池缓冲的起始地址对齐由 FFmpeg 的 pool allocator 决定，跨平台不保证
-    // 32 字节（Windows 上 `av_malloc` 通常仅 16 对齐）。而编码器的 SIMD
-    // 读取依赖平面指针 32 字节对齐（与 `av_frame_get_buffer` 的默认一致），
-    // 故在缓冲内部把数据基准偏移到下一个 32 字节边界后，再交给
-    // `av_image_fill_arrays` 铺排平面——这样 `data[0]` 恒为 32 对齐。
-    // offset ∈ [0, 31]，`POOL_PADDING` 足以覆盖；`av_image_fill_arrays` 的
-    // 排布随之从对齐后的起点延续，不越界。
+    // 32 字节（Windows 上 `av_malloc` 通常仅 16 对齐）。编码器的 SIMD 读取
+    // 依赖平面指针按 FFmpeg 自己的 `av_cpu_max_align()` 对齐（与
+    // `av_frame_get_buffer` 的默认一致），故在缓冲内部把数据基准偏移到下一个
+    // 对齐边界后，再交给 `av_image_fill_arrays` 铺排平面。
+    // offset ∈ [0, align-1]，`pool_frame_padding()` 按定义足以覆盖；
+    // `av_image_fill_arrays` 的排布随之从对齐后的起点延续，不越界。
+    let align = pool_align();
+    let align_bytes = align as usize;
     let base = unsafe { (*buffer.as_ptr()).data as usize };
-    let offset = (POOL_ALIGN as usize - (base % POOL_ALIGN as usize)) % POOL_ALIGN as usize;
-    // Safety: offset ∈ [0,31] 落在池缓冲内部（POOL_PADDING=64 足够覆盖）。
+    let offset = (align_bytes - (base % align_bytes)) % align_bytes;
+    // Safety: offset ∈ [0, align-1] 落在池缓冲内部（留白 ≥ align）。
     let aligned = unsafe { (*buffer.as_ptr()).data.add(offset) as *const u8 };
 
     let mut data = [std::ptr::null_mut::<u8>(); 8];
@@ -835,7 +859,7 @@ fn alloc_pooled_frame(
             fmt.into(),
             width,
             height,
-            POOL_ALIGN,
+            align,
         )
     };
     if ret < 0 {
@@ -879,7 +903,7 @@ fn alloc_pooled_frame(
 ///
 /// # Safety
 ///
-/// `data`/`linesize` 必须是 `av_image_fill_arrays(fmt, width, height, POOL_ALIGN)` 在
+/// `data`/`linesize` 必须是 `av_image_fill_arrays(fmt, width, height, pool_align())` 在
 /// `buffer` 内部排布的结果，且 `buffer` 是独占引用（无其他持有者）。
 unsafe fn zero_frame_padding(
     buffer: &AVBufferRef,
@@ -1281,22 +1305,50 @@ mod tests {
         Ok(())
     }
 
-    /// 安全性：池化帧的缓冲指针至少 32 字节对齐（`av_malloc` 的跨平台
-    /// 保证下限），`av_image_fill_arrays` 的平面排布与编码器 SIMD 读取
-    /// 都依赖这一点。
+    /// 安全性：池化帧的平面指针按 FFmpeg 自己要求的 [`pool_align`] 对齐，
+    /// `av_image_fill_arrays` 的平面排布与编码器 SIMD 读取都依赖这一点。
+    ///
+    /// 断言跟着 [`pool_align`] 走而不是写死 32：本机的对齐随 CPU 能力变化
+    /// （AVX-512 上是 64），写死会让测试在别的机器上失去意义——或者在曾经
+    /// 的这个实现下，**恰好因为两边都写死 32 而测不出 AVX-512 上的欠对齐**。
     #[test]
     fn test_scaler_pool_frame_alignment() -> Result<()> {
+        let align = pool_align() as usize;
+        assert!(
+            align.is_power_of_two(),
+            "align {align} must be a power of two"
+        );
         let mut scaler = Scaler::new().with_buffer_pool(true);
         let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
         for _ in 0..4 {
             let frame = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
             let addr = frame.data[0] as usize;
-            assert_eq!(addr % 32, 0, "pooled frame data at {addr:#x} not aligned");
+            assert_eq!(
+                addr % align,
+                0,
+                "pooled frame data at {addr:#x} not aligned"
+            );
             // 平面 1/2 的指针同样对齐（fill_arrays 在缓冲内按 align 排布）。
             let addr_uv = frame.data[1] as usize;
-            assert_eq!(addr_uv % 32, 0, "chroma plane at {addr_uv:#x} not aligned");
+            assert_eq!(
+                addr_uv % align,
+                0,
+                "chroma plane at {addr_uv:#x} not aligned"
+            );
         }
         Ok(())
+    }
+
+    /// `pool_size` 之外，缓冲尺寸必须容下对齐偏移：留白 ≥ align，否则在池缓冲
+    /// 起点刚好不与 `av_cpu_max_align()` 对齐时，那次偏移会越过缓冲末端。
+    #[test]
+    fn test_pooled_buffer_holds_the_alignment_offset() {
+        let align = pool_align() as usize;
+        assert!(
+            pool_frame_padding() >= align,
+            "padding {} must cover an offset of up to {align} bytes",
+            pool_frame_padding()
+        );
     }
 
     /// 安全性：几何变化重建池时，**旧池的未归还缓冲**必须安全存活到

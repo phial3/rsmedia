@@ -339,16 +339,37 @@ impl Time {
         }
     }
 
-    /// Creates a new timestamp that reprsents `nth` of a second.
+    /// Creates a new timestamp that represents one `nth` of a second — the
+    /// instant `1 / nth` s, spelled as the tick `1` in a `1 / nth` time base
+    /// rather than as a rounded float.
     ///
     /// # Arguments
     ///
-    /// * `nth` - Denominator of the time in seconds as in `1 / nth`.
-    pub fn from_nth_of_a_second(nth: usize) -> Self {
-        Self {
+    /// * `nth` - Denominator of the time in seconds as in `1 / nth`. [`i32`]
+    ///   because that is the width of `AVRational`'s fields: the value the caller
+    ///   writes is the value FFmpeg reads, with no narrowing in between.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `nth == 0`: `1 / 0` is not a
+    /// number, and [`Rational`] cannot hold it. That is [`Rational::new`]'s own
+    /// rule, not an extra one — it is the only case this constructor has to
+    /// reject.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsmedia::Time;
+    ///
+    /// assert_eq!(Time::from_nth_of_a_second(4)?.as_secs_f64(), 0.25);
+    /// assert!(Time::from_nth_of_a_second(0).is_err());
+    /// # Ok::<(), rsmedia::RsmediaError>(())
+    /// ```
+    pub fn from_nth_of_a_second(nth: i32) -> Result<Self> {
+        Ok(Self {
             time: Some(1),
-            time_base: one_over(nth as i32),
-        }
+            time_base: Rational::new(1, nth)?,
+        })
     }
 
     /// Creates a new timestamp from a number of seconds.
@@ -379,13 +400,33 @@ impl Time {
     ///
     /// # Arguments
     ///
-    /// * `time` - Relative time in `time_base` units.
+    /// * `time` - Relative time in `time_base` units. [`i64`] because that is
+    ///   FFmpeg's own timestamp width (`AVFrame.pts`, `AVPacket.pts`).
     /// * `base_den` - Time base denominator i.e. time base is `1 / base_den`.
-    pub fn from_units(time: usize, base_den: usize) -> Self {
-        Self {
-            time: Some(time as i64),
-            time_base: one_over(base_den as i32),
-        }
+    ///   [`i32`], like `AVRational`'s fields.
+    ///
+    /// Both are the widths FFmpeg reads back, so neither is narrowed on the way
+    /// in — see [`Self::from_nth_of_a_second`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `base_den == 0`, for the same
+    /// reason [`Self::from_nth_of_a_second`] does: `1 / 0` is not a number.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsmedia::Time;
+    ///
+    /// assert_eq!(Time::from_units(3, 2)?.as_secs_f64(), 1.5);
+    /// assert!(Time::from_units(1, 0).is_err());
+    /// # Ok::<(), rsmedia::RsmediaError>(())
+    /// ```
+    pub fn from_units(time: i64, base_den: i32) -> Result<Self> {
+        Ok(Self {
+            time: Some(time),
+            time_base: Rational::new(1, base_den)?,
+        })
     }
 
     /// Create a new zero-valued timestamp.
@@ -527,20 +568,6 @@ impl Time {
                 .map(|time| time.rescale(self.time_base, time_base)),
             time_base,
         }
-    }
-}
-
-/// `1 / den` as a time base.
-///
-/// A denominator of zero cannot be a time base, and [`Rational`] cannot hold one;
-/// such a value folds to [`Rational::ZERO`], so the resulting [`Time`] simply has
-/// no convertible value (see [`Time::as_secs_f64`]) instead of carrying an
-/// infinity around.
-fn one_over(den: i32) -> Rational {
-    if den > 0 {
-        Rational::unit(den)
-    } else {
-        Rational::ZERO
     }
 }
 
@@ -889,12 +916,31 @@ mod tests {
     }
 
     #[test]
-    fn test_from_nth_of_a_second() {
-        let time = Time::from_nth_of_a_second(4);
+    fn test_from_nth_of_a_second() -> Result<()> {
+        let time = Time::from_nth_of_a_second(4)?;
         assert!(time.has_value());
         assert_eq!(time.as_secs(), 0.25);
         assert_eq!(time.as_secs_f64(), 0.25);
         assert_eq!(Duration::from(time), Duration::from_millis(250));
+        Ok(())
+    }
+
+    /// `1 / 0` is refused rather than folded into a "no time base" [`Time`].
+    ///
+    /// Everything else is now out of reach instead of checked: the denominator is
+    /// [`i32`] — `AVRational`'s own width — so there is no narrowing left for a
+    /// value to wrap in. `from_nth_of_a_second(2^31 + 5)` used to become `1 / 5`
+    /// at the `as i32` cast; it now does not compile.
+    #[test]
+    fn test_from_nth_of_a_second_rejects_a_zero_denominator() {
+        let zero = Time::from_nth_of_a_second(0).unwrap_err();
+        assert!(zero.is_invalid_config(), "{zero}");
+
+        // The whole i32 range is usable, and reaches FFmpeg unchanged.
+        let extreme =
+            Time::from_nth_of_a_second(i32::MAX).expect("i32::MAX is a valid denominator");
+        assert_eq!(extreme.time_base, Rational::new(1, i32::MAX).unwrap());
+        assert_eq!(extreme.time_base.den(), i32::MAX);
     }
 
     #[test]
@@ -914,11 +960,28 @@ mod tests {
     }
 
     #[test]
-    fn test_from_units() {
-        let time = Time::from_units(3, 5);
+    fn test_from_units() -> Result<()> {
+        let time = Time::from_units(3, 5)?;
         assert!(time.has_value());
         assert_eq!(time.as_secs(), 3.0 / 5.0);
         assert_eq!(Duration::from(time), Duration::from_millis(600));
+        Ok(())
+    }
+
+    /// Both arguments are FFmpeg's own widths (`int64_t` ticks, `int` denominator),
+    /// so the only case left to reject is `1 / 0`. Ticks used to be `usize`, which
+    /// wraps to `-1` past `i64::MAX` on a 64-bit target; they are `i64` now.
+    #[test]
+    fn test_from_units_rejects_a_zero_denominator() -> Result<()> {
+        assert!(Time::from_units(1, 0).unwrap_err().is_invalid_config());
+
+        // The whole range is usable and reaches FFmpeg unchanged — including
+        // negative ticks, which FFmpeg legitimately carries.
+        let extreme = Time::from_units(i64::MAX, i32::MAX).expect("in-range arguments");
+        assert_eq!(extreme.into_value(), Some(i64::MAX));
+        let negative = Time::from_units(-3, 2)?;
+        assert_eq!(negative.as_secs_f64(), -1.5);
+        Ok(())
     }
 
     #[test]
@@ -1066,41 +1129,45 @@ mod tests {
     }
 
     #[test]
-    fn test_aligned_with() {
-        let a = Time::from_units(3, 16);
-        let b = Time::from_units(1, 8);
+    fn test_aligned_with() -> Result<()> {
+        let a = Time::from_units(3, 16)?;
+        let b = Time::from_units(1, 8)?;
         let aligned = a.aligned_with(b);
         assert_eq!(aligned.lhs, Some(3));
         assert_eq!(aligned.rhs, Some(2));
+        Ok(())
     }
 
     #[test]
-    fn test_into_aligned_with() {
-        let a = Time::from_units(2, 7);
-        let b = Time::from_units(2, 3);
+    fn test_into_aligned_with() -> Result<()> {
+        let a = Time::from_units(2, 7)?;
+        let b = Time::from_units(2, 3)?;
         let aligned = a.aligned_with(b);
         assert_eq!(aligned.lhs, Some(2));
         assert_eq!(aligned.rhs, Some(5));
+        Ok(())
     }
 
     #[test]
-    fn test_as_secs() {
-        let time = Time::from_nth_of_a_second(4);
+    fn test_as_secs() -> Result<()> {
+        let time = Time::from_nth_of_a_second(4)?;
         assert_eq!(time.as_secs(), 0.25);
         let time = Time::from_secs(0.3);
         assert_eq!(time.as_secs(), 0.3);
         let time = Time::new(None, rat(0, 0));
         assert_eq!(time.as_secs(), 0.0);
+        Ok(())
     }
 
     #[test]
-    fn test_as_secs_f64() {
-        let time = Time::from_nth_of_a_second(4);
+    fn test_as_secs_f64() -> Result<()> {
+        let time = Time::from_nth_of_a_second(4)?;
         assert_eq!(time.as_secs_f64(), 0.25);
         let time = Time::from_secs_f64(0.3);
         assert_eq!(time.as_secs_f64(), 0.3);
         let time = Time::new(None, rat(0, 0));
         assert_eq!(time.as_secs_f64(), 0.0);
+        Ok(())
     }
 
     #[test]
@@ -1134,15 +1201,16 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_different_time_bases() {
+    fn test_apply_different_time_bases() -> Result<()> {
         let a = Time::new(Some(3), rat(2, 32));
-        let b = Time::from_nth_of_a_second(4);
+        let b = Time::from_nth_of_a_second(4)?;
         assert!(
             (a.aligned_with(b).apply(|x, y| x + y).as_secs()
                 - Time::from_secs(7.0 / 16.0).as_secs())
             .abs()
                 < 0.001
         );
+        Ok(())
     }
 
     #[test]

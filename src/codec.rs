@@ -224,7 +224,7 @@ macro_rules! impl_codec_builder_setters {
         /// # Ok(())
         /// # }
         /// ```
-        pub fn with_hw_pool_size(mut self, pool_size: u32) -> Self {
+        pub fn with_hw_pool_size(mut self, pool_size: i32) -> Self {
             self.hw_pool_size = Some(pool_size);
             self
         }

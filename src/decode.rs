@@ -108,7 +108,7 @@ pub struct DecoderBuilder {
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
     /// 硬件帧池的预分配表面数（`None` = [`crate::hwaccel::DEFAULT_HW_POOL_SIZE`]）。
-    hw_pool_size: Option<u32>,
+    hw_pool_size: Option<i32>,
     /// 缩放核选择（互斥，只取一个算法位）
     scale_algorithm: ScaleAlgorithm,
     /// 缩放质量位（可多位，见 [`ScaleQuality`]）。

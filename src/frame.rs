@@ -1153,8 +1153,7 @@ where
             {
                 (*raw).alpha_mode = self.alpha_mode;
             }
-            // `duration` is the canonical field; `pkt_duration` is only a mirror, see
-            // the field docs.
+            // `duration` is the canonical field; `pkt_duration` is only a mirror
             (*raw).duration = self.duration;
             // `AVFrame::new()` leaves `pkt_dts` at `AV_NOPTS_VALUE`, so this is the
             // only place the frame's decode timestamp can come from.
@@ -1593,9 +1592,14 @@ fn plane_ptr(frame: &AVFrame, plane: usize) -> *mut u8 {
 ///
 /// `linesize` is a byte distance and negative for bottom-up frames, so it is
 /// divided by the element size only when that division is exact: a linesize that
-/// is not a whole number of elements (or cannot hold one row of `row_len`
-/// samples) would make the row-wise copy walk outside the plane. One-row planes —
-/// every audio plane — never apply the stride, so nothing is validated for them.
+/// is not a whole number of elements would make the row-wise copy walk outside
+/// the plane. That check applies to **every** plane, including one-row ones — a
+/// silently rounded stride is not a value any caller should be handed.
+///
+/// What one-row planes *are* exempt from is the "row fits" check below: a single
+/// row is read or written in one piece, so the stride is never traversed. Audio
+/// planes lean on that exemption: FFmpeg records no usable `linesize` for the
+/// channels past its inline array, and every audio plane is one row tall.
 fn plane_stride<T: ElementType>(
     frame: &AVFrame,
     plane: usize,
@@ -1608,16 +1612,13 @@ fn plane_stride<T: ElementType>(
     // past the array would panic, and those planes are one row tall anyway, so
     // the missing entry is treated as "no stride".
     let linesize = frame.linesize.get(plane).copied().unwrap_or(0) as i64;
-    if rows <= 1 {
-        return Ok(linesize / element_size);
-    }
     if linesize % element_size != 0 {
         return Err(RsmediaError::msg(format!(
             "Frame plane {plane} has linesize {linesize}, not a multiple of the {element_size}-byte element size"
         )));
     }
     let stride = linesize / element_size;
-    if row_len as i64 > stride.abs() {
+    if rows > 1 && row_len as i64 > stride.abs() {
         return Err(RsmediaError::msg(format!(
             "Frame plane {plane} holds {stride} samples per row, but {row_len} are needed"
         )));
@@ -1917,8 +1918,46 @@ fn write_side_data(frame: &mut AVFrame, entries: &[FrameSideData]) {
 mod tests {
     use super::*;
     use crate::colors::Color;
+    use rsmpeg::UnsafeDerefMut;
     use std::error::Error as _;
     use std::time::Duration;
+
+    /// 单行的平面同样要做"能整除"这道校验。
+    ///
+    /// `plane_stride` 曾对 `rows <= 1` 直接返回 `linesize / element_size`：当
+    /// `linesize` 不是元素大小的整数倍时得到的是一个**被截断**的 stride，虽然
+    /// 当前两处调用方的循环恰好用不到它（只有一行），但这个函数自身的契约是
+    /// "validated stride"，把截断值交出去就是在埋雷。
+    ///
+    /// 反过来，"一行放得下吗"对单行平面仍然免检：音频平面（以及高度为一的视频
+    /// 平面）从 FFmpeg 那里拿到的 `linesize` 未必衡量行宽——超过内联数组 8 个平面
+    /// 的多声道就没有条目。
+    #[test]
+    fn test_plane_stride_validates_one_row_planes() -> Result<()> {
+        let mut frame = AVFrame::new();
+        frame.set_format(i32::from(PixelFormat::RGB24));
+        frame.set_width(8);
+        frame.set_height(1);
+        frame.alloc_buffer()?;
+
+        // u8 元素：任何行数都能整除。
+        let even = frame.linesize[0];
+        assert_eq!(plane_stride::<u8>(&frame, 0, 1, 8)?, i64::from(even));
+
+        // u16 元素、奇数 linesize：过去会返回 被截断 的值，现在必须报错。
+        // Safety: `linesize` 是可写的本地帧字段，改成奇数只影响本探针。
+        unsafe { frame.deref_mut().linesize[0] = 65 };
+        let err = plane_stride::<u16>(&frame, 0, 1, 8).unwrap_err();
+        assert!(
+            err.to_string().contains("not a multiple of"),
+            "expected a divisibility error, got {err}"
+        );
+
+        // Safety: 负的 stride（bottom-up 帧）同样是判断整除，而不是判断正负。
+        unsafe { frame.deref_mut().linesize[0] = -128 };
+        assert_eq!(plane_stride::<u16>(&frame, 0, 1, 8)?, -64);
+        Ok(())
+    }
 
     const TEST_WIDTH: u32 = 320;
     const TEST_HEIGHT: u32 = 240;

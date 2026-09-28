@@ -255,7 +255,7 @@ const HW_CTX_CACHE_MAX_ENTRIES: usize = 8;
 /// [`EncoderBuilder::with_hw_pool_size`](crate::encode::EncoderBuilder::with_hw_pool_size)
 /// 或 [`DecoderBuilder::with_hw_pool_size`](crate::decode::DecoderBuilder::with_hw_pool_size)；
 /// 传 `0` 表示交给后端自己决定（FFmpeg 的默认行为：按需分配，不预占）。
-pub(crate) const DEFAULT_HW_POOL_SIZE: u32 = 20;
+pub(crate) const DEFAULT_HW_POOL_SIZE: i32 = 20;
 
 /// 无锁地收集缓存中**当前未被使用**（引用计数为 1，仅缓存自身持有）的条目键。
 fn unused_hw_ctx_configs() -> Vec<HWDeviceConfig> {
@@ -434,7 +434,7 @@ impl HWContext {
         codec_ctx: &mut AVCodecContext,
         width: i32,
         height: i32,
-        pool_size: u32,
+        pool_size: i32,
     ) -> Result<()> {
         let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
         codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
@@ -477,7 +477,7 @@ impl HWContext {
         codec_ctx: &mut AVCodecContext,
         width: i32,
         height: i32,
-        pool_size: u32,
+        pool_size: i32,
     ) -> Result<()> {
         let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
         codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
@@ -490,18 +490,21 @@ impl HWContext {
     ///
     /// 仅共享访问 device_ctx：`hwframe_ctx_alloc` 内部只做 av_buffer_ref（原子），
     /// 每次调用都新建独立的 AVHWFramesContext，由调用方（codec_ctx）独占持有。
+    /// `pool_size` is [`i32`] — the type of `AVHWFramesContext::initial_pool_size` —
+    /// so it reaches FFmpeg exactly as the caller wrote it, with no narrowing and
+    /// therefore no way for a value to be silently reinterpreted on the way in.
     pub(crate) fn create_hw_frames_ctx(
         &self,
         width: i32,
         height: i32,
-        pool_size: u32,
+        pool_size: i32,
     ) -> Result<rsmpeg::avutil::AVHWFramesContext> {
         let mut hw_frames_ctx = self.device_ctx.hwframe_ctx_alloc();
         hw_frames_ctx.data().format = self.get_format(true);
         hw_frames_ctx.data().sw_format = self.get_format(false);
         hw_frames_ctx.data().width = width;
         hw_frames_ctx.data().height = height;
-        hw_frames_ctx.data().initial_pool_size = pool_size as i32;
+        hw_frames_ctx.data().initial_pool_size = pool_size;
 
         hw_frames_ctx
             .init()
@@ -1481,12 +1484,12 @@ mod tests {
             .config
             .device_type
             .is_available(ProbeDepth::SurfaceAlloc);
-        for pool_size in [0u32, 1, 7, DEFAULT_HW_POOL_SIZE] {
+        for pool_size in [0, 1, 7, DEFAULT_HW_POOL_SIZE] {
             let is_d3d11_zero = pool_size == 0 && ctx.config.device_type == HWDeviceType::D3D11VA;
             match ctx.create_hw_frames_ctx(64, 64, pool_size) {
                 Ok(mut frames) => assert_eq!(
                     frames.data().initial_pool_size,
-                    pool_size as i32,
+                    pool_size,
                     "requested pool size {pool_size} must reach AVHWFramesContext"
                 ),
                 // D3D11VA 的 frames_init 对 0 无条件 ENOMEM：后端硬约束，非透传缺陷。

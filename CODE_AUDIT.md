@@ -60,10 +60,13 @@ bytes → Reader(io.rs) → Demuxer(mux.rs) → Decoder(decode.rs)
 > | B2 | 已修 | `decode.rs` 新增 `send_packet_with_retry` + `drain_decoder_frames` + `pending_frames` 队列；`decode_raw_packet`/`drain_raw` 改走重试入口 | `test_send_packet_with_retry_recovers_from_a_full_decoder`、`test_decode_raw_packet_recovers_from_a_full_decoder` |
 > | B3 | 〔未修〕 | rsmpeg 侧 `hwframe_ctx_alloc().unwrap()`，需上游改 | — |
 > | B4 | 已修 | `filter.rs` `init` 前置拒绝空 `filters`（`InvalidConfig`）；顺手修正 `build` 的过时文档（缺滤镜是 `Unsupported`） | `test_empty_filter_list_is_invalid_config` |
-> | B5–B7 | 〔未修〕 | 均为"仅在畸形输入下出问题" | — |
+> | B5 | 已修（2026-09-28） | `stream.rs::find_{de,en}coder_name` 的 c-name 转换失败处理为"未注册"并 `warn!`；`options.rs::build` 由转换自身决定跳过，去掉 check/unwrap 漂移 | `options::tests::test_interior_nul_entries_are_skipped_not_panicking` |
+> | B6 | 已修（2026-09-28） | `Time::from_nth_of_a_second`/`from_units` 改 `Result<Self>`，参数改用 FFmpeg 自己的宽度（`i32` 分母 / `i64` 刻度）⇒ 原 `one_over` 的"折叠成无值时基"与 `as i32` 回绕都失去立足点；没有新增任何范围判断，剩下的只有 `Rational::new` 本就有的 `den != 0` | `time::tests::test_from_nth_of_a_second_rejects_a_zero_denominator`、`time::tests::test_from_units_rejects_a_zero_denominator` |
+> | B7 | 已修（2026-09-28） | `scale.rs` 对齐改查 `av_cpu_max_align()`（留白 ≥ align）；`hwaccel.rs` 的 `pool_size` 一路改 `i32`（= `AVHWFramesContext::initial_pool_size` 的宽度），直接赋值、不做转换判断；`frame.rs::plane_stride` 对所有平面判整除 | `scale::tests::test_pooled_buffer_holds_the_alignment_offset`、`scale::tests::test_scaler_pool_frame_alignment`（断言改随 `pool_align`）、`frame::tests::test_plane_stride_validates_one_row_planes` |
 > | C1 | 已修 | `encode.rs` `build()` 前置校验 `width`/`height` ∈ `1..=i32::MAX`（视频） | `test_video_size_out_of_range_is_invalid_config` |
 > | C2 | 已修 | 新增 `codec.rs` `apply_thread_count`（超 `i32` 打 `warn!`）；`rc_max_rate`/`rc_buffer_size` 负值 `warn!`、显式 0 只 `debug!` | `test_builder_thread_count_beyond_i32_is_ignored`、`test_non_positive_rate_control_is_not_applied` |
-> | C3–C5 | 〔未修〕 | 同上，`b68f5ed` 的有意设计 | — |
+> | C3 | 〔未修〕 | 同上，`b68f5ed` 的有意设计（typed setter 与 `with_options` 同名键冲突时字典静默胜出；文档已写明但无重建期诊断） | — |
+> | C4/C5 | 已修（更早批次） | **更正**：`thread_count` 两侧现已都是 `i32`；位掩码 setter 由批次 5 的 `FlagSet<E>` 强类型化，`src/` 下再无 `impl Into<u32>` | — |
 > | D | 〔未修〕 | 纯增量：`# Errors` 优先 | — |
 >
 > 验证：`cargo fmt --check` ✅、`clippy -D warnings`（含 / 不含 `image`）✅、
@@ -118,7 +121,7 @@ loop { ... Err(e) => return Err(e.with_context("... output is truncated")) }
 ```
 排空循环里 `receive_packet()` 报错、或撞上 `MAX_DRAIN_ITERATIONS` 时返回 `Err`，但 `state` 已经停在 `Drained` 且不会回退。此时**第二次**调用 `flush()`（用户重试、或 `Muxer::flush_if_needed`/`Drop` 再次驱动，`mux.rs:1190`）命中这个守卫 → 返回 `Ok(默认累加器)` → `finish()` 照常写 trailer → **截断的容器以成功返回**。守卫的判定应该是 `is_flushed()`（真的排空完成）而不是 `!is_normal()`。这是"把可恢复的 I/O 错误升级成静默数据丢失"，值得优先修。
 
-### B. 健壮性 / 健全性　**（B1 / B2 / B4 已修；B3、B5–B7 未修）**
+### B. 健壮性 / 健全性　**（B1 / B2 / B4 / B5 / B6 / B7 已修；B3 未修）**
 
 | # | 位置 | 问题 | 复核 |
 |---|---|---|---|
@@ -126,44 +129,49 @@ loop { ... Err(e) => return Err(e.with_context("... output is truncated")) }
 | B2 | `decode.rs:1029-1035` | `decode_raw_packet` = 送 1 包 + 收 **1** 帧；`encode` 侧有 `send_frame_with_retry` + 全量排空，解码侧没有对应物。H.264 场编码 / MPEG-2 field picture 这类"一个包出多帧"的流，下一次 `send_packet` 会返回 `EAGAIN`，被 rsmpeg 映射成 `DecoderFullError` 抛出，而不是先把已就绪的帧交出来 | 已复核（`EAGAIN` 映射为推理，未实测） |
 | B3 | `hwaccel.rs:865` | `hw_device_ctx.hwframe_ctx_alloc()` 内部是 rsmpeg 的 `av_hwframe_ctx_alloc(...).upgrade().unwrap()`：FFmpeg 返回 NULL（OOM/未知类型）时 **panic**，而 `is_available()` 是 `-> bool` 的探测 API，不该 unwind | 已复核 |
 | B4 | `filter.rs:1952-1988` | `with_filters(Some(vec![]))` 不被拒绝：`filter_spec = ""` → `setup_endpoints` → `graph.config()` 失败，报的是一句**不透明 FFmpeg 错误**，而不是像 `FilterGraphBuilder::build`（`filter.rs:2717`）那样给 `InvalidConfig`。`decode.rs:547`/`encode.rs:708` 的注释还承诺"校验在 `init` 里做" | 已复核 |
-| B5 | `stream.rs:452` `stream.rs:476` `options.rs:122-123` | 对 `str_to_cstring(...)` 的 `.unwrap()`。当前输入分别是静态表和"NUL 已预检过"的键值，**都不可达**；但这是唯一一类"未来改动即 panic"的写法，建议顺手换成 `?`/`InvalidConfig` | 已复核 |
-| B6 | `time.rs:56` `time.rs:92-93` | `from_nth_of_a_second(0)` → 时间基 `1/0`（退化）；`from_nth_of_a_second(usize::MAX)`/`from_units(_, usize::MAX)` 在 `as i32` 处回绕成负数。且 `has_value()` 对 `1/0` 返回 true，`seconds_or_none()` 返回 `None`，两个"可用"定义不一致 | 已复核 |
-| B7 | `scale.rs:728` `hwaccel.rs:486` `frame.rs:1591` | 池化缓冲固定 32 字节对齐（`av_frame_get_buffer` 默认是 `av_cpu_max_align()`，AVX-512 上是 64）；`pool_size as i32` 对 `u32::MAX` 回绕成 -1；`plane_stride` 对单行平面跳过全部校验。都是"只在畸形输入下出问题" | 部分复核 |
+| B5 | `stream.rs:452` `stream.rs:476` `options.rs:122-123` | 对 `str_to_cstring(...)` 的 `.unwrap()`。当前输入分别是静态表和"NUL 已预检过"的键值，**都不可达**；但这是唯一一类"未来改动即 panic"的写法，建议顺手换成 `?`/`InvalidConfig` | **已修**（2026-09-28）：`stream.rs` 两处改为带 `warn!` 的"不可表示 ⇒ 未注册"（回退软件编解码器，`find_*_name` 仍返回 `Option<String>` 不改 API）；`options.rs::build` 去掉"先 `contains('\0')` 预检、再 `unwrap()`"的漂移形状，改成转换自身决定，且能分别指出是 key 还是 value |
+| B6 | `time.rs:56` `time.rs:92-93` | `from_nth_of_a_second(0)` → 时间基 `1/0`（退化）；`from_nth_of_a_second(usize::MAX)`/`from_units(_, usize::MAX)` 在 `as i32` 处回绕成负数。且 `has_value()` 对 `1/0` 返回 true，`seconds_or_none()` 返回 `None`，两个"可用"定义不一致 | **已修**（2026-09-28）：签名改为 `from_nth_of_a_second(nth: i32)` / `from_units(time: i64, base_den: i32)` —— **用 FFmpeg 自己的宽度承接**，越界值因此根本不可表达，无需任何范围判断；原 `one_over` 的"折叠成无值时基"删除（那正是"悄悄换掉调用方的值"）。剩下的唯一拒绝是 `Rational::new` 本就有的 `den != 0`。`has_value`/`seconds_or_none` 的不一致在更早一轮已统一 |
+| B7 | `scale.rs:728` `hwaccel.rs:486` `frame.rs:1591` | 池化缓冲固定 32 字节对齐（`av_frame_get_buffer` 默认是 `av_cpu_max_align()`，AVX-512 上是 64）；`pool_size as i32` 对 `u32::MAX` 回绕成 -1；`plane_stride` 对单行平面跳过全部校验。都是"只在畸形输入下出问题" | **已修**（2026-09-28）：对齐改查 `av_cpu_max_align()`（`OnceLock` 缓存，实测 x86 8/16/32/64 随 CPU 变、aarch64 16/8），留白改为 `max(64, align)` 以兜住偏移；`hw_pool_size` 用 `i32::try_from` 并把校验拆成自由函数（无 GPU 也能测）；`plane_stride` 对**所有**平面判整除，只对单行平面免"行放得下"检查（音频平面靠这条豁免） |
 
-### C. 静默接受矛盾/越界配置（多数是 `b68f5ed` 的有意设计，但缺诊断）　**（C1 / C2 已修；C3–C5 未修）**
+### C. 静默接受矛盾/越界配置（多数是 `b68f5ed` 的有意设计，但缺诊断）　**（C1 / C2 / C4 / C5 已修；C3 未修）**
 
 | # | 位置 | 问题 |
 |---|---|---|
 | C1 | `encode.rs:594-602`（校验点）+ `encode.rs:411`、`680`（`as i32`） | `width/height` 改成 `u32` 后没有任何范围校验，`build()` 只校验 `req_fps`。`new_video(1 << 31, 720)` 得到负的 `AVCodecContext.width`，最终报的是 `avcodec_open2` 的不透明错误 |
 | C2 | `codec.rs:18-21` + `encode.rs:506` + `decode.rs:326` | `thread_count` 超出 `i32` 会**下溢成负数被忽略**，静默退回 FFmpeg 默认；`with_buffer_size(0)`/`with_max_bit_rate(0)` 从"build 报错"变成"视为未设置"（doc 已同步，但没有 `warn!`）。三处都只在代码注释里说明 |
-| C3 | `codec.rs:130-147` | 删掉 `owned_option_keys` 守卫后，typed setter 与 `with_options` 同名键（`threads`/`flags`/`b`/`crf`/`g`/`bf`…）冲突时**由 dict 静默胜出**，build 期无任何提示 |
-| C4 | `encode.rs:1707` vs `decode.rs:703` | 同一个 `thread_count` 在 `Encoder` 上返回 `u32`、在 `Decoder` 上返回 `i32` |
-| C5 | `codec.rs:104-128` + `init.rs:80-95` | `impl Into<u32>` 的 flag setter 接受任意 u32（`u32::MAX`）直接写进 `flags/flags2/thread_type`，不再受枚举约束 |
+| C3 | `codec.rs:130-147` | 删掉 `owned_option_keys` 守卫后，typed setter 与 `with_options` 同名键（`threads`/`flags`/`b`/`crf`/`g`/`bf`…）冲突时**由 dict 静默胜出**，build 期无任何提示。**〔未修〕** |
+| C4 | `encode.rs:1707` vs `decode.rs:703` | 同一个 `thread_count` 在 `Encoder` 上返回 `u32`、在 `Decoder` 上返回 `i32`。**〔已修〕** 两侧现在都是 `i32`（`encode.rs:1867`、`decode.rs:737`） |
+| C5 | `codec.rs:104-128` + `init.rs:80-95` | `impl Into<u32>` 的 flag setter 接受任意 u32（`u32::MAX`）直接写进 `flags/flags2/thread_type`，不再受枚举约束。**〔已修〕** 批次 5 引入 `FlagSet<E>`（`src/flags.rs`），setter 收 `impl Into<FlagSet<_>>`；`src/` 下已无 `impl Into<u32>`。注：这条原不顺 §五 P4 的"`impl Into<AVCodecFlag>`"修法——那样的签名会让 `A \| B`（无名组合）和 `0` 都编译不过 |
 
 ### D. 工程质量债（量化）
 
-| 维度 | 现状 | 说明 |
+> **§D 的数字是 2026-09-28 的实测值**（`rsmedia-codebase-audit/scripts/audit_quality.py`），与 2026-09-27 那版有明显漂移，
+> 主要来自其间的"文档/实现一致性"一轮（`148a2c6`）与 B5–B7 修复。
+
+| 维度 | 现状（2026-09-28） | 说明 |
 |---|---|---|
-| 公开文档语言 | 英文 **1675** 行 / 中文 **1828** 行 | 项目规则要求公开项英文；集中在 `filter.rs`(665)、`mux.rs`(257)、`decode.rs`(166)、`io.rs`(114)、`hwaccel.rs`(109) |
-| `# Errors` 段 | **146** 个返回 `Result` 的公开函数缺（本轮未变） | 用户靠它知道该 match `is_invalid_config` 还是 `is_unsupported` |
-| 公开项无文档 | **100** 个（`codec.rs` 的 `CodecConfig` 整块、`scale.rs` 等；本轮未变） | |
-| `unsafe` 缺 `SAFETY:` | **95 / 143**（本轮未变） | 优先补 `unsafe impl Send` 这类健全性声明（`io.rs` 17、`scale.rs` 15、`mux.rs` 12、`imgutils.rs` 11） |
-| 泛化 `Other` | **39 → 40** 处 | 本轮新增的 1 处是 `decode.rs` 的"重试仍 EAGAIN"防挂死不变量（与 `encode.rs` 既有那条同形），**保留是正确的**。仍然只有 `io.rs:587` 该用 `.context()` |
-| 长函数 | `encode.rs:607 build` **286 行**（C1 校验 +7）、`filter.rs:2723 build` 279、`decode.rs:361 build_from_reader` 217、`decode.rs:1224 receive_normalized_frame` 138、`stream.rs:200 from_stream` 138 | `filter.rs` 单文件 **4680** 行（本轮净增 51） |
+| 公开文档语言 | 英文 **2166** 行 / 中文 **2057** 行 | 项目规则要求公开项英文；集中在 `filter.rs`(775)、`mux.rs`(261)、`decode.rs`(170)、`hwaccel.rs`(124)、`io.rs`(114) |
+| `# Errors` 段 | **145** 个返回 `Result` 的公开函数缺 | 用户靠它知道该 match `is_invalid_config` 还是 `is_unsupported`。**优先级最高、纯增量** |
+| 公开项无文档 | **90** 个 | |
+| `unsafe` 缺 `SAFETY:` | **94 / 144** | 优先补 `unsafe impl Send` 这类健全性声明（`io.rs` 17、`scale.rs` 15、`mux.rs` 12、`imgutils.rs` 11） |
+| 缺 `# Panics` 段 | **23** 个可能 panic 的公开函数缺 | |
+| 泛化 `Other` | **41** 处 | 26 内部不变量（应保留）、11 疑似该是 `InvalidConfig`、3 数据形状（保留）、1 该用 `.context()`（`io.rs:600`） |
+| 长函数 | `encode.rs:705 build` **294 行**、`filter.rs:3107 build` 279、`decode.rs:379 build_from_reader` 217、`stream.rs:207 from_stream` 141、`decode.rs:1248 receive_normalized_frame` 138 | `filter.rs` 单文件 **5260** 行 |
 | 重复守卫 | "header 之后不准加流"在 `io.rs:1125`、`mux.rs:364`、`mux.rs:443` **三份**（两份逐字相同、消息不一致）；`get_stream`/`get_stream_mut` 在 `Muxer`/`Demuxer` 各一份 | 该不变量坏掉会 SIGSEGV，漂移有实际风险 |
 
 ---
 
 ## 三、建议修复顺序
 
-**1–3 已完成（2026-09-27），剩余 4 与 A3/B3/C3–C5 未动。**
+**4 未完成；A3 / B3 / C3 未动（B5–B7 已于 2026-09-28 修完）。**
 
 1. ~~**A5**（`flush` 守卫，1 行改动 + 一个回归测试）→ **A2**（阈值改 `< 2160`）→ **A1**（奇数尺寸按 ceil）→ **A4**（对齐 `pixel.rs` 的规则）~~ ✅ 已完成
    → **A3**（`MediaFrame` 增 `AVChannelLayout` 字段，是 API 变更，单独一轮）**未修**。
 2. ~~**B4**（空 filters 前置拒绝）、**B1**（补 `R: Send`）、**B2**（解码侧补全量排空）~~ ✅ 已完成。
 3. ~~**C2/C1**：给静默路径补 `tracing::warn!` 或范围校验~~ ✅ 已完成。
 4. **D**：`# Errors` 优先（信息量最大、纯增量），再翻译公开文档，`SAFETY:` 按文件清。**未动用**。
-5. 未列入本轮：**A3**（声道布局字段）、**B3**（rsmpeg 侧 `unwrap`，需上游）、**B5–B7**（仅畸形输入）、**C3–C5**（`b68f5ed` 的有意设计）、§D 全部。
+5. ~~**B5–B7**（仅畸形输入）~~ ✅ 已于 2026-09-28 修完（见 §二 表内各行）。
+6. 仍未动：**A3**（声道布局字段）、**B3**（rsmpeg 侧 `unwrap`，需上游）、**C3**（`b68f5ed` 的有意设计）、§D 全部。
 
 ## 四、已确认健康（勿重复报警）
 

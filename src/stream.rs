@@ -14,12 +14,6 @@ use rsmpeg::ffi;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 
-// 由单源表生成枚举与双向映射：判别值即 FFmpeg 常量值。
-// 未列出的值走 `fallback`（此处为 panic，fail fast），需要"报告而非中止"时用
-// 宏另外生成的 `from_ffi_checked`（见本文件 `StreamInfo::from_stream` 对
-// 未知像素格式的处理）。
-// 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）——
-// 挂在宏调用外部的 doc 注释 rustdoc 不认，会触发 unused_doc_comments 警告。
 ffi_enum_wrap_from!(
     /// Media type (FFmpeg `AVMEDIA_TYPE_*`): the classification of a stream.
     ///
@@ -464,9 +458,19 @@ impl StreamInfo {
         let hw_codec_name = hw_device_type
             .and_then(|hw| hw_decoder_name(hw, codec_id))
             .filter(|name| {
-                let exists =
-                    AVCodec::find_decoder_by_name(&strutils::str_to_cstring(name).unwrap())
-                        .is_some();
+                // The table below only yields literals, so this branch is not
+                // reachable today — but a name that cannot be written as a C
+                // string cannot name an FFmpeg codec either, so "unrepresentable"
+                // means exactly "not registered". Saying so keeps a future table
+                // entry from falling back to software without leaving a trace.
+                let Ok(c_name) = strutils::str_to_cstring(name) else {
+                    tracing::warn!(
+                        "HW decoder name for {codec_name:?} carries an interior NUL, \
+                         treating it as unregistered"
+                    );
+                    return false;
+                };
+                let exists = AVCodec::find_decoder_by_name(&c_name).is_some();
                 if !exists {
                     tracing::debug!(
                         "HW decoder '{name}' not registered in this FFmpeg build, \
@@ -493,9 +497,17 @@ impl StreamInfo {
         let hw_codec_name = hw_device_type
             .and_then(|hw| hw_encoder_name(hw, codec_id))
             .filter(|name| {
-                let exists =
-                    AVCodec::find_encoder_by_name(&strutils::str_to_cstring(name).unwrap())
-                        .is_some();
+                // Same reasoning as [`Self::find_decoder_name`]: a name that is
+                // not representable as a C string is a name FFmpeg cannot have
+                // registered, which means "fall back" rather than "panic".
+                let Ok(c_name) = strutils::str_to_cstring(name) else {
+                    tracing::warn!(
+                        "HW encoder name for {codec_name:?} carries an interior NUL, \
+                         treating it as unregistered"
+                    );
+                    return false;
+                };
+                let exists = AVCodec::find_encoder_by_name(&c_name).is_some();
                 if !exists {
                     tracing::debug!(
                         "HW encoder '{name}' not registered in this FFmpeg build, \
