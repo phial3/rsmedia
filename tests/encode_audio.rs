@@ -498,7 +498,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
     let output_path = test_output_path("encode_audio", &format!("sine.{container_type}"));
 
     let audio_filters = vec![
-        filter::audio::volume(1.2),  // 音量提升
+        filter::audio::volume(1.2)?, // 音量提升
         filter::audio::highpass(80), // 切除 80Hz 以下低频
         filter::audio::atempo(1.25), // 加速 25%
     ];

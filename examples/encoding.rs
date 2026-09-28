@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
     let height = 640;
 
     let mut filters = vec![
-        filter::video::scale(1280, 720, Some("bicubic")),
+        filter::video::scale(1280, 720, Some("bicubic"))?,
         filter::video::crop(20, 20, width, height),
         filter::video::hqdn3d(3.0, 2.0), // 视频降噪
     ];
@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
     // 不可用就跳过时间水印，保证示例在各种 FFmpeg 上都能跑。
     let drawtext = filter::video::DrawText::new("", 50, 50, 18, "white@0.5")
         .time_text("%{localtime}") // 当前时间水印
-        .build();
+        .build()?;
     if filter::get_by_name(drawtext.name())?.is_some() {
         filters.push(drawtext);
     } else {

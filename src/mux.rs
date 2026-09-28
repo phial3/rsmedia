@@ -2622,7 +2622,7 @@ mod tests {
         let out_fps = 10.0f32;
 
         // 没有gif_palette
-        let gif_palette = crate::filter::video::gif_palette(out_fps, None);
+        let gif_palette = crate::filter::video::gif_palette(out_fps, None)?;
         if crate::filter::get_by_name(gif_palette.name())?.is_none() {
             return Ok(());
         }

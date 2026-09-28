@@ -168,13 +168,13 @@ fn swap_background(
             &format!("0x{:02X}{:02X}{:02X}", key_rgb.0, key_rgb.1, key_rgb.2),
             similarity,
             0.1,
-        ))
+        )?)
         .with_inputs(["photo"])
         .with_label("keyed"),
     );
     // overlay 输入 0 = 主画面（新底色），输入 1 = 叠加层（抠像后的照片，
     // 原底色处已透明，透出白底；人像处不透明，盖在白底上）。
-    builder.add_node(FilterNode::new(video::overlay("0", "0")).with_inputs(["bg", "keyed"]));
+    builder.add_node(FilterNode::new(video::overlay("0", "0")?).with_inputs(["bg", "keyed"]));
     builder.add_output_tail(endpoint);
     let mut graph = builder
         .build()
@@ -227,12 +227,12 @@ fn crop_scale(
     let out_endpoint = rgb_endpoint(tw as i32, th as i32);
     let mut chain: Vec<Filter> = vec![
         video::crop(cx, cy, cw, ch),
-        video::scale(tw as u32, th as u32, Some("lanczos")),
+        video::scale(tw as u32, th as u32, Some("lanczos"))?,
     ];
     if beautify {
         // 磨皮 + 轻微提亮 + 锐化，证件照标准美颜三连（有画质损失，默认关）。
         chain.push(video::smartblur(0.1, 3.0));
-        chain.push(video::lutyuv(Some("val+8"), None, None));
+        chain.push(video::lutyuv(Some("val+8"), None, None)?);
         chain.push(video::unsharp());
     }
 

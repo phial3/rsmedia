@@ -280,7 +280,7 @@ mod video {
         );
 
         let filters = vec![
-            filter::video::scale(640, 360, None),
+            filter::video::scale(640, 360, None)?,
             filter::video::crop(0, 0, 640, 360),
         ];
 
@@ -956,11 +956,11 @@ mod video {
             ("vflip", video::vflip(), n_frames, Some((width, height))),
             ("negate", video::negate(), n_frames, Some((width, height))),
             ("hue", video::hue(30), n_frames, Some((width, height))),
-            ("gamma", video::gamma(1.2), n_frames, Some((width, height))),
+            ("gamma", video::gamma(1.2)?, n_frames, Some((width, height))),
             ("noise", video::noise(10), n_frames, Some((width, height))),
             (
                 "saturation",
-                video::saturation(1.5),
+                video::saturation(1.5)?,
                 n_frames,
                 Some((width, height)),
             ),
@@ -972,8 +972,8 @@ mod video {
             ),
             ("deblock", video::deblock(), n_frames, Some((width, height))),
             ("unsharp", video::unsharp(), n_frames, Some((width, height))),
-            ("blur", video::blur(2.0), n_frames, Some((width, height))),
-            ("eq", video::eq(0.2, 1.5), n_frames, Some((width, height))),
+            ("blur", video::blur(2.0)?, n_frames, Some((width, height))),
+            ("eq", video::eq(0.2, 1.5)?, n_frames, Some((width, height))),
             (
                 "hqdn3d",
                 video::hqdn3d(2.0, 2.0),
@@ -1000,7 +1000,7 @@ mod video {
             ),
             (
                 "drawbox",
-                video::drawbox(0, 0, 32, 32, "red", 2),
+                video::drawbox(0, 0, 32, 32, "red", 2)?,
                 n_frames,
                 Some((width, height)),
             ),
@@ -1026,20 +1026,20 @@ mod video {
             // 画布默认仍是输入尺寸，故方形输入下尺寸不变）。
             (
                 "scale_down",
-                video::scale(32, 32, None),
+                video::scale(32, 32, None)?,
                 n_frames,
                 Some((32, 32)),
             ),
             (
                 "scale_up",
-                video::scale(128, 128, None),
+                video::scale(128, 128, None)?,
                 n_frames,
                 Some((128, 128)),
             ),
             ("crop", video::crop(0, 0, 32, 32), n_frames, Some((32, 32))),
             (
                 "pad",
-                video::pad(96, 96, 0, 0, "black"),
+                video::pad(96, 96, 0, 0, "black")?,
                 n_frames,
                 Some((96, 96)),
             ),
@@ -1051,11 +1051,16 @@ mod video {
                 Some((width, height)),
             ),
             // 帧率保持类（`fps` 按时间戳取整，末帧可能被舍去，故最小帧数放宽一帧）
-            ("fps", video::fps(24.0), n_frames - 1, Some((width, height))),
+            (
+                "fps",
+                video::fps(24.0)?,
+                n_frames - 1,
+                Some((width, height)),
+            ),
             // DrawText 依赖 FFmpeg 以 libfreetype 编译；缺省字体为项目内 fonts/Arial.ttf
             (
                 "DrawText",
-                video::DrawText::new("Hello", 5, 5, 16, "white").build(),
+                video::DrawText::new("Hello", 5, 5, 16, "white").build()?,
                 n_frames,
                 Some((width, height)),
             ),
@@ -2160,7 +2165,7 @@ mod audio {
         type FilterCase = (&'static str, Filter, bool);
         let cases: Vec<FilterCase> = vec![
             // 时长保持类
-            ("volume", audio::volume(0.8), true),
+            ("volume", audio::volume(0.8)?, true),
             ("equalizer", audio::equalizer(1000, 3.0, 200), true),
             (
                 "compressor",
@@ -2196,7 +2201,7 @@ mod audio {
             ("loudnorm", audio::loudnorm(-16.0), false),
             (
                 "asetpts",
-                filter::setpts(MediaType::AUDIO, "PTS-STARTPTS"),
+                filter::setpts(MediaType::AUDIO, "PTS-STARTPTS")?,
                 false,
             ),
             (

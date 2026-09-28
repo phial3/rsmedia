@@ -1598,7 +1598,7 @@ mod tests {
 
     #[test]
     fn test_decode_video() -> Result<()> {
-        let filters = vec![filter::video::scale(1280, 720, None)];
+        let filters = vec![filter::video::scale(1280, 720, None)?];
 
         let mut reader = StreamReader::new("assets/mp4.mp4")?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
@@ -1689,7 +1689,7 @@ mod tests {
     fn test_decode_audio() -> Result<()> {
         let filters = vec![
             filter::audio::resample(2, 48000, SampleFormat::FLTP),
-            filter::audio::volume(1.5),
+            filter::audio::volume(1.5)?,
         ];
 
         let mut reader = StreamReader::new("assets/wav.wav")?;
@@ -1889,7 +1889,7 @@ mod tests {
         eprintln!("[B] filter only");
         let mut reader_b = StreamReader::new(video_path)?;
         let mut dec_b = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(vec![filter::video::scale(320, 240, None)])
+            .with_filters(vec![filter::video::scale(320, 240, None)?])
             .build_from_reader(&reader_b)?;
         let mut b_dims = HashSet::new();
         while let Some(f) = dec_b.decode_raw(&mut reader_b)? {
@@ -1908,7 +1908,7 @@ mod tests {
         let mut reader_c = StreamReader::new(video_path)?;
         let mut dec_c = DecoderBuilder::new(MediaType::VIDEO)
             .with_resize(Resize::Exact(320, 240))
-            .with_filters(vec![filter::video::scale(640, 480, None)])
+            .with_filters(vec![filter::video::scale(640, 480, None)?])
             .build_from_reader(&reader_c)?;
         let mut c_dims = HashSet::new();
         while let Some(f) = dec_c.decode_raw(&mut reader_c)? {
@@ -1989,7 +1989,7 @@ mod tests {
         let video_path = "assets/mp4.mp4";
         let mut reader = StreamReader::new(video_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(vec![crate::filter::video::fps(10.0)])
+            .with_filters(vec![crate::filter::video::fps(10.0)?])
             .build_from_reader(&reader)?;
 
         let mut first_pass = 0usize;
@@ -2060,7 +2060,7 @@ mod tests {
 
         let mut reader = StreamReader::new(&path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(vec![crate::filter::video::fps(FILTER_FPS)])
+            .with_filters(vec![crate::filter::video::fps(FILTER_FPS)?])
             .build_from_reader(&reader)?;
 
         // 从头解几帧，让滤镜图里真正开始有缓冲

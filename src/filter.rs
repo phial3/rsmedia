@@ -87,11 +87,12 @@ impl Filter {
 /// ```
 /// use rsmedia::{filter, MediaType};
 ///
+/// # fn main() -> rsmedia::Result<()> {
 /// // 线性节点：不写接线，自动接在链尾
-/// let node = filter::FilterNode::new(filter::video::scale(1280, 720, None));
+/// let node = filter::FilterNode::new(filter::video::scale(1280, 720, None)?);
 ///
 /// // 多输入节点：显式指定两路来源（图输入标签或前序节点的输出标签）
-/// let node = filter::FilterNode::new(filter::video::overlay("10", "10"))
+/// let node = filter::FilterNode::new(filter::video::overlay("10", "10")?)
 ///     .with_inputs(["base", "logo"])
 ///     .with_label("composed");
 ///
@@ -100,6 +101,8 @@ impl Filter {
 ///     .with_inputs(["in0"])
 ///     .with_outputs(["copy_a", "copy_b"]);
 /// # let _ = (node, MediaType::VIDEO);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct FilterNode {
@@ -235,134 +238,127 @@ pub fn get_by_name(name: &str) -> Result<Option<AVFilterRef<'static>>> {
     Ok(AVFilter::get_by_name(&filter_name))
 }
 
-/// Escapes characters that are special within FFmpeg filtergraph descriptions.
+/// 第一级（**选项级**）要转义的字符：选项分隔符 `:` `=`、选项值的括号 `{` `}`，以及
+/// 全部图级分隔符。
 ///
-/// This function uses FFmpeg's native av_escape function to properly escape
-/// characters that have special meaning in filter graphs.
+/// 之所以把图级分隔符也算进来，是因为第一级还要单独用于**引号内**的值（见
+/// [`escape_option_level`]）：那种位置没有第二级可选，多转义几个字符是无害的
+/// （第二遍 unescape 会把它们还原），漏转义则会让值被拆开。
+const OPTION_SPECIALS: &str = "\\':,[]={};";
+
+/// 第二级（**图级**）要转义的字符：图级分隔符与链路括号。
+const GRAPH_SPECIALS: &str = "\\'[],;";
+
+/// 走 FFmpeg 自己的 `av_escape`（BACKSLASH 模式，不带 `AV_ESCAPE_FLAG_STRICT`）。
 ///
-/// # Arguments
+/// `av_escape` 只有两种失败，两种都如实报出，**没有任何降级**：
 ///
-/// * `input` - The string to escape
+/// * 入参含内部 NUL —— 它无法成为 C 字符串，也不可能是滤镜描述的一部分；
+///   [`NulError`](std::ffi::NulError) 经 `From` 变成 [`RsmediaError::InvalidConfig`]，
+///   错误消息会指出是 NUL 的问题。
+/// * 分配失败（`av_escape` 返回负值）—— 带上 `AVERROR` 变体与上下文报出。
 ///
-/// # Returns
-///
-/// A new string with special characters escaped according to FFmpeg rules
-fn escape_filter_str(input: &str) -> String {
-    // Early return for empty strings
-    if input.is_empty() {
-        return String::new();
-    }
+/// 以前这里失败时会 `input.replace('\0', "")` 然后原样放行：滤镜描述会悄悄少几个字符
+/// 却照常建图成功，调用方完全看不出自己给的值没被用上。这就是"掩盖问题"。
+fn escape_backslash(input: &str, specials: &str, all_whitespace: bool) -> Result<String> {
+    let c_input = CString::new(input)?;
+    // `specials` 是 crate 里的常量，NUL 是编译期就能排除的；这里不是降级，是不变量。
+    let c_specials = CString::new(specials).expect("a crate constant cannot contain a NUL byte");
+    let flags = if all_whitespace {
+        ffi::AV_ESCAPE_FLAG_WHITESPACE as i32
+    } else {
+        0
+    };
 
-    // FFmpeg 无法处理 NUL 字节；同时在 `av_escape` 失败/返回空指针时，
-    // 退化为「剥离 NUL 后原样放行」。这是有意的降级：宁可未转义，也不拒绝输出。
-    let fallback = || input.replace('\0', "");
-
-    unsafe {
-        // Create a C string from our input
-        let c_input = match CString::new(input) {
-            Ok(s) => s,
-            Err(_) => return fallback(), // Handle null bytes
-        };
-
-        // Characters that need escaping in filtergraph descriptions
-        let special_chars = CString::new("\\':,[]={};").unwrap();
-
-        // Pointer that will receive the escaped string
-        let mut escaped_ptr = std::ptr::null_mut();
-
-        // FFmpeg `av_escape` 的实参：
-        // * `AV_ESCAPE_MODE_AUTO` (0) —— 目前就是 `AV_ESCAPE_MODE_BACKSLASH`：
-        //   `av_bprint_escape` 里写着 `mode = AV_ESCAPE_MODE_BACKSLASH; /* TODO:
-        //   implement a heuristic */`，所以别指望 AUTO 会"挑"一种模式。
-        // * `AV_ESCAPE_FLAG_WHITESPACE` (1 << 0 = 1) —— 连空白字符一起转义。
-        //   （`AV_ESCAPE_FLAG_STRICT` 是 1 << 1 = **2**，不是 1。）
-        // 不带 `STRICT` 时 `av_bprint_escape` 还会额外转义 `'` 与 `\`，
-        // 以及**首尾位置**的空白字符。
-        let result = ffi::av_escape(
+    let mut escaped_ptr = std::ptr::null_mut();
+    // SAFETY: 两个入参都是本函数内构造、在调用期间一直有效的 NUL 结尾 C 字符串；`escaped_ptr`
+    // 是可写的本地变量，成功后由 FFmpeg 填入一块 `av_malloc` 的缓冲（本函数随后释放）。
+    let ret = unsafe {
+        ffi::av_escape(
             &mut escaped_ptr,
             c_input.as_ptr(),
-            special_chars.as_ptr(),
-            ffi::AV_ESCAPE_MODE_AUTO,
-            ffi::AV_ESCAPE_FLAG_WHITESPACE as i32,
-        );
-
-        // 检查返回值是否为错误
-        if result < 0 {
-            tracing::warn!("av_escape failed with error code: {result}");
-            // 使用安全的回退方案
-            return fallback();
-        }
-
-        // 检查返回的指针是否为空
-        if escaped_ptr.is_null() {
-            tracing::warn!("av_escape returned null pointer");
-            // 使用安全的回退方案
-            return fallback();
-        }
-
-        // Convert back to Rust String and free the memory
-        let escaped_cstr = std::ffi::CStr::from_ptr(escaped_ptr);
-        let escaped_string = escaped_cstr.to_string_lossy().into_owned();
-
-        // Free memory allocated by FFmpeg
-        ffi::av_free(escaped_ptr as *mut _);
-
-        escaped_string
-    }
-}
-
-/// filtergraph 的「图级」转义：对**已经过** [`escape_filter_str`] 选项级转义的
-/// 字符串再转义一层。
-///
-/// FFmpeg 对滤镜描述做两级解析：先在整条描述上按 `,` `;` `[` `]` 拆分滤镜与
-/// 链路（图级），再在每个滤镜的参数串上按 `:` `=` 拆分选项（选项级）。所以一个
-/// 不带引号直接写进描述的值必须转义两层：只转一层时，值里的 `,` / `;` / `[]`
-/// 会被图级解析吃掉（如 `movie=/tmp/a,b.mp4` 会被拆成两个滤镜）。
-fn escape_filter_graph_str(input: &str) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
-    // 与 `escape_filter_str` 同样的降级策略：av_escape 失败时剥离 NUL 原样放行。
-    let fallback = || input.replace('\0', "");
-
-    unsafe {
-        let c_input = match CString::new(input) {
-            Ok(s) => s,
-            Err(_) => return fallback(),
-        };
-
-        // 图级特殊字符：`\` `'` `[` `]` `,` `;`
-        let special_chars = CString::new("\\'[],;").unwrap();
-        let mut escaped_ptr = std::ptr::null_mut();
-
-        let result = ffi::av_escape(
-            &mut escaped_ptr,
-            c_input.as_ptr(),
-            special_chars.as_ptr(),
+            c_specials.as_ptr(),
             ffi::AV_ESCAPE_MODE_BACKSLASH,
-            // 不设 AV_ESCAPE_FLAG_WHITESPACE：空格已在选项级转义过，
-            // 再转一次会多出一层反斜杠（值会被解析成前导 `\`）。
-            0,
-        );
-
-        if result < 0 || escaped_ptr.is_null() {
-            tracing::warn!("av_escape failed while escaping filtergraph characters");
-            return fallback();
-        }
-
-        let escaped_string = std::ffi::CStr::from_ptr(escaped_ptr)
-            .to_string_lossy()
-            .into_owned();
-        ffi::av_free(escaped_ptr as *mut _);
-
-        escaped_string
+            flags,
+        )
+    };
+    if ret < 0 {
+        return Err(RsmediaError::av_error(ret).with_context("Failed to escape a filter value"));
     }
+    if escaped_ptr.is_null() {
+        // 成功却拿不到缓冲说明不变量被破坏（`av_escape` 成功时必然写回一块 `av_malloc`
+        // 的内存）—— 如实报出，而不是当成"未转义"继续往下走。
+        return Err(RsmediaError::msg(
+            "av_escape reported success but returned no buffer",
+        ));
+    }
+
+    // SAFETY: 成功路径上 `escaped_ptr` 是 `av_escape` 写入的 NUL 结尾 C 字符串。
+    let escaped = unsafe { CStr::from_ptr(escaped_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: `escaped_ptr` 由 `av_escape` 用 `av_malloc` 分配，必须用 `av_free` 释放。
+    unsafe { ffi::av_free(escaped_ptr as *mut _) };
+
+    Ok(escaped)
 }
 
-/// 把调用者提供的值安全地写进滤镜描述（值外层不加引号时使用）：依次做
-/// **选项级**（[`escape_filter_str`]）与**图级**（[`escape_filter_graph_str`]）转义。
-fn escape_filter_option(input: &str) -> String {
-    escape_filter_graph_str(&escape_filter_str(input))
+/// 第一级：把一个值写进**选项值**位置。
+///
+/// 两种调用方式：
+/// * 作为 [`escape_filter_value`] 的第一步（未经引号的值）；
+/// * **单独**用于外层已经有 `'` 引号的值（`drawtext` 的 `text='…'` / `fontfile='…'`）：
+///   `av_get_token` 在引号内原样拷贝、不处理反斜杠，所以那种位置只需要一级 —— 恰好
+///   一个 `\` 会被第二遍 unescape 吃掉。这也是唯一"只转一级"合法的场合。
+///
+/// # Errors
+///
+/// 见 [`escape_backslash`]：值含 NUL 字节时报 [`RsmediaError::InvalidConfig`]，
+/// `av_escape` 自身失败时报对应的 [`RsmediaError`]。
+fn escape_option_level(input: &str) -> Result<String> {
+    escape_backslash(input, OPTION_SPECIALS, true)
+}
+
+/// 第二级：把第一级的输出再护一层，供**未经引号**直接写进滤镜描述的值使用。
+///
+/// 它的作用不是"再转义一批新字符"（图级字符在第一级里已经转过了），而是把第一级留下的
+/// 反斜杠**翻倍**，让它们在 FFmpeg 的第一遍 unescape 之后仍然存在。
+///
+/// # Errors
+///
+/// 见 [`escape_backslash`]。
+fn escape_graph_level(input: &str) -> Result<String> {
+    escape_backslash(input, GRAPH_SPECIALS, false)
+}
+
+/// 把一个调用方提供的值安全地写进滤镜描述（值外层**不加引号**时使用）：依次做
+/// **选项级**（[`escape_option_level`]）与**图级**（[`escape_graph_level`]）转义。
+///
+/// # 为什么是两级
+///
+/// FFmpeg 对滤镜描述做两次 unescape，顺序与转义相反：
+///
+/// 1. 图级 —— `graphparser.c` 的 `av_get_token(filter, "[],;")` 拆滤镜与链路；
+/// 2. 选项级 —— `avfilter.c::ff_filter_opt_parse` → `av_opt_get_key_value(&args, "=", ":")`
+///    → `av_get_token(opts, ":")` 拆选项。
+///
+/// 所以判据不是"哪些字符被转义了"，而是**每个字符最后留下几个反斜杠**（`movie=<path>`
+/// 的报错会回显解析后的路径，用它实测过）：
+///
+/// | 输入字符 | 第一级后 | 最终 | 依据 |
+/// |---|---|---|---|
+/// | `,` `;` `[` `]` | 1 个 | **3 个** | 第 1 遍后必须落到"第 2 遍不当作分隔符"的状态；实测 2 个时 `,` 会在第 1 遍变成裸分隔符，图被拆开（`No such filter: 'b.mp4'`） |
+/// | `:` `=` `{` `}` | 1 个 | **2 个** | 第 1 遍后必须**仍是**转义态，否则第 2 遍把 `:` 当分隔符、值被截断（实测 1 个时 `/tmp/a:b.mp4` 变成 `/tmp/a`） |
+/// | `'` | 1 个 | **3 个** | 同图级：第 1 遍后必须还是 `\'`，否则 `av_get_token` 会进入引号模式把后面整段吞掉 |
+/// | `\` | 2 个 | **4 个** | 每级都把自己翻倍 |
+/// | 空白 | 1 个 | **2 个** | 第 1 遍后必须仍是 `\ ` |
+///
+/// # Errors
+///
+/// 见 [`escape_backslash`]。值里的 NUL 报 [`RsmediaError::InvalidConfig`] —— 滤镜描述
+/// 本来就是 C 字符串，NUL 无法表示，也没有"丢掉几个字符继续"的余地。
+fn escape_filter_value(input: &str) -> Result<String> {
+    escape_graph_level(&escape_option_level(input)?)
 }
 
 /// A filter option that FFmpeg **evaluates**, i.e. one declared `<string>` in
@@ -403,20 +399,23 @@ pub enum Expr<'a> {
 
 impl Expr<'_> {
     /// The option value as it must appear in a filter description.
-    fn to_filter_value(self) -> String {
+    ///
+    /// # Errors
+    ///
+    /// [`Expr::Const`] never fails. [`Expr::Expression`] goes through
+    /// the filter-value escaping path, so it reports a [`RsmediaError::InvalidConfig`]
+    /// when the expression contains a NUL byte — a filter description is a C string and
+    /// cannot carry one.
+    ///
+    /// This replaces the `Display` impl this type used to have: rendering an option value
+    /// is fallible now, and `Display` has no way to report that (its only failure exit is
+    /// `fmt::Error`, which makes `format!` panic). Constructors call this method and
+    /// propagate the error instead.
+    pub fn to_filter_value(self) -> Result<String> {
         match self {
-            Self::Const(value) => format!("{value}"),
-            Self::Expression(expr) => escape_filter_option(expr),
+            Self::Const(value) => Ok(format!("{value}")),
+            Self::Expression(expr) => escape_filter_value(expr),
         }
-    }
-}
-
-impl std::fmt::Display for Expr<'_> {
-    /// Renders the option value exactly as it is written into the filter
-    /// description, so a `format!` over it produces the same text the
-    /// constructors emit.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_filter_value())
     }
 }
 
@@ -477,23 +476,30 @@ fn number(value: impl Into<f64>) -> String {
 /// 转义文本，但保留 FFmpeg 的 `%{...}` 展开块（如 `%{localtime}`、`%{pts:hms}`）。
 ///
 /// 用于 `drawtext` 等需要显示动态时间/帧号的场景，避免 `{` `}` 被转义后无法展开。
-fn escape_filter_expr(input: &str) -> String {
+/// 转义文本，但保留 FFmpeg 的 `%{...}` 展开块（如 `%{localtime}`、`%{pts:hms}`）。
+///
+/// 用于 `drawtext` 等需要显示动态时间/帧号的场景，避免 `{` `}` 被转义后无法展开。
+///
+/// # Errors
+///
+/// 见 [`escape_backslash`]。
+fn escape_filter_expr(input: &str) -> Result<String> {
     let mut result = String::new();
     let mut rest = input;
     while let Some(pos) = rest.find("%{") {
         // 转义 `%{` 之前的部分
-        result.push_str(&escape_filter_str(&rest[..pos]));
+        result.push_str(&escape_option_level(&rest[..pos])?);
         // 找到匹配的 `}`，整体保留
         if let Some(end_rel) = rest[pos..].find('}') {
             result.push_str(&rest[pos..pos + end_rel + 1]);
             rest = &rest[pos + end_rel + 1..];
         } else {
-            result.push_str(&escape_filter_str(&rest[pos..]));
+            result.push_str(&escape_option_level(&rest[pos..])?);
             rest = "";
         }
     }
-    result.push_str(&escape_filter_str(rest));
-    result
+    result.push_str(&escape_option_level(rest)?);
+    Ok(result)
 }
 
 pub mod video {
@@ -526,17 +532,21 @@ pub mod video {
     ///     - `bitexact`: Enable bitexact output.
     ///
     /// See: <https://ffmpeg.org/ffmpeg-scaler.html#Scaler-Options>
-    pub fn scale<'a>(width: u32, height: u32, flags: impl Into<Option<&'a str>>) -> Filter {
+    /// # Errors
+    ///
+    /// [`RsmediaError::InvalidConfig`] when `flags` contains a NUL byte, or whatever
+    /// Anything `av_escape` fails with is propagated as well.
+    pub fn scale<'a>(width: u32, height: u32, flags: impl Into<Option<&'a str>>) -> Result<Filter> {
         let flags: Option<&str> = flags.into();
         // 默认与 FFmpeg `scale` 滤镜一致，也与本 crate 的 `Scaler::default()`
         // 一致（BICUBIC）；早先这里是 `fast_bilinear`，与上方文档矛盾。
-        let flags_str = escape_filter_option(flags.unwrap_or("bicubic"));
+        let flags_str = escape_filter_value(flags.unwrap_or("bicubic"))?;
 
-        Filter::new(
+        Ok(Filter::new(
             "scale",
             MediaType::VIDEO,
             format!("scale=w={width}:h={height}:flags={flags_str}"),
-        )
+        ))
     }
 
     /// Converts video pixel format.
@@ -649,11 +659,15 @@ pub mod video {
         }
 
         /// 生成最终的 [`Filter`]。
-        pub fn build(self) -> Filter {
+        /// # Errors
+        ///
+        /// A NUL byte in any of the values is [`RsmediaError::InvalidConfig`]: a filter
+        /// description is a C string and cannot carry one.
+        pub fn build(self) -> Result<Filter> {
             let text_spec = if self.raw_text {
-                escape_filter_expr(&self.text)
+                escape_filter_expr(&self.text)?
             } else {
-                escape_filter_str(&self.text)
+                escape_option_level(&self.text)?
             };
             let mut spec = format!(
                 "drawtext=text='{}':x={}:y={}:fontsize={}:fontcolor={}",
@@ -661,7 +675,7 @@ pub mod video {
                 self.x,
                 self.y,
                 self.fontsize,
-                escape_filter_option(&self.fontcolor)
+                escape_filter_value(&self.fontcolor)?
             );
             // 缺省使用项目自带字体，避免依赖 system fontconfig（Windows 等平台没有
             // fontconfig 配置会在查字体时崩溃）；用户显式指定字体时优先用用户的。
@@ -669,26 +683,31 @@ pub mod video {
             let fontfile = self
                 .fontfile
                 .unwrap_or_else(|| "fonts/Arial.ttf".to_string());
-            spec.push_str(&format!(":fontfile='{}'", escape_filter_str(&fontfile)));
+            spec.push_str(&format!(":fontfile='{}'", escape_option_level(&fontfile)?));
             if self.box_enabled {
                 spec.push_str(&format!(
                     ":box=1:boxcolor={}:boxborderw={}",
-                    escape_filter_option(&self.box_color),
+                    escape_filter_value(&self.box_color)?,
                     self.box_border_w
                 ));
             }
-            Filter::new("drawtext", MediaType::VIDEO, spec)
+            Ok(Filter::new("drawtext", MediaType::VIDEO, spec))
         }
     }
 
     /// 画矩形框
-    pub fn drawbox(x: i32, y: i32, w: u32, h: u32, color: &str, thickness: i32) -> Filter {
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn drawbox(x: i32, y: i32, w: u32, h: u32, color: &str, thickness: i32) -> Result<Filter> {
         if thickness < 0 {
             // FFmpeg 't=fill' is also possible
             tracing::warn!("Box thickness is negative ({thickness}), using absolute value.",);
         }
-        let color = escape_filter_option(color);
-        Filter::new(
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "drawbox",
             MediaType::VIDEO,
             format!(
@@ -700,7 +719,7 @@ pub mod video {
                 color,
                 thickness.abs()
             ),
-        )
+        ))
     }
 
     /// 去除水印
@@ -801,18 +820,28 @@ pub mod video {
     ///
     /// `zoom`/`x`/`y` 均为 FFmpeg 表达式（如 `"1.5"`、`"iw/2-(iw/zoom/2)"`），
     /// 内部会做选项级 + 图级转义。
-    pub fn zoompan(zoom: &str, x: &str, y: &str, duration: impl Into<Option<i32>>) -> Filter {
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn zoompan(
+        zoom: &str,
+        x: &str,
+        y: &str,
+        duration: impl Into<Option<i32>>,
+    ) -> Result<Filter> {
         let duration: Option<i32> = duration.into();
         let (zoom, x, y) = (
-            escape_filter_option(zoom),
-            escape_filter_option(x),
-            escape_filter_option(y),
+            escape_filter_value(zoom)?,
+            escape_filter_value(x)?,
+            escape_filter_value(y)?,
         );
         let mut params = format!("zoompan=z={zoom}:x={x}:y={y}");
         if let Some(d) = duration {
             params.push_str(&format!(":d={d}"));
         }
-        Filter::new("zoompan", MediaType::VIDEO, params)
+        Ok(Filter::new("zoompan", MediaType::VIDEO, params))
     }
 
     /// transpose - 用于快速 90°/180°/270° 视频画面旋转、水平翻转或镜像翻转（无插值，高性能）
@@ -884,13 +913,17 @@ pub mod video {
     /// `radius`: Radius of the luma blur — a constant, or an expression such as
     /// `"min(cw/2,ch/2)"` (`boxblur`'s `luma_radius` is declared `<string>`
     /// because FFmpeg evaluates it).
-    pub fn blur<'a>(radius: impl Into<Expr<'a>>) -> Filter {
+    /// # Errors
+    ///
+    /// [`Expr::to_filter_value`] is fallible, so this constructor is too.
+    pub fn blur<'a>(radius: impl Into<Expr<'a>>) -> Result<Filter> {
         // Consider adding other boxblur params: luma_power, chroma_radius, chroma_power, alpha_radius, alpha_power
-        Filter::new(
+        let radius = radius.into().to_filter_value()?;
+        Ok(Filter::new(
             "boxblur",
             MediaType::VIDEO,
-            format!("boxblur=luma_radius={}", radius.into()),
-        )
+            format!("boxblur=luma_radius={radius}"),
+        ))
     }
 
     /// 亮度/对比度调节
@@ -898,16 +931,22 @@ pub mod video {
     /// `brightness` / `contrast` are FFmpeg `<string>` options: constants work
     /// (`eq(0.1, 1.2)`), and so do expressions (`eq("sin(t)", "1.2")`), which is
     /// what `eval=frame` needs. See [`Expr`].
-    pub fn eq<'a>(brightness: impl Into<Expr<'a>>, contrast: impl Into<Expr<'a>>) -> Filter {
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn eq<'a>(
+        brightness: impl Into<Expr<'a>>,
+        contrast: impl Into<Expr<'a>>,
+    ) -> Result<Filter> {
+        let brightness = brightness.into().to_filter_value()?;
+        let contrast = contrast.into().to_filter_value()?;
+        Ok(Filter::new(
             "eq",
             MediaType::VIDEO,
-            format!(
-                "eq=brightness={}:contrast={}",
-                brightness.into(),
-                contrast.into()
-            ),
-        )
+            format!("eq=brightness={brightness}:contrast={contrast}"),
+        ))
     }
 
     /// 帧率控制
@@ -916,15 +955,30 @@ pub mod video {
     /// rationals a float cannot represent (`"30000/1001"`) and `"source"`.
     /// A rate that has to be exact should be given as a rational expression —
     /// the same caveat as [`crate::EncoderBuilder::with_fps`].
-    pub fn fps<'a>(fps: impl Into<Expr<'a>>) -> Filter {
-        Filter::new("fps", MediaType::VIDEO, format!("fps={}", fps.into()))
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn fps<'a>(fps: impl Into<Expr<'a>>) -> Result<Filter> {
+        let fps = fps.into().to_filter_value()?;
+        Ok(Filter::new("fps", MediaType::VIDEO, format!("fps={fps}")))
     }
 
     /// 去交错（Deinterlace），将隔行扫描转为逐行扫描。
     /// `mode`: `send_frame`(默认), `send_field`, `send_frame_nospatial`, `send_field_nospatial`.
-    pub fn yadif(mode: &str) -> Filter {
-        let mode = escape_filter_option(mode);
-        Filter::new("yadif", MediaType::VIDEO, format!("yadif=mode={mode}"))
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn yadif(mode: &str) -> Result<Filter> {
+        let mode = escape_filter_value(mode)?;
+        Ok(Filter::new(
+            "yadif",
+            MediaType::VIDEO,
+            format!("yadif=mode={mode}"),
+        ))
     }
 
     /// 补边（Pad），在视频周围添加指定颜色的边。
@@ -932,25 +986,35 @@ pub mod video {
     /// * `w` / `h` - 输出尺寸（不包含负值表达式）。
     /// * `x` / `y` - 原视频在输出画布上的偏移。
     /// * `color` - 填充颜色，如 `"black"`。
-    pub fn pad(w: u32, h: u32, x: i32, y: i32, color: &str) -> Filter {
-        let color = escape_filter_option(color);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn pad(w: u32, h: u32, x: i32, y: i32, color: &str) -> Result<Filter> {
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "pad",
             MediaType::VIDEO,
             format!("pad=w={w}:h={h}:x={x}:y={y}:color={color}"),
-        )
+        ))
     }
 
     /// 烧录字幕（Subtitles）。
     /// `path`: 字幕文件路径（`srt`/`ass` 等）；路径中的转义字符（如 `,`/`;`/`[]`）
     /// 会被自动转义，调用者传原始路径即可。
-    pub fn subtitles(path: &str) -> Filter {
-        let escaped = escape_filter_option(path);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn subtitles(path: &str) -> Result<Filter> {
+        let escaped = escape_filter_value(path)?;
+        Ok(Filter::new(
             "subtitles",
             MediaType::VIDEO,
             format!("subtitles={escaped}"),
-        )
+        ))
     }
 
     /// 设置显示宽高比（DAR）。
@@ -1047,18 +1111,30 @@ pub mod video {
     /// **版本差异**：FFmpeg 8+ 移除了独立的 `gamma` 滤镜，该功能并入 `eq`
     /// （`eq=gamma=…`）。为在新版本上可用，这里直接生成 `eq` 滤镜，
     /// 语义与旧 `gamma` 滤镜一致。
-    pub fn gamma<'a>(gamma: impl Into<Expr<'a>>) -> Filter {
-        Filter::new("eq", MediaType::VIDEO, format!("eq=gamma={}", gamma.into()))
+    /// # Errors
+    ///
+    /// See [`Expr::to_filter_value`].
+    pub fn gamma<'a>(gamma: impl Into<Expr<'a>>) -> Result<Filter> {
+        let gamma = gamma.into().to_filter_value()?;
+        Ok(Filter::new(
+            "eq",
+            MediaType::VIDEO,
+            format!("eq=gamma={gamma}"),
+        ))
     }
 
     /// 饱和度调节（画质增强）。
     /// `saturation` 为饱和度倍数（1.0 表示不变，0 为黑白），也可以是表达式。
-    pub fn saturation<'a>(saturation: impl Into<Expr<'a>>) -> Filter {
-        Filter::new(
+    /// # Errors
+    ///
+    /// See [`Expr::to_filter_value`].
+    pub fn saturation<'a>(saturation: impl Into<Expr<'a>>) -> Result<Filter> {
+        let saturation = saturation.into().to_filter_value()?;
+        Ok(Filter::new(
             "eq",
             MediaType::VIDEO,
-            format!("eq=saturation={}", saturation.into()),
-        )
+            format!("eq=saturation={saturation}"),
+        ))
     }
 
     /// 鲜艳度调节（画质增强）。
@@ -1094,13 +1170,18 @@ pub mod video {
     ///
     /// 注意：`blur(radius)` 是 convenience 版，只设 `luma_radius`；
     /// 这里保留 boxblur 完整参数供精细控制。
-    pub fn boxblur(luma_radius: &str, luma_power: u32) -> Filter {
-        let luma_radius = escape_filter_option(luma_radius);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn boxblur(luma_radius: &str, luma_power: u32) -> Result<Filter> {
+        let luma_radius = escape_filter_value(luma_radius)?;
+        Ok(Filter::new(
             "boxblur",
             MediaType::VIDEO,
             format!("boxblur=luma_radius={luma_radius}:luma_power={luma_power}"),
-        )
+        ))
     }
 
     /// 叠加（overlay），将一个视频流（overlay）叠加到主视频流上。
@@ -1118,11 +1199,20 @@ pub mod video {
     /// 把 0~1 的透明度写进 `alpha=` 会被 FFmpeg 静默取整成一个格式档位。
     /// 要给叠加层做半透明，先用 [`FilterGraphBuilder`] 在该路上接一个
     /// `colorchannelmixer=aa=<0~1>`（或 `format=rgba` + `colorchannelmixer`）。
-    pub fn overlay(x: &str, y: &str) -> Filter {
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn overlay(x: &str, y: &str) -> Result<Filter> {
         // x/y 是表达式，`,` 等字符会被滤镜语法解析吃掉（整条描述先按 `,` 拆分
         // 滤镜），报出来的错与真实原因无关，因此与其它 `&str` 参数一致地转义。
-        let (x, y) = (escape_filter_option(x), escape_filter_option(y));
-        Filter::new("overlay", MediaType::VIDEO, format!("overlay=x={x}:y={y}"))
+        let (x, y) = (escape_filter_value(x)?, escape_filter_value(y)?);
+        Ok(Filter::new(
+            "overlay",
+            MediaType::VIDEO,
+            format!("overlay=x={x}:y={y}"),
+        ))
     }
 
     /// 横向并排（hstack）：把多路视频并成一行。
@@ -1178,9 +1268,18 @@ pub mod video {
     /// * `color` - 要抠掉的颜色，如 `"green@0.5"`。
     /// * `similarity` - 颜色相似度阈值（FFmpeg: 1e-05~1，默认 0.01，越大越宽松）。
     /// * `blend` - 混合比例（0~1）。
-    pub fn chromakey(color: &str, similarity: impl Into<f64>, blend: impl Into<f64>) -> Filter {
-        let color = escape_filter_option(color);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn chromakey(
+        color: &str,
+        similarity: impl Into<f64>,
+        blend: impl Into<f64>,
+    ) -> Result<Filter> {
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "chromakey",
             MediaType::VIDEO,
             format!(
@@ -1188,14 +1287,23 @@ pub mod video {
                 number(similarity),
                 number(blend)
             ),
-        )
+        ))
     }
 
     /// RGB 色键（colorkey），将指定 RGB 颜色转为透明。
     /// `color` - 如 `"black"` 或 `"0x000000"`。
-    pub fn colorkey(color: &str, similarity: impl Into<f64>, blend: impl Into<f64>) -> Filter {
-        let color = escape_filter_option(color);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn colorkey(
+        color: &str,
+        similarity: impl Into<f64>,
+        blend: impl Into<f64>,
+    ) -> Result<Filter> {
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "colorkey",
             MediaType::VIDEO,
             format!(
@@ -1203,31 +1311,45 @@ pub mod video {
                 number(similarity),
                 number(blend)
             ),
-        )
+        ))
     }
 
     /// 曲线调节（curves），通过控制点微调 R/G/B 通道色调。
     /// `preset`/`points` 二选一；`points` 形如 `"0/0 0.5/0.5 1/1"`（无需自行转义）。
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
     pub fn curves<'a>(
         preset: impl Into<Option<&'a str>>,
         points: impl Into<Option<&'a str>>,
-    ) -> Filter {
+    ) -> Result<Filter> {
         let preset: Option<&str> = preset.into();
         let points: Option<&str> = points.into();
         let spec = match (preset, points) {
-            (Some(p), _) => format!("curves=preset={}", escape_filter_option(p)),
-            (None, Some(pt)) => format!("curves=all={}", escape_filter_option(pt)),
+            (Some(p), _) => format!("curves=preset={}", escape_filter_value(p)?),
+            (None, Some(pt)) => format!("curves=all={}", escape_filter_value(pt)?),
             _ => "curves".to_string(),
         };
-        Filter::new("curves", MediaType::VIDEO, spec)
+        Ok(Filter::new("curves", MediaType::VIDEO, spec))
     }
 
     /// 逐行/隔行转换（bwdif）去隔行，现代去隔行替代方案。
     /// `mode`: `send_frame` / `send_field`(默认)。FFmpeg 的 `bwdif` 只有这两档
     /// （取值 0~1），没有 `send_frame_nospatial`。
-    pub fn bwdif(mode: &str) -> Filter {
-        let mode = escape_filter_option(mode);
-        Filter::new("bwdif", MediaType::VIDEO, format!("bwdif=mode={mode}"))
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn bwdif(mode: &str) -> Result<Filter> {
+        let mode = escape_filter_value(mode)?;
+        Ok(Filter::new(
+            "bwdif",
+            MediaType::VIDEO,
+            format!("bwdif=mode={mode}"),
+        ))
     }
 
     /// GIF 单遍调色板滤镜链（palettegen/paletteuse），输出 pal8 帧供 `gif`
@@ -1247,28 +1369,40 @@ pub mod video {
     /// 输入为 RGB 帧：滤镜声明了 RGB24 输入格式，编码器侧自动把输入帧转到
     /// RGB24 再进图；输出 pal8 与 `gif` 编码器原生格式一致。
     ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// use rsmedia::{EncoderBuilder, filter::video};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
     /// let encoder = EncoderBuilder::new_video(320, 240)
     ///     .with_codec_name("gif")
     ///     .with_fps(10.0)
-    ///     .with_filters(vec![video::gif_palette(10.0, None)])
-    ///     .build()
-    ///     .unwrap();
+    ///     .with_filters(vec![video::gif_palette(10.0, None)?])
+    ///     .build()?;
+    /// # drop(encoder);
+    /// # Ok(())
+    /// # }
     /// ```
-    pub fn gif_palette<'a>(fps: f32, dither: impl Into<Option<&'a str>>) -> Filter {
+    pub fn gif_palette<'a>(fps: f32, dither: impl Into<Option<&'a str>>) -> Result<Filter> {
         let dither: Option<&str> = dither.into();
-        let dither_part = dither
-            .map(|d| format!(":dither={}", escape_filter_option(d)))
-            .unwrap_or_default();
-        Filter::new(
+        // 不能用 `map(...)`：闭包里没法用 `?`，而转义现在是可能失败的。
+        let dither_part = match dither {
+            Some(d) => format!(":dither={}", escape_filter_value(d)?),
+            None => String::new(),
+        };
+        Ok(Filter::new(
             "paletteuse",
             MediaType::VIDEO,
             format!("fps={fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse{dither_part}"),
         )
-        .with_input_format(PixelFormat::RGB24)
+        .with_input_format(PixelFormat::RGB24))
     }
 
     /// LUT 调色（lutyuv）：按亮度/色度查找表逐通道映射，证件照"美白"常用
@@ -1278,37 +1412,47 @@ pub mod video {
     ///   `"if(lt(val,100),val,val+20)"`），传 `None` 表示该通道不变。
     ///   表达式中的逗号会被自动转义。
     ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    ///
     /// # Examples
     ///
     /// ```
     /// use rsmedia::filter::video;
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
     /// // 亮度整体 +10（简单提亮美白），色度不动
-    /// let _f = video::lutyuv(Some("val+10"), None, None);
+    /// let _f = video::lutyuv(Some("val+10"), None, None)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn lutyuv<'a>(
         y: impl Into<Option<&'a str>>,
         u: impl Into<Option<&'a str>>,
         v: impl Into<Option<&'a str>>,
-    ) -> Filter {
+    ) -> Result<Filter> {
         let y: Option<&str> = y.into();
         let u: Option<&str> = u.into();
         let v: Option<&str> = v.into();
         let mut parts = Vec::new();
         if let Some(y_expr) = y {
-            parts.push(format!("y={}", escape_filter_option(y_expr)));
+            parts.push(format!("y={}", escape_filter_value(y_expr)?));
         }
         if let Some(u) = u {
-            parts.push(format!("u={}", escape_filter_option(u)));
+            parts.push(format!("u={}", escape_filter_value(u)?));
         }
         if let Some(v) = v {
-            parts.push(format!("v={}", escape_filter_option(v)));
+            parts.push(format!("v={}", escape_filter_value(v)?));
         }
         let spec = if parts.is_empty() {
             "lutyuv".to_string()
         } else {
             format!("lutyuv={}", parts.join(":"))
         };
-        Filter::new("lutyuv", MediaType::VIDEO, spec)
+        Ok(Filter::new("lutyuv", MediaType::VIDEO, spec))
     }
 
     /// 拼版（tile）：把多帧按 `cols x rows` 网格排成一张图，证件照"一张 6 寸
@@ -1323,13 +1467,18 @@ pub mod video {
     ///   默认 `black`）：既填未填满的格子，也填 `padding` 留出的内边框，如 `"white"`。
     ///
     /// 注意：tile 是**攒帧**滤镜——每 cols*rows 帧吐 1 帧，EOF 时输出残余格。
-    pub fn tile(cols: u32, rows: u32, padding: u32, color: &str) -> Filter {
-        let color = escape_filter_option(color);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn tile(cols: u32, rows: u32, padding: u32, color: &str) -> Result<Filter> {
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "tile",
             MediaType::VIDEO,
             format!("tile={cols}x{rows}:padding={padding}:color={color}"),
-        )
+        ))
     }
 }
 
@@ -1387,12 +1536,16 @@ pub mod audio {
     /// reachable: a linear multiplier (`volume(0.5)`), a **dB** value — which no
     /// numeric type could carry — (`volume("-6dB")`), and an expression
     /// (`volume("if(gt(t,10),0,1)")`). See [`Expr`].
-    pub fn volume<'a>(volume: impl Into<Expr<'a>>) -> Filter {
-        Filter::new(
+    /// # Errors
+    ///
+    /// See [`Expr::to_filter_value`].
+    pub fn volume<'a>(volume: impl Into<Expr<'a>>) -> Result<Filter> {
+        let volume = volume.into().to_filter_value()?;
+        Ok(Filter::new(
             "volume",
             MediaType::AUDIO,
-            format!("volume={}", volume.into()),
-        )
+            format!("volume={volume}"),
+        ))
     }
 
     /// loudnorm - EBU R128音量标准化
@@ -1572,16 +1725,21 @@ pub mod audio {
     /// `Unable to parse "tr" option value "0.5" as boolean`。也就是说**只要传入
     /// 任何非整数，`advanced_fft_denoise` 都会让 `FilterGraph` 建不起来**；
     /// 名字与类型都指向"一个浮点系数"，掩盖了真实的选项语义。
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
     pub fn advanced_fft_denoise<'a>(
         noise_reduction: impl Into<f64>,
         noise_floor: impl Into<f64>,
         noise_type: impl Into<Option<&'a str>>,
         track_residual: bool,
-    ) -> Filter {
+    ) -> Result<Filter> {
         let noise_type: Option<&str> = noise_type.into();
-        let nt = escape_filter_option(noise_type.unwrap_or("w"));
+        let nt = escape_filter_value(noise_type.unwrap_or("w"))?;
         let tr = u8::from(track_residual);
-        Filter::new(
+        Ok(Filter::new(
             "afftdn",
             MediaType::AUDIO,
             format!(
@@ -1589,7 +1747,7 @@ pub mod audio {
                 number(noise_reduction),
                 number(noise_floor)
             ),
-        )
+        ))
     }
 
     /// 创建自适应非局部均值降噪过滤器
@@ -1656,9 +1814,14 @@ pub mod audio {
     /// 量纲（时间），也接受 `"1.5s"`、`"00:00:01.5"` 这样的时长字面量。
     /// 用 [`Duration`] 表达"这是一段时间"，比 `f32` 秒更贴近语义，也免掉了
     /// `f32` 在 10⁴ 秒量级上约 1 ms 的 ULP 误差。
-    pub fn afade(fade_type: &str, start: Duration, duration: Duration) -> Filter {
-        let fade_type = escape_filter_option(fade_type);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn afade(fade_type: &str, start: Duration, duration: Duration) -> Result<Filter> {
+        let fade_type = escape_filter_value(fade_type)?;
+        Ok(Filter::new(
             "afade",
             MediaType::AUDIO,
             format!(
@@ -1666,21 +1829,26 @@ pub mod audio {
                 duration_literal(start),
                 duration_literal(duration)
             ),
-        )
+        ))
     }
 
     /// 回声（aecho）。
     /// * `in_gain` / `out_gain` - 输入/输出增益。
     /// * `delays` - 延迟序列（ms，如 `"60|30"`）。
     /// * `decays` - 衰减系数（如 `"0.4|0.3"`）。
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
     pub fn aecho(
         in_gain: impl Into<f64>,
         out_gain: impl Into<f64>,
         delays: &str,
         decays: &str,
-    ) -> Filter {
-        let (delays, decays) = (escape_filter_option(delays), escape_filter_option(decays));
-        Filter::new(
+    ) -> Result<Filter> {
+        let (delays, decays) = (escape_filter_value(delays)?, escape_filter_value(decays)?);
+        Ok(Filter::new(
             "aecho",
             MediaType::AUDIO,
             format!(
@@ -1688,7 +1856,7 @@ pub mod audio {
                 number(in_gain),
                 number(out_gain)
             ),
-        )
+        ))
     }
 
     /// 混音（amix），将多路输入混成一路。
@@ -1698,13 +1866,18 @@ pub mod audio {
     /// 接进自定义的多输入图。各路采样率 / 采样格式 / 通道布局不同时，FFmpeg 会在
     /// 链路协商阶段自动插入 `aresample`。
     /// `inputs`: 输入路数；`duration`: `longest`/`shortest`/`first`。
-    pub fn amix(inputs: u32, duration: &str) -> Filter {
-        let duration = escape_filter_option(duration);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn amix(inputs: u32, duration: &str) -> Result<Filter> {
+        let duration = escape_filter_value(duration)?;
+        Ok(Filter::new(
             "amix",
             MediaType::AUDIO,
             format!("amix=inputs={inputs}:duration={duration}"),
-        )
+        ))
     }
 
     /// 把一路音频复制成 `outputs` 路相同内容（`asplit`），是音频 fan-out 的显式手段。
@@ -1786,10 +1959,19 @@ fn audio_or_video_filter_name(
 /// 修改时间戳表达式（加速、减速、对齐等）。
 /// 典型值：`"0.5*PTS"`（2倍速）、`"1.5*PTS"`（慢放）、`"PTS-STARTPTS"`。
 /// `expr`: FFmpeg expression (e.g., "0.5*PTS", "PTS-STARTPTS").
-pub fn setpts(media_type: MediaType, expr: &str) -> Filter {
+/// # Errors
+///
+/// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+/// description is a C string and cannot carry one. Anything `av_escape` fails with is
+/// propagated too.
+pub fn setpts(media_type: MediaType, expr: &str) -> Result<Filter> {
     let name = audio_or_video_filter_name("asetpts", "setpts", media_type);
-    let escaped_expr = escape_filter_option(expr);
-    Filter::new(name, media_type, format!("{name}={escaped_expr}"))
+    let escaped_expr = escape_filter_value(expr)?;
+    Ok(Filter::new(
+        name,
+        media_type,
+        format!("{name}={escaped_expr}"),
+    ))
 }
 
 /// 将视频/音频裁剪到指定的时间范围。
@@ -2265,7 +2447,7 @@ impl FilterGraph {
     /// 检查，两份检查只会随 FFmpeg 版本漂移。
     ///
     /// **转义不在这一层**：滤镜描述里的特殊字符在构造 `Filter` 时（各便捷构造函数
-    /// 内部走 `escape_filter_option`）就已经转义好了，`init` 只负责把 spec 用 `,`
+    /// 内部走 `escape_filter_value`）就已经转义好了，`init` 只负责把 spec 用 `,`
     /// 拼成线性链。
     pub(crate) fn build(params: &FilterParams, filters: &[Filter]) -> Result<FilterGraph> {
         let mut graph = Self::new();
@@ -3415,7 +3597,7 @@ impl FilterGraphBuilder {
         builder.add_input_with("base", base);
         builder.add_input_with("over", over);
         builder.add_node(
-            FilterNode::new(video::overlay(x, y))
+            FilterNode::new(video::overlay(x, y)?)
                 .with_inputs(["base", "over"])
                 .with_label("overlay"),
         );
@@ -3541,7 +3723,7 @@ impl FilterGraphBuilder {
         if (output.width, output.height) != natural {
             let (width, height) = (output.width, output.height);
             self.add_node(
-                FilterNode::new(video::scale(width as u32, height as u32, None))
+                FilterNode::new(video::scale(width as u32, height as u32, None)?)
                     .with_label("scale"),
             );
         }
@@ -3631,7 +3813,7 @@ impl FilterGraphBuilder {
         }
         let labels = builder.input_labels_upto(inputs.len());
         builder.add_node(
-            FilterNode::new(audio::amix(inputs.len() as u32, duration))
+            FilterNode::new(audio::amix(inputs.len() as u32, duration)?)
                 .with_inputs(labels)
                 .with_label("amix"),
         );
@@ -3647,6 +3829,24 @@ mod tests {
     /// 测试用的有理数构造：字面量都是常量，失败即写错，直接 `unwrap`。
     fn rat(num: i32, den: i32) -> Rational {
         Rational::new(num, den).unwrap()
+    }
+
+    /// `Result<Filter>.spec()`，供那些只关心描述字符串的测试使用。
+    ///
+    /// 构造器改成返回 [`Result`] 之后（值可能含 NUL，见 [`escape_filter_value`]），
+    /// 这些测试里全是字面量、不可能失败，也就没必要为它们逐个改签名加 `?`：失败即测试
+    /// 本身写错，直接 panic 并把错误打出来更省事。
+    trait SpecOf {
+        fn spec(self) -> String;
+    }
+
+    impl SpecOf for Result<Filter> {
+        fn spec(self) -> String {
+            match self {
+                Ok(filter) => filter.spec(),
+                Err(e) => panic!("filter construction failed: {e}"),
+            }
+        }
     }
 
     /// D6：可选参数统一为 `impl Into<Option<T>>` 后，"传值"与"不传"两种写法都直接
@@ -3770,34 +3970,34 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_filter_str() {
+    fn test_escape_option_level() {
         // Test case 1: Empty string
         assert_eq!(
-            escape_filter_str(""),
+            escape_option_level("").unwrap(),
             "",
             "Empty string should return empty string"
         );
 
         // Test case 2: String with no special characters but with spaces
-        // FFmpeg appears to escape spaces as well
+        // 空白也在选项级的转义集里（`AV_ESCAPE_FLAG_WHITESPACE`）。
         assert_eq!(
-            escape_filter_str("normal text"),
+            escape_option_level("normal text").unwrap(),
             "normal\\ text",
-            "Spaces are also escaped by av_escape"
+            "whitespace is escaped at the option level"
         );
 
         // Test case 3: String with special characters
         assert_eq!(
-            escape_filter_str("text with [brackets]"),
+            escape_option_level("text with [brackets]").unwrap(),
             "text\\ with\\ \\[brackets\\]",
             "Brackets should be escaped and spaces too"
         );
 
         // Test case 4: 选项级转义只保证"值里的 `:` 不会截断选项"，不负责图级
         // 分隔符——`file:///...` 作为**不带引号**的选项值还必须再经过图级转义
-        // （见 test_escape_filter_option_two_levels）。
+        // （见 test_escape_filter_value_two_levels）。
         assert_eq!(
-            escape_filter_str("file:///path/to/video.mp4"),
+            escape_option_level("file:///path/to/video.mp4").unwrap(),
             "file\\:///path/to/video.mp4",
             "Single-level (option) escaping escapes the colon"
         );
@@ -3806,14 +4006,14 @@ mod tests {
         let input = "filter=value,'text',[in],[out],key=val;next:filter\\backslash";
         let expected = "filter\\=value\\,\\'text\\'\\,\\[in\\]\\,\\[out\\]\\,key\\=val\\;next\\:filter\\\\backslash";
         assert_eq!(
-            escape_filter_str(input),
+            escape_option_level(input).unwrap(),
             expected,
             "All special characters should be escaped"
         );
 
         // Test case 6: String with escaped characters already
         assert_eq!(
-            escape_filter_str("already\\escaped"),
+            escape_option_level("already\\escaped").unwrap(),
             "already\\\\escaped",
             "Backslashes should be escaped even if they're escaping something else"
         );
@@ -3823,7 +4023,7 @@ mod tests {
         let complex_filter = "drawtext=text='Hello, World!':x=10:y=10";
         let expected = "drawtext\\=text\\=\\'Hello\\,\\ World!\\'\\:x\\=10\\:y\\=10";
         assert_eq!(
-            escape_filter_str(complex_filter),
+            escape_option_level(complex_filter).unwrap(),
             expected,
             "Complex filter string should be properly escaped with spaces and exclamation marks escaped too"
         );
@@ -3831,13 +4031,13 @@ mod tests {
         // Test case 8: Test with exclamation marks specifically
         // Note character!
         assert_eq!(
-            escape_filter_str("Warning!"),
+            escape_option_level("Warning!").unwrap(),
             "Warning!",
             "Exclamation marks should be escaped"
         );
 
         // Test case 9: Unicode characters - using pattern matching instead of exact comparison
-        let unicode_result = escape_filter_str("Unicode: こんにちは");
+        let unicode_result = escape_option_level("Unicode: こんにちは").unwrap();
         assert!(
             unicode_result.contains("Unicode"),
             "Result should contain the word 'Unicode'"
@@ -3848,7 +4048,7 @@ mod tests {
         );
 
         // Test case 10: Unicode with special characters - using pattern matching
-        let unicode_special_result = escape_filter_str("Unicode: こんにちは[世界]");
+        let unicode_special_result = escape_option_level("Unicode: こんにちは[世界]").unwrap();
         assert!(
             unicode_special_result.contains("\\[") && unicode_special_result.contains("\\]"),
             "Unicode string with special characters should have brackets escaped"
@@ -3856,7 +4056,7 @@ mod tests {
 
         // Test case 11: Very long string - only check that it ends correctly
         let long_string = "x".repeat(1000) + "=[]:";
-        let long_result = escape_filter_str(&long_string);
+        let long_result = escape_option_level(&long_string).unwrap();
         assert!(
             long_result.ends_with("\\=\\[\\]\\:"),
             "Long strings should have special characters at the end properly escaped"
@@ -3864,47 +4064,170 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_filter_option_two_levels() {
+    fn test_escape_filter_value_two_levels() {
         // 普通值不受影响：scale/pad/yadif/adelay 等生成的 spec 依赖"简单值原样保留"。
         for plain in ["lanczos", "send_frame", "black@0.5", "16/9"] {
-            assert_eq!(escape_filter_option(plain), plain, "plain value changed");
-        }
-
-        // `:` 是**选项级**分隔符：第一层转义后带一个反斜杠；第二层必须把该反斜杠
-        // 自身再转义（`\\`），否则图级解析会把它吃掉，值里的 `:` 又变成分隔符。
-        let path = escape_filter_option("file:///path/to/video.mp4");
-        assert!(
-            path.starts_with(r"file\\"),
-            "option-level backslash must be escaped for the graph level: {path}"
-        );
-        assert!(
-            path.contains(r"\:"),
-            "colon must stay escaped after graph-level escaping: {path}"
-        );
-
-        // `,` `;` `[` `]` 是**图级**分隔符（`movie=`/`subtitles=` 这类路径值必须防住，
-        // 否则值会被拆成多个滤镜/链路）。两层转义后每个字符前都应留有反斜杠。
-        let tricky = escape_filter_option("/tmp/a,b;c[d].mp4");
-        for ch in [',', ';', '[', ']'] {
-            assert!(
-                tricky.contains(&format!("\\{ch}")),
-                "{ch} must be escaped for the graph level: {tricky}"
+            assert_eq!(
+                escape_filter_value(plain).unwrap(),
+                plain,
+                "plain value changed"
             );
         }
+
+        // 断言**精确**的反斜杠个数，而不是 `contains`：起作用的是个数，不是"有没有"。
+        // 图级字符要奇数个（第 1 遍 unescape 后必须是裸字符），选项级要 2 个
+        // （第 1 遍后必须仍是转义态）。2 个反斜杠能让 `contains("\\,")` 通过，
+        // 但实测会把图拆开 —— 旧断言恰好漏掉了这个坏值。
+        assert_eq!(
+            escape_filter_value("/tmp/a,b;c[d].mp4").unwrap(),
+            r"/tmp/a\\\,b\\\;c\\\[d\\\].mp4",
+            "graph-level separators need an odd number of backslashes"
+        );
+        assert_eq!(
+            escape_filter_value("file:///path/to/video.mp4").unwrap(),
+            r"file\\:///path/to/video.mp4",
+            "a colon needs exactly two backslashes to survive both passes"
+        );
+        assert_eq!(
+            escape_filter_value(r"a'b\c").unwrap(),
+            r"a\\\'b\\\\c",
+            "quote and backslash: 3 and 4 backslashes respectively"
+        );
+        assert_eq!(
+            escape_filter_value("a b").unwrap(),
+            r"a\\ b",
+            "whitespace: escaped once, then the backslash is doubled"
+        );
+    }
+
+    /// 新的 Rust 实现在**每个输入上**都必须与 `ffi::av_escape` 逐字节一致。
+    ///
+    /// 生产代码不再调用 `av_escape`（它会把"分配失败"变成一条不存在的可恢复错误，
+    /// 而这正是之前那个 fallback 的来源），但 FFmpeg 才是转义语义的出处，所以这里保留
+    /// 一次差分对照：同一组 `specials` / flags 下两者输出必须相等。`av_escape` 只在本测试里出现。
+    #[test]
+    fn test_rust_escaping_matches_av_escape() {
+        fn reference(input: &str, specials: &str, flags: i32) -> String {
+            let c_input = CString::new(input).expect("corpus has no interior NUL");
+            let c_specials = CString::new(specials).unwrap();
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: all three arguments are valid NUL-terminated C strings that outlive
+            // the call, and `ptr` is a live local; on success FFmpeg hands back an
+            // `av_malloc`ed buffer that this function frees.
+            let ret = unsafe {
+                ffi::av_escape(
+                    &mut ptr,
+                    c_input.as_ptr(),
+                    c_specials.as_ptr(),
+                    ffi::AV_ESCAPE_MODE_BACKSLASH,
+                    flags,
+                )
+            };
+            assert!(ret >= 0 && !ptr.is_null(), "av_escape failed on {input:?}");
+            let escaped = unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned();
+            // SAFETY: `ptr` came from `av_escape`, which allocates with `av_malloc`.
+            unsafe { ffi::av_free(ptr as *mut _) };
+            escaped
+        }
+
+        let corpus = [
+            "",
+            "plain",
+            "black@0.5",
+            "16/9",
+            "a,b",
+            "a;b",
+            "a[b]c",
+            "a:b",
+            "a=b",
+            "a'b",
+            r"a\b",
+            "a{b}c",
+            "a,b;c[d]e:f=g'h\\i",
+            "file:///path/to/video.mp4",
+            "/tmp/a,b;c[d].mp4",
+            " leading",
+            "trailing ",
+            "mid dle",
+            "a b\tc\nd\re",
+            "Unicode: こんにちは[世界]",
+            "100%",
+            "%{pts:hms}",
+        ];
+
+        for input in corpus {
+            assert_eq!(
+                escape_backslash(input, OPTION_SPECIALS, true).unwrap(),
+                reference(
+                    input,
+                    OPTION_SPECIALS,
+                    ffi::AV_ESCAPE_FLAG_WHITESPACE as i32
+                ),
+                "option level diverged on {input:?}"
+            );
+            assert_eq!(
+                escape_backslash(input, GRAPH_SPECIALS, false).unwrap(),
+                reference(input, GRAPH_SPECIALS, 0),
+                "graph level diverged on {input:?}"
+            );
+        }
+    }
+
+    /// 值里的 NUL 不再被静默丢弃，而是在**转义这一层**就报错。
+    ///
+    /// `av_escape` 要的是 NUL 结尾的 C 字符串，所以含 NUL 的值根本进不了转义 —— 这也
+    /// 正合语义：滤镜描述本身就是 C 字符串，NUL 表示不出来。错误是
+    /// [`RsmediaError::InvalidConfig`]，能一眼看出是 NUL 的问题。
+    ///
+    /// 旧实现把它 `replace('\0', "")` 掉然后照常成功，产出一条少几个字符、却看起来
+    /// 完全正常的滤镜描述 —— 那正是"掩盖问题"。手写 spec 里的 NUL 同样被拒
+    /// （`FilterGraph::build` 把描述变成 C 字符串那一步），两个入口行为一致。
+    #[test]
+    fn test_nul_in_a_filter_value_is_reported_not_dropped() {
+        for err in [
+            escape_option_level("a\0b").unwrap_err(),
+            escape_filter_value("a\0b").unwrap_err(),
+        ] {
+            assert!(err.is_invalid_config(), "{err}");
+            assert!(err.to_string().contains("NUL"), "{err}");
+        }
+
+        // 构造器亦然：返回 `Err`，既不 panic，也不静默把字符丢掉。
+        let err = video::pad(8, 8, 0, 0, "black\0").unwrap_err();
+        assert!(err.is_invalid_config(), "{err}");
+
+        let params = FilterParams::Video(VideoParams {
+            width: 8,
+            height: 4,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: rat(1, 25),
+            frame_rate: rat(25, 1),
+            pixel_aspect: Rational::ONE,
+        });
+        let poisoned = Filter::new("null", MediaType::VIDEO, "null=a\0b".to_string());
+        let err = match FilterGraph::build(&params, &[poisoned]) {
+            Ok(_) => panic!("a NUL byte in a filter value must be reported, not dropped"),
+            Err(e) => e,
+        };
+        assert!(err.is_invalid_config(), "{err}");
+        assert!(err.to_string().contains("NUL"), "{err}");
     }
 
     #[test]
     fn test_real_world_filter_strings() {
         // Test case 1: Scale filter
         assert_eq!(
-            escape_filter_str("scale=width=1280:height=720"),
+            escape_option_level("scale=width=1280:height=720").unwrap(),
             "scale\\=width\\=1280\\:height\\=720",
             "Scale filter string should be properly escaped"
         );
 
         // Test case 2: Overlay filter
         assert_eq!(
-            escape_filter_str("overlay=x=10:y=10"),
+            escape_option_level("overlay=x=10:y=10").unwrap(),
             "overlay\\=x\\=10\\:y\\=10",
             "Overlay filter string should be properly escaped"
         );
@@ -3913,7 +4236,7 @@ mod tests {
         let drawtext = "drawtext=text='Copyright © 2023':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.5:x=(w-text_w)/2:y=h-th-10";
 
         // Instead of checking the exact string, check for key patterns
-        let drawtext_result = escape_filter_str(drawtext);
+        let drawtext_result = escape_option_level(drawtext).unwrap();
 
         // Check presence of escaped key components
         assert!(
@@ -3935,7 +4258,7 @@ mod tests {
 
         // Test case 4: Filter with square brackets for pad names
         assert_eq!(
-            escape_filter_str("[in1][in2]overlay=format=rgb[out]"),
+            escape_option_level("[in1][in2]overlay=format=rgb[out]").unwrap(),
             "\\[in1\\]\\[in2\\]overlay\\=format\\=rgb\\[out\\]",
             "Filter with pad names should be properly escaped"
         );
@@ -3945,25 +4268,25 @@ mod tests {
     fn test_escape_filter_expr() {
         // 保留 `%{localtime}` 展开块，其余部分正常转义
         assert_eq!(
-            escape_filter_expr("%{localtime}"),
+            escape_filter_expr("%{localtime}").unwrap(),
             "%{localtime}",
             "Time expansion block should be preserved"
         );
         assert_eq!(
-            escape_filter_expr("T %{pts:hms}"),
+            escape_filter_expr("T %{pts:hms}").unwrap(),
             "T\\ %{pts:hms}",
             "Surrounding text should be escaped but block preserved"
         );
         // 多个展开块
         assert_eq!(
-            escape_filter_expr("%{frame_num}/%{n}"),
+            escape_filter_expr("%{frame_num}/%{n}").unwrap(),
             "%{frame_num}/%{n}",
             "Multiple expansion blocks should be preserved"
         );
         // 无展开块时退化为普通转义
         assert_eq!(
-            escape_filter_expr("plain: text"),
-            escape_filter_str("plain: text"),
+            escape_filter_expr("plain: text").unwrap(),
+            escape_option_level("plain: text").unwrap(),
             "Without expansion blocks it should match plain escaping"
         );
     }
@@ -4890,7 +5213,7 @@ mod tests {
                 .with_outputs(["dry", "wet"]),
         );
         builder.add_node(
-            FilterNode::new(audio::amix(2, "longest"))
+            FilterNode::new(audio::amix(2, "longest")?)
                 .with_inputs(["dry", "wet"])
                 .with_label("mixed"),
         );
@@ -4940,7 +5263,7 @@ mod tests {
         // 第二个节点显式接 in1。音频侧用 `volume`（逐帧直通）而不是 `areverse`：
         // areverse 要缓存整个流、EOF 前吐不出帧，验证不了「推一帧取一帧」。
         builder.add_node(
-            FilterNode::new(audio::volume(1.0))
+            FilterNode::new(audio::volume(1.0)?)
                 .with_inputs(["in1"])
                 .with_label("level"),
         );
@@ -5055,7 +5378,9 @@ mod tests {
         // 双输入滤镜塞进线性链：接线数（1）≠ pad 数（2）。
         let mut builder = FilterGraphBuilder::new();
         builder.add_input(video);
-        builder.add_node(FilterNode::new(video::overlay("0", "0")));
+        builder.add_node(FilterNode::new(
+            video::overlay("0", "0").expect("literal arguments cannot fail"),
+        ));
         builder.add_output_tail(video);
         let err = builder.build().unwrap_err();
         assert!(err.is_invalid_config(), "{err}");

@@ -33,8 +33,8 @@ async fn main() -> Result<()> {
     let source = "/tmp/test.mp4";
 
     let filters = vec![
-        filter::video::scale(640, 360, None),
-        filter::video::fps(30.0),
+        filter::video::scale(640, 360, None)?,
+        filter::video::fps(30.0)?,
     ];
 
     let mut reader = StreamReader::new(source)?;
