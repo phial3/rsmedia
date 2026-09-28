@@ -21,7 +21,7 @@ ffi_enum!(
     XYZ => ffi::AV_PIX_FMT_FLAG_XYZ;
 });
 
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Pixel format (FFmpeg `AV_PIX_FMT_*`): how a picture is laid out in memory.
     ///
     /// Generated from one `variant => constant` table with a two-way `From`. A value the table

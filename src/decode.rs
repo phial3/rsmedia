@@ -1,4 +1,4 @@
-use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType, impl_codec_builder_setters};
+use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::flags::FlagSet;
@@ -14,8 +14,8 @@ use crate::state::ProcessState;
 use crate::stream::StreamInfo;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
-use crate::time::Rational;
-use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
+use crate::time::{Rational, Time};
+use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket, AVSubtitle};
 use rsmpeg::avformat::AVStream;
@@ -25,7 +25,7 @@ use rsmpeg::ffi;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// 帧丢弃粒度（`AVCodecContext.skip_frame`，`AVDiscard`）。
     ///
     /// 只影响**解码器是否把解出的帧交出来**，不省去比特流解析/解码本身
@@ -159,7 +159,7 @@ impl DecoderBuilder {
         }
     }
 
-    // 与 EncoderBuilder 共有的那批 setter：定义与文档在 `codec.rs` 的宏里，
+    // 与 EncoderBuilder 共有的那批 setter：定义与文档在 `macros.rs` 的宏里，
     // 改一次两端同时生效（见 `impl_codec_builder_setters` 的说明）。
     impl_codec_builder_setters!();
 
@@ -478,8 +478,7 @@ impl DecoderBuilder {
 
         // 输出像素格式：仅视频有效。任何能表示为数据平面的格式都接受
         // （布局由描述符推导，见 `PixelFormat::data_layout`）；位流 / 调色板 /
-        // 硬件格式在构建期快速失败，而不是拖到运行时。解码输出经 swscale
-        // 统一转换到目标格式。
+        // 硬件格式在构建期快速失败，而不是拖到运行时。解码输出经 swscale 统一转换到目标格式。
         // 非视频类型配置了 pix_fmt 视为调用方错误，快速失败而非静默忽略。
         let output_pix_fmt = match (media_type, self.pix_fmt) {
             (MediaType::VIDEO, Some(fmt)) => {

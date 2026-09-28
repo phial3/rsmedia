@@ -14,7 +14,7 @@ use rsmpeg::ffi;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Media type (FFmpeg `AVMEDIA_TYPE_*`): the classification of a stream.
     ///
     /// Generated from one `variant => constant` table with a two-way `From`. A value the table

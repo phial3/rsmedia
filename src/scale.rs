@@ -135,7 +135,7 @@ impl ScaleQuality {
 }
 
 #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// How to dither when reducing colour depth (maps to `SwsContext.dither`, FFmpeg 8+).
     ///
     /// See the official libswscale documentation for `SwsDither`.
@@ -159,7 +159,7 @@ ffi_enum_wrap_from!(
 );
 
 #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// How source-alpha is blended onto the destination when the destination has an
     /// alpha channel (maps to `SwsContext.alpha_blend`, FFmpeg 8).
     ///
@@ -178,7 +178,7 @@ ffi_enum_wrap_from!(
 );
 
 #[cfg(feature = "ffmpeg9")]
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Explicit selection of the scaling filter (maps to `SwsContext.scaler` / `scaler_sub`,
     /// **FFmpeg 9+**: neither the fields nor `SWS_SCALE_*` exist in FFmpeg 8, whose
     /// `SwsContext` only carries `scaler_params`). When set to anything other than `AUTO`,
@@ -211,7 +211,7 @@ ffi_enum_wrap_from!(
 );
 
 #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Intent for colour conversions (maps to `SwsContext.intent`, FFmpeg 8).
     ///
     /// See the official `SwsIntent` enumeration.
@@ -231,7 +231,7 @@ ffi_enum_wrap_from!(
 );
 
 #[cfg(feature = "ffmpeg9")]
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Hardware/software implementation backend selector (maps to `SwsContext.backends`,
     /// FFmpeg 9+ only). Like the other swscale IDs, this is a mutually-exclusive selection,
     /// and it fails fast on an unlisted value.

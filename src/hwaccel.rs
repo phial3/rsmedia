@@ -774,7 +774,7 @@ impl HWContext {
 unsafe impl Send for HWContext {}
 unsafe impl Sync for HWContext {}
 
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Hardware device type (FFmpeg `AV_HWDEVICE_TYPE_*`).
     ///
     /// Generated from one `variant => constant` table with a two-way `From`. A value the table

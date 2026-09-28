@@ -1,6 +1,4 @@
-use crate::codec::{
-    AVCodecFlag, AVCodecFlag2, CodecConfig, ThreadType, impl_codec_builder_setters,
-};
+use crate::codec::{AVCodecFlag, AVCodecFlag2, CodecConfig, ThreadType};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::flags::FlagSet;
@@ -15,8 +13,7 @@ use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
 use crate::state::ProcessState;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
-use crate::time::Rational;
-use crate::time::{self, Rescale};
+use crate::time::{self, Rational, Rescale};
 use crate::{MediaType, SampleFormat};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket, AVSubtitle};
@@ -218,7 +215,7 @@ impl EncoderBuilder {
         self
     }
 
-    // 与 DecoderBuilder 共有的那批 setter：定义与文档在 `codec.rs` 的宏里，
+    // 与 DecoderBuilder 共有的那批 setter：定义与文档在 `macros.rs` 的宏里，
     // 改一次两端同时生效（见 `impl_codec_builder_setters` 的说明）。
     impl_codec_builder_setters!();
 

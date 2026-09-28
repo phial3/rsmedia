@@ -38,7 +38,7 @@ ffi_enum!(
 });
 
 // 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）。
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Audio sample format (FFmpeg `AV_SAMPLE_FMT_*`).
     ///
     /// Generated from one `variant => constant` table with a two-way `From`. A value the table
