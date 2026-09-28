@@ -19,8 +19,8 @@ fn main() -> anyhow::Result<()> {
     );
 
     // 2. Explicit RGB -> YUV color matrices
-    const W: u32 = 320;
-    const H: u32 = 180;
+    const W: i32 = 320;
+    const H: i32 = 180;
     let mut rgb = MediaFrame::<u8>::new_video_frame(W, H, PixelFormat::RGB24)?;
     let samples = rgb
         .data

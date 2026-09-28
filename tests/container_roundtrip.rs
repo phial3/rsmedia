@@ -37,8 +37,8 @@ use rsmpeg::avcodec::AVCodec;
 use rsmpeg::avutil::AVMediaType;
 use rsmpeg::ffi;
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
+const WIDTH: i32 = 320;
+const HEIGHT: i32 = 240;
 const FPS: f32 = 25.0;
 /// 0.4 s of video — long enough to decode a real sequence, short enough to keep
 /// the whole matrix fast.

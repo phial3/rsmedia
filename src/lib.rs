@@ -50,7 +50,7 @@ pub use pcm::{PcmSink, PcmSpec};
 pub use pixel::PixelFormat;
 pub use resample::Resampler;
 pub use resize::Resize;
-pub use scale::{ScaleAlgorithm, ScaleQuality, Scaler};
+pub use scale::{ScaleAlgorithm, ScaleQuality, Scaler, VideoSpec};
 pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
 pub use time::{Rational, Time};

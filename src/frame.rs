@@ -18,6 +18,7 @@ use crate::error::{Context, Result, RsmediaError};
 use crate::fmt::{DataLayout, FrameFormat, SampleFormat};
 use crate::options::Metadata;
 use crate::pixel::PixelFormat;
+use crate::scale::VideoSpec;
 use crate::time::Rational;
 
 use ndarray::{Array2, Array3, ArrayView2, ArrayViewMut2};
@@ -610,9 +611,15 @@ pub struct MediaFrame<T> {
     pub media_type: MediaType,
     // Video
     /// 仅视频字段：图像宽度（像素）。
-    pub width: u32,
+    ///
+    /// `i32` — FFmpeg's `AVFrame.width` is an `int`, and the value goes straight to
+    /// `set_width`/the scaler unchanged (a width can never be negative in practice,
+    /// so the signed type only ever sees non-negative values).
+    pub width: i32,
     /// 仅视频字段：图像高度（像素）。
-    pub height: u32,
+    ///
+    /// `i32` for the same reason as [`width`](Self::width): it mirrors `AVFrame.height`.
+    pub height: i32,
     /// 仅视频字段：图像类型（I/P/B 帧等，`AVPictureType`）。
     pub pict_type: ffi::AVPictureType,
     // Audio
@@ -751,14 +758,16 @@ where
                 .format
                 .into_pixel()
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
-            format.data_layout(self.width, self.height).ok_or_else(|| {
-                RsmediaError::unsupported(format!(
-                    "pixel format {} cannot be stored as sample planes at {}x{}",
-                    format.get_pix_fmt_name(),
-                    self.width,
-                    self.height
-                ))
-            })
+            format
+                .data_layout(self.width as usize, self.height as usize)
+                .ok_or_else(|| {
+                    RsmediaError::unsupported(format!(
+                        "pixel format {} cannot be stored as sample planes at {}x{}",
+                        format.get_pix_fmt_name(),
+                        self.width,
+                        self.height
+                    ))
+                })
         } else {
             let format = self
                 .format
@@ -783,8 +792,8 @@ where
     /// pts（见 [`time_base`](Self::time_base)）。要按自己的时间基表达 pts 时再调
     /// [`set_time_base`](Self::set_time_base)。
     pub fn new_video(
-        width: u32,
-        height: u32,
+        width: i32,
+        height: i32,
         format: PixelFormat,
         data: impl Into<FrameData<T>>,
     ) -> Result<Self> {
@@ -802,13 +811,15 @@ where
     /// 创建视频帧（各平面零初始化）。
     ///
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
-    pub fn new_video_frame(width: u32, height: u32, format: PixelFormat) -> Result<Self> {
-        let layout = format.data_layout(width, height).ok_or_else(|| {
-            RsmediaError::unsupported(format!(
-                "pixel format {} cannot be stored as sample planes at {width}x{height}",
-                format.get_pix_fmt_name()
-            ))
-        })?;
+    pub fn new_video_frame(width: i32, height: i32, format: PixelFormat) -> Result<Self> {
+        let layout = format
+            .data_layout(width as usize, height as usize)
+            .ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "pixel format {} cannot be stored as sample planes at {width}x{height}",
+                    format.get_pix_fmt_name()
+                ))
+            })?;
         Self::new_video(width, height, format, FrameData::zeros(&layout))
     }
 
@@ -998,7 +1009,7 @@ where
             ));
         }
 
-        let (width, height) = (frame.width as u32, frame.height as u32);
+        let (width, height) = (frame.width, frame.height);
         let pts = frame.pts;
         let pkt_dts = frame.pkt_dts;
         let format = frame.format;
@@ -1267,8 +1278,8 @@ where
         let mut frame = AVFrame::new();
         frame.set_format(i32::from(self.format));
         if self.media_type == MediaType::VIDEO {
-            frame.set_width(self.width as i32);
-            frame.set_height(self.height as i32);
+            frame.set_width(self.width);
+            frame.set_height(self.height);
             frame.set_pict_type(self.pict_type);
         } else {
             frame.set_nb_samples(self.nb_samples as i32);
@@ -1464,34 +1475,36 @@ where
     ///
     /// Fails for audio frames, for a destination the source's element width or
     /// swscale cannot serve, and for `dst` formats with no sample planes.
-    pub fn convert_to(&self, dst: PixelFormat) -> Result<Self> {
+    pub fn convert_to(&self, dst_fmt: PixelFormat) -> Result<Self> {
         if self.media_type != MediaType::VIDEO {
             return Err(RsmediaError::invalid_config(
                 "converting pixel formats only applies to video frames, got an audio frame",
             ));
         }
-        if self.format == FrameFormat::Pixel(dst) {
+        if self.format == FrameFormat::Pixel(dst_fmt) {
             return Ok(self.clone());
         }
-        let dst_layout = dst.data_layout(self.width, self.height).ok_or_else(|| {
-            RsmediaError::unsupported(format!(
-                "pixel format {} cannot be stored as sample planes at {}x{}",
-                dst.get_pix_fmt_name(),
-                self.width,
-                self.height
-            ))
-        })?;
+        let dst_layout = dst_fmt
+            .data_layout(self.width as usize, self.height as usize)
+            .ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "pixel format {} cannot be stored as sample planes at {}x{}",
+                    dst_fmt.get_pix_fmt_name(),
+                    self.width,
+                    self.height
+                ))
+            })?;
         // `read_samples::<T>` reads `size_of::<T>()`-wide elements, so a target
         // with a different component width must be rejected here rather than
         // reinterpreted: asking for `YUV420P10LE` out of a `MediaFrame<u8>`
         // would otherwise read half a plane of garbage.
-        let element_bytes = dst.bytes_per_component().ok_or_else(|| {
+        let element_bytes = dst_fmt.bytes_per_component().ok_or_else(|| {
             RsmediaError::unsupported(format!(
                 "pixel format {} has no per-component size",
-                dst.get_pix_fmt_name()
+                dst_fmt.get_pix_fmt_name()
             ))
         })?;
-        validate_element_size::<T>(FrameFormat::Pixel(dst), element_bytes)?;
+        validate_element_size::<T>(FrameFormat::Pixel(dst_fmt), element_bytes)?;
 
         let src = self.to_avframe()?;
         // 尺寸不变，只换格式：swscale 的同一上下文即可完成格式与色彩空间转换。
@@ -1499,10 +1512,10 @@ where
         // 复用一个即可，不必为每帧新建上下文；缩放后的样本仍要拷回 `FrameData`，
         // 这是 `Scaler` 只吃 `AVFrame` 的接口所决定的。
         let converted = CONVERT_SCALER.with_borrow_mut(|scaler| {
-            scaler.scale_frame(&src, self.width as i32, self.height as i32, dst)
+            scaler.scale_frame(&src, VideoSpec::new(self.width, self.height, dst_fmt))
         })?;
         let data = read_samples::<T>(&converted, &dst_layout)?;
-        Ok(self.with_data(data, dst))
+        Ok(self.with_data(data, dst_fmt))
     }
 }
 
@@ -1570,7 +1583,7 @@ impl MediaFrame<u8> {
         };
         let array = Array3::from_shape_vec((height, width, 3), raw)
             .context("Failed to build ndarray from image")?;
-        Self::new_video(width as u32, height as u32, PixelFormat::RGB24, array)
+        Self::new_video(width as i32, height as i32, PixelFormat::RGB24, array)
     }
 }
 
@@ -1762,7 +1775,7 @@ fn rgb24_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
         RsmediaError::msg("RGB24 samples must be interleaved (packed), not planar")
     })?;
     let (height, width, _) = packed.dim();
-    check_layout(data, PixelFormat::RGB24, width as u32, height as u32)?;
+    check_layout(data, PixelFormat::RGB24, width as i32, height as i32)?;
     Ok((height, width))
 }
 
@@ -1776,7 +1789,7 @@ fn yuv420p_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
         .first()
         .map(|plane| plane.dim())
         .ok_or_else(|| RsmediaError::msg("YUV420P frame has no luma plane"))?;
-    check_layout(data, PixelFormat::YUV420P, width as u32, height as u32)?;
+    check_layout(data, PixelFormat::YUV420P, width as i32, height as i32)?;
     Ok((height, width))
 }
 
@@ -1784,15 +1797,17 @@ fn yuv420p_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
 fn check_layout<T>(
     data: &FrameData<T>,
     format: PixelFormat,
-    width: u32,
-    height: u32,
+    width: i32,
+    height: i32,
 ) -> Result<()> {
-    let layout = format.data_layout(width, height).ok_or_else(|| {
-        RsmediaError::unsupported(format!(
-            "pixel format {} has no data layout at {width}x{height}",
-            format.get_pix_fmt_name()
-        ))
-    })?;
+    let layout = format
+        .data_layout(width as usize, height as usize)
+        .ok_or_else(|| {
+            RsmediaError::unsupported(format!(
+                "pixel format {} has no data layout at {width}x{height}",
+                format.get_pix_fmt_name()
+            ))
+        })?;
     if data.matches(&layout) {
         Ok(())
     } else {
@@ -1959,8 +1974,8 @@ mod tests {
         Ok(())
     }
 
-    const TEST_WIDTH: u32 = 320;
-    const TEST_HEIGHT: u32 = 240;
+    const TEST_WIDTH: i32 = 320;
+    const TEST_HEIGHT: i32 = 240;
     /// 30 fps, as a time base: `1/30`.
     fn time_base_30fps() -> Rational {
         Rational::new(1, 30).expect("1/30 is a rational")
@@ -1970,8 +1985,8 @@ mod tests {
     /// 返回 r/g/b 三个平面，方便调用方做断言。
     fn fill_rgb_data(
         frame: &mut MediaFrame<u8>,
-        width: u32,
-        height: u32,
+        width: i32,
+        height: i32,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let w = width as usize;
         let h = height as usize;
@@ -2008,7 +2023,7 @@ mod tests {
     /// 这里锁定一批代表性格式的布局。
     #[test]
     fn test_pixel_format_data_layout() {
-        let (width, height) = (64u32, 48u32);
+        let (width, height) = (64usize, 48usize);
 
         // 交错格式：单数组 `(height, width, 每像素元素数)`
         for (format, elements) in [
@@ -2023,8 +2038,8 @@ mod tests {
             assert_eq!(
                 format.data_layout(width, height),
                 Some(DataLayout::Interleaved {
-                    rows: height as usize,
-                    cols: width as usize,
+                    rows: height,
+                    cols: width,
                     components: elements,
                 }),
                 "{format:?}"
@@ -2396,8 +2411,8 @@ mod tests {
 
     #[test]
     fn test_create_rgb24_frame() -> Result<()> {
-        let width = 640u32;
-        let height = 360u32;
+        let width = 640i32;
+        let height = 360i32;
 
         let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24)?;
 
@@ -2701,7 +2716,7 @@ mod tests {
     #[cfg(feature = "image")]
     fn test_from_dynamic_image() -> Result<()> {
         // RGB8 输入（零拷贝路径）
-        let rgb = image::RgbImage::from_fn(TEST_WIDTH, TEST_HEIGHT, |x, y| {
+        let rgb = image::RgbImage::from_fn(TEST_WIDTH as u32, TEST_HEIGHT as u32, |x, y| {
             image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 233) as u8])
         });
         let frame = MediaFrame::<u8>::from_dynamic_image(rgb.clone())?;
@@ -2718,7 +2733,7 @@ mod tests {
         );
 
         // RGBA 输入（to_rgb8 转换路径）
-        let rgba = image::RgbaImage::from_fn(TEST_WIDTH, TEST_HEIGHT, |x, y| {
+        let rgba = image::RgbaImage::from_fn(TEST_WIDTH as u32, TEST_HEIGHT as u32, |x, y| {
             image::Rgba([(x % 251) as u8, (y % 241) as u8, ((x + y) % 233) as u8, 255])
         });
         let expected = image::DynamicImage::from(rgba.clone()).to_rgb8().into_raw();
@@ -2747,7 +2762,7 @@ mod tests {
     #[test]
     fn test_yuv_matrix_heuristic_boundaries() -> Result<()> {
         for (height, expected) in [
-            (480u32, YuvStandardMatrix::Bt601), // SD
+            (480i32, YuvStandardMatrix::Bt601), // SD
             (719, YuvStandardMatrix::Bt601),    // SD 上界（取 719 避开偶数约束）
             (720, YuvStandardMatrix::Bt709),    // HD 起点
             (1080, YuvStandardMatrix::Bt709),   // 最常见的 HD —— 旧代码在此错判
@@ -2792,7 +2807,7 @@ mod tests {
     #[test]
     fn test_yuv420p_to_rgb24_odd_dimensions() -> Result<()> {
         // 色度平面应为 ceil：(65/2, 49/2) = (33, 25)，而不是 floor 的 (32, 24)。
-        let (width, height) = (65u32, 49u32);
+        let (width, height) = (65i32, 49i32);
         let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::YUV420P)?;
         assert_eq!(
             frame.data.shapes(),

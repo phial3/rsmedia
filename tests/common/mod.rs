@@ -44,7 +44,7 @@ pub fn remove_test_output(path: &std::path::Path) {
 /// gradients plus a phase-shifted blue channel, so round-trips exercise every
 /// plane.
 #[allow(dead_code)]
-pub fn gradient_video_frame(width: u32, height: u32, phase: f32) -> rsmedia::MediaFrame<u8> {
+pub fn gradient_video_frame(width: i32, height: i32, phase: f32) -> rsmedia::MediaFrame<u8> {
     let mut frame =
         rsmedia::MediaFrame::<u8>::new_video_frame(width, height, rsmedia::PixelFormat::RGB24)
             .expect("video frame allocation");

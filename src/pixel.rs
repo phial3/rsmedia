@@ -490,12 +490,10 @@ impl PixelFormat {
     /// 以及该格式无法用整像素元素表达（水平二次采样的打包格式会出现分数个元素
     /// 每像素，如 `uyyvyy411` 的 4 像素 6 字节）。前两种可由
     /// [`Self::is_plane_storable`] 预判，第三种不行。
-    pub fn data_layout(self, width: u32, height: u32) -> Option<DataLayout> {
+    pub fn data_layout(self, width: usize, height: usize) -> Option<DataLayout> {
         if width == 0 || height == 0 {
             return None;
         }
-        // 布局本身用 `ndarray` 的维度表示，几何运算一律按 `usize` 做。
-        let (width, height) = (width as usize, height as usize);
         let desc = AVPixFmtDescriptorRef::get(self.into())?;
         if has_no_sample_planes(&desc) {
             return None;

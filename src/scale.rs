@@ -261,28 +261,88 @@ ffi_enum_from!(
     }
 );
 
+/// 一帧视频的几何与像素格式：宽 + 高 + 像素格式。
+///
+/// 这三样在缩放里总是一起出现（源一份、目标一份），打包传递后：
+/// [`Scaler::scale_frame`] 与 [`Scaler::scale_if_needed`] 的目标只占**一个**参数
+/// （尺寸与格式不会再各传各的，也不会写反）；[`Scaler`] 里"上下文是按什么建出来的"
+/// 那份记录从 6 个字段变成 2 个；`setup_scaler` 的 7 个位置参数变成 3 个。
+///
+/// 音频侧的对应物是 `resample::AudioSpec`，差别在于它只在 crate 内部出现：那边的逐帧入口
+/// [`Resampler::convert_frame_owned`](crate::Resampler::convert_frame_owned) 用的是上下文
+/// 自己记着的那份输出格式；这里的目标必须逐次给出 —— 一个 [`Scaler`] 同时服务解码
+/// （改尺寸 + 换格式）与编码（只换格式）两条路，两者的目的地不同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoSpec {
+    width: i32,
+    height: i32,
+    pix_fmt: PixelFormat,
+}
+
+impl VideoSpec {
+    /// 帧宽（像素）、帧高（像素）与像素格式。
+    pub const fn new(width: i32, height: i32, pix_fmt: PixelFormat) -> Self {
+        Self {
+            width,
+            height,
+            pix_fmt,
+        }
+    }
+
+    /// `frame` 自己的规格。
+    ///
+    /// # Errors
+    ///
+    /// [`RsmediaError::Unsupported`] 当帧的像素格式超出本 crate 收录的范围 —— 这种帧
+    /// 缩放不了，报在这里比让 `swscale` 拿到一个它不认识的枚举更好。
+    pub fn from_frame(frame: &AVFrame) -> Result<Self> {
+        let pix_fmt = PixelFormat::from_ffi_checked(frame.format).ok_or_else(|| {
+            RsmediaError::unsupported(format!(
+                "Unsupported source pixel format {} on a {}x{} frame",
+                frame.format, frame.width, frame.height
+            ))
+        })?;
+        Ok(Self::new(frame.width, frame.height, pix_fmt))
+    }
+
+    /// 只换像素格式，尺寸不变。
+    pub const fn with_pix_fmt(self, pix_fmt: PixelFormat) -> Self {
+        Self { pix_fmt, ..self }
+    }
+
+    /// `frame` 是否已经是这个规格（尺寸与像素格式都一致）。
+    ///
+    /// 帧的格式超出收录范围时不算匹配 —— 那不可能等于目标格式，于是交给
+    /// [`Scaler::scale_frame`] 报出可读的"不支持"错误，而不是在这里悄悄放行。
+    fn matches(self, frame: &AVFrame) -> bool {
+        self.width == frame.width
+            && self.height == frame.height
+            && PixelFormat::from_ffi_checked(frame.format) == Some(self.pix_fmt)
+    }
+}
+
+impl std::fmt::Display for VideoSpec {
+    /// Renders as `1920x1080 YUV420P`, which is what the error messages and the debug
+    /// log below print.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x{} {:?}", self.width, self.height, self.pix_fmt)
+    }
+}
+
 /// 创建软件缩放上下文（按 FFmpeg 版本走新旧 API 路径）：
 /// - FFmpeg 6/7：legacy 路径，`sws_getContext()` 一次性传入源/目标参数完成初始化；
 /// - FFmpeg 8+：modern 全动态路径，`sws_alloc_context()` 分配后仅设置 flags 字段，
 ///   尺寸/格式等参数由 `sws_scale_frame()` 从帧属性推导（`sws_init_context()` 自
 ///   FFmpeg 8.0 起废弃，FFmpeg 9 起拒绝 legacy/modern API 混用）。
 #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-fn setup_scaler(
-    src_width: i32,
-    src_height: i32,
-    src_pix_fmt: ffi::AVPixelFormat,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: ffi::AVPixelFormat,
-    flags: u32,
-) -> Result<SwsContext> {
+fn setup_scaler(src_spec: VideoSpec, dst_spec: VideoSpec, flags: u32) -> Result<SwsContext> {
     SwsContext::get_context(
-        src_width,
-        src_height,
-        src_pix_fmt,
-        dst_width,
-        dst_height,
-        dst_pix_fmt,
+        src_spec.width,
+        src_spec.height,
+        src_spec.pix_fmt.into(),
+        dst_spec.width,
+        dst_spec.height,
+        dst_spec.pix_fmt.into(),
         flags,
         None,
         None,
@@ -295,15 +355,7 @@ fn setup_scaler(
 /// 除 flags 外的参数（尺寸/格式）由 [`SwsContext::scale_full_frame`] 从帧属性推导，
 #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
 #[allow(unused_variables)]
-fn setup_scaler(
-    src_width: i32,
-    src_height: i32,
-    src_pix_fmt: ffi::AVPixelFormat,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: ffi::AVPixelFormat,
-    flags: u32,
-) -> Result<SwsContext> {
+fn setup_scaler(src_spec: VideoSpec, dst_spec: VideoSpec, flags: u32) -> Result<SwsContext> {
     let mut sws_ctx = SwsContext::alloc().context("Failed to allocate swscale context.")?;
     sws_ctx.set_flags(flags);
     Ok(sws_ctx)
@@ -403,7 +455,10 @@ pub fn scale_frame(
     // Delegates to a one-off `Scaler` so there is exactly one implementation of
     // the actual scaling; a caller who needs another kernel builds a `Scaler`
     // itself (`Scaler::new_with_options`).
-    Scaler::new().scale_frame(src_frame, dst_width, dst_height, dst_pix_fmt)
+    Scaler::new().scale_frame(
+        src_frame,
+        VideoSpec::new(dst_width, dst_height, dst_pix_fmt),
+    )
 }
 
 /// Persistent streaming video scaler, held by the encoder and the decoder.
@@ -460,12 +515,8 @@ pub struct Scaler {
 /// still held by previously returned frames are freed instead of recycled).
 struct BoundScaler {
     sws: SwsContext,
-    src_width: i32,
-    src_height: i32,
-    src_pix_fmt: PixelFormat,
-    dst_width: i32,
-    dst_height: i32,
-    dst_pix_fmt: PixelFormat,
+    src_spec: VideoSpec,
+    dst_spec: VideoSpec,
     pool: Option<AVBufferPool>,
 }
 
@@ -582,72 +633,49 @@ impl Scaler {
         self.algorithm.as_raw() | self.quality.bits()
     }
 
-    /// Scale a frame into a newly allocated destination frame of `dst_width` ×
-    /// `dst_height` in `dst_pix_fmt`.
+    /// Scale a frame into a newly allocated destination frame with the given geometry and
+    /// pixel format.
     ///
     /// The source geometry and pixel format come from `src_frame`. The scaling context is
     /// created on the first call and rebuilt whenever either side's geometry or pixel
-    /// format changes.
-    pub fn scale_frame(
-        &mut self,
-        src_frame: &AVFrame,
-        dst_width: i32,
-        dst_height: i32,
-        dst_pix_fmt: PixelFormat,
-    ) -> Result<AVFrame> {
+    /// format changes — `dst_spec` may differ from one call to the next, which is what lets
+    /// one `Scaler` serve both the decode path (resize *and* format) and the encode path
+    /// (format only).
+    ///
+    /// # Errors
+    ///
+    /// [`RsmediaError::Unsupported`] for a hardware source frame, or when its pixel format
+    /// is outside the set this crate models (see [`VideoSpec::from_frame`]); otherwise
+    /// whatever `swscale` reports for the conversion.
+    pub fn scale_frame(&mut self, src_frame: &AVFrame, dst_spec: VideoSpec) -> Result<AVFrame> {
         if !src_frame.hw_frames_ctx.is_null() {
             return Err(RsmediaError::unsupported(
                 "Hardware frames are not supported in this software scaler",
             ));
         }
-
         // 帧的格式来自解码器，可能超出本 crate 收录的范围：报错而不是 panic。
-        let src_pix_fmt = PixelFormat::from_ffi_checked(src_frame.format).ok_or_else(|| {
-            RsmediaError::unsupported(format!(
-                "Unsupported source pixel format {} on a {}x{} frame",
-                src_frame.format, src_frame.width, src_frame.height
-            ))
-        })?;
-        let reusable = self.bound.as_ref().is_some_and(|bound| {
-            bound.src_width == src_frame.width
-                && bound.src_height == src_frame.height
-                && bound.src_pix_fmt == src_pix_fmt
-                && bound.dst_width == dst_width
-                && bound.dst_height == dst_height
-                && bound.dst_pix_fmt == dst_pix_fmt
-        });
+        let src_spec = VideoSpec::from_frame(src_frame)?;
+
+        let reusable = self
+            .bound
+            .as_ref()
+            .is_some_and(|bound| bound.src_spec == src_spec && bound.dst_spec == dst_spec);
         if !reusable {
             // FFmpeg 6/7 的 legacy `SwsContext` 在此固定源/目标几何与格式；FFmpeg 8+
             // 的动态上下文只取 flags，几何在缩放时由帧属性推导——两条路径都按这里的
-            // 目标参数调用，故两个版本的行为保持一致。
-            let sws = setup_scaler(
-                src_frame.width,
-                src_frame.height,
-                src_frame.format,
-                dst_width,
-                dst_height,
-                dst_pix_fmt.into(),
-                self.flags(),
-            )?;
-            // 池与上下文同生命周期：按本次绑定的目标几何建池，几何/格式变化
+            // 源/目标规格调用，故两个版本的行为保持一致。
+            let sws = setup_scaler(src_spec, dst_spec, self.flags())?;
+            // 池与上下文同生命周期：按本次绑定的目标规格建池，规格变化
             // 重建时旧池一并析构（未归还的缓冲由引用计数安全释放）。
             let pool = if self.pool_enabled {
-                Some(AVBufferPool::new(pooled_frame_buffer_size(
-                    dst_pix_fmt,
-                    dst_width,
-                    dst_height,
-                )?)?)
+                Some(AVBufferPool::new(pooled_frame_buffer_size(dst_spec)?)?)
             } else {
                 None
             };
             self.bound = Some(BoundScaler {
                 sws,
-                src_width: src_frame.width,
-                src_height: src_frame.height,
-                src_pix_fmt,
-                dst_width,
-                dst_height,
-                dst_pix_fmt,
+                src_spec,
+                dst_spec,
                 pool,
             });
         }
@@ -656,12 +684,12 @@ impl Scaler {
         })?;
 
         let mut dst_frame = match bound.pool.as_mut() {
-            Some(pool) => alloc_pooled_frame(pool, dst_width, dst_height, dst_pix_fmt)?,
+            Some(pool) => alloc_pooled_frame(pool, dst_spec)?,
             None => {
                 let mut dst_frame = AVFrame::new();
-                dst_frame.set_width(dst_width);
-                dst_frame.set_height(dst_height);
-                dst_frame.set_format(dst_pix_fmt.into());
+                dst_frame.set_width(dst_spec.width);
+                dst_frame.set_height(dst_spec.height);
+                dst_frame.set_format(dst_spec.pix_fmt.into());
                 dst_frame
                     .alloc_buffer()
                     .context("Failed to allocate destination frame buffer")?;
@@ -670,7 +698,7 @@ impl Scaler {
         };
         imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
         // 目标帧的像素格式与源帧不同，色域标记要按目标格式修正（见函数注释）。
-        fix_output_color_metadata(&mut dst_frame, dst_pix_fmt);
+        fix_output_color_metadata(&mut dst_frame, dst_spec.pix_fmt);
 
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         set_scaler_colorspace_details(&mut bound.sws, src_frame, &dst_frame);
@@ -686,9 +714,7 @@ impl Scaler {
             };
             if ret < 0 {
                 return Err(RsmediaError::av_error(ret).with_context(format!(
-                    "Failed to scale {}x{} {src_pix_fmt:?} into {}x{} {dst_pix_fmt:?} \
-                     (sws_scale_frame)",
-                    src_frame.width, src_frame.height, dst_frame.width, dst_frame.height
+                    "Failed to scale {src_spec} into {dst_spec} (sws_scale_frame)"
                 )));
             }
         }
@@ -699,43 +725,31 @@ impl Scaler {
             .scale_full_frame(&mut dst_frame, src_frame)
             .context("Failed to scale frame.")?;
 
-        tracing::debug!(
-            "Sws scale from src:[{}x{}, {:?}] to dst:[{}x{}, {:?}]",
-            src_frame.width,
-            src_frame.height,
-            src_pix_fmt,
-            dst_width,
-            dst_height,
-            dst_pix_fmt
-        );
+        tracing::debug!("Sws scale from src:[{src_spec}] to dst:[{dst_spec}]");
 
         Ok(dst_frame)
     }
 
     /// Like [`Scaler::scale_frame`], but takes ownership of `src`.
     ///
-    /// When the source already matches the requested destination format **and**
-    /// dimensions, `src` is returned unchanged (zero-cost, no allocation);
-    /// otherwise it is converted via the persistent context into a newly
-    /// allocated destination frame.
+    /// When the source already matches `dst_spec` — same geometry **and** same pixel
+    /// format — `src` is returned unchanged (zero-cost, no allocation); otherwise it is
+    /// converted via the persistent context into a newly allocated destination frame.
     ///
-    /// This centralises the "convert only when the pixel format / geometry
-    /// differ" short-circuit that would otherwise be duplicated across the
-    /// decode and encode pipelines.
-    pub fn scale_if_needed(
-        &mut self,
-        src: AVFrame,
-        dst_width: i32,
-        dst_height: i32,
-        dst_pix_fmt: PixelFormat,
-    ) -> Result<AVFrame> {
-        if src.format == i32::from(dst_pix_fmt)
-            && src.width == dst_width
-            && src.height == dst_height
-        {
+    /// This centralises the "convert only when the pixel format / geometry differ"
+    /// short-circuit that would otherwise be duplicated across the decode and encode
+    /// pipelines.
+    ///
+    /// # Errors
+    ///
+    /// See [`Scaler::scale_frame`]. The match is tested **before** the source format is
+    /// validated, so a frame whose pixel format this crate does not model falls through to
+    /// there and gets its "unsupported" error, rather than being silently passed on.
+    pub fn scale_if_needed(&mut self, src: AVFrame, dst_spec: VideoSpec) -> Result<AVFrame> {
+        if dst_spec.matches(&src) {
             return Ok(src);
         }
-        self.scale_frame(&src, dst_width, dst_height, dst_pix_fmt)
+        self.scale_frame(&src, dst_spec)
     }
 }
 
@@ -794,12 +808,19 @@ fn pool_frame_padding() -> usize {
 /// 计算池化帧缓冲所需尺寸：`av_image_get_buffer_size`（与
 /// [`alloc_pooled_frame`] 使用的 `av_image_fill_arrays` 同一 `align`，
 /// 两者互为镜像）加上安全留白。
-fn pooled_frame_buffer_size(fmt: PixelFormat, width: i32, height: i32) -> Result<usize> {
+fn pooled_frame_buffer_size(dst_spec: VideoSpec) -> Result<usize> {
     let align = pool_align();
-    let size = unsafe { ffi::av_image_get_buffer_size(fmt.into(), width, height, align) };
+    let size = unsafe {
+        ffi::av_image_get_buffer_size(
+            dst_spec.pix_fmt.into(),
+            dst_spec.width,
+            dst_spec.height,
+            align,
+        )
+    };
     if size < 0 {
         return Err(RsmediaError::invalid_config(format!(
-            "cannot size a pooled frame buffer for {fmt:?} {width}x{height}: \
+            "cannot size a pooled frame buffer for {dst_spec:?}: \
              av_image_get_buffer_size returned {size}"
         )));
     }
@@ -818,16 +839,11 @@ fn pooled_frame_buffer_size(fmt: PixelFormat, width: i32, height: i32) -> Result
 /// swscale 不会写入的 padding 字节清零（见 [`zero_frame_padding`]）：代价是
 /// 一次只覆盖 padding 的写，换来比 `alloc_buffer` **更严格**的语义——帧的
 /// padding 字节内容确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。
-fn alloc_pooled_frame(
-    pool: &mut AVBufferPool,
-    width: i32,
-    height: i32,
-    fmt: PixelFormat,
-) -> Result<AVFrame> {
+fn alloc_pooled_frame(pool: &mut AVBufferPool, dst_spec: VideoSpec) -> Result<AVFrame> {
     let mut frame = AVFrame::new();
-    frame.set_width(width);
-    frame.set_height(height);
-    frame.set_format(fmt.into());
+    frame.set_width(dst_spec.width);
+    frame.set_height(dst_spec.height);
+    frame.set_format(dst_spec.pix_fmt.into());
 
     let buffer = pool
         .get()
@@ -856,16 +872,15 @@ fn alloc_pooled_frame(
             data.as_mut_ptr(),
             linesize.as_mut_ptr(),
             aligned,
-            fmt.into(),
-            width,
-            height,
+            dst_spec.pix_fmt.into(),
+            dst_spec.width,
+            dst_spec.height,
             align,
         )
     };
     if ret < 0 {
         return Err(RsmediaError::av_error(ret).with_context(format!(
-            "Failed to lay out a pooled {fmt:?} frame {width}x{height} \
-             (av_image_fill_arrays)"
+            "Failed to lay out a pooled {dst_spec:?} frame (av_image_fill_arrays)"
         )));
     }
 
@@ -878,7 +893,7 @@ fn alloc_pooled_frame(
     // Safety: buffer 为独占引用（引用计数 1），data/linesize 是上面
     // `av_image_fill_arrays` 在 buffer 内部排布的结果。
     unsafe {
-        zero_frame_padding(&buffer, fmt, width, height, &data, &linesize)?;
+        zero_frame_padding(&buffer, dst_spec, &data, &linesize)?;
     }
 
     // Safety: frame 由本函数刚构造，无其他引用；rsmpeg 的 wrap 不实现
@@ -903,13 +918,11 @@ fn alloc_pooled_frame(
 ///
 /// # Safety
 ///
-/// `data`/`linesize` 必须是 `av_image_fill_arrays(fmt, width, height, pool_align())` 在
-/// `buffer` 内部排布的结果，且 `buffer` 是独占引用（无其他持有者）。
+/// `data`/`linesize` 必须是 `av_image_fill_arrays(spec, pool_align())` 在 `buffer`
+/// 内部排布的结果，且 `buffer` 是独占引用（无其他持有者）。
 unsafe fn zero_frame_padding(
     buffer: &AVBufferRef,
-    fmt: PixelFormat,
-    width: i32,
-    height: i32,
+    spec: VideoSpec,
     data: &[*mut u8; 8],
     linesize: &[i32; 8],
 ) -> Result<()> {
@@ -921,11 +934,12 @@ unsafe fn zero_frame_padding(
 
     let mut visible = [0i32; 8];
     // Safety: 本地数组 + 调用方已校验的格式/尺寸。
-    let ret = unsafe { ffi::av_image_fill_linesizes(visible.as_mut_ptr(), fmt.into(), width) };
+    let ret = unsafe {
+        ffi::av_image_fill_linesizes(visible.as_mut_ptr(), spec.pix_fmt.into(), spec.width)
+    };
     if ret < 0 {
         return Err(RsmediaError::av_error(ret).with_context(format!(
-            "Failed to get the visible line sizes of {fmt:?} at width {width} \
-             (av_image_fill_linesizes)"
+            "Failed to get the visible line sizes of {spec:?} (av_image_fill_linesizes)"
         )));
     }
     let visible_isize: [isize; 8] = visible.map(|bytes| bytes as isize);
@@ -934,27 +948,26 @@ unsafe fn zero_frame_padding(
     let ret = unsafe {
         ffi::av_image_fill_plane_sizes(
             plane_bytes.as_mut_ptr(),
-            fmt.into(),
-            height,
+            spec.pix_fmt.into(),
+            spec.height,
             visible_isize.as_ptr(),
         )
     };
     if ret < 0 {
         return Err(RsmediaError::av_error(ret).with_context(format!(
-            "Failed to get the plane sizes of {fmt:?} at height {height} \
-             (av_image_fill_plane_sizes)"
+            "Failed to get the plane sizes of {spec:?} (av_image_fill_plane_sizes)"
         )));
     }
     // Safety: 纯查询，参数为已校验的像素格式。
-    let planes = unsafe { ffi::av_pix_fmt_count_planes(fmt.into()) };
+    let planes = unsafe { ffi::av_pix_fmt_count_planes(spec.pix_fmt.into()) };
     if planes < 0 {
         return Err(RsmediaError::av_error(planes)
-            .with_context(format!("Failed to count the planes of {fmt:?}")));
+            .with_context(format!("Failed to count the planes of {spec:?}")));
     }
     // 计数为 0 的格式没有可清空的 padding，但也没有平面可遍历；
     // 上层只对已知有数据的格式调用本函数，走到这里说明格式假设不成立。
     if planes == 0 {
-        return Err(RsmediaError::msg(format!("{fmt:?} reports no planes")));
+        return Err(RsmediaError::msg(format!("{spec:?} reports no planes")));
     }
 
     // Safety: 下面所有写入都限制在 [buf_start, buf_start + buf_size) 内——各平面的可见区
@@ -1104,7 +1117,7 @@ mod tests {
     fn test_scaler_pool_frame_supports_ffmpeg_ref() -> Result<()> {
         let mut scaler = Scaler::new().with_buffer_pool(true);
         let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
-        let frame = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        let frame = scaler.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
         assert!(!frame.buf[0].is_null());
 
         let mut retained = AVFrame::new();
@@ -1136,18 +1149,18 @@ mod tests {
         let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
 
         // 第 1 帧：真实分配。
-        let a = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        let a = scaler.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
         assert!(!a.buf[0].is_null(), "池化帧必须持有 buf[0]");
         assert!(a.is_allocated());
         let ptr_a = a.data[0];
 
         // 归还后第 2 帧：必须复用同一缓冲（同数据指针）。
         drop(a);
-        let b = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        let b = scaler.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
         assert_eq!(b.data[0], ptr_a, "复用的缓冲数据指针应与上一帧相同");
 
         // b 仍存活：第 3 帧必须拿新缓冲。
-        let c = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        let c = scaler.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
         assert_ne!(c.data[0], b.data[0]);
 
         // 全部归还后：两次取回应恰好是 b/c 的两个缓冲。
@@ -1155,8 +1168,8 @@ mod tests {
         let ptr_c = c.data[0];
         drop(b);
         drop(c);
-        let d = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
-        let e = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        let d = scaler.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
+        let e = scaler.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
         let got = [d.data[0], e.data[0]];
         assert!(
             (got[0] == ptr_b && got[1] == ptr_c) || (got[0] == ptr_c && got[1] == ptr_b),
@@ -1188,8 +1201,8 @@ mod tests {
             let mut pooled = Scaler::new().with_buffer_pool(true);
             let mut plain = Scaler::new();
 
-            let a = pooled.scale_frame(&src, dw, dh, dst_fmt)?;
-            let b = plain.scale_frame(&src, dw, dh, dst_fmt)?;
+            let a = pooled.scale_frame(&src, VideoSpec::new(dw, dh, dst_fmt))?;
+            let b = plain.scale_frame(&src, VideoSpec::new(dw, dh, dst_fmt))?;
             assert_eq!((a.width, a.height), (dw, dh));
             assert_eq!(a.format, b.format);
             assert_eq!(a.linesize[0] % 32, 0, "池化帧 stride 应按 32 对齐");
@@ -1197,7 +1210,7 @@ mod tests {
 
             // 复用后的缓冲内容同样正确（先归还 a，再缩放一帧比对）。
             drop(a);
-            let a2 = pooled.scale_frame(&src, dw, dh, dst_fmt)?;
+            let a2 = pooled.scale_frame(&src, VideoSpec::new(dw, dh, dst_fmt))?;
             assert_visible_pixels_equal(&a2, &b, dw as u32, dh as u32, dst_fmt);
         }
         Ok(())
@@ -1215,19 +1228,19 @@ mod tests {
         let src_mid = create_test_frame(48, 48, PixelFormat::YUV420P)?;
 
         // 建立旧池并产出小尺寸帧。
-        let a = scaler.scale_frame(&src_small, 32, 32, PixelFormat::YUV420P)?;
+        let a = scaler.scale_frame(&src_small, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
         assert_eq!((a.width, a.height), (32, 32));
         drop(a);
 
         // 几何变化：旧池析构、新池按 24x20 尺寸重建。
-        let b = scaler.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        let b = scaler.scale_frame(&src_mid, VideoSpec::new(24, 20, PixelFormat::RGB24))?;
         assert_eq!((b.width, b.height), (24, 20));
         assert_eq!(b.format, i32::from(PixelFormat::RGB24));
-        let reference = plain.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        let reference = plain.scale_frame(&src_mid, VideoSpec::new(24, 20, PixelFormat::RGB24))?;
         assert_visible_pixels_equal(&b, &reference, 24, 20, PixelFormat::RGB24);
 
         // 新几何再取一帧，内容依旧正确（旧几何的缓冲不再影响新池）。
-        let c = scaler.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        let c = scaler.scale_frame(&src_mid, VideoSpec::new(24, 20, PixelFormat::RGB24))?;
         assert_eq!((c.width, c.height), (24, 20));
         assert_visible_pixels_equal(&c, &reference, 24, 20, PixelFormat::RGB24);
         Ok(())
@@ -1242,7 +1255,7 @@ mod tests {
 
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let frame = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+            let frame = scaler.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
             assert_eq!((frame.width, frame.height), (32, 32));
             seen.insert(frame.data[0] as usize);
             drop(frame); // 每帧用完即归还
@@ -1268,7 +1281,7 @@ mod tests {
         }
 
         // 第一帧：把它的整个池缓冲写满垃圾再归还。
-        let first = scaler.scale_frame(&src, 32, 24, PixelFormat::YUV420P)?;
+        let first = scaler.scale_frame(&src, VideoSpec::new(32, 24, PixelFormat::YUV420P))?;
         let buf_size = unsafe { (*first.buf[0]).size };
         unsafe {
             std::ptr::write_bytes((*first.buf[0]).data, 0xFF, buf_size);
@@ -1277,9 +1290,9 @@ mod tests {
         drop(first);
 
         // 第二帧（复用同一缓冲）：可见像素必须正确，padding 必须为 0。
-        let second = scaler.scale_frame(&src, 32, 24, PixelFormat::YUV420P)?;
+        let second = scaler.scale_frame(&src, VideoSpec::new(32, 24, PixelFormat::YUV420P))?;
         let mut plain = Scaler::new();
-        let reference = plain.scale_frame(&src, 32, 24, PixelFormat::YUV420P)?;
+        let reference = plain.scale_frame(&src, VideoSpec::new(32, 24, PixelFormat::YUV420P))?;
         assert_visible_pixels_equal(&second, &reference, 32, 24, PixelFormat::YUV420P);
 
         // 行间隙：YUV420P luma 行内 width..linesize 必须全零。
@@ -1321,7 +1334,7 @@ mod tests {
         let mut scaler = Scaler::new().with_buffer_pool(true);
         let src = create_test_frame(64, 64, PixelFormat::YUV420P)?;
         for _ in 0..4 {
-            let frame = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+            let frame = scaler.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
             let addr = frame.data[0] as usize;
             assert_eq!(
                 addr % align,
@@ -1360,11 +1373,12 @@ mod tests {
         let src_mid = create_test_frame(48, 48, PixelFormat::YUV420P)?;
 
         // 旧池的帧，故意不归还。
-        let outstanding = scaler.scale_frame(&src_small, 32, 32, PixelFormat::YUV420P)?;
+        let outstanding =
+            scaler.scale_frame(&src_small, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
         let old_ptr = outstanding.data[0];
 
         // 几何变化：旧池析构（outstanding 仍持有其缓冲），新池建立。
-        let b = scaler.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        let b = scaler.scale_frame(&src_mid, VideoSpec::new(24, 20, PixelFormat::RGB24))?;
         assert_eq!((b.width, b.height), (24, 20));
         drop(b);
 
@@ -1372,7 +1386,7 @@ mod tests {
         drop(outstanding);
 
         // 新池继续正常工作：新几何的帧不受影响。
-        let c = scaler.scale_frame(&src_mid, 24, 20, PixelFormat::RGB24)?;
+        let c = scaler.scale_frame(&src_mid, VideoSpec::new(24, 20, PixelFormat::RGB24))?;
         assert_eq!((c.width, c.height), (24, 20));
         assert_ne!(c.data[0], old_ptr, "新池的缓冲不应与旧池缓冲混淆");
         Ok(())
@@ -1414,9 +1428,7 @@ mod tests {
         // 掩码确实送到 FFmpeg：默认策略下可正常缩放。
         let dst = default.scale_frame(
             &create_test_frame(64, 64, PixelFormat::YUV420P)?,
-            16,
-            16,
-            PixelFormat::RGB24,
+            VideoSpec::new(16, 16, PixelFormat::RGB24),
         )?;
         assert_eq!((dst.width, dst.height), (16, 16));
         assert_eq!(dst.format, i32::from(PixelFormat::RGB24));
@@ -1434,18 +1446,14 @@ mod tests {
         // 首帧：绑定上下文。
         let first = scaler.scale_frame(
             &create_test_frame(64, 64, PixelFormat::YUV420P)?,
-            32,
-            32,
-            PixelFormat::RGB24,
+            VideoSpec::new(32, 32, PixelFormat::RGB24),
         )?;
         assert_eq!((first.width, first.height), (32, 32));
 
         // 第二帧：源与目标几何都变了，必须重建后仍然正确。
         let second = scaler.scale_frame(
             &create_test_frame(48, 48, PixelFormat::YUV420P)?,
-            24,
-            20,
-            PixelFormat::RGB24,
+            VideoSpec::new(24, 20, PixelFormat::RGB24),
         )?;
         assert_eq!((second.width, second.height), (24, 20));
         assert_eq!(second.format, i32::from(PixelFormat::RGB24));
@@ -1453,9 +1461,7 @@ mod tests {
         // 回到第一组参数：仍可复用（重建不影响后续调用）。
         let third = scaler.scale_frame(
             &create_test_frame(64, 64, PixelFormat::YUV420P)?,
-            32,
-            32,
-            PixelFormat::RGB24,
+            VideoSpec::new(32, 32, PixelFormat::RGB24),
         )?;
         assert_eq!((third.width, third.height), (32, 32));
         Ok(())
@@ -1471,9 +1477,7 @@ mod tests {
         // 源已是目标格式与尺寸 → 应原样返回（no-op）。
         let matching = scaler.scale_if_needed(
             create_test_frame(64, 64, PixelFormat::RGB24)?,
-            64,
-            64,
-            PixelFormat::RGB24,
+            VideoSpec::new(64, 64, PixelFormat::RGB24),
         )?;
         assert_eq!((matching.width, matching.height), (64, 64));
         assert_eq!(matching.format, i32::from(PixelFormat::RGB24));
@@ -1481,18 +1485,14 @@ mod tests {
         // 仅尺寸不同 → 必须缩放。
         let resized = scaler.scale_if_needed(
             create_test_frame(64, 64, PixelFormat::RGB24)?,
-            32,
-            32,
-            PixelFormat::RGB24,
+            VideoSpec::new(32, 32, PixelFormat::RGB24),
         )?;
         assert_eq!((resized.width, resized.height), (32, 32));
 
         // 仅格式不同 → 必须转换。
         let conv = scaler.scale_if_needed(
             create_test_frame(64, 64, PixelFormat::YUV420P)?,
-            64,
-            64,
-            PixelFormat::RGB24,
+            VideoSpec::new(64, 64, PixelFormat::RGB24),
         )?;
         assert_eq!((conv.width, conv.height), (64, 64));
         assert_eq!(conv.format, i32::from(PixelFormat::RGB24));

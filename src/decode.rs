@@ -9,7 +9,7 @@ use crate::io::Reader;
 use crate::options::Options;
 use crate::resample;
 use crate::resize::Resize;
-use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
+use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler, VideoSpec};
 use crate::state::ProcessState;
 use crate::stream::StreamInfo;
 use crate::strutils;
@@ -588,7 +588,7 @@ impl DecoderBuilder {
             output_pix_fmt,
             output_sample_fmt,
             filter_input_format,
-            audio_converter: resample::StreamingConverter::new(),
+            resampler: None,
             pending_frames: VecDeque::new(),
         })
     }
@@ -628,6 +628,9 @@ pub struct Decoder {
     stream_index: usize,
     media_type: MediaType,
     state: ProcessState,
+    /// 视频像素缩放器（改尺寸 + 换格式）。与 [`Self::resampler`] 不同，它**不是**
+    /// `Option`：`Scaler::new` 不需要输入规格（swscale 从帧属性推导源格式），而
+    /// `Resampler` 的输入规格只有第一帧才知道、因此惰性建在 `resample_if_needed` 里。
     scaler: Scaler,
     resize: Option<Resize>,
     /// 解码输出目标像素格式（仅视频）
@@ -637,8 +640,12 @@ pub struct Decoder {
     /// 滤镜链声明的**进图**格式（见 [`Filter::with_input_format`]）；`None` =
     /// 图输入就是解码输出格式（零额外转换）。有值时进图前的帧会被转成它。
     filter_input_format: Option<FrameFormat>,
-    /// 音频输出格式转换器；跨帧复用同一个 `SwrContext`，避免逐帧重建丢掉重采样延迟。
-    audio_converter: resample::StreamingConverter,
+    /// 音频输出格式重采样器（与视频的 `scaler` 一一对应；跨帧复用同一个 [`Resampler`]，
+    /// 避免逐帧重建丢掉重采样延迟）。
+    ///
+    /// `None` = 还没遇到过需要转换的帧：上下文的输入格式要到第一帧才知道，因此它由
+    /// [`Resampler::new`] 在第一次转换时建立（见 [`resample::resample_if_needed`]）。
+    resampler: Option<resample::Resampler>,
     /// 解码器已经吐出、但还没交出去的帧（**未经归一化**：还没做 HW 下载、缩放与滤镜）
     ///
     /// 一个包可以解出**多帧**（H.264 场编码、MPEG-2 field picture…），而
@@ -691,16 +698,16 @@ impl Decoder {
     /// `AVCodecContext.width` field is an FFmpeg `int`; the conversion here can
     /// never see a negative value.
     #[inline(always)]
-    pub fn width(&self) -> u32 {
-        self.context.width as u32
+    pub fn width(&self) -> i32 {
+        self.context.width
     }
 
     /// Height of the decoder's input video frame, in pixels.
     ///
     /// Returned as `u32` for the same reason as [`Self::width`].
     #[inline(always)]
-    pub fn height(&self) -> u32 {
-        self.context.height as u32
+    pub fn height(&self) -> i32 {
+        self.context.height
     }
 
     /// `AVCodecContext.flags` 位集（`AV_CODEC_FLAG_*`，取值见 [`AVCodecFlag`]）。
@@ -1325,9 +1332,7 @@ impl Decoder {
                 };
                 self.scaler.scale_if_needed(
                     sw_frame,
-                    out_w as i32,
-                    out_h as i32,
-                    target_sw_pix_fmt,
+                    VideoSpec::new(out_w as i32, out_h as i32, target_sw_pix_fmt),
                 )?
             }
             MediaType::AUDIO => match self
@@ -1337,21 +1342,11 @@ impl Decoder {
             {
                 // 统一音频输出格式（由 `with_sample_fmt` 配置，或滤镜声明的输入
                 // 格式）。与视频侧一样在进滤镜图之前完成，图内因此按目标格式声明
-                // 输入（见 build_from_reader）。只在格式真的不同、且帧确实带样本时
-                // 转换：默认（未指定目标）与「目标 == 原生」两种情况都零开销，空帧
-                // 也无从转换。
-                Some(target)
-                    if target != SampleFormat::from(sw_frame.format) && sw_frame.nb_samples > 0 =>
-                {
-                    self.audio_converter
-                        .convert(
-                            &sw_frame,
-                            sw_frame.ch_layout,
-                            target.into(),
-                            sw_frame.sample_rate,
-                        )
-                        .context("Failed to convert decoded audio to the output sample format")?
-                }
+                // 输入（见 build_from_reader）。默认（未指定目标）时不进这里；
+                // 「目标 == 原生」与空帧两种情况由 `resample_if_needed` 判掉，零开销。
+                Some(target) => self
+                    .convert_decoded_audio(sw_frame, target.into())
+                    .context("Failed to convert decoded audio to the output sample format")?,
                 _ => sw_frame,
             },
             _ => {
@@ -1381,6 +1376,19 @@ impl Decoder {
             // 如果没有 Filter Graph，直接返回 CPU 帧
             Ok(Some(raw_frame))
         }
+    }
+
+    /// 把解码出的音频帧转成目标采样格式（声道布局与采样率不变）。
+    ///
+    /// 目标格式 = 帧自己的布局与采样率 + 由配置决定的采样格式；重采样器跨帧复用，
+    /// 因此重采样延迟缓冲里的尾巴不会每帧被丢掉（逐帧新建上下文就会）。
+    fn convert_decoded_audio(
+        &mut self,
+        frame: AVFrame,
+        out_sample_fmt: ffi::AVSampleFormat,
+    ) -> Result<AVFrame> {
+        let out_spec = resample::AudioSpec::from_frame(&frame).with_sample_fmt(out_sample_fmt);
+        resample::resample_if_needed(&mut self.resampler, frame, out_spec)
     }
 
     /// Pull a decoded frame from the decoder. This function also implements retry mechanism in case

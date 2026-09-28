@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut filters = vec![
         filter::video::scale(1280, 720, Some("bicubic"))?,
-        filter::video::crop(20, 20, width, height),
+        filter::video::crop(20, 20, width as u32, height as u32),
         filter::video::hqdn3d(3.0, 2.0), // 视频降噪
     ];
 
@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rainbow_frame(width: u32, height: u32, p: f32) -> MediaFrame<u8> {
+fn rainbow_frame(width: i32, height: i32, p: f32) -> MediaFrame<u8> {
     // This is what generated the rainbow effect!
     // We loop through the HSV color spectrum and convert to RGB.
     let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);

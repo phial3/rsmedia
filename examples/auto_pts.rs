@@ -14,8 +14,8 @@ use rsmedia::frame::MediaFrame;
 use rsmedia::mux::Muxer;
 use rsmedia::{EncoderBuilder, PixelFormat, SampleFormat};
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
+const WIDTH: i32 = 320;
+const HEIGHT: i32 = 240;
 const FPS: f32 = 30.0;
 const VIDEO_FRAMES: usize = 90; // 3 s
 

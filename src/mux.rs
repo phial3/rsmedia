@@ -669,8 +669,8 @@ impl<W: Writer> Muxer<W> {
     ///
     /// Returns the output stream index of the cover stream.
     pub fn add_cover_art(&mut self, cover_frame: AVFrame) -> Result<usize> {
-        let width = cover_frame.width as u32;
-        let height = cover_frame.height as u32;
+        let width = cover_frame.width;
+        let height = cover_frame.height;
         let encoder = EncoderBuilder::new_video(width, height)
             .with_codec_name("mjpeg")
             .build()?;
@@ -1768,10 +1768,10 @@ mod tests {
     use std::path::Path;
 
     /// 生成YUV420P格式的视频帧,彩色渐变测试图
-    fn generate_video_frame(width: u32, height: u32, frame_index: i64) -> AVFrame {
+    fn generate_video_frame(width: i32, height: i32, frame_index: i64) -> AVFrame {
         let mut frame = AVFrame::new();
-        frame.set_width(width as i32);
-        frame.set_height(height as i32);
+        frame.set_width(width);
+        frame.set_height(height);
         frame.set_format(PixelFormat::YUV420P.into());
         frame
             .alloc_buffer()
@@ -2195,8 +2195,8 @@ mod tests {
     #[test]
     fn test_multiple_streams() -> Result<()> {
         // 视频参数
-        pub const VIDEO_WIDTH: u32 = 640;
-        pub const VIDEO_HEIGHT: u32 = 360;
+        pub const VIDEO_WIDTH: i32 = 640;
+        pub const VIDEO_HEIGHT: i32 = 360;
         pub const VIDEO_FPS: f32 = 30f32;
         pub const VIDEO_DURATION_SEC: u32 = 3;
 
@@ -2657,8 +2657,8 @@ mod tests {
             frames.len()
         );
         let (_, frame) = &frames[0];
-        assert_eq!(frame.width as u32, width);
-        assert_eq!(frame.height as u32, height);
+        assert_eq!(frame.width, width);
+        assert_eq!(frame.height, height);
 
         let frame_count = frames.len() as f64;
 
@@ -2702,8 +2702,8 @@ mod tests {
 
         // 生成一张 RGB24 渐变封面帧（编码器自动协商并转换为 mjpeg 支持的格式）
         let mut cover = AVFrame::new();
-        cover.set_width(width as i32);
-        cover.set_height(height as i32);
+        cover.set_width(width);
+        cover.set_height(height);
         cover.set_format(PixelFormat::RGB24.into());
         cover.alloc_buffer().context("alloc cover frame")?;
         let rgb = cover.data_mut()[0];
