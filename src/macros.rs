@@ -837,7 +837,11 @@ macro_rules! impl_codec_builder_setters {
         /// Off by default. With it on, frames this codec scales are allocated from an
         /// internal `AVBufferPool` instead of being freshly allocated per frame, so a
         /// steady stream of same-geometry conversions stops allocating after a couple
-        /// of frames; buffers are zero-filled before use, matching `alloc_buffer`.
+        /// of frames. Note that the pool only zeroes the bytes swscale never writes
+        /// (alignment offset, stride slack, plane gaps, tail padding) — it does **not**
+        /// zero the visible pixels, and `AVFrame::alloc_buffer` does not zero anything
+        /// either (it goes through `av_frame_get_buffer` → `av_buffer_alloc` →
+        /// `av_malloc`).
         pub fn with_scale_pool(mut self, enabled: bool) -> Self {
             self.scale_pool = enabled;
             self

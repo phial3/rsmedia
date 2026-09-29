@@ -648,6 +648,10 @@ pub struct Decoder {
     ///
     /// `None` = 还没遇到过需要转换的帧：上下文的输入格式要到第一帧才知道，因此它由
     /// [`Resampler::new`] 在第一次转换时建立（见 [`resample::resample_if_needed`]）。
+    ///
+    /// **不需要在流末排空**：它的目标布局与采样率都取自帧本身、只换采样格式（见
+    /// [`Self::convert_decoded_audio`]），上下文不做重采样因而没有延迟线 —— 与需要
+    /// 排空的那个（输出采样率取自编码器的 `Encoder` 侧重采样器）不同。
     resampler: Option<resample::Resampler>,
     /// 解码器已经吐出、但还没交出去的帧（**未经归一化**：还没做 HW 下载、缩放与滤镜）
     ///
@@ -2227,8 +2231,13 @@ mod tests {
         Ok(())
     }
 
-    /// 造一段可预测的视频：`content` 为 `true` 时逐像素填噪声（损坏实验用，
-    /// 噪声让码流对字节翻转更敏感），否则留空（静态画面）。
+    /// 造一段可预测的视频：`noise` 为 `true` 时逐像素填噪声（损坏实验用，
+    /// 噪声让码流对字节翻转更敏感），否则填纯黑（静态画面）。
+    ///
+    /// ⚠️ "留空"必须**显式填**而不能省略：`AVFrame::alloc_buffer()` 走
+    /// `av_frame_get_buffer` → `av_buffer_alloc`（`av_malloc`），**不清零**。把未初始化
+    /// 的像素送进编码器，每次跑出来的码流都不一样 —— 依赖"同一份输入必得同一份输出"
+    /// 的损坏实验会间歇性失败。
     fn write_test_clip(path: &std::path::Path, frames: i64, gop: i32, noise: bool) -> Result<()> {
         let mut muxer = crate::Muxer::new(path)?;
         let encoder = crate::EncoderBuilder::new_video(160, 120)
@@ -2245,6 +2254,10 @@ mod tests {
             frame
                 .alloc_buffer()
                 .context("Failed to allocate frame buffer")?;
+            // 先整帧填黑，保证"留空"是确定的黑而不是脏内存。用 `fill_black` 而不
+            // 是 `fill_color`：后者底层 `av_image_fill_color` 自 FFmpeg 7.0 才有，
+            // 这里必须在所有受支持的版本上都能跑。
+            crate::imgutils::fill_black(&mut frame)?;
             if noise {
                 // 线性同余发生器：同样的序号得到同样的画面，损坏实验因此可复现。
                 let mut state = (i as u32 + 1) | 1;

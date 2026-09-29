@@ -577,8 +577,14 @@ impl Scaler {
     /// [`BufferPool`](rsmpeg::avutil::AVBufferPool) instead of being freshly allocated per call; when
     /// a previously returned frame is dropped, its buffer goes back to the pool and the
     /// next same-geometry call reuses it. A steady stream of same-geometry output thus
-    /// stops allocating after a couple of frames, and the buffers' padding bytes are
-    /// zeroed exactly like `alloc_buffer`'s, so they stay deterministic for the encoder.
+    /// stops allocating after a couple of frames. The pool zeroes exactly the bytes
+    /// swscale never writes (alignment offset, stride slack, plane gaps, tail padding),
+    /// so those stay deterministic for the encoder; the visible pixels are always fully
+    /// overwritten by swscale. Note that `AVFrame::alloc_buffer` does **not** zero
+    /// anything — it goes through `av_frame_get_buffer` → `av_buffer_alloc` →
+    /// `av_malloc` — so if you allocate a frame yourself and feed it to an encoder,
+    /// fill it (e.g. with [`crate::imgutils::fill_black`]) instead of relying on
+    /// zeroed memory.
     ///
     /// The pool is created lazily together with the scaling context and sized for the
     /// bound destination geometry; a geometry/format change rebuilds it. This is a
@@ -1266,9 +1272,9 @@ mod tests {
         Ok(())
     }
 
-    /// 安全性：**复用的缓冲必须清零**。FFmpeg 的池归还时不重置内容，而
-    /// `alloc_buffer` 保证帧 padding 为零——池化路径在使用前显式清零整个
-    /// 缓冲，本测试把整个缓冲写满垃圾、归还、再缩放，断言可见像素正确且
+    /// 安全性：**复用的缓冲必须清零**。FFmpeg 的池归还时不重置内容（而
+    /// `alloc_buffer` 本身也**不**清零 —— 它走 `av_malloc`），所以池化路径在使用前
+    /// 显式清零整个缓冲。本测试把整个缓冲写满垃圾、归还、再缩放，断言可见像素正确且
     /// 全部 padding（行间隙 + 平面间隙 + 尾部留白）为 0。
     #[test]
     fn test_scaler_pool_padding_zeroed_on_reuse() -> Result<()> {
