@@ -92,6 +92,79 @@ bytes → Reader(io.rs) → Demuxer(mux.rs) → Decoder(decode.rs)
 > VM 6.1 / 7.1 / 8.1 = 344 / 345 / 346（各 = 基线 + 本轮 5 个新测试）；
 > harness 38 模式 **293 pass / 0 fail / 2 xfail**（与基线一致，`vf_transpose` 实测 320×180 → 180×320）。
 
+> **修复记录（A6 尾部延迟 + 破坏性签名，2026-09-29）**
+>
+> **A6** 见上一节的落地记录：只有 `Encoder::encode_resampler` 需要排空（另两个上下文不做
+> 重采样、没有延迟线，已在文档与测试里写明）。
+>
+> | 位置 | 原签名 | 改后 | 理由 |
+> |---|---|---|---|
+> | `filter.rs::video::pad` | `pad(w, h, x, y, color)` | `pad(x, y, w, h, color)` | 与 `crop` / `delogo` / `Delogo::add_region` 统一为"先位置、后尺寸" |
+> | `filter.rs::VideoEndpoint::new` | `new(w, h, fmt, time_base, frame_rate)` | `new(w, h, fmt)` + `with_time_base` / `with_frame_rate` / `with_pixel_aspect` | 三个相邻同类型 `Rational` 写反了编译得过；改成按名字设置。"忘了设"不会静默：`buffer` 源直接拒 `time_base=0/1`（实测 `Invalid time base 0/1`） |
+> | `hwaccel.rs::HWDeviceConfig::new` | `new(device_type, hw_pixel_format, sw_pixel_format, device_id, options)` | `new(device_type)` + `with_hw_pixel_format` / `with_sw_pixel_format` / `with_device_id` / `with_options` | 两个相邻 `PixelFormat` 成对出现、写反了要等设备初始化才报错；默认取设备类型的默认格式映射（唯一真相源） |
+> | `subtitle.rs::copy_subtitle_stream` | `(reader, writer, src_index, out_index)` | `(reader, src_index, writer, out_index)` | 两个 `usize` 流索引挨着可互换；中间隔着类型不同的 `writer` 就换不动 |
+> | `codec.rs`（`CodecConfig::new` / `id` / `encoders_for` / `decoders_for`） | `ffi::AVCodecID` | `u32` | 该 FFI 别名就是 `c_uint`；换掉后公开 API 不再漏 `rsmpeg::ffi`，且与 `StreamInfo::codec_id: u32` 同一写法（**类型未变，非破坏性**） |
+> | `encode.rs::Encoder::flush` | `flush(writer, interleaved: bool, index, tb)` | `flush(writer, mode: WriteMode, index, tb)` | 新增 `io::WriteMode { Interleaved, Direct }`：调用处原来是 `flush(&mut w, true, 0, tb)` |
+> | `imgutils::apply_cropping` | `apply_cropping(frame, flags: i32)` | ~~`impl Into<FlagSet<CropFlag>>`~~ **已回退，仍是 `flags: i32`** | 见下一节：用户裁定"一个位不值得为它定义类型"，中间形态 `CropAlignment` 也被删了 |
+>
+> 连带更新：`examples/{encoding,filter_compose,filter_demo,id_photo}.rs`、`benches/encode_mux_container.rs`、
+> `tests/encode_pipeline.rs`、`src/mux.rs`（由 `Muxer::interleaved` 推出 `WriteMode`），
+> 以及 harness `../rsmedia_test`（5 处调用点）。
+>
+> **有意未动**：`filter.rs::VideoParams` 也有同样的三个相邻 `Rational`（`time_base` /
+> `frame_rate` / `pixel_aspect`），但它不是构造入口 —— `From<VideoParams> for VideoEndpoint`
+> 与 `FilterParams` 内部才建它，且 `VideoEndpoint` 已经能从它派生。若要一并改成按名字设置，
+> 需要连带改 `VideoParams` 的构造（当前全靠 struct 字面量），属更大范围的 API 变更，留待后续。
+>
+> 验证（2026-09-29）：`cargo fmt --check` ✅、`clippy --all-targets -D warnings`
+> （含 / 不含 `image`）✅、`RUSTDOCFLAGS="-D warnings" cargo doc` ✅、
+> **lib 350 / doctest 70 / 集成 19 个 binary 全绿**（各 = 基线 + 本轮 4 个新测试）；
+> VM 6.1 / 7.1 / 8.1 = 349 / 350 / 351；
+> harness 38 模式 **293 pass / 0 fail / 2 xfail**（与基线一致）。
+
+> **修复记录（复核后的三处回退 + `alloc_buffer` 陷阱，2026-09-29）**
+>
+> 上一节落地后用户逐条复核，四处按裁决改回 / 简化：
+>
+> | 项 | 上一节的做法 | 本轮 | 理由 |
+> |---|---|---|---|
+> | `codec.rs::CodecConfig` | `ffi::AVCodecID` → `u32` | **整体还原** | 该别名本来就是 `c_uint`，换签名只是"看起来不漏 FFI"，收益为零，却多一次全仓调用点改动 |
+> | `encode.rs::Encoder::flush` | 新增 `io::WriteMode{Interleaved,Direct}` 取代 `bool` | **删掉 `WriteMode`**，回到 `interleaved: bool` | 一个二元开关套一层枚举是过度设计；`flush(&mut w, true, 0, tb)` 比 `flush(&mut w, WriteMode::Interleaved, 0, tb)` 更短且无需 import |
+> | `imgutils::apply_cropping` | `impl Into<FlagSet<CropFlag>>`（`ffi_enum!` 位集） | 中间形态 `impl Into<CropAlignment>` → **最终两个都删，回到 `flags: i32`** | 核对 `data/ffmpeg-{5_1,6_1,7_1,8_1,9_0}/binding.rs`：**`AV_FRAME_CROP_UNALIGNED` 是唯一的 `AV_FRAME_CROP_*` 常量**（5.1/6.1 上是 `_bindgen_ty_2`、7.1+ 是 `_bindgen_ty_1`，值均为 1）。**一个位既不成"位集"、也不值得为它单独定义类型** —— 用户裁定：`apply_cropping(&mut f, ffi::AV_FRAME_CROP_UNALIGNED as i32)` 已经够清楚，多一个枚举只是多一层要记的名字。调用方直接传 FFI 常量，`as i32` 处加 `#[allow(clippy::unnecessary_cast)]`（Windows/vcpkg 绑定里它已是 `i32`，Linux 上是 `u32`） |
+>
+> **真 BUG（本轮调试中踩到，已修）**：`AVFrame::alloc_buffer()` 给的是**未初始化**内存 —— 它走
+> `av_frame_get_buffer` → `av_buffer_alloc` → `av_malloc`，**没有 memset**。把这样的帧直接喂编码器，
+> 里面的随机浮点会触发 `avcodec_send_frame` 返回 `EINVAL(-22)`，而且是**间歇性**的（单独跑过、
+> 整套跑挂），极易被误判成并发 bug。
+>
+> | 位置 | 问题 | 修法 |
+> |---|---|---|
+> | `src/decode.rs::write_test_clip`（测试夹具） | `noise=false` 时"留空"= 直接送未初始化像素进编码器，同一份输入产出不同码流，依赖"输入相同 ⇒ 输出相同"的损坏实验间歇性失败 | 分配后先 `imgutils::fill_black(&mut frame)` 整帧填黑，再决定是否叠噪声。用 `fill_black` 而非 `fill_color`：后者底层 `av_image_fill_color` 自 FFmpeg 7.0 才有（`#[cfg(any(ffmpeg7,ffmpeg8,ffmpeg9))]`），VM 上的 6.1 会编不过 |
+> | `src/scale.rs:580-583`、`src/scale.rs:1270`、`src/macros.rs:840` | 三处文档声称池化缓冲"清零，与 `alloc_buffer` 一致" —— **是错的** | 改为：池只清零 swscale 不会写的字节（对齐偏移 / stride 余量 / 平面间隙 / 尾部留白），可见像素由 swscale 整体覆写；并明确写出 `alloc_buffer` 不清零、`av_malloc` 链路 |
+>
+> 顺带修的非本轮问题：`../rsmedia_test/examples/{seek_probe,seekflag_probe,stream_probe}.rs`
+> 仍在按 `u32` 传 `MediaFrame::new_video_frame` / `EncoderBuilder::new_video`（这两个参数本轮前已改
+> `i32`），`cargo clippy --all-targets` 因此编不过。共 7 处：`W`/`H` 常量与 `solid_frame` 形参各
+> 2 + 1，以及 `stream_probe` 里 `box_of` / `label_bar_of` 的 `w/h: u32`（调用方传的是
+> `MediaFrame::width`，本来就是 `i32`，`run_all.sh` 只编 bin 所以一直没暴露）。
+> 全部改 `i32`，索引处仍就地转 `usize`。
+>
+> ⚠️ **自查更正**：这一小节第一次报"harness `clippy --all-targets` 编得过"是**错的** —— 那次命令
+> 以 `| tail` 结尾，`$?` 取的是 `tail` 的退出码，把 cargo 的非零冲掉了；真实情况是还剩 4 个
+> `E0308`。已改为**重定向到文件再取 `$?`**，重跑后 `CLIPPY_EXIT=0`。教训：**要断言"通过"
+> 就不能把编译器的输出接进管道**。
+>
+> 验证（2026-09-29，退出码均为直接取到的真值）：`cargo fmt --check` ✅（0）、
+> `clippy --all-targets -D warnings`（含 / 不含 `image`）✅（0 / 0）、
+> `RUSTDOCFLAGS="-D warnings" cargo doc` ✅（0）、**lib 350 / doctest 68 / 集成 19 个 binary 全绿**
+> （doctest 从上一节的 70 回到 68：那 +2 是 `WriteMode` 的文档示例，跟着枚举一起删了）；
+> VM 6.1 / 7.1 / 8.1 = 349 / 350 / 351（与上一节一致，`VM_EXIT` 均为 0）；
+> harness 38 模式 **293 pass / 0 fail / 2 xfail**（与基线一致，`EXIT=0`），
+> harness `clippy --all-targets` **真正编得过**（`CLIPPY_EXIT=0`，仅剩 21 条既有风格 warning）。
+>
+> 上面四行在**再删掉 `CropAlignment` 之后**原样复跑过一遍，数字完全一致（lib 350 / doctest 68 /
+> VM 349-350-351 / harness 293-0-2），退出码仍全为 0。
+
 ### A. 会**静默产出错误数据**（最高优先级，建议先修）　**（A5 / A1 / A2 / A4 已修；A3 / A6 未修）**
 
 **A1〔已修·中〕奇数尺寸 `YUV420P` → `RGB24` 静默错位**
@@ -168,6 +241,31 @@ loop { ... Err(e) => return Err(e.with_context("... output is truncated")) }
    会变多，需要 harness 音频组复验。
 2. **维持现状并明写** —— 在 `Resampler` 及编码/解码侧的文档里写明"主链路不排空，末尾
    的延迟采样会被丢弃"，把这个取舍从"未记录的隐式行为"变成"有文档的已知限制"。
+
+> **已修（2026-09-29，用户裁决"只处理 2 3"后按"该排空的排空、该写明的写明"落地）**
+>
+> 先分清三个 `Resampler` 谁真的有延迟线 —— 这是"排空 vs 写明"的分界：
+>
+> | 位置 | 输出规格取自 | 会不会重采样 | 处理 |
+> |---|---|---|---|
+> | `Encoder::encode_resampler` | **编码器**（`audio_spec()`，采样率可能与输入不同） | 会 | **排空** |
+> | `Encoder::filter_resampler` | 帧自己（`from_frame(&f).with_sample_fmt(..)`） | 不会 | 写明（无需排空） |
+> | `Decoder::resampler` | 帧自己（同上，见 `convert_decoded_audio`） | 不会 | 写明（无需排空） |
+>
+> - 新增 `Resampler::flush_frames()`（`resample.rs`）：按一秒容量分配、循环取空、循环
+>   次数以 `MAX_DRAIN_ITERATIONS` 为上限（与 `pcm.rs::drain_resampler` 同一做法）。
+> - `Encoder::flush` 的"输入侧收尾"抽成 `finish_input()`，顺序为
+>   **滤镜冲刷 → 排空重采样延迟线 → 冲刷 audio_fifo → 送 EOS**；尾帧走新的
+>   `send_frame_ready()`（而非 `send_frame_post_filter`）—— 它们已出过重采样、pts 也在
+>   编码器时间基上，再走一遍滤镜输出时间基的换算会换算两次。
+> - 回归测试：`encode::tests::test_finish_input_drains_the_resampler_delay_line`
+>   （48kHz → 44.1kHz，8×1024 样本；**实测排空前 7510、期望 7526，少 16 个样本**，
+>   排空后相符）、`resample::tests::test_flush_frames_returns_the_delay_line`、
+>   `resample::tests::test_a_format_only_resampler_keeps_no_delay_line`（钉住"只换格式的
+>   上下文没有延迟线"，即另两个不需要排空的依据）。
+>
+> ⚠️ 顺带记录一个**测试侧**的坑：`AVFrame::alloc_buffer()` 给的是**未初始化**内存；把
+> 里面的随机浮点喂给 aac 会以 `SendFrameError(-22)` **间歇性**失败。填真实样本才稳定。
 
 ### B. 健壮性 / 健全性　**（B1 / B2 / B4 / B5 / B6 / B7 已修；B3 未修）**
 
@@ -554,6 +652,12 @@ vs 裸 `Option<T>`（`HWDeviceConfig::new(options: Option<Options>)`、`with_har
 
 **D10 闭集选项用 `&str`**：
 - `filter::video::afade(fade_type: &str)` —— 只有 `in`/`out` 两个值，应收窄为枚举（传错字符串现在会静默走 FFmpeg 默认）。
+  **〔2026-09-29 部分修〕** 枚举化仍未做（破坏性），但已与 `yadif`/`bwdif`/`amix` 一起走
+  `check_closed_set` 前置校验：名字与 FFmpeg 的数字写法都收，越界/拼错在构造期即
+  `InvalidConfig` 并点名候选值（值集按 `ffmpeg -h` + 运行时实测核对：
+  `yadif.mode` 0..=3、`bwdif.mode` 0..=1、`afade.t` 0..=1、`amix.duration` 0..=2）。
+  `amix` 的两个入口（`audio::amix` 与 `FilterGraphBuilder::amix`）此前一个校验一个不校验，
+  现共用 `check_amix_duration`。
 - `filter::video::scale(flags: Option<&str>)` —— crate **已经有** `ScaleAlgorithm`/`ScaleQuality` 强类型枚举，
   这里却绕过它们收裸字符串。
 - `curves(preset)`/`gif_palette(dither)`/`advanced_fft_denoise(noise_type)`/`lutyuv(y,u,v)` —— 这些是**有意**的
