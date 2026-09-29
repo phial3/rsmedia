@@ -14,8 +14,9 @@ const MAX_FFMPEG_PLANES: usize = 4;
 /// Fill plane linesizes for an image with pixel format pix_fmt and width.
 ///
 /// This mirrors `av_image_fill_linesizes` one-to-one, including its `int`
-/// parameters and result — hence `width: i32` and `[i32; 4]` rather than the
-/// `u32` the high-level API uses.
+/// parameters and result — hence `width: i32` and `[i32; 4]`, the same width the
+/// rest of this crate uses for sizes (FFmpeg's `int`, so that a value reaches
+/// `AVFrame.width` unchanged instead of being narrowed into a wrap).
 ///
 /// A negative `width` is **rejected**, not mirrored: FFmpeg's `image_get_linesize`
 /// answers `AVERROR(EINVAL)` for `width < 0`, so no stride is ever negative
