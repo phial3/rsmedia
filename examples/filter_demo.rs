@@ -160,8 +160,8 @@ fn print_filter_catalog() -> Result<()> {
             filter::video::yadif("send_frame")?.spec(),
         ),
         (
-            "pad(w,h,x,y,color)",
-            filter::video::pad(1920, 1080, 0, 0, "black")?.spec(),
+            "pad(x,y,w,h,color)",
+            filter::video::pad(0, 0, 1920, 1080, "black")?.spec(),
         ),
         ("setdar(16,9)", filter::video::setdar(16, 9).spec()),
         ("setsar(1,1)", filter::video::setsar(1, 1).spec()),

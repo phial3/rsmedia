@@ -29,50 +29,65 @@ pub struct HWDeviceConfig {
 }
 
 impl HWDeviceConfig {
-    /// create a new HWDeviceConfig with the given parameters
+    /// Create a config for `device_type`, with that type's default format mapping.
     ///
-    /// # Arguments
+    /// The two pixel formats (hardware side / software side) are the same type and
+    /// always appear as a pair, so a positional constructor lets them be swapped
+    /// without the compiler noticing — the mistake only surfaces when the device
+    /// is opened. They are therefore not positional: this takes the type's
+    /// default mapping, the same one [`Self::cuda`] / [`Self::vaapi`] / … use, and
+    /// [`Self::with_hw_pixel_format`] / [`Self::with_sw_pixel_format`] override it
+    /// by name. `HWDeviceType::default_hw_pixel_format` and
+    /// `HWDeviceType::default_sw_pixel_format` are the single source of truth for
+    /// the mapping, so there is no second place that could disagree with it.
     ///
-    /// * `device_type` - The type of hardware device
-    /// * `hw_pixel_format` - The pixel format of the hardware device
-    /// * `sw_pixel_format` - The pixel format of the software device
-    /// * `device_id` - The type-specific string identifying of the GPU device,
-    ///   e.g. for NVIDIA CUDA, device_id should be explicitly the GPU ID  "0" or "1",
-    ///   for VAAPI: device_id should be set like "/dev/dri/renderD128"
-    /// * `options` - Additional (type-specific) options to use in opening the device
-    ///
-    /// Both optional arguments take an `impl Into<Option<_>>`, so a value that is
-    /// always present is passed bare and "no value" is spelled `None`: no
-    /// `Some(...)` wrapper at the call site.
-    pub fn new(
-        device_type: HWDeviceType,
-        hw_pixel_format: PixelFormat,
-        sw_pixel_format: PixelFormat,
-        device_id: impl Into<Option<String>>,
-        options: impl Into<Option<Options>>,
-    ) -> Self {
+    /// `device_id` and `options` are set the same way, with
+    /// [`Self::with_device_id`] / [`Self::with_options`].
+    pub fn new(device_type: HWDeviceType) -> Self {
         Self {
             device_type,
-            hw_pixel_format,
-            sw_pixel_format,
-            device_id: device_id.into(),
-            options: options.into(),
+            hw_pixel_format: device_type.default_hw_pixel_format(),
+            sw_pixel_format: device_type.default_sw_pixel_format(),
+            device_id: None,
+            options: None,
         }
     }
 
-    /// 按设备类型的**默认格式映射**构造配置。
+    /// 覆盖硬件侧像素格式（如把 CUDA 的 NV12 换成别的 surface 格式）。
+    pub fn with_hw_pixel_format(mut self, hw_pixel_format: PixelFormat) -> Self {
+        self.hw_pixel_format = hw_pixel_format;
+        self
+    }
+
+    /// 覆盖软件侧像素格式（硬件帧下载到内存后的格式）。
+    pub fn with_sw_pixel_format(mut self, sw_pixel_format: PixelFormat) -> Self {
+        self.sw_pixel_format = sw_pixel_format;
+        self
+    }
+
+    /// 设备标识：NVIDIA CUDA 用 GPU 编号字符串（如 `"0"`），VAAPI 用 DRM 渲染节点
+    /// 路径（如 `"/dev/dri/renderD128"`），QSV 用设备序号。
     ///
-    /// [`Self::default_hw_pixel_format`]/[`Self::default_sw_pixel_format`]（定义在
-    /// [`HWDeviceType`] 上）是格式映射的唯一真相源：构造器与平台自动选择
+    /// 参数取 `impl Into<Option<_>>`，因此"总是有值"时裸传值即可、"无值"写 `None`
+    /// （表示让后端自选默认设备），都不需要 `Some(...)` 包装。
+    pub fn with_device_id(mut self, device_id: impl Into<Option<String>>) -> Self {
+        self.device_id = device_id.into();
+        self
+    }
+
+    /// 打开设备时的附加（设备类型相关）选项。
+    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.options = options.into();
+        self
+    }
+
+    /// 按设备类型的**默认格式映射**构造配置，只额外指定设备标识。
+    ///
+    /// [`HWDeviceType::default_hw_pixel_format`]/[`HWDeviceType::default_sw_pixel_format`]
+    /// 是格式映射的唯一真相源：本构造器、[`Self::new`] 与平台自动选择
     /// （[`Self::auto_platform`]）都走这里，避免同一设备类型出现两套说法。
     fn default_for(device_type: HWDeviceType, device_id: Option<String>) -> Self {
-        Self::new(
-            device_type,
-            device_type.default_hw_pixel_format(),
-            device_type.default_sw_pixel_format(),
-            device_id,
-            None,
-        )
+        Self::new(device_type).with_device_id(device_id)
     }
 
     /// build CUDA HWDeviceConfig
@@ -964,13 +979,7 @@ impl HWDeviceType {
                 ))
             })?;
         tracing::info!("Auto-selected hardware device: {device:?}");
-        Ok(HWDeviceConfig::new(
-            device,
-            device.default_hw_pixel_format(),
-            device.default_sw_pixel_format(),
-            None,
-            None,
-        ))
+        Ok(HWDeviceConfig::new(device))
     }
 
     /// List available hardware acceleration device types on this system.

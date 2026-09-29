@@ -1039,7 +1039,7 @@ mod video {
             ("crop", video::crop(0, 0, 32, 32), n_frames, Some((32, 32))),
             (
                 "pad",
-                video::pad(96, 96, 0, 0, "black")?,
+                video::pad(0, 0, 96, 96, "black")?,
                 n_frames,
                 Some((96, 96)),
             ),

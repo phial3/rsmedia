@@ -266,13 +266,9 @@ fn compose_amix() -> Result<()> {
 
 /// 这一批场景统一的视频端点：YUV420P、25fps、时间基 1/25。
 fn video_endpoint(width: i32, height: i32) -> VideoEndpoint {
-    VideoEndpoint::new(
-        width,
-        height,
-        PixelFormat::YUV420P,
-        Rational::new(1, FPS).unwrap(),
-        Rational::new(FPS, 1).unwrap(),
-    )
+    VideoEndpoint::new(width, height, PixelFormat::YUV420P)
+        .with_time_base(Rational::new(1, FPS).unwrap())
+        .with_frame_rate(Rational::new(FPS, 1).unwrap())
 }
 
 /// 统一的音频端点：48kHz 单声道 FLTP，时间基 1/48000。

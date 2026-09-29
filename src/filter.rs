@@ -171,8 +171,9 @@ impl FilterNode {
     /// # use rsmedia::Rational;
     /// # use rsmedia::PixelFormat;
     /// # fn main() -> rsmedia::Result<()> {
-    /// # let endpoint = VideoEndpoint::new(320, 240, PixelFormat::YUV420P,
-    /// #     Rational::new(1, 25).unwrap(), Rational::new(25, 1).unwrap());
+    /// # let endpoint = VideoEndpoint::new(320, 240, PixelFormat::YUV420P)
+    /// #     .with_time_base(Rational::new(1, 25).unwrap())
+    /// #     .with_frame_rate(Rational::new(25, 1).unwrap());
     /// let mut builder = FilterGraphBuilder::new();
     /// builder.add_input_with("src", endpoint);
     /// // 一路输入复制成两路：一路原样输出、一路水平翻转后输出。
@@ -500,6 +501,51 @@ fn escape_filter_expr(input: &str) -> Result<String> {
     }
     result.push_str(&escape_option_level(rest)?);
     Ok(result)
+}
+
+/// 校验一个**闭集**滤镜选项：值必须是 `names` 之一，或 `0..=max` 里的整数。
+///
+/// FFmpeg 这类选项在绑定里是 `<int>` 加一组具名常量 —— `ffmpeg -h filter=yadif`
+/// 里 `mode` 声明 `from 0 to 3`，同时给四个值起了 `send_frame`、`send_field`…
+/// 的名字。**名字和数字都合法**，只按名字收会把 FFmpeg 认的值挡在门外，只按整数
+/// 收同理，所以两边都要收。
+///
+/// 不做校验的话，拼错的名字会被原样写进滤镜串，直到建图才变成一句 FFmpeg 的解析
+/// 错误（"Unable to parse \"mode\" option value \"…\""），既没有本 crate 的上下文、
+/// 也定位不到是哪个参数；在这里前置拦下，是 `InvalidConfig` 且点名了候选值。
+///
+/// `max` 是 FFmpeg 声明的上界（含），取自 `ffmpeg -h filter=<name>` 的范围。
+fn check_closed_set(
+    filter: &str,
+    option: &str,
+    value: &str,
+    names: &[&str],
+    max: i32,
+) -> Result<()> {
+    let in_numeric_range = value.parse::<i32>().is_ok_and(|n| (0..=max).contains(&n));
+    if in_numeric_range || names.contains(&value) {
+        return Ok(());
+    }
+    let quoted: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
+    Err(RsmediaError::invalid_config(format!(
+        "{filter} {option} must be one of {} (or an integer in 0..={max}), got '{value}'",
+        quoted.join(", ")
+    )))
+}
+
+/// `amix` 的 `duration`（如何判定流结束）只认三个档位。
+///
+/// 单独抽出来是因为它有两个入口 —— [`audio::amix`] 与 [`FilterGraphBuilder::amix`]
+/// —— 之前只有后者校验，于是同一个概念在一个入口拼错立刻报错、在另一个入口静默写进
+/// 滤镜串直到建图才炸。
+fn check_amix_duration(duration: &str) -> Result<()> {
+    check_closed_set(
+        "amix",
+        "duration",
+        duration,
+        &["longest", "shortest", "first"],
+        2,
+    )
 }
 
 pub mod video {
@@ -996,10 +1042,24 @@ pub mod video {
     /// `mode`: `send_frame`(默认), `send_field`, `send_frame_nospatial`, `send_field_nospatial`.
     /// # Errors
     ///
-    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
-    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
-    /// propagated too.
+    /// Returns [`RsmediaError::InvalidConfig`] when `mode` is not one of the four
+    /// directions FFmpeg names (`send_frame`, `send_field`, `send_frame_nospatial`,
+    /// `send_field_nospatial`) or an integer in `0..=3`, or when a value contains a NUL
+    /// byte — a filter description is a C string and cannot carry one. Anything
+    /// `av_escape` fails with is propagated too.
     pub fn yadif(mode: &str) -> Result<Filter> {
+        check_closed_set(
+            "yadif",
+            "mode",
+            mode,
+            &[
+                "send_frame",
+                "send_field",
+                "send_frame_nospatial",
+                "send_field_nospatial",
+            ],
+            3,
+        )?;
         let mode = escape_filter_value(mode)?;
         Ok(Filter::new(
             "yadif",
@@ -1010,15 +1070,18 @@ pub mod video {
 
     /// 补边（Pad），在视频周围添加指定颜色的边。
     ///
-    /// * `w` / `h` - 输出尺寸（不包含负值表达式）。
+    /// 参数顺序 `(x, y, w, h)` 与 [`crop`] / [`delogo`] / [`Delogo::add_region`] 一致 ——
+    /// 四者都是"先位置、后尺寸"，顺序反着写（`w, h, x, y`）编译得过但画出来是错的。
+    ///
     /// * `x` / `y` - 原视频在输出画布上的偏移。
+    /// * `w` / `h` - 输出尺寸（不包含负值表达式）。
     /// * `color` - 填充颜色，如 `"black"`。
     /// # Errors
     ///
     /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
     /// description is a C string and cannot carry one. Anything `av_escape` fails with is
     /// propagated too.
-    pub fn pad(w: u32, h: u32, x: i32, y: i32, color: &str) -> Result<Filter> {
+    pub fn pad(x: i32, y: i32, w: u32, h: u32, color: &str) -> Result<Filter> {
         let color = escape_filter_value(color)?;
         Ok(Filter::new(
             "pad",
@@ -1367,10 +1430,15 @@ pub mod video {
     /// （取值 0~1），没有 `send_frame_nospatial`。
     /// # Errors
     ///
-    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
-    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
-    /// propagated too.
+    /// Returns [`RsmediaError::InvalidConfig`] when `mode` is not one of the two
+    /// directions FFmpeg names (`send_frame`, `send_field`) or an integer in `0..=1`, or
+    /// when a value contains a NUL byte — a filter description is a C string and cannot
+    /// carry one. Anything `av_escape` fails with is propagated too.
+    ///
+    /// Note the range is narrower than [`yadif`]'s: `bwdif` has no
+    /// `*_nospatial` variants.
     pub fn bwdif(mode: &str) -> Result<Filter> {
+        check_closed_set("bwdif", "mode", mode, &["send_frame", "send_field"], 1)?;
         let mode = escape_filter_value(mode)?;
         Ok(Filter::new(
             "bwdif",
@@ -1843,10 +1911,12 @@ pub mod audio {
     /// `f32` 在 10⁴ 秒量级上约 1 ms 的 ULP 误差。
     /// # Errors
     ///
-    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
-    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
-    /// propagated too.
+    /// Returns [`RsmediaError::InvalidConfig`] when `fade_type` is neither `in` nor `out`
+    /// (nor the integers `0`/`1` FFmpeg maps them to), or when a value contains a NUL
+    /// byte — a filter description is a C string and cannot carry one. Anything
+    /// `av_escape` fails with is propagated too.
     pub fn afade(fade_type: &str, start: Duration, duration: Duration) -> Result<Filter> {
+        check_closed_set("afade", "type", fade_type, &["in", "out"], 1)?;
         let fade_type = escape_filter_value(fade_type)?;
         Ok(Filter::new(
             "afade",
@@ -1895,10 +1965,12 @@ pub mod audio {
     /// `inputs`: 输入路数；`duration`: `longest`/`shortest`/`first`。
     /// # Errors
     ///
-    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
-    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
-    /// propagated too.
+    /// Returns [`RsmediaError::InvalidConfig`] when `duration` is not one of `longest`,
+    /// `shortest`, `first` (nor the integers `0`/`1`/`2` FFmpeg maps them to), or when a
+    /// value contains a NUL byte — a filter description is a C string and cannot carry
+    /// one. Anything `av_escape` fails with is propagated too.
     pub fn amix(inputs: u32, duration: &str) -> Result<Filter> {
+        check_amix_duration(duration)?;
         let duration = escape_filter_value(duration)?;
         Ok(Filter::new(
             "amix",
@@ -2150,9 +2222,16 @@ impl From<AudioEndpoint> for Endpoint {
 
 /// Format declaration for a video endpoint.
 ///
-/// Like [`VideoParams`], the sizes mirror FFmpeg's own field shapes and stay
-/// `i32` (FFmpeg's `int`) while the high-level API uses `u32`; the rational
-/// fields are plain [`Rational`].
+/// Like [`VideoParams`], the sizes stay `i32` — FFmpeg's `int` — and so does the
+/// rest of this crate's size API: a value has to reach `AVFrame.width` and
+/// `AVCodecContext.width` unchanged, so `u32` would only add a narrowing step in
+/// which an out-of-range value wraps silently. The rational fields are plain
+/// [`Rational`].
+///
+/// The three rationals share a type and sit next to each other, so both a struct
+/// literal and a positional constructor can swap them without the compiler
+/// noticing. Build the value with [`VideoEndpoint::new`] plus the `with_*`
+/// setters, where each one is named by what it sets.
 #[derive(Debug, Clone, Copy)]
 pub struct VideoEndpoint {
     /// Width in pixels
@@ -2170,25 +2249,37 @@ pub struct VideoEndpoint {
 }
 
 impl VideoEndpoint {
-    /// 用尺寸、像素格式、时间基与帧率建一个视频端点（像素宽高比取 1:1）。
-    pub fn new(
-        width: i32,
-        height: i32,
-        format: PixelFormat,
-        time_base: Rational,
-        frame_rate: Rational,
-    ) -> Self {
+    /// 用尺寸与像素格式建一个视频端点。
+    ///
+    /// 三个有理数**不**走位置参数：它们类型相同、含义又相近（时间基与帧率还互为
+    /// 倒数），写反了编译得过、要到出片才看得出错。用下面的 `with_*` 逐个按名字设置。
+    ///
+    /// 默认值：时间基与帧率 [`Rational::ZERO`]（`buffer` 源会直接拒绝 `time_base=0/1`，
+    /// 不会静默建出一个错的图）、像素宽高比 [`Rational::ONE`]（1:1，最常见的情形）。
+    pub fn new(width: i32, height: i32, format: PixelFormat) -> Self {
         Self {
             width,
             height,
             format,
-            time_base,
-            frame_rate,
+            time_base: Rational::ZERO,
+            frame_rate: Rational::ZERO,
             pixel_aspect: Rational::ONE,
         }
     }
 
-    /// 覆盖像素宽高比。
+    /// 设置时间基。同一张图内各路输入应当一致，否则画面会错位。
+    pub fn with_time_base(mut self, time_base: Rational) -> Self {
+        self.time_base = time_base;
+        self
+    }
+
+    /// 设置帧率。
+    pub fn with_frame_rate(mut self, frame_rate: Rational) -> Self {
+        self.frame_rate = frame_rate;
+        self
+    }
+
+    /// 设置像素宽高比。
     pub fn with_pixel_aspect(mut self, pixel_aspect: Rational) -> Self {
         self.pixel_aspect = pixel_aspect;
         self
@@ -3264,9 +3355,13 @@ impl std::fmt::Debug for FilterGraph {
 /// # fn main() -> rsmedia::Result<()> {
 /// let tb = Rational::new(1, 25).unwrap();
 /// let fps = Rational::new(25, 1).unwrap();
-/// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps);
+/// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P)
+///     .with_time_base(tb)
+///     .with_frame_rate(fps);
 /// // 叠加层不必与主画面同尺寸、同像素格式：FFmpeg 会自动插 scale。
-/// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA, tb, fps);
+/// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA)
+///     .with_time_base(tb)
+///     .with_frame_rate(fps);
 ///
 /// let mut graph = FilterGraphBuilder::overlay(main, logo, "W-w-20", "H-h-20", main)?;
 /// // 图输入 0 = 主画面、图输入 1 = 叠加层；唯一的输出是合成结果。
@@ -3661,8 +3756,12 @@ impl FilterGraphBuilder {
     /// # fn main() -> rsmedia::Result<()> {
     /// let tb = Rational::new(1, 25).unwrap();
     /// let fps = Rational::new(25, 1).unwrap();
-    /// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps);
-    /// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA, tb, fps);
+    /// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P)
+    ///     .with_time_base(tb)
+    ///     .with_frame_rate(fps);
+    /// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA)
+    ///     .with_time_base(tb)
+    ///     .with_frame_rate(fps);
     /// let mut graph = FilterGraphBuilder::overlay(main, logo, "W-w-20", "H-h-20", main)?;
     /// # Ok(())
     /// # }
@@ -3697,12 +3796,18 @@ impl FilterGraphBuilder {
     /// # fn main() -> rsmedia::Result<()> {
     /// let tb = Rational::new(1, 25).unwrap();
     /// let fps = Rational::new(25, 1).unwrap();
-    /// let left = VideoEndpoint::new(640, 720, PixelFormat::YUV420P, tb, fps);
-    /// let right = VideoEndpoint::new(640, 720, PixelFormat::YUV420P, tb, fps);
+    /// let left = VideoEndpoint::new(640, 720, PixelFormat::YUV420P)
+    ///     .with_time_base(tb)
+    ///     .with_frame_rate(fps);
+    /// let right = VideoEndpoint::new(640, 720, PixelFormat::YUV420P)
+    ///     .with_time_base(tb)
+    ///     .with_frame_rate(fps);
     /// // 图输入 0 / 1 分别对应 left / right，输出是 1280x720。
     /// let mut graph = FilterGraphBuilder::hstack(
     ///     &[left, right],
-    ///     VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps),
+    ///     VideoEndpoint::new(1280, 720, PixelFormat::YUV420P)
+    ///         .with_time_base(tb)
+    ///         .with_frame_rate(fps),
     /// )?;
     /// # Ok(())
     /// # }
@@ -3777,11 +3882,7 @@ impl FilterGraphBuilder {
         duration: &str,
         output: AudioEndpoint,
     ) -> Result<FilterGraph> {
-        if !matches!(duration, "longest" | "shortest" | "first") {
-            return Err(RsmediaError::invalid_config(format!(
-                "amix duration must be one of 'longest', 'shortest', 'first', got '{duration}'"
-            )));
-        }
+        check_amix_duration(duration)?;
         Self::stack_audio(inputs, output, duration)
     }
 
@@ -4276,7 +4377,7 @@ mod tests {
         }
 
         // 构造器亦然：返回 `Err`，既不 panic，也不静默把字符丢掉。
-        let err = video::pad(8, 8, 0, 0, "black\0").unwrap_err();
+        let err = video::pad(0, 0, 8, 8, "black\0").unwrap_err();
         assert!(err.is_invalid_config(), "{err}");
 
         let params = FilterParams::Video(VideoParams {
@@ -4448,7 +4549,7 @@ mod tests {
             ),
             (
                 "pad=w=1280:h=720:x=0:y=0:color=black".into(),
-                video::pad(1280, 720, 0, 0, "black").spec(),
+                video::pad(0, 0, 1280, 720, "black").spec(),
                 VIDEO,
             ),
             (
@@ -4820,7 +4921,35 @@ mod tests {
     }
 
     fn video_endpoint(width: i32, height: i32) -> VideoEndpoint {
-        VideoEndpoint::new(width, height, PixelFormat::YUV420P, rat(1, 25), rat(25, 1))
+        VideoEndpoint::new(width, height, PixelFormat::YUV420P)
+            .with_time_base(rat(1, 25))
+            .with_frame_rate(rat(25, 1))
+    }
+
+    /// `with_*` 让三个有理数只能按名字设置，代价是"忘了设"变成可能 —— 那必须是
+    /// **响亮失败**，不能是静默建出一个时间基为 0 的图。
+    #[test]
+    fn test_a_video_endpoint_without_a_time_base_is_rejected() {
+        let endpoint = VideoEndpoint::new(320, 240, PixelFormat::YUV420P);
+        assert_eq!(endpoint.time_base, Rational::ZERO);
+        assert_eq!(endpoint.frame_rate, Rational::ZERO);
+        assert_eq!(endpoint.pixel_aspect, Rational::ONE);
+
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("src", endpoint);
+        builder.add_node(FilterNode::new(Filter::new(
+            "hflip",
+            MediaType::VIDEO,
+            "hflip".to_string(),
+        )));
+        builder.add_output_tail(endpoint);
+        let err = builder
+            .build()
+            .expect_err("a buffer source with time_base 0/1 must not build");
+        assert!(
+            err.to_string().contains("buffer"),
+            "the failure should name the buffer source, got: {err}"
+        );
     }
 
     fn audio_endpoint(sample_rate: i32) -> AudioEndpoint {
@@ -5732,6 +5861,71 @@ mod tests {
             let err = video::transpose(mode).unwrap_err();
             assert!(err.is_invalid_config(), "mode {mode}: {err}");
             assert!(err.to_string().contains("0..=3"), "mode {mode}: {err}");
+        }
+    }
+
+    /// 闭集滤镜选项：名字与 FFmpeg 的数字写法都收，越界/拼错在**构造期**就拒绝。
+    ///
+    /// `yadif`/`bwdif`/`afade`/`amix` 原先**完全不校验**：拼错的名字被原样写进滤镜
+    /// 串，直到建图才变成一句 FFmpeg 的解析错误（"Unable to parse \"mode\" option
+    /// value \"…\""），既没有本 crate 的上下文也定位不到是哪个参数。`amix` 更糟——
+    /// 两个入口一个校验（`FilterGraphBuilder::amix`）一个不校验（`audio::amix`），
+    /// 同一个值在两个入口行为不同。
+    ///
+    /// 值集按 `ffmpeg -h filter=<name>` 实测：`yadif.mode` 声明 `from 0 to 3` 并给
+    /// 四个名字，`bwdif.mode` 是 `0..=1`（**没有** `*_nospatial`），`afade.t` 是
+    /// `in`/`out`，`amix.duration` 是三个名字对应 0/1/2。名字和数字**都**要收。
+    #[test]
+    fn test_closed_set_options_are_validated_at_construction_time() {
+        for mode in [
+            "send_frame",
+            "send_field",
+            "send_frame_nospatial",
+            "send_field_nospatial",
+            "0",
+            "3",
+        ] {
+            video::yadif(mode).unwrap_or_else(|err| panic!("yadif({mode:?}) rejected: {err}"));
+        }
+        for mode in ["4", "-1", "bogus", "send_frames", ""] {
+            let err = video::yadif(mode).unwrap_err();
+            assert!(err.is_invalid_config(), "yadif({mode:?}): {err}");
+            assert!(err.to_string().contains("yadif mode"), "{err}");
+        }
+
+        for mode in ["send_frame", "send_field", "0", "1"] {
+            video::bwdif(mode).unwrap_or_else(|err| panic!("bwdif({mode:?}) rejected: {err}"));
+        }
+        // `send_frame_nospatial` 是 yadif 的值，bwdif 没有这一档。
+        for mode in ["2", "send_frame_nospatial", "bogus"] {
+            let err = video::bwdif(mode).unwrap_err();
+            assert!(err.is_invalid_config(), "bwdif({mode:?}): {err}");
+        }
+
+        for fade in ["in", "out", "0", "1"] {
+            audio::afade(fade, Duration::from_secs(0), Duration::from_secs(1))
+                .unwrap_or_else(|err| panic!("afade({fade:?}) rejected: {err}"));
+        }
+        for fade in ["2", "In", "fadein", ""] {
+            let err =
+                audio::afade(fade, Duration::from_secs(0), Duration::from_secs(1)).unwrap_err();
+            assert!(err.is_invalid_config(), "afade({fade:?}): {err}");
+        }
+
+        // `amix` 的两个入口必须对同一个值给出同一个结论。
+        for duration in ["longest", "shortest", "first", "0", "1", "2"] {
+            audio::amix(2, duration)
+                .unwrap_or_else(|err| panic!("amix({duration:?}) rejected: {err}"));
+        }
+        for duration in ["long", "3", "-1", ""] {
+            let from_filter = audio::amix(2, duration).unwrap_err();
+            let endpoint = audio_endpoint(48000);
+            let from_builder =
+                FilterGraphBuilder::amix(&[endpoint, endpoint], duration, endpoint).unwrap_err();
+            for err in [&from_filter, &from_builder] {
+                assert!(err.is_invalid_config(), "amix({duration:?}): {err}");
+                assert!(err.to_string().contains("amix duration"), "{err}");
+            }
         }
     }
 }

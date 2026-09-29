@@ -37,11 +37,15 @@ use std::ffi::CStr;
 /// to the output stream's time_base, and writes them to `writer` at
 /// `out_index`. No decode/encode — the codec is preserved as-is.
 ///
+/// 参数按"源一对、目标一对"分组（`reader, src_index, writer, out_index`）：两个流
+/// 索引都是 `usize`，挨着写反了编译得过、读出来的是错的流 —— 中间隔着类型不同的
+/// `writer` 就换不动了。
+///
 /// Returns the number of packets copied.
 pub fn copy_subtitle_stream<R: Reader, W: Writer>(
     reader: &mut R,
+    in_index: usize,
     writer: &mut W,
-    src_index: usize,
     out_index: usize,
 ) -> Result<usize> {
     // 两个流索引都必须存在：源索引写错会让每个时间戳都按错误的时间基换算，
@@ -50,11 +54,11 @@ pub fn copy_subtitle_stream<R: Reader, W: Writer>(
     let src_tb = reader
         .input()
         .streams()
-        .get(src_index)
+        .get(in_index)
         .map(|s| Rational::from(s.time_base))
         .ok_or_else(|| {
             RsmediaError::invalid_config(format!(
-                "Input stream {src_index} does not exist ({} streams)",
+                "Input stream {in_index} does not exist ({} streams)",
                 reader.input().nb_streams
             ))
         })?;
@@ -63,7 +67,7 @@ pub fn copy_subtitle_stream<R: Reader, W: Writer>(
 
     let mut count = 0usize;
     while let Some((stream_index, mut packet)) = reader.read_packet()? {
-        if stream_index != src_index {
+        if stream_index != in_index {
             continue;
         }
         packet.rescale_ts(src_tb.into(), out_tb.into());
@@ -532,12 +536,12 @@ mod tests {
         let mut out_writer = crate::io::StreamWriter::new(&output_path)?;
 
         // Find subtitle stream in input
-        let (src_index, _) = reader.find_best_stream(crate::MediaType::SUBTITLE)?;
+        let (in_index, _) = reader.find_best_stream(crate::MediaType::SUBTITLE)?;
 
         // Copy codec parameters to output stream (clone to release the borrow
         // on reader before calling copy_subtitle_stream which needs &mut reader).
         let (codecpar, src_tb) = {
-            let src_stream = reader.input().streams().get(src_index).unwrap();
+            let src_stream = reader.input().streams().get(in_index).unwrap();
             (
                 src_stream.codecpar().clone(),
                 Rational::from(src_stream.time_base),
@@ -547,7 +551,7 @@ mod tests {
 
         // Write header, copy packets, write trailer
         out_writer.write_header()?;
-        let count = copy_subtitle_stream(&mut reader, &mut out_writer, src_index, out_index)?;
+        let count = copy_subtitle_stream(&mut reader, in_index, &mut out_writer, out_index)?;
         out_writer.write_trailer()?;
 
         assert_eq!(count, segments.len(), "should copy all subtitle packets");

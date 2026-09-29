@@ -334,13 +334,9 @@ fn encode_jpeg(frame: &MediaFrame<u8>, qscale: u32) -> Result<Vec<u8>> {
 
 /// 证件照统一用的 RGB24 视频端点（25fps，时间基 1/25）。
 fn rgb_endpoint(width: i32, height: i32) -> VideoEndpoint {
-    VideoEndpoint::new(
-        width,
-        height,
-        PixelFormat::RGB24,
-        Rational::new(1, 25).unwrap(),
-        Rational::new(25, 1).unwrap(),
-    )
+    VideoEndpoint::new(width, height, PixelFormat::RGB24)
+        .with_time_base(Rational::new(1, 25).unwrap())
+        .with_frame_rate(Rational::new(25, 1).unwrap())
 }
 
 /// 校验合成模式的结果：尺寸正确；开了换底则再校验新底色生效且人像未被盖住。
