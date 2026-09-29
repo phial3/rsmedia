@@ -784,3 +784,93 @@ vs 裸 `Option<T>`（`HWDeviceConfig::new(options: Option<Options>)`、`with_har
 > 验证（退出码均直接取真值）：`cargo fmt --check` 0、clippy `-D warnings`（含/不含 `image`）0/0、
 > `RUSTDOCFLAGS="-D warnings" cargo doc` 0、lib **355** / doctest **72** / 集成 19 binary 全绿；
 > VM 6.1 / 7.1 / 8.1 = **354 / 355 / 356**；harness 38 模式 **293 pass / 0 fail / 2 xfail**。
+
+---
+
+## 修复记录（`Writer` 输出模型：推 → 拉，2026-09-29）
+
+用户对 `Writer` 的评价原文：
+
+> 这样的 Writer 设计我觉得很愚蠢，为了适配 API 写没用的定义；Writer 中的
+> `merge_out` 和 `merge_accum` 对用户来说，他们就不明白如何使用
+
+以及选型指示：**"设计最优为原则，先不考虑改动大小"**。
+
+### 旧模型（推）的问题
+
+```rust
+pub trait Writer {
+    type Out;                    // 单次 write_* 的输出
+    type Accum: Default;         // 跨调用累积的容器
+    fn write_header(&mut self) -> Result<Self::Out>;
+    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<Self::Out>;
+    ...
+    fn merge_out(acc: &mut Self::Accum, out: Self::Out);      // 静态方法
+    fn merge_accum(acc: &mut Self::Accum, other: Self::Accum); // 静态方法
+}
+```
+
+1. **6 个实现里有 4 个的 `Out`/`Accum` 是 `()`**，两个 `merge_*` 是空函数体 —— 这些
+   定义只为 `BufferWriter` 一个实现存在，却分摊到每个实现者头上。
+2. **`merge_out`/`merge_accum` 是内部胶水**：全仓 15 处调用点全在 `mux.rs` /
+   `encode.rs` / `pcm.rs` 内部，用户一次都不该调，却出现在 trait 的公开契约里。
+3. **不是 object-safe** ⇒ 不得不额外写一整套 `WriterInner` + `DynWriter` 转发层
+   （`io.rs` 约 200 行），且 `BufferWriter` 因 `Out = Bytes` **无法被擦除**（擦掉就
+   静默丢数据，代码注释里自己承认了）。
+4. **失败模式是"静默丢数据"**：`Out` 是*增量*字节，任何一个调用点忘了累积，那
+   些字节就永远消失了。`examples/pcm_recorder.rs` 里那个"定义了却从未使用"的
+   `recorded_out`（`Accum = ()`）正是这份责任的化石。
+
+### 新模型（拉）
+
+```rust
+pub trait Writer {
+    fn write_header(&mut self) -> Result<()>;
+    fn is_header_written(&self) -> bool;
+    fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()>;
+    fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()>;
+    fn write_trailer(&mut self) -> Result<()>;
+    fn output(&self) -> &AVFormatContextOutput;
+    fn output_mut(&mut self) -> &mut AVFormatContextOutput;
+    fn add_stream(..) -> Result<usize> { .. }        // 默认实现不变
+    fn stream_time_base(..) -> Result<Rational> { .. } // 默认实现不变
+}
+```
+
+字节留在 writer 里，由调用方按需取：
+
+| Writer | 取数方式 |
+|---|---|
+| `StreamWriter` | 无（已落盘 / 已发到 URL） |
+| `IoWriter` | `into_inner()` 取回底层 `std::io::Write` |
+| `BufferWriter` | `take_written()`（增量，**新公开**）/ `into_bytes()`（完整容器） |
+
+**为什么拉模型更安全**：`take_written()` 只推进 `delivered` 游标，是**非破坏性**
+的；`into_bytes()` 返回的是完整 `data`，与游标无关。所以"忘了取"最坏的结果是内
+存多占一会儿，而"忘了累积"是**字节永久消失**。失败模式从"静默丢数据"降级成
+"内存增长"。（内存增长不是本次引入：`MemWriterState.data` 从来就是只增不减。）
+
+### 连带简化
+
+- **删掉 `WriterInner` 与 `DynWriter` 的 ~200 行转发层**：trait 现在 object-safe，
+  只需要 `pub type DynWriter = Box<dyn Writer + Send>;` + 一个
+  `impl<W: Writer + ?Sized> Writer for Box<W>`（顺带让 `Box<BufferWriter>` 之类也
+  能直接当 `Writer` 用）。
+- `Muxer::mux` / `mux_packet` / `mux_subtitle_segment` / `finish` 一律返回
+  `Result<()>`；`Encoder::flush`、`PcmSink::write_*` / `finish` 同样。
+- 新增 `PcmSink::writer_mut()`：边产边发的场景需要 `&mut` 才能调 `take_written()`。
+- 两处"验证累积正确"的测试替身（`mux.rs` 的 `CountingWriter`）改为验证更本质的
+  不变量 —— 全程 `take_written()` 之和 == `into_bytes().len()`。
+- **`PcmSink::finish` 与 `finish_into_writer` 合并成一个 `finish(self) -> Result<W>`。**
+  原 `finish(self) -> Result<()>` 会**把 writer 一起丢掉** —— 在拉模型下这就是"静默
+  丢掉全部字节"，与本次要建立的不变量直接冲突。合并后落盘型 writer 直接丢弃返回值
+  即可，内存型拿它调 `into_bytes()`；`finish_into_writer` 这个只多一步的别名删掉。
+
+净行数：`src/` **−207**、`examples/` **−23**（删掉的分多于加的）。
+
+### 风险与遗留
+
+- **破坏性变更**：`Writer` 的实现者、`Muxer::mux` 等返回值的调用方、以及
+  `DynWriter::new(w)`（现在写 `Box::new(w)`）。0.x 且用户明确要求"设计最优"，接受。
+- `BufferWriter` 现在**可以**被擦进 `DynWriter` 了，但擦除后拿不到字节 —— 需要取
+  字节时请保持具体类型（文档已写明）。
