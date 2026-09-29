@@ -2434,7 +2434,7 @@ const SINGLE_OUTPUT_LABEL: &str = "out";
 /// 一条链上只能有**一个** Rust 侧所有者：rsmpeg 的 `Drop` 调的是
 /// `avfilter_inout_free`，它会顺着 `next` 释放**整条链**。所以先把所有节点
 /// `into_raw()` 交出所有权（不析构），链接完成后只把头节点包回 RAII —— 其余节点
-/// 从此归头节点那一份所有者管，不再需要（也不能）逐个 `mem::forget`。
+/// 从此归头节点那一份所有者管
 fn chain_inouts(nodes: Vec<AVFilterInOut>) -> Option<AVFilterInOut> {
     let ptrs: Vec<NonNull<ffi::AVFilterInOut>> =
         nodes.into_iter().map(AVFilterInOut::into_raw).collect();

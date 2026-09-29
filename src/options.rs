@@ -166,9 +166,8 @@ impl Options {
         let Some(ptr) = NonNull::new(dict) else {
             return Self::new();
         };
-        // SAFETY: the reference is non-owning (`wrap_ref_pure` wraps the pointer in
-        // `ManuallyDrop`) and is dropped before this function returns; the caller
-        // guarantees the dictionary outlives the call.
+        // SAFETY: the reference is non-owning and is dropped before this function returns;
+        // the caller guarantees the dictionary outlives the call.
         let borrowed = unsafe { AVDictionaryRef::from_raw(ptr) };
         Self::from_dict(&borrowed)
     }

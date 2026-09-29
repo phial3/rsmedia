@@ -749,7 +749,7 @@ vs 裸 `Option<T>`（`HWDeviceConfig::new(options: Option<Options>)`、`with_har
 > **修复记录（`mem::forget` / `ManuallyDrop` / `drop()` 审计，2026-09-29）**
 >
 > 全仓扫描只有 4 处 `forget`/`ManuallyDrop`/`drop_in_place`（第 5 处 `options.rs:170`
-> 只是注释里提到 rsmpeg 内部的 `ManuallyDrop`），加 29 处显式 `drop()`。逐处判定：
+> 只是注释里提到 rsmpeg 内部的 `ManuallyDrop`）。逐处判定：
 >
 > | 位置 | 判定 | 处理 |
 > |---|---|---|
@@ -758,15 +758,28 @@ vs 裸 `Option<T>`（`HWDeviceConfig::new(options: Option<Options>)`、`with_har
 > | `src/mux.rs` `into_writer` | **必须保留 unsafe**（`Muxer` 有 `Drop` + `pub writer: W`，Rust 不允许部分 move），但可从 5 个 unsafe 操作降到 1 个 | 把需要析构的字段收成私有 `MuxerResources`（`#[derive(Default)]`）：`self.resources = MuxerResources::default();` 一次赋值即掏空并析构（编码器等资源随之释放），之后只剩 `writer` 需要 `ManuallyDrop` + `ptr::read`。**顺带修掉一个隐患**：原来逐个 `drop_in_place` 四个字段，将来新增字段会被静默泄漏 |
 > | `src/encode.rs:2884` `drop(pkt)` | **冗余**（包在 match 臂末尾本来就会析构） | 改成 `Some(_) =>` |
 >
-> 判定为**有意保留**的 `drop()`（错删会改变语义）：
-> `io.rs:1816` / `:1970`（必须先把 format context 析构掉才能 `Arc::try_unwrap`）、
-> `hwaccel.rs:418`（锁外、且及时释放落败的重复硬件上下文）、
-> `filter.rs:2916-2917`（显式丢弃 `parse_ptr` 返回的未配对节点链表，配 8 行注释说明为何不会重复释放）、
-> `scale.rs` ×9 / `bsf.rs` ×2 / `pcm.rs:1067` / `hwaccel.rs:1468`（测试里"先归还缓冲 / 先关文件再删文件"的顺序依赖）、
-> `macros.rs:795`、`filter.rs:1484`（文档示例里的 `# drop(encoder);`）。
->
 > 净效果：`mem::forget` 2 处 → **0**；`drop_in_place` 4 处 → **0**；
 > `ManuallyDrop` + `ptr::read` 保留 1 处（无法避免，已写明原因）。
+>
+> **复核补充（同日，`drop()` 全量清单）**：上一节只扫了 `src/`，`drop()` 的统计不准。
+> 重扫全仓（含 `tests/`、`examples/`、`benches/`）后，显式 `drop()` 共 **27 处**
+> （另 2 处在 doctest 里：`macros.rs:795`、`filter.rs:1485`），全部判定为保留：
+>
+> | 类别 | 处数 | 位置 | 为什么不能删 |
+> |---|---|---|---|
+> | 先析构才能取回 | 2 | `io.rs:1820` / `:1974` | 必须先释放 format context，`Arc::try_unwrap` 才拿得回 state/inner |
+> | 停采集的同步点 | 1 | `examples/pcm_recorder.rs:152` | `drop(stream)` 停止 cpal 采集，之后的 `try_iter()` 才拿得到在途的尾部块 |
+> | 锁外 / 及时释放 | 1 | `hwaccel.rs:418` | 落败的重复硬件上下文不能在写锁内析构（会触发驱动调用/日志回调） |
+> | 未配对节点 | 2 | `filter.rs:2913` / `:2914` | 显式丢弃 `parse_ptr` 返回的未配对节点链表 |
+> | 缓冲池归还 | 9 | `scale.rs` ×9 | 测试断言"归还后复用同一缓冲"，`drop` 就是被测动作 |
+> | 断言语义 | 1 | `hwaccel.rs:1468` | 先释放引用，再断言 `release_unused_hw_contexts()` 移除该条目 |
+> | 先关句柄再删/重开文件 | 11 | `bsf.rs:274`/`:323`、`pcm.rs:1067`、`tests/buffer_pool.rs:115`/`159`/`251`、`tests/encode_pipeline.rs:521`/`570`/`1660`/`1825`/`1857` | 句柄还开着时删文件在 Windows 上会失败（POSIX 不会，所以这两处容易被误判为"多余"） |
+>
+> 另：`../rsmedia_test/src/main.rs` 有 3 处同类（`:1659`/`:2827` 关 writer 后回读、
+> `:2927` 关 muxer 后删文件），均为必需。
+>
+> 结论：**没有再可删的 `drop()`**。唯一"多余"的一处（`encode.rs` 里 match 臂末尾的
+> `drop(pkt)`）已在上表中删掉。
 >
 > 验证（退出码均直接取真值）：`cargo fmt --check` 0、clippy `-D warnings`（含/不含 `image`）0/0、
 > `RUSTDOCFLAGS="-D warnings" cargo doc` 0、lib **355** / doctest **72** / 集成 19 binary 全绿；
