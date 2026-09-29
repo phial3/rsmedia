@@ -1108,11 +1108,19 @@ pub struct Encoder {
     ///
     /// `None` = 尚未遇到需要转换的帧：上下文的输入格式要到第一帧才知道（见
     /// [`resample::resample_if_needed`]）。没有滤镜图时本字段从不使用。
+    ///
+    /// **不需要排空**：它的输出布局与采样率都取自帧本身，只换采样格式，上下文因此
+    /// 不做重采样、也就没有延迟线（见
+    /// `resample::tests::test_a_format_only_resampler_keeps_no_delay_line`）。
+    /// 需要排空的是 [`Self::encode_resampler`] —— 它的输出采样率是编码器的。
     filter_resampler: Option<resample::Resampler>,
     /// 送进**编码器**前的音频重采样：把帧对齐到编码器的完整规格（`self.audio_spec()` 的
     /// 布局 + 采样格式 + 采样率）。滤镜输出（或无滤镜时的原始帧）在这里做最终对齐。
     ///
     /// `None` = 尚未遇到需要转换的帧；见 [`Self::filter_resampler`]。
+    ///
+    /// 输出采样率取自**编码器**（与输入可能不同），因此这个上下文真的会重采样、真的
+    /// 有延迟线 —— EOF 时由 [`Self::drain_resampler_tail`] 排空。
     encode_resampler: Option<resample::Resampler>,
 }
 
@@ -1466,22 +1474,31 @@ impl Encoder {
 
         // 确保帧的格式匹配编码器要求
         let scaled_frame = self.rescale(frame)?;
+        self.send_frame_ready(scaled_frame)
+    }
 
+    /// 把**已经对齐编码器规格、且 pts 已在编码器时间基上**的帧送进编码器。
+    ///
+    /// 与 [`Self::send_frame_post_filter`] 只差前置的两步（格式转换与滤镜输出时间基
+    /// 换算）：重采样延迟排出的尾帧由 [`Self::drain_resampler_tail`] 交到这里，它们
+    /// 已经是编码器规格、pts 也已在编码器时间基上 —— 再走一遍滤镜输出时间基的换算
+    /// 会把同一个 pts 换算两次。
+    fn send_frame_ready(&mut self, frame: AVFrame) -> Result<()> {
         // 转换硬件帧
         let hw_frame = match self.hw_context.as_ref() {
-            Some(hw_ctx) if hw_ctx.is_sw_frame(&scaled_frame) => {
+            Some(hw_ctx) if hw_ctx.is_sw_frame(&frame) => {
                 // sw_frame -> hw_frame
                 hw_ctx
-                    .hw_upload(&mut self.context, &scaled_frame)
+                    .hw_upload(&mut self.context, &frame)
                     .context("Failed to upload frame to HW")?
             }
             // 已是硬件帧，但属于**别的** frames context（解码器/另一台设备/调用方
             // 自建）：映射进编码器自己那份，同设备时零拷贝。已经在编码器 frames
             // context 里的帧由 `map_hw_frame` 原样返回。
-            Some(hw_ctx) if hw_ctx.is_hw_frame(&scaled_frame) => hw_ctx
-                .map_hw_frame(&mut self.context, scaled_frame)
+            Some(hw_ctx) if hw_ctx.is_hw_frame(&frame) => hw_ctx
+                .map_hw_frame(&mut self.context, frame)
                 .context("Failed to map the input hardware frame into the encoder")?,
-            _ => scaled_frame, // 不需要上传或已经是 HW frame
+            _ => frame, // 不需要上传或已经是 HW frame
         };
 
         // 固定帧长音频编码器（如 aac，frame_size=1024）要求每次 `send_frame` 恰好给出
@@ -1583,6 +1600,41 @@ impl Encoder {
         let frame = self.fifo_pop_frame(remaining)?;
         self.check_frame(Some(&frame))?;
         self.send_frame_with_retry(Some(&frame))
+    }
+
+    /// 冲刷 [`Self::encode_resampler`] 延迟线上的尾样，并按正常帧的路径送进编码器。
+    ///
+    /// 采样率变化时 `swr` 会把滤波延迟里的几十毫秒样本留在上下文里，只有 EOF 之后才
+    /// 吐得出来（见 [`Resampler::flush_frames`](resample::Resampler::flush_frames)）；
+    /// 不排空就丢掉音频末尾的一小段 —— 而且丢得毫无征兆：帧数、pts、包数都对，
+    /// 只是末尾少了一点声音。
+    ///
+    /// 排出的帧走 [`Self::send_frame_ready`]（而不是
+    /// [`Self::send_frame_post_filter`]）：它们已经出过重采样，pts 也在编码器时间基
+    /// 上，再走一遍滤镜输出的换算会换算两次。固定帧长音频随后仍由
+    /// [`Self::flush_audio_fifo`] 把不足一帧的尾巴送出，因此这里必须**先于**它调用。
+    ///
+    /// 只有 [`Self::encode_resampler`] 需要这一步：[`Self::filter_resampler`] 的目标
+    /// 布局与采样率都取自帧本身（只换采样格式），上下文不做重采样，因而没有延迟线。
+    fn drain_resampler_tail(&mut self) -> Result<()> {
+        // take() 取出以避免同时可变借用 `self`；尾样排完就不再需要它。
+        let Some(mut resampler) = self.encode_resampler.take() else {
+            return Ok(());
+        };
+        let time_base = self.time_base();
+        // 固定帧长音频的输出 pts 由 `audio_fifo` 按已输出样本数维护（见
+        // `assign_pts_sample_rate`），这里再按尾样推进计数器会与 `fifo_pop_frame`
+        // 重复累加一次。
+        let numbered_by_fifo = self.media_type == MediaType::AUDIO && self.frame_size() > 0;
+        for mut frame in resampler.flush_frames()? {
+            frame.set_time_base(time_base.into());
+            if !numbered_by_fifo {
+                frame.set_pts(self.next_pts);
+                self.next_pts += i64::from(frame.nb_samples);
+            }
+            self.send_frame_ready(frame)?;
+        }
+        Ok(())
     }
 
     /// 向编码器发送一帧（或 EOF）已就绪的输入；若编码器缓冲已满（EAGAIN），
@@ -1933,6 +1985,38 @@ impl Encoder {
         }
     }
 
+    /// 输入侧收尾：把还压在滤镜、重采样延迟与音频 FIFO 里的样本全部送进编码器，
+    /// 然后发 EOS。
+    ///
+    /// 只在 `Normal`（EOS 尚未送出）时调用一次 —— 之后编码器进入排空阶段，不允许
+    /// 再送帧。顺序不是随意的：滤镜的缓冲帧要先全部推出（它们还要过重采样），
+    /// 重采样延迟线排在滤镜之后，音频 FIFO 的末帧排在重采样之后 —— 每一步的产物
+    /// 都是下一步的输入。
+    fn finish_input(&mut self) -> Result<()> {
+        if let Some(filter) = self.filter_graph.as_mut() {
+            let frames = filter.flush()?;
+            for frame in frames {
+                // filter 已 Flushed，缓冲帧直接走 post-filter 路径，不可再进 process_frame
+                self.send_frame_post_filter(frame)?;
+            }
+        }
+
+        // 采样率变化时重采样器还压着几十毫秒的尾样，只有 EOF 之后才吐得出来。
+        self.drain_resampler_tail()?;
+
+        // 冲刷音频缓冲中不足一帧的剩余样本（作为末帧送编码器）
+        self.flush_audio_fifo()?;
+
+        // EOF: Notify the encoder that the last frame has been sent.
+        self.send_frame_to_encoder(None)?;
+
+        // 只有 EOS 真正送出、才进入排空阶段（此后不允许再送帧）。置位点必须在这里，
+        // 而不是在 `receive_packet` 的 EAGAIN 分支——那里 read 阶段也会走到。
+        // 与 `Decoder::drain_raw` 同一写法：阶段只由 `state` 表示。
+        self.state = ProcessState::Drained;
+        Ok(())
+    }
+
     /// Flush the encoder and write any remaining packets.
     ///
     /// This function sends an end-of-stream signal to the encoder, and continues
@@ -1986,23 +2070,7 @@ impl Encoder {
         // `Normal` = EOS 还没送出：先排滤镜与音频 FIFO，再送 EOS；
         // `Drained` = EOS 已送出，只是上次没排完，直接从下面的排空循环继续。
         if self.state.is_normal() {
-            if let Some(filter) = self.filter_graph.as_mut() {
-                let frames = filter.flush()?;
-                for frame in frames {
-                    // filter 已 Flushed，缓冲帧直接走 post-filter 路径，不可再进 process_frame
-                    self.send_frame_post_filter(frame)?;
-                }
-            }
-
-            // 冲刷音频缓冲中不足一帧的剩余样本（作为末帧送编码器）
-            self.flush_audio_fifo()?;
-
-            // EOF: Notify the encoder that the last frame has been sent.
-            self.send_frame_to_encoder(None)?;
-            // 只有 EOS 真正送出、才进入排空阶段（此后不允许再送帧）。置位点必须在这里，
-            // 而不是在 `receive_packet` 的 EAGAIN 分支——那里 read 阶段也会走到。
-            // 与 `Decoder::drain_raw` 同一写法：阶段只由 `state` 表示。
-            self.state = ProcessState::Drained;
+            self.finish_input()?;
         }
 
         // drain the items still on the queue before giving up.
@@ -2569,6 +2637,62 @@ mod tests {
             frame.pts,
             ffi::AV_NOPTS_VALUE,
             "fixed-frame-size audio is numbered by the fifo, not here"
+        );
+        Ok(())
+    }
+
+    /// 采样率变化时 `swr` 的滤波延迟里压着尾样（见
+    /// `resample::tests::test_streaming_resampler_carries_delay_and_flushes`），只有
+    /// EOF 之后才吐得出来。收尾必须先把它们排进编码器，否则音频末尾静默短掉一小段。
+    #[test]
+    fn test_finish_input_drains_the_resampler_delay_line() -> Result<()> {
+        const IN_RATE: i32 = 48_000;
+        const OUT_RATE: i32 = 44_100;
+        const FRAMES: i32 = 8;
+        const NB_SAMPLES: i32 = 1024;
+
+        let mut encoder =
+            EncoderBuilder::new_audio(128_000, 2, OUT_RATE, SampleFormat::FLTP).build()?;
+        assert!(encoder.frame_size() > 0, "aac has a fixed frame size");
+
+        for _ in 0..FRAMES {
+            let mut frame = AVFrame::new();
+            frame.set_format(ffi::AV_SAMPLE_FMT_FLTP);
+            frame.set_ch_layout(AVChannelLayout::from_nb_channels(2).into_inner());
+            frame.set_sample_rate(IN_RATE);
+            frame.set_nb_samples(NB_SAMPLES);
+            frame.set_pts(ffi::AV_NOPTS_VALUE);
+            frame
+                .alloc_buffer()
+                .context("Failed to allocate the input frame")?;
+            // 必须填真实样本：`alloc_buffer` 给的是未初始化内存，把里面的随机浮点
+            // 喂给 aac 会让它以 EINVAL 失败 —— 而且是间歇性的（取决于那块内存的内容）。
+            for plane in 0..2 {
+                // SAFETY: 平面已按 `nb_samples` 个 f32 分配（FLTP，每平面一条声道）。
+                unsafe {
+                    let samples = std::slice::from_raw_parts_mut(
+                        frame.deref_mut().data[plane] as *mut f32,
+                        NB_SAMPLES as usize,
+                    );
+                    // 静音即可：本测试只关心样本**数量**，不关心内容。
+                    samples.fill(0.0);
+                }
+            }
+            // 固定帧长音频不为输入帧编号（见 `assign_pts_sample_rate`），所以 `next_pts`
+            // 从 0 起步、只由 `fifo_pop_frame` 按已输出样本数推进。
+            encoder.send_frame_to_encoder(Some(frame))?;
+        }
+
+        encoder.finish_input()?;
+
+        // 送进编码器的样本总数 = 已从 fifo 切出的（`next_pts`）+ 还压在 fifo 里的。
+        let buffered = encoder.audio_fifo.as_ref().map_or(0, |fifo| fifo.size());
+        let total = encoder.next_pts + i64::from(buffered);
+        let expected = i64::from(FRAMES * NB_SAMPLES) * i64::from(OUT_RATE) / i64::from(IN_RATE);
+        assert!(
+            (total - expected).abs() <= 2,
+            "expected ~{expected} samples at the encoder input, got {total} \
+             (the resampler's delay line was not drained)"
         );
         Ok(())
     }

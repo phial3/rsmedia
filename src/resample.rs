@@ -310,8 +310,10 @@ pub(crate) fn resample_if_needed(
 /// `Resampler` holds a reusable `SwrContext` for continuous streaming input:
 /// when resampling (different input/output sample rates), the internal filter
 /// delay buffers samples between calls and outputs them with subsequent data;
-/// at the end, [`Resampler::flush`] must be called to drain the tail, otherwise
-/// the last few milliseconds of samples will be lost.
+/// at the end, [`Resampler::flush_frames`] must be called to drain the tail,
+/// otherwise the last few milliseconds of samples will be lost. A context whose
+/// output sample rate equals its input rate does no resampling and keeps no
+/// delay, so draining one that only converts the sample format is a no-op.
 ///
 /// Three ways to drive it, in increasing order of how much the caller has to arrange:
 ///
@@ -518,6 +520,48 @@ impl Resampler {
         self.swr
             .convert_frame(None, dst)
             .context("Failed to flush streaming resampler")
+    }
+
+    /// Drain the whole delay line into newly allocated frames.
+    ///
+    /// The end-of-stream counterpart of [`Self::convert_frame_owned`]: that one takes a
+    /// frame and returns the resampled one, this one takes no input and returns what the
+    /// delay line still holds — frames in this resampler's output spec, ready to be sent
+    /// on like any other. An empty `Vec` means nothing was left, which is the usual
+    /// answer: a context built for a 1:1 sample rate does no resampling and therefore
+    /// keeps no delay at all.
+    ///
+    /// `swr` need not hand everything over in a single call, so this loops until a call
+    /// comes back empty. The loop is bounded by `MAX_DRAIN_ITERATIONS` — the same cap
+    /// every drain loop in this crate uses — because an unbounded one would let "finish
+    /// this audio stream" hang forever.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::flush`] reports, plus [`RsmediaError::Other`] if the delay line
+    /// does not empty within the iteration bound.
+    pub fn flush_frames(&mut self) -> Result<Vec<AVFrame>> {
+        let out_spec = self.out_spec;
+        let capacity = out_spec.sample_rate.max(1);
+        let mut frames = Vec::new();
+        for _ in 0..crate::MAX_DRAIN_ITERATIONS {
+            let mut dst = AVFrame::new();
+            dst.set_format(out_spec.sample_fmt);
+            dst.set_ch_layout(out_spec.ch_layout);
+            dst.set_sample_rate(out_spec.sample_rate);
+            dst.set_nb_samples(capacity);
+            dst.alloc_buffer()
+                .context("Failed to allocate a frame to drain the resampler")?;
+            self.flush(&mut dst)?;
+            if dst.nb_samples <= 0 {
+                return Ok(frames);
+            }
+            frames.push(dst);
+        }
+        Err(RsmediaError::msg(format!(
+            "Resampler keeps producing samples while draining ({} iterations); giving up",
+            crate::MAX_DRAIN_ITERATIONS
+        )))
     }
 }
 
@@ -941,6 +985,79 @@ mod tests {
         assert!(
             (produced as f64 - expected).abs() <= 2.0,
             "expected ~{expected:.0} samples across {chunks} chunks + flush, got {produced}"
+        );
+        Ok(())
+    }
+
+    /// [`Resampler::flush_frames`] 排出的正是上面那条测试里"少了的那一段"。
+    #[test]
+    fn test_flush_frames_returns_the_delay_line() -> Result<()> {
+        let (in_rate, out_rate) = (48_000, 44_100);
+        let (channels, in_samples, chunks) = (2, 1024, 5);
+        let layout = || AVChannelLayout::from_nb_channels(channels).into_inner();
+
+        let mut resampler = Resampler::new(
+            layout(),
+            ffi::AV_SAMPLE_FMT_FLTP,
+            in_rate,
+            layout(),
+            ffi::AV_SAMPLE_FMT_FLTP,
+            out_rate,
+        )?;
+        let mut produced = 0i64;
+        for _ in 0..chunks {
+            let src = create_test_frame(&AUDIO_FORMATS[7], in_rate, channels, in_samples)?;
+            produced += i64::from(resampler.convert_frame_owned(&src)?.nb_samples);
+        }
+
+        let tail: i64 = resampler
+            .flush_frames()?
+            .iter()
+            .map(|frame| i64::from(frame.nb_samples))
+            .sum();
+        assert!(
+            tail > 0,
+            "flush_frames produced nothing: the delay line was never drained"
+        );
+        // 排空后再排一次必须为空 —— 循环按"取到空帧"终止，不会无限吐下去。
+        assert!(resampler.flush_frames()?.is_empty());
+
+        let expected = f64::from(in_samples * chunks) * f64::from(out_rate) / f64::from(in_rate);
+        assert!(
+            ((produced + tail) as f64 - expected).abs() <= 2.0,
+            "expected ~{expected:.0} samples across {chunks} chunks + flush_frames, got {}",
+            produced + tail
+        );
+        Ok(())
+    }
+
+    /// 只换采样格式（采样率不变）的上下文不做重采样 ⇒ **没有延迟线可排**。
+    ///
+    /// 这正是 [`resample_if_needed`] 在「进滤镜图前」与解码输出两处的用法：目标布局与
+    /// 采样率都取自帧本身，只有采样格式由配置决定。所以那两个 [`Resampler`] 不需要
+    /// 排空 —— 只有输出规格取自**编码器**（采样率可能与输入不同）的那个才需要。
+    #[test]
+    fn test_a_format_only_resampler_keeps_no_delay_line() -> Result<()> {
+        let (rate, channels, samples) = (48_000, 2, 1024);
+        let layout = AVChannelLayout::from_nb_channels(channels).into_inner();
+        let mut resampler = Resampler::new(
+            layout,
+            ffi::AV_SAMPLE_FMT_S16,
+            rate,
+            layout,
+            ffi::AV_SAMPLE_FMT_FLTP,
+            rate,
+        )?;
+
+        let src = create_test_frame(&AUDIO_FORMATS[2], rate, channels, samples)?;
+        let out = resampler.convert_frame_owned(&src)?;
+        assert_eq!(
+            out.nb_samples, samples,
+            "same rate in and out: one sample out per sample in"
+        );
+        assert!(
+            resampler.flush_frames()?.is_empty(),
+            "a context that does no resampling must have nothing to drain"
         );
         Ok(())
     }
