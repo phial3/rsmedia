@@ -448,9 +448,9 @@ impl HWContext {
         // ABI matches and FFmpeg may call it), and `sw_pix_fmt` is a plain
         // enum write of this device type's software format.
         unsafe {
-            let ctx_mut_ptr = codec_ctx.deref_mut();
-            ctx_mut_ptr.get_format = Some(hwaccel_get_format);
-            ctx_mut_ptr.sw_pix_fmt = self.get_format(false);
+            let ctx_raw = codec_ctx.deref_mut();
+            ctx_raw.get_format = Some(hwaccel_get_format);
+            ctx_raw.sw_pix_fmt = self.get_format(false);
         }
         // clone 即 av_buffer_ref：codec_ctx 拥有独立引用，析构时正确 unref，
         // 无需 Decoder::Drop 手动置空防 double-free。
@@ -550,15 +550,15 @@ impl HWContext {
             // `av_hwframe_map` 要裸指针，但**填字段不需要**：`deref_mut` 给出
             // `&mut ffi::AVFrame`，只在调用处隐式转成 `*mut`（`&mut T -> *mut T`）。
             // 读侧同理走安全的 `Deref`。
-            let dst_ptr = dst.deref_mut();
-            let src_ptr = &*src;
-            dst_ptr.format = src_ptr.format;
-            dst_ptr.width = src_ptr.width;
-            dst_ptr.height = src_ptr.height;
-            dst_ptr.hw_frames_ctx = ffi::av_buffer_ref(dst_ref);
+            let dst_raw = dst.deref_mut();
+            let src_raw = &*src;
+            dst_raw.format = src_raw.format;
+            dst_raw.width = src_raw.width;
+            dst_raw.height = src_raw.height;
+            dst_raw.hw_frames_ctx = ffi::av_buffer_ref(dst_ref);
             // flags 按 FFmpeg 文档传 0（当前未使用）。失败时 dst 由 Drop 负责
             // unref 上面那个 buffer ref，无需手工清理。
-            ffi::av_hwframe_map(dst_ptr, src_ptr, 0)
+            ffi::av_hwframe_map(dst_raw, src_raw, 0)
         };
         if map_ret < 0 {
             if map_ret != -(ffi::ENOSYS as i32) {

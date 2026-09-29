@@ -195,10 +195,10 @@ impl Bsf {
                     }
                     out.push(owned);
                 }
-                // 需要更多输入
-                Err(RsmpegError::BitstreamDrainError) => return Ok(out),
-                // 已无更多输出
-                Err(RsmpegError::BitstreamFlushedError) => return Ok(out),
+                // 要更多输入，或已排空。
+                Err(RsmpegError::BitstreamDrainError) | Err(RsmpegError::BitstreamFlushedError) => {
+                    return Ok(out);
+                }
                 Err(e) => return Err(e.into()),
             }
         }

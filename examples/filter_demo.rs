@@ -180,7 +180,7 @@ fn print_filter_catalog() -> Result<()> {
                 .build()?
                 .spec()
         }),
-        ("transpose(1)", filter::video::transpose(1).spec()),
+        ("transpose(1)", filter::video::transpose(1)?.spec()),
         (
             "delogo(0,0,100,50)",
             filter::video::delogo(0, 0, 100, 50).spec(),

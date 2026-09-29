@@ -522,14 +522,14 @@ impl EncoderBuilder {
             encoder.set_pix_fmt(pixel_format.into());
             encoder.set_sample_aspect_ratio(Rational::ONE.into());
         } else if media_type == MediaType::AUDIO {
-            if !config.is_support_channel_count(self.nb_channels) {
+            if !config.supports_channel_count(self.nb_channels) {
                 return Err(RsmediaError::InvalidConfig(format!(
                     "encoder '{}' does not support nb_channels {}",
                     config.name().to_string_lossy(),
                     self.nb_channels
                 )));
             }
-            if !config.is_support_sample_rate(self.sample_rate) {
+            if !config.supports_sample_rate(self.sample_rate) {
                 return Err(RsmediaError::InvalidConfig(format!(
                     "encoder '{}' does not support sample rate {}",
                     config.name().to_string_lossy(),
@@ -561,9 +561,9 @@ impl EncoderBuilder {
         // `debug!` 里留痕，免得把正常用法刷成警告。
         // SAFETY: `encoder` 在此处独占（`&mut`），`deref_mut` 只在块内存活。
         unsafe {
-            let raw = encoder.deref_mut();
+            let ctx_raw = encoder.deref_mut();
             match self.max_bit_rate {
-                Some(rate) if rate.is_positive() => raw.rc_max_rate = rate,
+                Some(rate) if rate.is_positive() => ctx_raw.rc_max_rate = rate,
                 Some(rate) if rate < 0 => tracing::warn!(
                     "max_bit_rate {rate} is negative and was not applied; \
                      rc_max_rate stays unset (no instantaneous rate cap)"
@@ -574,7 +574,7 @@ impl EncoderBuilder {
                 None => {}
             }
             match self.buffer_size {
-                Some(size) if size.is_positive() => raw.rc_buffer_size = size,
+                Some(size) if size.is_positive() => ctx_raw.rc_buffer_size = size,
                 Some(size) if size < 0 => tracing::warn!(
                     "buffer_size {size} is negative and was not applied; rc_buffer_size stays unset"
                 ),
@@ -635,7 +635,7 @@ impl EncoderBuilder {
     fn resolve_pixel_format(&self, config: &CodecConfig, codec_name: &str) -> Result<PixelFormat> {
         match self.pixel_format {
             Some(fmt) => {
-                if self.hw_device_config.is_none() && !config.is_support_pixel_format(fmt as i32) {
+                if self.hw_device_config.is_none() && !config.supports_pixel_format(fmt as i32) {
                     return Err(RsmediaError::InvalidConfig(format!(
                         "encoder '{codec_name}' does not support pixel format {fmt:?}"
                     )));
@@ -666,7 +666,7 @@ impl EncoderBuilder {
     ) -> Result<SampleFormat> {
         match self.sample_format {
             Some(fmt) => {
-                if !config.is_support_sample_format(fmt as i32) {
+                if !config.supports_sample_format(fmt as i32) {
                     return Err(RsmediaError::InvalidConfig(format!(
                         "encoder '{codec_name}' does not support sample format {fmt:?}"
                     )));
@@ -852,7 +852,7 @@ impl EncoderBuilder {
         // 注：滤镜输出时间基无需在此缓存——`send_frame_post_filter` 会在发送前按需
         // 从滤镜图实时查询，用于把 pts 换算到编码器时间基。
         let (filter_frame_rate, filter_size) = match filter_graph.as_mut() {
-            Some(graph) => (graph.output_frame_rate(), graph.output_size()),
+            Some(graph) => (Some(graph.output_frame_rate()?), Some(graph.output_size()?)),
             None => (None, None),
         };
         if media_type == MediaType::VIDEO {
@@ -1454,7 +1454,8 @@ impl Encoder {
         if let Some(filter_tb) = self
             .filter_graph
             .as_mut()
-            .and_then(|g| g.output_time_base())
+            .map(|g| g.output_time_base())
+            .transpose()?
         {
             let enc_tb = Rational::from(self.context.time_base);
             if frame.pts != ffi::AV_NOPTS_VALUE {
@@ -1618,8 +1619,9 @@ impl Encoder {
         loop {
             match self.context.receive_packet() {
                 Ok(pkt) => self.pending_packets.push_back(pkt),
-                Err(rsmpeg::error::RsmpegError::EncoderDrainError) => break,
-                Err(rsmpeg::error::RsmpegError::EncoderFlushedError) => break,
+                // 要更多输入，或已排空
+                Err(rsmpeg::error::RsmpegError::EncoderDrainError)
+                | Err(rsmpeg::error::RsmpegError::EncoderFlushedError) => break,
                 Err(e) => return Err(RsmediaError::FFmpeg(e)),
             }
         }
@@ -1689,7 +1691,7 @@ impl Encoder {
                 if !frame.hw_frames_ctx.is_null() {
                     return Ok(());
                 }
-                if !self.config.is_support_pixel_format(frame.format) {
+                if !self.config.supports_pixel_format(frame.format) {
                     return Err(RsmediaError::unsupported(format!(
                         "this encoder cannot encode frames in pixel format {:?}",
                         frame.format
@@ -1714,14 +1716,14 @@ impl Encoder {
             }
 
             MediaType::AUDIO => {
-                if !self.config.is_support_sample_format(frame.format) {
+                if !self.config.supports_sample_format(frame.format) {
                     return Err(RsmediaError::unsupported(format!(
                         "this encoder cannot encode frames in sample format {:?}",
                         frame.format
                     )));
                 }
 
-                if !self.config.is_support_sample_rate(frame.sample_rate) {
+                if !self.config.supports_sample_rate(frame.sample_rate) {
                     return Err(RsmediaError::unsupported(format!(
                         "this encoder cannot encode audio at sample rate {:?}",
                         frame.sample_rate

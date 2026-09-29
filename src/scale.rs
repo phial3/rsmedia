@@ -384,9 +384,9 @@ fn fix_output_color_metadata(dst_frame: &mut AVFrame, dst_pix_fmt: PixelFormat) 
     }
     // Safety: dst_frame 由本模块新建/持有（引用计数为 1），`&mut` 保证这段借用独占。
     unsafe {
-        let raw = dst_frame.deref_mut();
-        raw.color_range = ffi::AVCOL_RANGE_JPEG;
-        raw.chroma_location = ffi::AVCHROMA_LOC_UNSPECIFIED;
+        let dst_raw = dst_frame.deref_mut();
+        dst_raw.color_range = ffi::AVCOL_RANGE_JPEG;
+        dst_raw.chroma_location = ffi::AVCHROMA_LOC_UNSPECIFIED;
     }
 }
 
@@ -898,14 +898,12 @@ fn alloc_pooled_frame(pool: &mut AVBufferPool, dst_spec: VideoSpec) -> Result<AV
 
     // Safety: frame 由本函数刚构造，无其他引用；rsmpeg 的 wrap 不实现
     // DerefMut，字段写入经 UnsafeDerefMut::deref_mut 完成。
-    let raw = unsafe { frame.deref_mut() };
-    raw.data = data;
-    raw.linesize = linesize;
-    // 视频帧约定 extended_data == data（av_frame_get_buffer 同样如此设置）。
-    raw.extended_data = raw.data.as_mut_ptr();
-    // Safety: 所有权整体移交（引用计数本就为 1），帧 Drop 时由
-    // av_frame_unref 归还/释放。
-    raw.buf[0] = buffer.into_raw().as_ptr();
+    let frame_raw = unsafe { frame.deref_mut() };
+    frame_raw.data = data;
+    frame_raw.linesize = linesize;
+    frame_raw.extended_data = frame_raw.data.as_mut_ptr();
+    // Safety: 所有权整体移交（引用计数本就为 1），帧 Drop 时由 av_frame_unref 归还/释放。
+    frame_raw.buf[0] = buffer.into_raw().as_ptr();
     Ok(frame)
 }
 

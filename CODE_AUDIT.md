@@ -75,6 +75,23 @@ bytes → Reader(io.rs) → Demuxer(mux.rs) → Decoder(decode.rs)
 > **（2026-09-28 复测）lib 340 + 集成 19 个 binary + 68 doctest 全绿**；
 > VM 6.1 / 7.1 / 8.1 / 9.0 = 339 / 340 / 341 / 341；harness 38 模式 293 pass / 0 fail / 2 xfail。
 
+> **修复记录（分支 / 参数 / 命名 专项，2026-09-29）**
+>
+> | 编号 | 结论 | 改动位置 | 回归测试 |
+> |---|---|---|---|
+> | A7 | 已修（**真 bug**） | `io.rs` `InterruptData` 的 deadline 互斥量被 poison 后，`triggered()`/`interrupt_callback` 用 `.unwrap_or(false)` 把它当成"没到期" ⇒ 已过期的 abort/timeout 请求被静默丢弃，阻塞读永远等下去。抽出唯一的 `is_set()` 谓词，`poison` 时 `unwrap_or_else(\|e\| e.into_inner())` 照读里面的值 | `io::tests::test_a_poisoned_deadline_mutex_still_reports_an_expired_timeout`、`test_abort_is_honoured_even_when_the_deadline_mutex_is_poisoned` |
+> | C6 | 已修 | `filter.rs` `output_frame_rate{,_at}` / `output_time_base{,_at}` / `output_size{,_at}` 原来 `self.get_sink_context(output).ok()?` 把 `InvalidConfig`（输出索引越界）吞成 `None`。实测三个 rsmpeg getter 都是**无失败**的（`get_w`/`get_h -> i32`、`get_frame_rate`/`get_time_base -> AVRational`），故 `Option` 从不表示"值不可用"，只是在撒谎；六个方法改 `Result<T>` | `test_output_index_out_of_range_is_an_error_not_a_missing_value`、`test_output_queries_on_a_graph_without_outputs_are_an_error` |
+> | C7 | 已修 | `filter.rs::video::transpose` 的守卫**方向反了**：原代码对 `!(0..=7)` 只 `warn!`，而 `4..=7` —— 实测 `transpose=4..7` 的输出与"不加滤镜"逐字节相同（静默直通）—— 反而不报警。改为 `Result<Filter>`，`0..=3` 之外一律 `InvalidConfig` | `test_transpose_rejects_the_modes_ffmpeg_applies_as_a_no_op` |
+> | D11 | 已修 | `mux.rs::mux_packet` 三次 `get_stream*` 查找 + `.expect("checked above")` ⇒ 改一次 `get_stream_mut` + `Option::transpose()` | 既有 mux 测试覆盖 |
+> | D12 | 已修 | `mux.rs` 两份逐字重复的"header 之后不准加流"守卫 ⇒ 收敛为一个 `ensure_streams_open()`（`have_written_header` 与 `Writer::is_header_written()` 由 `ensure_header_written` 同步置位，本就不存在不一致窗口） | 既有 `io.rs` `test_writer_rejects_header_and_add_stream_after_header_written` 等 |
+> | D13 | 已修 | 合并等价 match arm：`encode.rs::drain_encoder_packets`、`bsf.rs::drain` | — |
+> | D14 | 已修 | 命名：`let raw = X.deref_mut()` ⇒ 按所指对象命名（`frame_raw`/`ctx_raw`/`dst_raw`）；名为 `_ptr` 实为引用/切片的 `ctx_mut_ptr`/`dst_ptr`/`src_ptr`/`data_ptr` 改名；`CodecConfig::is_support_*` ⇒ `supports_*`（`pub(crate)`）；`DrawText::raw_text` ⇒ `text_is_expression` | — |
+>
+> 验证（2026-09-29）：`cargo fmt --check` ✅、`clippy --all-targets -D warnings`（含 / 不含 `image`）✅、
+> `RUSTDOCFLAGS="-D warnings" cargo doc` ✅、**lib 345 / doctest 68 / 集成 19 个 binary 全绿**；
+> VM 6.1 / 7.1 / 8.1 = 344 / 345 / 346（各 = 基线 + 本轮 5 个新测试）；
+> harness 38 模式 **293 pass / 0 fail / 2 xfail**（与基线一致，`vf_transpose` 实测 320×180 → 180×320）。
+
 ### A. 会**静默产出错误数据**（最高优先级，建议先修）　**（A5 / A1 / A2 / A4 已修；A3 / A6 未修）**
 
 **A1〔已修·中〕奇数尺寸 `YUV420P` → `RGB24` 静默错位**

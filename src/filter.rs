@@ -600,7 +600,9 @@ pub mod video {
         box_enabled: bool,
         box_color: String,
         box_border_w: u32,
-        raw_text: bool,
+        /// `text` holds an FFmpeg expression (`%{localtime}`, `%{frame_num}`, …)
+        /// rather than a literal string; `%{...}` must survive escaping intact.
+        text_is_expression: bool,
     }
 
     impl DrawText {
@@ -621,7 +623,7 @@ pub mod video {
                 box_enabled: false,
                 box_color: "black@0.5".to_string(),
                 box_border_w: 0,
-                raw_text: false,
+                text_is_expression: false,
             }
         }
 
@@ -654,7 +656,7 @@ pub mod video {
         /// ```
         pub fn time_text(mut self, fmt: &str) -> Self {
             self.text = fmt.to_string();
-            self.raw_text = true;
+            self.text_is_expression = true;
             self
         }
 
@@ -664,7 +666,7 @@ pub mod video {
         /// A NUL byte in any of the values is [`RsmediaError::InvalidConfig`]: a filter
         /// description is a C string and cannot carry one.
         pub fn build(self) -> Result<Filter> {
-            let text_spec = if self.raw_text {
+            let text_spec = if self.text_is_expression {
                 escape_filter_expr(&self.text)?
             } else {
                 escape_option_level(&self.text)?
@@ -844,19 +846,44 @@ pub mod video {
         Ok(Filter::new("zoompan", MediaType::VIDEO, params))
     }
 
-    /// transpose - 用于快速 90°/180°/270° 视频画面旋转、水平翻转或镜像翻转（无插值，高性能）
-    /// mode: 0=逆时针90度/垂直翻转, 1=顺时针90度, 2=逆时针90度, 3=顺时针90度/垂直翻转
+    /// Rotates by a multiple of 90°, optionally with a vertical flip.
     ///
-    /// Transposes video (rotates by multiples of 90 degrees and/or flips).
-    /// See `ffmpeg -filters` (search transpose) for valid modes.
+    /// No interpolation is involved, so this is much cheaper than [`rotate`] —
+    /// but it can only express the four quarter turns.
+    ///
+    /// | `mode` | direction                | effect                                     |
+    /// |--------|--------------------------|--------------------------------------------|
+    /// | `0`    | `cclock_flip`            | 90° counter-clockwise, then flip vertically |
+    /// | `1`    | `clock`                  | 90° clockwise                              |
+    /// | `2`    | `cclock`                 | 90° counter-clockwise                      |
+    /// | `3`    | `clock_flip`             | 90° clockwise, then flip vertically        |
+    ///
+    /// # Why 4..=7 is rejected
+    ///
+    /// FFmpeg's `dir` option declares the range `0..=7`, so it *accepts* 4..=7
+    /// without complaint — and then passes every frame through untouched.
+    /// `transpose=5` is byte-for-byte identical to applying no filter at all
+    /// (verified with `ffmpeg -vf transpose=N` on FFmpeg 9.0). Handing that back
+    /// as a working filter would turn "the video silently did not rotate" into a
+    /// value this crate appears to vouch for, so those modes are rejected here.
     ///
     /// See: <https://ffmpeg.org/ffmpeg-filters.html#transpose-1>
-    pub fn transpose(mode: i32) -> Filter {
-        // Common range is 0-3, but ffmpeg might support more
-        if !(0..=7).contains(&mode) {
-            tracing::warn!("Transpose mode {mode} might be invalid.");
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `mode` is outside `0..=3`.
+    pub fn transpose(mode: i32) -> Result<Filter> {
+        if !(0..=3).contains(&mode) {
+            return Err(RsmediaError::invalid_config(format!(
+                "transpose mode must be in 0..=3 (0=cclock_flip, 1=clock, 2=cclock, 3=clock_flip), \
+                 got {mode}: FFmpeg accepts 4..=7 but passes frames through unchanged"
+            )));
         }
-        Filter::new("transpose", MediaType::VIDEO, format!("transpose={mode}"))
+        Ok(Filter::new(
+            "transpose",
+            MediaType::VIDEO,
+            format!("transpose={mode}"),
+        ))
     }
 
     /// rotate - 任意角度旋转滤镜（支持动画表达式）
@@ -3024,37 +3051,91 @@ impl FilterGraph {
         self.sink_names.len()
     }
 
-    /// 主输出链路的帧率（`av_buffersink_get_frame_rate`），无滤镜或不可用时返回 `None`。
-    pub fn output_frame_rate(&mut self) -> Option<Rational> {
+    /// Frame rate of the primary (index `0`) output link, as reported by
+    /// `av_buffersink_get_frame_rate`.
+    ///
+    /// A filter such as `fps` or `framerate` rewrites the frame rate, and an
+    /// encoder fed from this graph has to follow it: a time base derived from
+    /// the *input* parameters no longer matches the pts the graph emits.
+    ///
+    /// When no frame rate has been negotiated the sink reports `0/0`, which
+    /// folds to [`Rational::ZERO`] — the spelling every consumer in this crate
+    /// already reads as "unset". That is a *value*, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when the graph declares no
+    /// output, or when the sink is missing from the graph.
+    pub fn output_frame_rate(&mut self) -> Result<Rational> {
         self.output_frame_rate_at(0)
     }
 
-    /// 第 `output` 路输出链路的帧率。
-    pub fn output_frame_rate_at(&mut self, output: usize) -> Option<Rational> {
-        let sink = self.get_sink_context(output).ok()?;
-        Some(sink.get_frame_rate().into())
+    /// Frame rate of the `output`-th output link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `output` is out of range, or
+    /// when the sink is missing from the graph. An out-of-range index is a
+    /// programming error and is deliberately *not* folded into "no frame rate":
+    /// callers must be able to tell the two apart.
+    pub fn output_frame_rate_at(&mut self, output: usize) -> Result<Rational> {
+        Ok(self.get_sink_context(output)?.get_frame_rate().into())
     }
 
-    /// 主输出链路的时间基（`av_buffersink_get_time_base`），无滤镜或不可用时返回 `None`。
-    pub fn output_time_base(&mut self) -> Option<Rational> {
+    /// Time base of the primary (index `0`) output link, as reported by
+    /// `av_buffersink_get_time_base`.
+    ///
+    /// A frame's pts comes out of the graph in *this* time base, not in the one
+    /// the input endpoint declared, so anything consuming filter output has to
+    /// rescale against it.
+    ///
+    /// An unnegotiated sink reports `0/0`, which folds to [`Rational::ZERO`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when the graph declares no
+    /// output, or when the sink is missing from the graph.
+    pub fn output_time_base(&mut self) -> Result<Rational> {
         self.output_time_base_at(0)
     }
 
-    /// 第 `output` 路输出链路的时间基。
-    pub fn output_time_base_at(&mut self, output: usize) -> Option<Rational> {
-        let sink = self.get_sink_context(output).ok()?;
-        Some(sink.get_time_base().into())
+    /// Time base of the `output`-th output link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `output` is out of range, or
+    /// when the sink is missing from the graph.
+    pub fn output_time_base_at(&mut self, output: usize) -> Result<Rational> {
+        Ok(self.get_sink_context(output)?.get_time_base().into())
     }
 
-    /// 主输出链路的尺寸 `(width, height)`（`av_buffersink_get_w/h`），无滤镜或不可用时返回 `None`。
-    pub fn output_size(&mut self) -> Option<(i32, i32)> {
+    /// Size `(width, height)` of the primary (index `0`) output link, as
+    /// reported by `av_buffersink_get_w` / `av_buffersink_get_h`.
+    ///
+    /// `scale`, `crop`, `pad`, `rotate` and `transpose` all change the size, and
+    /// an encoder fed from this graph has to be opened with the *filter's*
+    /// size — sending a frame of a different size fails.
+    ///
+    /// A sink that has not negotiated a size reports `(0, 0)`; an audio sink has
+    /// no size at all and reports the same. Both are values, not errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when the graph declares no
+    /// output, or when the sink is missing from the graph.
+    pub fn output_size(&mut self) -> Result<(i32, i32)> {
         self.output_size_at(0)
     }
 
-    /// 第 `output` 路输出链路的尺寸。
-    pub fn output_size_at(&mut self, output: usize) -> Option<(i32, i32)> {
-        let sink = self.get_sink_context(output).ok()?;
-        Some((sink.get_w(), sink.get_h()))
+    /// Size `(width, height)` of the `output`-th output link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `output` is out of range, or
+    /// when the sink is missing from the graph.
+    pub fn output_size_at(&mut self, output: usize) -> Result<(i32, i32)> {
+        let sink = self.get_sink_context(output)?;
+        Ok((sink.get_w(), sink.get_h()))
     }
 
     /// 运行时给图里的滤镜发一条命令（`avfilter_graph_send_command`）。
@@ -4559,8 +4640,8 @@ mod tests {
 
         // 输出链路尺寸应与输入一致。
         assert_eq!(
-            graph.output_size(),
-            Some((w, h)),
+            graph.output_size()?,
+            (w, h),
             "output_size should match input size"
         );
 
@@ -4767,7 +4848,7 @@ mod tests {
             (2, 1),
             "hstack has 2 inputs and 1 output"
         );
-        assert_eq!(graph.output_size(), Some((8, 2)), "stacked size");
+        assert_eq!(graph.output_size()?, (8, 2), "stacked size");
 
         graph.push_frame_to(0, Some(make_yuv420p_frame(4, 2, 10)))?;
         graph.push_frame_to(1, Some(make_yuv420p_frame(4, 2, 200)))?;
@@ -4834,7 +4915,7 @@ mod tests {
             "2",
             video_endpoint(4, 4),
         )?;
-        assert_eq!(graph.output_size(), Some((4, 4)), "overlay keeps base size");
+        assert_eq!(graph.output_size()?, (4, 4), "overlay keeps base size");
 
         graph.push_frame_to(0, Some(make_yuv420p_frame(4, 4, 0)))?;
         graph.push_frame_to(1, Some(make_yuv420p_frame(2, 2, 255)))?;
@@ -5273,9 +5354,7 @@ mod tests {
         assert_eq!(graph.output_count(), 2);
         assert_eq!(graph.input_count(), 2);
         // 输出 1 的时间基来自音频端点，说明 sink 与逻辑输出的映射正确。
-        let audio_tb = graph
-            .output_time_base_at(1)
-            .expect("output 1 is the audio sink");
+        let audio_tb = graph.output_time_base_at(1)?;
         assert_eq!(
             (audio_tb.num(), audio_tb.den()),
             (1, 48000),
@@ -5572,7 +5651,7 @@ mod tests {
             &[video_endpoint(4, 2), video_endpoint(4, 2)],
             video_endpoint(2, 2),
         )?;
-        assert_eq!(graph.output_size(), Some((2, 2)), "output收口到声明尺寸");
+        assert_eq!(graph.output_size()?, (2, 2), "output收口到声明尺寸");
 
         graph.push_frame_to(0, Some(make_yuv420p_frame(4, 2, 10)))?;
         graph.push_frame_to(1, Some(make_yuv420p_frame(4, 2, 200)))?;
@@ -5581,5 +5660,78 @@ mod tests {
             .expect("scaled frame should come out");
         assert_eq!((out.width, out.height), (2, 2));
         Ok(())
+    }
+
+    /// 输出索引越界必须是**错误**，不能被折叠成"这一路没有帧率/时间基/尺寸"。
+    ///
+    /// 这三个查询原先都用 `.ok()?` 吞掉 `get_sink_context` 的失败，于是
+    /// "调用方写错了索引"和"汇没协商出帧率"在返回类型上完全同形（`None`），
+    /// 前者被静默忽略。改成 `Result` 之后两者必须可区分，这里钉住这一点。
+    #[test]
+    fn test_output_index_out_of_range_is_an_error_not_a_missing_value() -> Result<()> {
+        let mut graph = FilterGraphBuilder::hstack(
+            &[video_endpoint(4, 2), video_endpoint(4, 2)],
+            video_endpoint(8, 2),
+        )?;
+        assert_eq!(graph.output_count(), 1, "hstack has exactly one output");
+
+        // 合法索引必须仍然拿到真实值（同时钉住"正常路径没被改坏"）。
+        assert_eq!(
+            graph.output_size_at(0)?,
+            (8, 2),
+            "sink 0 is the stacked output"
+        );
+        assert_eq!(
+            graph.output_frame_rate_at(0)?,
+            rat(25, 1),
+            "sink frame rate follows the endpoint's declared frame rate"
+        );
+        assert_eq!(
+            graph.output_time_base_at(0)?,
+            rat(1, 25),
+            "sink time base follows the endpoint's declared time base"
+        );
+
+        // 越界：三处都必须是 InvalidConfig，而且点名 out of range。
+        for err in [
+            graph.output_frame_rate_at(1).unwrap_err(),
+            graph.output_time_base_at(1).unwrap_err(),
+            graph.output_size_at(1).unwrap_err(),
+        ] {
+            assert!(err.is_invalid_config(), "not InvalidConfig: {err}");
+            assert!(err.to_string().contains("out of range"), "{err}");
+        }
+        Ok(())
+    }
+
+    /// 一张还没有任何输出的图，主输出查询同样报错而不是返回 `None`。
+    #[test]
+    fn test_output_queries_on_a_graph_without_outputs_are_an_error() {
+        let mut graph = FilterGraph::new();
+        assert_eq!(graph.output_count(), 0, "a fresh graph declares no output");
+        assert!(graph.output_size().unwrap_err().is_invalid_config());
+        assert!(graph.output_frame_rate().unwrap_err().is_invalid_config());
+        assert!(graph.output_time_base().unwrap_err().is_invalid_config());
+    }
+
+    /// `transpose` 只接受 0..=3。
+    ///
+    /// FFmpeg 的 `dir` 选项声明 0..=7：4..=7 能解析通过，但**静默直通** —— 实测
+    /// `transpose=4..7` 的输出与"不加滤镜"逐字节相同。把它们当作可用滤镜交出去，
+    /// 就会把"视频根本没转"伪装成一个正常工作的 `Filter`，所以必须在这里挡掉。
+    #[test]
+    fn test_transpose_rejects_the_modes_ffmpeg_applies_as_a_no_op() {
+        for mode in 0..=3 {
+            assert_eq!(
+                video::transpose(mode).unwrap().spec(),
+                format!("transpose={mode}"),
+                "mode {mode} is a real direction"
+            );
+        }
+        for mode in [-1, 4, 5, 6, 7, 8, i32::MAX] {
+            let err = video::transpose(mode).unwrap_err();
+            assert!(err.is_invalid_config(), "mode {mode}: {err}");
+            assert!(err.to_string().contains("0..=3"), "mode {mode}: {err}");
+        }
     }
 }

@@ -326,21 +326,21 @@ impl CodecConfig {
 
     /// 查询结果为 `None`（FFmpeg 未限制，支持所有值）或查询失败（如媒体类型
     /// 不匹配的配置项）时按"支持"处理，避免误拦合法帧。
-    pub(crate) fn is_support_pixel_format(&self, pix_fmt: i32) -> bool {
+    pub(crate) fn supports_pixel_format(&self, pix_fmt: i32) -> bool {
         match self.supported_pixel_formats() {
             Ok(None) | Err(_) => true,
             Ok(Some(formats)) => formats.contains(&pix_fmt),
         }
     }
 
-    pub(crate) fn is_support_sample_format(&self, sample_fmt: i32) -> bool {
+    pub(crate) fn supports_sample_format(&self, sample_fmt: i32) -> bool {
         match self.supported_sample_formats() {
             Ok(None) | Err(_) => true,
             Ok(Some(formats)) => formats.contains(&sample_fmt),
         }
     }
 
-    pub(crate) fn is_support_sample_rate(&self, sample_rate: i32) -> bool {
+    pub(crate) fn supports_sample_rate(&self, sample_rate: i32) -> bool {
         match self.supported_sample_rates() {
             Ok(None) | Err(_) => true,
             Ok(Some(rates)) => rates.contains(&sample_rate),
@@ -348,8 +348,8 @@ impl CodecConfig {
     }
 
     /// 编码器是否支持指定声道数；未声明限制或查询失败时按"支持"处理，
-    /// 与 [`CodecConfig::is_support_sample_rate`] 语义一致。
-    pub(crate) fn is_support_channel_count(&self, nb_channels: i32) -> bool {
+    /// 与 [`CodecConfig::supports_sample_rate`] 语义一致。
+    pub(crate) fn supports_channel_count(&self, nb_channels: i32) -> bool {
         match self.supported_channel_counts() {
             None => true,
             Some(counts) => counts.contains(&nb_channels),
@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn test_audio_supported_capabilities() {
         // AAC 是最常见的软件音频编码器：断言其声道数/采样率能力可被
-        // is_support_channel_count / is_support_sample_rate 识别，且对
+        // supports_channel_count / supports_sample_rate 识别，且对
         // 非法值返回 false（证明校验并非恒真 no-op）。
         let Some(config) = AVCodec::find_encoder_by_name(c"aac") else {
             eprintln!("aac encoder not available, skipping");
@@ -657,15 +657,15 @@ mod tests {
         let config = CodecConfig::from_codec(config);
         // 常见合法组合必须被认定为支持。
         assert!(
-            config.is_support_channel_count(2),
+            config.supports_channel_count(2),
             "aac should support stereo (2 channels)"
         );
         assert!(
-            config.is_support_sample_rate(44100),
+            config.supports_sample_rate(44100),
             "aac should support 44100 Hz"
         );
         assert!(
-            !config.is_support_sample_rate(-1),
+            !config.supports_sample_rate(-1),
             "aac must not report support for negative sample rate"
         );
     }

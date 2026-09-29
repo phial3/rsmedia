@@ -353,12 +353,12 @@ impl DecoderBuilder {
         //
         // SAFETY: `decoder` 在此处独占（`&mut`），`deref_mut` 只在块内存活。
         unsafe {
-            let raw = decoder.deref_mut();
+            let ctx_raw = decoder.deref_mut();
             if let Some(skip_frame) = self.skip_frame {
-                raw.skip_frame = skip_frame.into();
+                ctx_raw.skip_frame = skip_frame.into();
             }
             if let Some(err_recognition) = self.err_recognition {
-                raw.err_recognition = err_recognition.bits() as i32;
+                ctx_raw.err_recognition = err_recognition.bits() as i32;
             }
         }
 

@@ -1353,9 +1353,9 @@ mod tests {
                 }
             }
             // 反转行序：data 指向原本的最后一行（图像第 0 行），后续行向低地址延伸
-            let raw = frame.deref_mut();
-            raw.data[0] = base.add((height - 1) * linesize);
-            raw.linesize[0] = -(linesize as i32);
+            let frame_raw = frame.deref_mut();
+            frame_raw.data[0] = base.add((height - 1) * linesize);
+            frame_raw.linesize[0] = -(linesize as i32);
         }
 
         let buf = get_plane_buffer(&frame, 0)?;
@@ -1897,11 +1897,11 @@ mod tests {
         let mut frame = create_test_frame(64, 48, ffi::AV_PIX_FMT_YUV420P)?;
         // 设置裁剪量（wrap 未提供字段 setter，经 `deref_mut` 写底层字段）
         unsafe {
-            let raw = frame.deref_mut();
-            raw.crop_top = 4;
-            raw.crop_bottom = 4;
-            raw.crop_left = 4;
-            raw.crop_right = 4;
+            let frame_raw = frame.deref_mut();
+            frame_raw.crop_top = 4;
+            frame_raw.crop_bottom = 4;
+            frame_raw.crop_left = 4;
+            frame_raw.crop_right = 4;
         }
         // AV_FRAME_CROP_UNALIGNED 在 Windows/vcpkg 绑定中已是 i32，而在
         // Linux 上是 u32；`as i32` 在 Windows 会触发多余的 cast 警告 unnecessary (`i32` -> `i32`)

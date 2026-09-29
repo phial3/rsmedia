@@ -1144,41 +1144,41 @@ where
         // SAFETY: rsmpeg 的 wrap 类型不实现 `DerefMut`，改 ffi 结构体成员只能走
         // `UnsafeDerefMut::deref_mut`；`frame` 由 `&mut` 独占，块内无其他访问路径。
         unsafe {
-            let raw = frame.deref_mut();
+            let frame_raw = frame.deref_mut();
             // `key_frame` 是 `AV_FRAME_FLAG_KEY` 的便捷镜像（读入方向见
             // `copy_avframe_meta`），因此写出时也要让它生效：否则
             // `frame.key_frame = true` 会被静默丢弃，两个字段互相矛盾。
             let key = ffi::AV_FRAME_FLAG_KEY as i32;
-            raw.flags = if self.key_frame {
+            frame_raw.flags = if self.key_frame {
                 self.flags | key
             } else {
                 self.flags & !key
             };
-            raw.quality = self.quality;
-            raw.repeat_pict = self.repeat_pict;
-            raw.colorspace = self.colorspace;
-            raw.color_primaries = self.color_primaries;
-            raw.color_trc = self.color_trc;
-            raw.color_range = self.color_range;
-            raw.chroma_location = self.chroma_location;
-            raw.sample_aspect_ratio = self.sample_aspect_ratio.into();
-            raw.crop_top = self.crop_top;
-            raw.crop_bottom = self.crop_bottom;
-            raw.crop_left = self.crop_left;
-            raw.crop_right = self.crop_right;
+            frame_raw.quality = self.quality;
+            frame_raw.repeat_pict = self.repeat_pict;
+            frame_raw.colorspace = self.colorspace;
+            frame_raw.color_primaries = self.color_primaries;
+            frame_raw.color_trc = self.color_trc;
+            frame_raw.color_range = self.color_range;
+            frame_raw.chroma_location = self.chroma_location;
+            frame_raw.sample_aspect_ratio = self.sample_aspect_ratio.into();
+            frame_raw.crop_top = self.crop_top;
+            frame_raw.crop_bottom = self.crop_bottom;
+            frame_raw.crop_left = self.crop_left;
+            frame_raw.crop_right = self.crop_right;
             #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
             {
-                raw.alpha_mode = self.alpha_mode;
+                frame_raw.alpha_mode = self.alpha_mode;
             }
             // `duration` is the canonical field; `pkt_duration` is only a mirror
-            raw.duration = self.duration;
+            frame_raw.duration = self.duration;
             // `AVFrame::new()` leaves `pkt_dts` at `AV_NOPTS_VALUE`, so this is the
             // only place the frame's decode timestamp can come from.
-            raw.pkt_dts = self.pkt_dts;
-            raw.best_effort_timestamp = self.best_effort_timestamp;
-            raw.decode_error_flags = self.decode_error_flags;
-            // SAFETY: `raw.metadata` is a live dictionary slot owned by `frame`.
-            self.metadata.write_into_raw_dict(&mut raw.metadata);
+            frame_raw.pkt_dts = self.pkt_dts;
+            frame_raw.best_effort_timestamp = self.best_effort_timestamp;
+            frame_raw.decode_error_flags = self.decode_error_flags;
+            // SAFETY: `frame_raw.metadata` is a live dictionary slot owned by `frame`.
+            self.metadata.write_into_raw_dict(&mut frame_raw.metadata);
         }
         write_side_data(frame, &self.side_data);
     }

@@ -1046,7 +1046,7 @@ mod video {
             ("rotate", video::rotate(90), n_frames, Some((width, height))),
             (
                 "transpose",
-                video::transpose(1),
+                video::transpose(1)?,
                 n_frames,
                 Some((width, height)),
             ),

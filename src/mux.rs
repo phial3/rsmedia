@@ -369,15 +369,7 @@ impl<W: Writer> Muxer<W> {
     }
 
     pub fn add_encoder(&mut self, encoder: Encoder) -> Result<usize> {
-        // header 一旦写出（首个包 mux 时懒触发），AVFormatContext 的流数组就固定了；
-        // 此时再加流会让 av_interleaved_write_frame 访问越界的流索引 → SIGSEGV
-        // （边界测试实测）。必须报错而不是放行。
-        if self.have_written_header {
-            return Err(RsmediaError::invalid_config(
-                "Cannot add a stream after the container header has been written; \
-                 register all streams before the first mux()/mux_packet()",
-            ));
-        }
+        self.ensure_streams_open()?;
         let stream_idx = self
             .writer
             .add_stream(encoder.codecpar(), encoder.time_base())?;
@@ -445,18 +437,29 @@ impl<W: Writer> Muxer<W> {
         self.add_copy_stream_inner(src_info, Some(bsf_name))
     }
 
-    fn add_copy_stream_inner(
-        &mut self,
-        src_info: &StreamInfo,
-        bsf_name: Option<&str>,
-    ) -> Result<usize> {
-        // 与 `add_encoder` 同一守卫：header 写出后流数组已固定，再加流是未定义行为。
+    /// header 写出后不能再加流：AVFormatContext 的流数组就此固定，此时再加流会让
+    /// 后续 `av_interleaved_write_frame` 访问越界的流索引 → SIGSEGV（边界测试实测）。
+    ///
+    /// 与 [`Writer::add_stream`] 是同一前提的两层：本方法在 `Muxer` 这一层提前拦下
+    /// 并给出可操作的提示，`Writer` 那层则是自定义实现也必须遵守的安全底线
+    /// （`have_written_header` 与 `is_header_written()` 由 `ensure_header_written`
+    /// 同步置位，不存在两者不一致的窗口）。
+    fn ensure_streams_open(&self) -> Result<()> {
         if self.have_written_header {
             return Err(RsmediaError::invalid_config(
                 "Cannot add a stream after the container header has been written; \
                  register all streams before the first mux()/mux_packet()",
             ));
         }
+        Ok(())
+    }
+
+    fn add_copy_stream_inner(
+        &mut self,
+        src_info: &StreamInfo,
+        bsf_name: Option<&str>,
+    ) -> Result<usize> {
+        self.ensure_streams_open()?;
         let src_time_base = src_info.time_base;
         // filter 必须在 `add_stream` 之前建好：输出流的 codecpar 要以
         // `par_out()` 为准（见 `add_copy_stream_with_bsf`），而 par_out 只有在
@@ -1097,13 +1100,13 @@ impl<W: Writer> Muxer<W> {
 
         // 带 filter 的流走独立通路：先整包过滤，再逐包写出（借用必须在写包前
         // 结束，因为 `write_out_packet` 又要独占 `self`）。
-        if self.get_stream(stream_idx)?.bsf.is_some() {
-            let filtered = self
-                .get_stream_mut(stream_idx)?
-                .bsf
-                .as_mut()
-                .expect("checked above")
-                .filter_packet(packet)?;
+        let filtered = self
+            .get_stream_mut(stream_idx)?
+            .bsf
+            .as_mut()
+            .map(|bsf| bsf.filter_packet(packet))
+            .transpose()?;
+        if let Some(filtered) = filtered {
             for mut out in filtered {
                 let out = self.write_copy_packet(&mut out, stream_idx, src_time_base)?;
                 W::merge_out(&mut collected, out);
@@ -1853,7 +1856,7 @@ mod tests {
         let two_pi_f = 2.0 * std::f32::consts::PI * freq;
 
         for ch in 0..channels {
-            let data_ptr = unsafe {
+            let samples = unsafe {
                 let ptr = frame.deref_mut().data[ch] as *mut f32;
                 if ptr.is_null() {
                     return Err(RsmediaError::msg("Audio data pointer is null"));
@@ -1862,7 +1865,7 @@ mod tests {
             };
 
             // 生成正弦波
-            data_ptr.iter_mut().enumerate().for_each(|(i, sample)| {
+            samples.iter_mut().enumerate().for_each(|(i, sample)| {
                 let t = i as f32 * sample_interval;
                 *sample = (two_pi_f * t).sin() * 0.8;
             });
