@@ -2029,12 +2029,8 @@ impl Encoder {
     /// * `index` - Stream index for the output stream.
     /// * `out_stream_time_base` - Time base of the output stream.
     ///
-    /// # Returns
+    /// 产出的字节留在 `writer` 里（见 [`Writer`] 的输出模型），由调用方按需取。
     ///
-    /// An accumulator (`W::Accum`) holding every flushed packet's output merged
-    /// via [`Writer::merge_out`], so a buffering writer sees its tail bytes too;
-    /// an empty accumulator when nothing was written (a subtitle stream, or a
-    /// writer whose output carries no data).
     /// May return an error if writing fails or encoder returns an error.
     ///
     /// Idempotent **only once the drain really finished** ([`is_flushed`](Self::is_flushed)):
@@ -2048,14 +2044,14 @@ impl Encoder {
         interleaved: bool,
         index: usize,
         out_stream_time_base: Rational,
-    ) -> Result<W::Accum> {
+    ) -> Result<()> {
         // 幂等只在**真正排空完成**时成立。`Drained` 表示 EOS 已送出、但上一次没排完
         // （排空循环报错，或撞上迭代上限）：那种情况必须重试排空。若按"不是 Normal"
-        // 就返回，第二次调用会直接给出空累积器，`Muxer::finish` 随后照样写 trailer，
+        // 就返回，第二次调用会直接成功，`Muxer::finish` 随后照样写 trailer，
         // 把截断的输出当成成功。
         if self.is_flushed() {
             tracing::debug!("Encoder already flushed ({:?}), nothing to do.", self.state);
-            return Ok(W::Accum::default());
+            return Ok(());
         }
 
         // 字幕编码器走同步 API（avcodec_encode_subtitle），无内部缓冲，
@@ -2064,7 +2060,7 @@ impl Encoder {
         // "未 flush" 告警只应针对真的丢了缓冲的编码器。
         if self.media_type == MediaType::SUBTITLE {
             self.state = ProcessState::Flushed;
-            return Ok(W::Accum::default());
+            return Ok(());
         }
 
         // `Normal` = EOS 还没送出：先排滤镜与音频 FIFO，再送 EOS；
@@ -2078,7 +2074,6 @@ impl Encoder {
         // 持续返回 EAGAIN（Drained）而不返回 EOF，增加迭代上限，避免死循环。
         let mut drained_iterations = 0usize;
         let mut written_packets = 0usize;
-        let mut flushed_output = W::Accum::default();
         loop {
             match self.receive_packet() {
                 Ok(Some(mut packet)) => {
@@ -2094,12 +2089,11 @@ impl Encoder {
                     // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
                     // encode_ctx_timebase => out_stream_time_base
                     packet.rescale_ts(self.time_base().into(), out_stream_time_base.into());
-                    let out = if interleaved {
+                    if interleaved {
                         writer.write_interleaved(&mut packet)?
                     } else {
                         writer.write_frame(&mut packet)?
                     };
-                    W::merge_out(&mut flushed_output, out);
                     written_packets += 1;
                 }
                 Ok(None) => {
@@ -2130,7 +2124,7 @@ impl Encoder {
             }
         }
 
-        Ok(flushed_output)
+        Ok(())
     }
 }
 
@@ -3179,17 +3173,21 @@ mod tests {
         writer.write_trailer()?;
         assert!(writer.bytes > 0, "the container must really have bytes");
 
-        // 只有真正排空完成之后才是幂等的 no-op。
-        assert_eq!(encoder.flush(&mut writer, false, 0, out_time_base)?, 0);
+        // 只有真正排空完成之后才是幂等的 no-op（返回值是 `()`，可用写入的包数没变来验收）
+        let packets_before = writer.packets;
+        encoder.flush(&mut writer, false, 0, out_time_base)?;
+        assert_eq!(
+            writer.packets, packets_before,
+            "the idempotent retry must not write anything"
+        );
         Ok(())
     }
 
     /// 包一层 [`BufferWriter`](crate::io::BufferWriter)，可切换"写包即失败"，
     /// 用来在排空循环中途制造一次 I/O 错误。
     ///
-    /// 单独记成功写出的包数：`BufferWriter` 的 `Out` 是**增量**字节，而 muxer 会先
-    /// 把数据攒在内部（header/簇/trailer 才吐出来），所以"排空确实写了包"必须用包数
-    /// 而不是字节数验收。
+    /// 单独记成功写出的包数：muxer 会把数据攒在内部（header/簇/trailer 才吐出来），
+    /// 所以"排空确实写了包"必须用包数而不是字节数验收。
     struct FlakyWriter {
         inner: crate::io::BufferWriter,
         fail: bool,
@@ -3207,50 +3205,42 @@ mod tests {
             })
         }
 
-        /// 计入本次写出的字节数，并把同样的大小作为本次的 `Out`。
-        fn count(&mut self, out: bytes::Bytes) -> usize {
-            self.bytes += out.len();
+        /// 记账（拉模型：字节留在内层 writer，这里只累计本次新增的量）。
+        fn count(&mut self) {
+            self.bytes += self.inner.take_written().len();
             self.packets += 1;
-            out.len()
         }
     }
 
     impl Writer for FlakyWriter {
-        type Out = usize;
-        type Accum = usize;
-
-        fn merge_out(acc: &mut usize, out: usize) {
-            *acc += out;
+        fn write_header(&mut self) -> Result<()> {
+            self.inner.write_header()?;
+            self.count();
+            Ok(())
         }
 
-        fn merge_accum(acc: &mut usize, other: usize) {
-            *acc += other;
-        }
-
-        fn write_header(&mut self) -> Result<usize> {
-            let bytes = self.inner.write_header()?;
-            Ok(self.count(bytes))
-        }
-
-        fn write_frame(&mut self, packet: &mut AVPacket) -> Result<usize> {
+        fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
             if self.fail {
                 return Err(RsmediaError::msg("simulated writer failure"));
             }
-            let bytes = self.inner.write_frame(packet)?;
-            Ok(self.count(bytes))
+            self.inner.write_frame(packet)?;
+            self.count();
+            Ok(())
         }
 
-        fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<usize> {
+        fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()> {
             if self.fail {
                 return Err(RsmediaError::msg("simulated writer failure"));
             }
-            let bytes = self.inner.write_interleaved(packet)?;
-            Ok(self.count(bytes))
+            self.inner.write_interleaved(packet)?;
+            self.count();
+            Ok(())
         }
 
-        fn write_trailer(&mut self) -> Result<usize> {
-            let bytes = self.inner.write_trailer()?;
-            Ok(self.count(bytes))
+        fn write_trailer(&mut self) -> Result<()> {
+            self.inner.write_trailer()?;
+            self.count();
+            Ok(())
         }
 
         fn output(&self) -> &rsmpeg::avformat::AVFormatContextOutput {

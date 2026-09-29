@@ -45,12 +45,14 @@
 //!
 //! # Recording into memory and reading it back
 //!
-//! Bind the sink to a [`BufferWriter`](crate::io::BufferWriter) and finish with
-//! [`PcmSink::finish_into_writer`] — not [`PcmSink::finish`]. Formats that patch
-//! their header while writing the trailer (mp4, mov, wav) rewrite bytes that were
-//! already handed out, so an accumulated `Vec<Bytes>` is permanently stale; only
+//! Bind the sink to a [`BufferWriter`](crate::io::BufferWriter);
+//! [`finish`](PcmSink::finish) hands the writer back, and
 //! [`BufferWriter::into_bytes`](crate::io::BufferWriter::into_bytes) sees the
-//! final image. `mpegts` / `matroska` / `adts` never patch, and either entry works.
+//! final image. That matters for formats that patch their header while writing
+//! the trailer (mp4, mov, wav): they rewrite bytes that were already handed out
+//! by [`take_written`](crate::io::BufferWriter::take_written), so a stream of
+//! increments is permanently stale. `mpegts` / `matroska` / `adts` never patch,
+//! and either entry works.
 //!
 //! ```no_run
 //! # use rsmedia::error::Result;
@@ -64,7 +66,7 @@
 //! let idx = muxer.add_encoder(encoder)?;
 //! let mut sink = PcmSink::new(muxer, idx, PcmSpec::new(48_000, 2))?;
 //! sink.write_f32(&[0.0f32; 4096])?;
-//! let bytes: Vec<u8> = sink.finish_into_writer()?.into_bytes();
+//! let bytes: Vec<u8> = sink.finish()?.into_bytes();
 //!
 //! let reader = BufferReader::new(bytes)?;          // 回灌：解码后再处理
 //! # Ok(())
@@ -90,7 +92,7 @@
 //!
 //! # Splitting a long recording into several files
 //!
-//! [`PcmSink::finish_into_writer`] consumes the sink, so each segment needs a
+//! [`PcmSink::finish`] consumes the sink, so each segment needs a
 //! fresh `Encoder` + `Muxer` + `PcmSink`. That costs nothing but setup: the tail
 //! of every segment *is* drained, so no samples are lost at the cut. What is not
 //! preserved is the resampler's filter state across the boundary — the first
@@ -170,7 +172,7 @@ const MAX_CHUNK_SAMPLES: usize = 4096;
 /// 内部的延迟样本不会被排出、错误也感知不到，详见 [`Self::finish`]。
 ///
 /// 本类型**故意不实现 `Drop`**：它必须能把内部的 `Muxer` 整体 move 出去
-/// （[`Self::finish_into_writer`]），而带 `Drop` 的类型不允许部分移动。收尾
+/// （[`Self::finish`]），而带 `Drop` 的类型不允许部分移动。收尾
 /// 由 `Muxer` 自己的 `Drop` 负责，语义不变。
 ///
 /// 内部持有一个**持久** [`Resampler`]（首次写入时按实际输入格式惰性创建）：
@@ -179,14 +181,18 @@ const MAX_CHUNK_SAMPLES: usize = 4096;
 /// 样本缓存在调用之间，若每次调用重建上下文（如逐帧临时转换），尾部样本
 /// 会随各块延迟丢失。
 ///
-/// # Every `write_*` returns output you must keep
+/// # Where the bytes go
 ///
-/// [`Writer::Accum`] is the writer's incremental output, and it is only ever
-/// handed out once. Dropping it **loses those bytes** — it does not reappear in
-/// a later call. That is invisible with [`StreamWriter`](crate::io::StreamWriter)
-/// (its `Accum` is `()`), but with a buffering writer such as
-/// [`BufferWriter`](crate::io::BufferWriter) discarding it silently truncates
-/// the result. Accumulate every call:
+/// `write_*` and [`finish`](Self::finish) return `Result<()>` — the bytes stay
+/// inside the muxer's writer and are pulled from it, never handed back by these
+/// calls. That means a dropped return value cannot lose data:
+///
+/// * streaming formats (mpegts, fmp4, …): pull each segment with
+///   [`BufferWriter::take_written`](crate::io::BufferWriter::take_written)
+///   between writes and send it out;
+/// * anything that rewrites its header in the trailer (mp4, mov, wav): take the
+///   finished writer with [`finish`](Self::finish) and call
+///   [`into_bytes`](crate::io::BufferWriter::into_bytes).
 ///
 /// ```no_run
 /// # use rsmedia::error::Result;
@@ -199,12 +205,13 @@ const MAX_CHUNK_SAMPLES: usize = 4096;
 /// let mut muxer = Muxer::new_from_writer(BufferWriter::new("mpegts")?);
 /// let idx = muxer.add_encoder(encoder)?;
 /// let mut sink = PcmSink::new(muxer, idx, PcmSpec::new(48_000, 2))?;
-/// let mut out = Vec::new();               // <-- keep it across calls
 /// for _ in 0..10 {
 ///     let block = [0.0f32; 1024];
-///     out.extend(sink.write_f32(&block)?);
+///     sink.write_f32(&block)?;
+///     let _segment = sink.writer_mut().take_written();   // send it out
 /// }
-/// out.extend(sink.finish()?);
+/// let mut writer = sink.finish()?;    // 收尾；字节都在 writer 里
+/// let _tail = writer.take_written();  // 最后一段
 /// # Ok(())
 /// # }
 /// ```
@@ -296,23 +303,22 @@ impl<W: Writer> PcmSink<W> {
 
     /// 写入交错 `f32` PCM 块（如 cpal `SampleFormat::F32` 回调数据）。
     ///
-    /// 返回本次写入经 mux 产生的输出增量 —— **必须累积**，丢弃即丢字节，
-    /// 见类型级文档的 "Every `write_*` returns output you must keep"。
-    pub fn write_f32(&mut self, interleaved: &[f32]) -> Result<W::Accum> {
+    /// 产出的字节留在底层 writer 里，见类型级文档的 "Where the bytes go"。
+    pub fn write_f32(&mut self, interleaved: &[f32]) -> Result<()> {
         self.write_chunks(interleaved, ffi::AV_SAMPLE_FMT_FLT)
     }
 
     /// 写入交错 `i16` PCM 块（如 cpal `SampleFormat::I16` 回调数据）。
     ///
-    /// 返回值必须累积，同 [`Self::write_f32`]。
-    pub fn write_i16(&mut self, interleaved: &[i16]) -> Result<W::Accum> {
+    /// 产出的字节留在底层 writer 里，同 [`Self::write_f32`]。
+    pub fn write_i16(&mut self, interleaved: &[i16]) -> Result<()> {
         self.write_chunks(interleaved, ffi::AV_SAMPLE_FMT_S16)
     }
 
     /// 写入交错 `u8` PCM 块（无符号 8bit，与 `AV_SAMPLE_FMT_U8` 一致）。
     ///
-    /// 返回值必须累积，同 [`Self::write_f32`]。
-    pub fn write_u8(&mut self, interleaved: &[u8]) -> Result<W::Accum> {
+    /// 产出的字节留在底层 writer 里，同 [`Self::write_f32`]。
+    pub fn write_u8(&mut self, interleaved: &[u8]) -> Result<()> {
         self.write_chunks(interleaved, ffi::AV_SAMPLE_FMT_U8)
     }
 
@@ -325,37 +331,25 @@ impl<W: Writer> PcmSink<W> {
     /// 所有 slice 必须等长，slice 个数必须等于 [`PcmSpec::channels`]。
     /// 输入很长时会自动按块切分，因此单次调用的样本数没有上限。
     ///
-    /// 返回值必须累积，同 [`Self::write_f32`]。
-    pub fn write_planar_f32(&mut self, planes: &[&[f32]]) -> Result<W::Accum> {
+    /// 产出的字节留在底层 writer 里，同 [`Self::write_f32`]。
+    pub fn write_planar_f32(&mut self, planes: &[&[f32]]) -> Result<()> {
         self.write_planar(planes, ffi::AV_SAMPLE_FMT_FLTP)
     }
 
-    /// 冲刷重采样器尾样、编码器剩余样本并写 trailer，消费 sink。
+    /// 冲刷重采样器尾样、编码器剩余样本并写 trailer，然后把 writer 交还给调用方。
+    ///
+    /// 消耗 sink，因此字节**只能**从返回的 writer 取 —— 这也是为什么本方法返回
+    /// `W` 而不是 `()`：落盘型 writer 直接丢弃返回值即可，内存型 writer 拿它调
+    /// [`BufferWriter::into_bytes`](crate::io::BufferWriter::into_bytes) 取完整容器。
     ///
     /// 未调用时 `Drop` 只做 `Muxer` 的那部分收尾（flush 编码器 + 写 trailer）：
     /// 容器仍然完整可读，但**不会**冲刷重采样器尾样（最后几十毫秒会丢），错误也
     /// 无法感知。因此显式调用 `finish` 是推荐做法。
     ///
-    /// 返回的 [`Writer::Accum`] 只含**收尾阶段**产生的字节，之前每次 `write_*`
-    /// 的返回值要自己累积起来，详见类型级文档。
-    ///
     /// # 落盘 vs 取回内存
     ///
     /// 对会在 trailer 阶段**回写头部**的格式（mp4 / mov / wav），增量字节拼不出
-    /// 完整文件 —— 那部分字节在交付之后才被改写。要拿完整内存输出请用
-    /// [`Self::finish_into_writer`]。
-    pub fn finish(mut self) -> Result<W::Accum> {
-        self.drain_resampler()?;
-        self.muxer.finish()
-    }
-
-    /// 收尾并把底层 writer 交还给调用方。
-    ///
-    /// 与 [`Self::finish`] 做同样的事（排重采样尾样 → 排编码器 → 写 trailer），
-    /// 但返回的是 writer 本身而不是增量字节 —— 这是拿到
-    /// [`BufferWriter::into_bytes`](crate::io::BufferWriter::into_bytes) 完整输出的
-    /// **唯一**途径：mp4/wav 之类格式会在 trailer 阶段 seek 回写已交付的头部，
-    /// 增量累加器里的那些字节永远不会被更新。
+    /// 完整文件 —— 那部分字节在交付之后才被改写，只有 `into_bytes()` 看得到。
     ///
     /// ```no_run
     /// # use rsmedia::error::Result;
@@ -368,16 +362,26 @@ impl<W: Writer> PcmSink<W> {
     /// let mut muxer = Muxer::new_from_writer(BufferWriter::new("mp4")?);
     /// let idx = muxer.add_encoder(encoder)?;
     /// let mut sink = PcmSink::new(muxer, idx, PcmSpec::new(48_000, 2))?;
-    /// sink.write_f32(&[0.0f32; 2048])?;              // 增量对 mp4 无用，可丢弃
-    /// let bytes: Vec<u8> = sink.finish_into_writer()?.into_bytes();
+    /// sink.write_f32(&[0.0f32; 2048])?;
+    /// let bytes: Vec<u8> = sink.finish()?.into_bytes();
     /// let reader = BufferReader::new(bytes)?;        // mp4 完整可读
     /// # Ok(())
     /// # }
     /// ```
-    pub fn finish_into_writer(mut self) -> Result<W> {
+    pub fn finish(mut self) -> Result<W> {
         self.drain_resampler()?;
         self.muxer.finish()?;
         Ok(self.muxer.into_writer())
+    }
+
+    /// 底层 [`Muxer`] 的 writer（可变借用）。
+    ///
+    /// 边产边发的场景用它取增量字节：缓冲型 writer 的
+    /// [`take_written`](crate::io::BufferWriter::take_written) 要 `&mut`，而
+    /// `write_*` 本身不返回字节。写入仍应走 `write_*`（那里面有重采样与 pts 编号），
+    /// 本方法只用于取数。
+    pub fn writer_mut(&mut self) -> &mut W {
+        &mut self.muxer.writer
     }
 
     /// 当前已写入的输入样本数（每声道）。
@@ -431,7 +435,7 @@ impl<W: Writer> PcmSink<W> {
         &mut self,
         interleaved: &[T],
         sample_format: ffi::AVSampleFormat,
-    ) -> Result<W::Accum> {
+    ) -> Result<()> {
         let channels = self.spec.channels as usize;
         if !interleaved.len().is_multiple_of(channels) {
             return Err(RsmediaError::invalid_config(format!(
@@ -442,24 +446,20 @@ impl<W: Writer> PcmSink<W> {
         }
         let samples_per_channel = interleaved.len() / channels;
         if samples_per_channel == 0 {
-            return Ok(W::Accum::default());
+            return Ok(());
         }
 
-        // 逐块累积：`Out` 对缓冲型 Writer 是**增量**字节，既不能被后续块的输出
-        // 覆盖，也不能因为末块因内部缓冲没有输出而丢掉前面已产生的字节。
-        let mut collected = W::Accum::default();
         for chunk in interleaved.chunks(MAX_CHUNK_SAMPLES * channels) {
-            let out = self.write_chunk(chunk, sample_format)?;
-            W::merge_accum(&mut collected, out);
+            self.write_chunk(chunk, sample_format)?;
         }
-        Ok(collected)
+        Ok(())
     }
 
     fn write_planar<T: Copy>(
         &mut self,
         planes: &[&[T]],
         sample_format: ffi::AVSampleFormat,
-    ) -> Result<W::Accum> {
+    ) -> Result<()> {
         let channels = self.spec.channels as usize;
         if planes.len() != channels {
             return Err(RsmediaError::invalid_config(format!(
@@ -469,7 +469,7 @@ impl<W: Writer> PcmSink<W> {
         }
         let nb_samples = planes.first().map_or(0, |p| p.len());
         if nb_samples == 0 {
-            return Ok(W::Accum::default());
+            return Ok(());
         }
         if let Some(bad) = planes.iter().position(|p| p.len() != nb_samples) {
             return Err(RsmediaError::invalid_config(format!(
@@ -479,7 +479,6 @@ impl<W: Writer> PcmSink<W> {
         }
         Self::check_element_width::<T>(sample_format)?;
 
-        let mut collected = W::Accum::default();
         let mut offset = 0usize;
         while offset < nb_samples {
             let n = (nb_samples - offset).min(MAX_CHUNK_SAMPLES);
@@ -506,18 +505,17 @@ impl<W: Writer> PcmSink<W> {
             }
             self.input_samples += n as u64;
 
-            let out = self.convert_and_mux(&mut src, sample_format)?;
-            W::merge_accum(&mut collected, out);
+            self.convert_and_mux(&mut src, sample_format)?;
             offset += n;
         }
-        Ok(collected)
+        Ok(())
     }
 
     fn write_chunk<T: Copy>(
         &mut self,
         interleaved: &[T],
         sample_format: ffi::AVSampleFormat,
-    ) -> Result<W::Accum> {
+    ) -> Result<()> {
         let nb_samples = (interleaved.len() / self.spec.channels as usize) as i32;
 
         // 输入帧：packed（交错）样本，全部位于 data[0]
@@ -574,7 +572,7 @@ impl<W: Writer> PcmSink<W> {
         &mut self,
         src: &mut AVFrame,
         sample_format: ffi::AVSampleFormat,
-    ) -> Result<W::Accum> {
+    ) -> Result<()> {
         // 转换到编码器规格并按实际输出样本数累计 pts。
         // 容量按本块的输出样本数上界分配（重采样会改变样本数），而不是按 1 秒的
         // 大上界：`swr_convert` 只写到容量为止，容量过剩只是白占内存。
@@ -587,7 +585,7 @@ impl<W: Writer> PcmSink<W> {
         let out_nb = dst.nb_samples;
         if out_nb <= 0 {
             // 重采样器内部缓冲（滤波延迟），随后续输入/flush 输出
-            return Ok(W::Accum::default());
+            return Ok(());
         }
         dst.set_pts(self.output_samples as i64);
         self.output_samples += out_nb as u64;
@@ -943,12 +941,12 @@ mod tests {
         Ok(())
     }
 
-    /// mp4 会在 trailer 阶段 seek **回写**已交付的头部字节，所以 `finish()` 的
-    /// 增量累加器永远拼不出完整文件（实测：`BufferReader` 打不开）。只有
-    /// `finish_into_writer()` + `into_bytes()` 能拿到最终镜像。
+    /// mp4 会在 trailer 阶段 seek **回写**头部字节（实测：`BufferReader` 打不开按
+    /// 增量拼出来的文件）。因此完整镜像只有 `finish()` 交回的 writer +
+    /// `into_bytes()` 能拿到。
     #[test]
-    fn test_finish_into_writer_yields_a_readable_mp4() -> Result<()> {
-        let output_path = test_support::test_output_path("pcm", "test_pcm_finish_into_writer.mp4");
+    fn test_finish_yields_a_readable_mp4() -> Result<()> {
+        let output_path = test_support::test_output_path("pcm", "test_pcm_finish.mp4");
         test_support::remove_test_output(&output_path);
 
         let (in_rate, channels) = (44_100i32, 2i32);
@@ -965,7 +963,7 @@ mod tests {
             sink.write_f32(&sine_samples(written as u64, n, channels, in_rate))?;
             written += n;
         }
-        let bytes: Vec<u8> = sink.finish_into_writer()?.into_bytes();
+        let bytes: Vec<u8> = sink.finish()?.into_bytes();
         assert!(!bytes.is_empty(), "mp4 output must not be empty");
         std::fs::write(&output_path, &bytes)?;
 

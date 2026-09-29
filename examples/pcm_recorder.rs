@@ -97,11 +97,6 @@ fn main() -> Result<()> {
 
     // ---- cpal 侧：音频回调线程 --mpsc--> 主线程（PcmSink 非线程安全，留在主线程）----
     let (chunk_tx, chunk_rx) = mpsc::channel::<Chunk>();
-    // 累积每次 write_* 的输出。对 StreamWriter 这个类型就是 `()`（字节已直接落盘），
-    // 这里仍显式持有，是为了把 "必须累积" 的写法摆在明面上：把 writer 换成
-    // BufferWriter 时下面一行都不用改，否则会静默丢掉全部数据。
-    #[allow(clippy::let_unit_value)]
-    let mut recorded_out = <rsmedia::io::StreamWriter as Writer>::Accum::default();
     let stream = match sample_format {
         SampleFormat::F32 => build_input_stream::<f32>(&device, &config, chunk_tx.clone())?,
         SampleFormat::I16 => build_input_stream::<i16>(&device, &config, chunk_tx.clone())?,
@@ -128,7 +123,7 @@ fn main() -> Result<()> {
         }
         match chunk_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(chunk) => {
-                write_chunk(&mut sink, chunk, &mut recorded_out)?;
+                write_chunk(&mut sink, chunk)?;
                 if stop_rx.try_recv().is_ok() {
                     break;
                 }
@@ -151,7 +146,7 @@ fn main() -> Result<()> {
     // 停止采集后冲掉仍在途的块，避免尾部截断
     drop(stream);
     for chunk in chunk_rx.try_iter() {
-        write_chunk(&mut sink, chunk, &mut recorded_out)?;
+        write_chunk(&mut sink, chunk)?;
     }
 
     // ---- 收尾：冲刷重采样器尾样 + 编码器剩余样本 + 写 trailer ----
@@ -181,17 +176,17 @@ fn main() -> Result<()> {
 
 /// 按块写入 PcmSink。
 ///
-/// ⚠️ `write_*` 返回的是 **writer 本次产生的新增输出**，只发一次，丢了就再也拿不到。
-/// 这里的目标 writer 是 `StreamWriter`，它的 `Accum` 是 `()`，所以丢弃无害；换成
-/// 缓冲型 writer（如 `BufferWriter`）就必须把每次的返回值累积起来，否则输出会被
-/// 静默截断。故此处显式累积，让这段示例代码可以直接改成 `BufferWriter` 而不踩坑。
-fn write_chunk<W: Writer>(sink: &mut PcmSink<W>, chunk: Chunk, out: &mut W::Accum) -> Result<()> {
-    let produced = match chunk {
+/// `write_*` 不返回字节：字节留在 writer 里。这里的 writer 是 `StreamWriter`
+/// （直接落盘），无需取数；换成缓冲型 writer（如 `BufferWriter`）时，在每次
+/// `write_*` 之后用 [`PcmSink::writer_mut`] 的
+/// [`take_written`](rsmedia::io::BufferWriter::take_written) 取增量即可——不取
+/// 也不会丢，最终 [`into_bytes`](rsmedia::io::BufferWriter::into_bytes) 仍是完整的。
+fn write_chunk<W: Writer>(sink: &mut PcmSink<W>, chunk: Chunk) -> Result<()> {
+    match chunk {
         Chunk::F32(c) => sink.write_f32(&c)?,
         Chunk::I16(c) => sink.write_i16(&c)?,
         Chunk::U8(c) => sink.write_u8(&c)?,
     };
-    W::merge_accum(out, produced);
     Ok(())
 }
 

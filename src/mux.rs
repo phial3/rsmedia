@@ -880,34 +880,30 @@ impl<W: Writer> Muxer<W> {
     ///
     /// header 一旦写出，后续所有 `mux`/`mux_packet` 直接写包；本函数在首个
     /// 包之前被主动调用，避免每个包路径各自重复 header 逻辑。
-    /// 返回 header 写入产生的输出（**已写过则返回空累加值** `W::Accum::default()`
-    /// ——返回类型是 `Result<W::Accum>`，没有 `None`），由调用方并入自己的
-    /// 结果一起返回。缓冲型 [`Writer`] 的 `Out` 是**增量**字节，**不能在这里
-    /// 丢掉**：`write_header` 已经把它们从 writer 的内部累积里取走，丢弃就意味着
-    /// header 那些字节永远不会到达调用方（`BufferWriter` 用户会拿到缺头的容器）。
-    fn ensure_header_written(&mut self) -> Result<W::Accum> {
+    ///
+    /// 已写过则直接返回 `Ok(())`（幂等）。本函数**不返回** header 的字节：字节
+    /// 留在 writer 里，由调用方按需从 writer 取（见 [`Writer`] 的输出模型）。
+    fn ensure_header_written(&mut self) -> Result<()> {
         if self.have_written_header {
-            return Ok(W::Accum::default());
+            return Ok(());
         }
         self.apply_metadata();
         self.apply_chapters();
-        let header = self.writer.write_header()?;
+        self.writer.write_header()?;
         // 只有 header 真正写出后才置位：否则一次失败会被记成"已写"，后续 `mux`
         // 会往无头容器里塞包、`finish` 还会补一个 trailer，错误被彻底掩盖。
         self.have_written_header = true;
-        // 刷新失败只告警：header 字节此刻已经从 writer 的内部累积里取出，若让
-        // 错误上抛，这些字节就永远不会到达调用方（缓冲型 Writer 会拿到缺头的
-        // 容器）。缓存仍是 header 之前的（旧）时间基，包按旧时间基换算——退化为
-        // 与"未刷新"一致的行为，而不是丢掉已经写出的 header。
+        // 刷新失败只告警：header 已经写出，让错误上抛会让调用方以为容器没写成功
+        // 而重试（二次 `write_header` 必然失败）。缓存仍是 header 之前的（旧）
+        // 时间基，包按旧时间基换算——退化为与"未刷新"一致的行为，而不是把已经
+        // 写出的 header 当成没写。
         if let Err(err) = self.refresh_stream_info() {
             tracing::warn!(
                 "Failed to refresh stream info after write_header: {err:#}; \
                  packet timestamps keep using the pre-header time bases"
             );
         }
-        let mut collected = W::Accum::default();
-        W::merge_out(&mut collected, header);
-        Ok(collected)
+        Ok(())
     }
 
     /// [`Self::mux_packet`] / [`Self::mux_subtitle_segment`] 的公共前置：必要时先写
@@ -917,7 +913,7 @@ impl<W: Writer> Muxer<W> {
     /// 索引已回填），继续写包不是"追加数据"而是把容器写坏。编码流路径
     /// （[`Self::mux`]）不需要这里的判断：它的 packet 由 encoder 产出，而已 flush
     /// 的 encoder 自己就会拒绝再编码。
-    fn begin_packet_write(&mut self) -> Result<W::Accum> {
+    fn begin_packet_write(&mut self) -> Result<()> {
         if self.have_written_trailer {
             return Err(RsmediaError::invalid_config(
                 "Cannot write more packets after the trailer has been written; \
@@ -932,7 +928,7 @@ impl<W: Writer> Muxer<W> {
     /// 按 [`Self::set_interleaved`] 的当前设置走 `write_interleaved`（跨流按 dts
     /// 交错，B 帧乱序也安全）或 `write_frame`（顺序直写）。三条 mux 路径
     /// （编码流 / 字幕流 / 复制流）收尾共用这一个出口，交错与否只在这一处判断。
-    fn write_packet(&mut self, packet: &mut AVPacket) -> Result<W::Out> {
+    fn write_packet(&mut self, packet: &mut AVPacket) -> Result<()> {
         if self.interleaved {
             self.writer.write_interleaved(packet)
         } else {
@@ -951,7 +947,7 @@ impl<W: Writer> Muxer<W> {
         packet: &mut AVPacket,
         stream_idx: usize,
         tb_from: Rational,
-    ) -> Result<W::Out> {
+    ) -> Result<()> {
         let out_time_base = self.get_stream(stream_idx)?.stream_info.time_base;
         packet.set_pos(-1);
         packet.set_stream_index(stream_idx as i32);
@@ -966,9 +962,15 @@ impl<W: Writer> Muxer<W> {
     ///
     /// # Arguments
     ///
+    /// 产出的字节留在 writer 里，由调用方取（缓冲型 writer 见
+    /// [`BufferWriter::take_written`](crate::io::BufferWriter::take_written) 与
+    /// [`BufferWriter::into_bytes`](crate::io::BufferWriter::into_bytes)）。
+    ///
+    /// # Arguments
+    ///
     /// * `frame` - [`AVFrame`] to encode and mux.
     /// * `stream_idx` - Index of the target output stream.
-    pub fn mux(&mut self, mut frame: AVFrame, stream_idx: usize) -> Result<W::Accum> {
+    pub fn mux(&mut self, mut frame: AVFrame, stream_idx: usize) -> Result<()> {
         // 先校验目标流是编码流，再提交 header（见 `ensure_header_written`）：拿
         // 透传流调 `mux()` 属于参数错误，不该把 header 不可逆地写出去。
         let enc_time_base = self
@@ -981,7 +983,7 @@ impl<W: Writer> Muxer<W> {
                 ))
             })?
             .time_base();
-        let mut collected = self.ensure_header_written()?;
+        self.ensure_header_written()?;
 
         // 归一化在**编码前**应用：编码器内部的自动编号与 flush 出的延迟包就都在同一
         // 坐标系里，输出侧（含 `finish()` 的 flush 路径）无需再区分处理。
@@ -1011,17 +1013,14 @@ impl<W: Writer> Muxer<W> {
         let duration_fallback = encoder.packet_duration();
         // mux_stream 对 self.resources.streams 的借用至此结束，之后可独占使用 self.writer
 
-        // 一帧可能编出多个 packet（B 帧重排序、编码器内部缓冲），必须（连同
-        // header 的输出一起）逐包累积而不能只留最后一个：缓冲型 Writer 的 `Out`
-        // 是**增量**字节，覆盖它会让调用方拿到被截断的流。
+        // 一帧可能编出多个 packet（B 帧重排序、编码器内部缓冲），逐个写出。
         for mut packet in packets {
             if packet.duration <= 0 {
                 packet.set_duration(duration_fallback);
             }
-            let out = self.write_out_packet(&mut packet, stream_idx, enc_time_base)?;
-            W::merge_out(&mut collected, out);
+            self.write_out_packet(&mut packet, stream_idx, enc_time_base)?;
         }
-        Ok(collected)
+        Ok(())
     }
 
     /// Encodes one subtitle segment through a subtitle encoder stream and
@@ -1043,7 +1042,7 @@ impl<W: Writer> Muxer<W> {
         &mut self,
         segment: &SubtitleSegment,
         stream_idx: usize,
-    ) -> Result<W::Accum> {
+    ) -> Result<()> {
         // 先校验目标流是字幕编码流，再提交 header（见 `begin_packet_write`）。
         {
             let mux_stream = self.get_stream(stream_idx)?;
@@ -1059,9 +1058,8 @@ impl<W: Writer> Muxer<W> {
                 )));
             }
         }
-        // header 的输出要并入返回值（见 `ensure_header_written`），且必须在
-        // 借出 `mux_stream` 之前调用。
-        let mut collected = self.begin_packet_write()?;
+        // 必须在借出 `mux_stream` 之前调用（它要独占 `self`）。
+        self.begin_packet_write()?;
 
         let mux_stream = self.get_stream_mut(stream_idx)?;
         let encoder = mux_stream.encoder.as_mut().ok_or_else(|| {
@@ -1072,7 +1070,7 @@ impl<W: Writer> Muxer<W> {
         let enc_time_base = encoder.time_base();
         let packets = encoder.encode_subtitle_segment(segment)?;
 
-        // 与 `mux` 相同的累积写法（字幕段通常是 0/1 个 packet，但没理由与 `mux` 用两套语义）。
+        // 字幕段通常是 0/1 个 packet。
         for mut packet in packets {
             // 与 `mux` 一致：归一化在写包前应用（字幕包的 pts/dts 在编码器的
             // 1/1000 时间基里），基准与音视频流共享，不破坏同步。
@@ -1084,10 +1082,9 @@ impl<W: Writer> Muxer<W> {
             if dts != packet.dts {
                 packet.set_dts(dts);
             }
-            let out = self.write_out_packet(&mut packet, stream_idx, enc_time_base)?;
-            W::merge_out(&mut collected, out);
+            self.write_out_packet(&mut packet, stream_idx, enc_time_base)?;
         }
-        Ok(collected)
+        Ok(())
     }
 
     /// Mux a raw (decoded_source / remux) packet through a **copy stream**.
@@ -1105,7 +1102,7 @@ impl<W: Writer> Muxer<W> {
     ///   会在写入前被改写为输出流 index。流带 filter 时该包在调用后失效
     ///   （所有权交给 filter），不要再用。
     /// * `stream_idx` - [`Self::add_copy_stream`] 返回的输出流 index。
-    pub fn mux_packet(&mut self, packet: &mut AVPacket, stream_idx: usize) -> Result<W::Accum> {
+    pub fn mux_packet(&mut self, packet: &mut AVPacket, stream_idx: usize) -> Result<()> {
         // 先确认这是透传流并取出源时间基（在 `begin_packet_write` 之前）：拿编码流调
         // `mux_packet()` 属于参数错误，不该把 header 不可逆地写出去。
         let src_time_base = self.get_stream(stream_idx)?.src_time_base.ok_or_else(|| {
@@ -1113,7 +1110,7 @@ impl<W: Writer> Muxer<W> {
                 "Stream {stream_idx} is not a copy stream: use mux() instead of mux_packet()"
             ))
         })?;
-        let mut collected = self.begin_packet_write()?;
+        self.begin_packet_write()?;
 
         // 带 filter 的流走独立通路：先整包过滤，再逐包写出（借用必须在写包前
         // 结束，因为 `write_out_packet` 又要独占 `self`）。
@@ -1125,17 +1122,14 @@ impl<W: Writer> Muxer<W> {
             .transpose()?;
         if let Some(filtered) = filtered {
             for mut out in filtered {
-                let out = self.write_copy_packet(&mut out, stream_idx, src_time_base)?;
-                W::merge_out(&mut collected, out);
+                self.write_copy_packet(&mut out, stream_idx, src_time_base)?;
             }
-            return Ok(collected);
+            return Ok(());
         }
 
         // src_stream_time_base => out_stream_time_base（重复调用会重复换算，
         // 因此只在我们自己保存的源时间基与输出时间基之间进行一次换算）
-        let out = self.write_copy_packet(packet, stream_idx, src_time_base)?;
-        W::merge_out(&mut collected, out);
-        Ok(collected)
+        self.write_copy_packet(packet, stream_idx, src_time_base)
     }
 
     /// 透传包写出的公共步骤：归一化时间戳 → 换算到输出流时间基 → 写出。
@@ -1147,7 +1141,7 @@ impl<W: Writer> Muxer<W> {
         packet: &mut AVPacket,
         stream_idx: usize,
         src_time_base: Rational,
-    ) -> Result<W::Out> {
+    ) -> Result<()> {
         // 与 `mux` 一致：归一化在写包前应用（透传包的 pts/dts 在源流时间基里），
         // 基准与编码流共享同一物理时刻。
         let pts = self.normalize_ts(packet.pts, src_time_base);
@@ -1163,15 +1157,12 @@ impl<W: Writer> Muxer<W> {
 
     /// Signal to the muxer that writing has finished. This will cause a trailer to be written if
     /// the container format has one.
-    pub fn finish(&mut self) -> Result<W::Accum> {
+    pub fn finish(&mut self) -> Result<()> {
         // 从未 mux 过任何数据（header 也尚未写入）：没有实际内容需要 flush，
-        // 直接空操作返回空累积器，不产生“无头”的残缺输出。
+        // 直接空操作返回，不产生"无头"的残缺输出。
         if !self.have_written_header {
-            return Ok(W::Accum::default());
+            return Ok(());
         }
-
-        // flush 与 trailer 的输出同样要累积（缓冲型 Writer 的 `Out` 是增量字节）。
-        let mut collected = W::Accum::default();
 
         // 先冲刷透传流的 bitstream filter：filter 内部可能缓冲（如 `aac_adtstoasc`
         // 需要看到足够数据才决定），不 flush 会丢掉尾部包。收集到局部 Vec 是因为
@@ -1191,8 +1182,7 @@ impl<W: Writer> Muxer<W> {
         }
         for (stream_idx, src_time_base, packets) in bsf_pending {
             for mut packet in packets {
-                let out = self.write_copy_packet(&mut packet, stream_idx, src_time_base)?;
-                W::merge_out(&mut collected, out);
+                self.write_copy_packet(&mut packet, stream_idx, src_time_base)?;
             }
         }
 
@@ -1204,25 +1194,23 @@ impl<W: Writer> Muxer<W> {
             };
             let out_stream_index = mux_stream.stream_index;
             let out_stream_time_base = mux_stream.stream_info.time_base;
-            let flushed = encoder.flush(
+            encoder.flush(
                 &mut self.writer,
                 self.interleaved,
                 out_stream_index,
                 out_stream_time_base,
             )?;
-            W::merge_accum(&mut collected, flushed);
         }
 
         // 已写 header 且未写 trailer 时才写 trailer；header + trailer 均已写说明
-        // 是重复调用 finish()，此时幂等返回已累积的内容，避免重复写 trailer。
+        // 是重复调用 finish()，此时幂等直接返回，避免重复写 trailer。
         if !self.have_written_trailer {
-            let trailer = self.writer.write_trailer()?;
+            self.writer.write_trailer()?;
             // 写成功后才置位：否则一次失败会被永久记成"已完成"，重试的 finish()
             // 直接返回 Ok，缺 trailer 的容器被当成正常收尾。
             self.have_written_trailer = true;
-            W::merge_out(&mut collected, trailer);
         }
-        Ok(collected)
+        Ok(())
     }
 
     /// 若 header 已写而 trailer 未写，则补写 trailer 兜底收尾（幂等）。
@@ -1788,7 +1776,6 @@ mod tests {
     use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter, strutils};
 
     use crate::error::{Context, Result};
-    use rsmpeg::avformat::AVFormatContextOutput;
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
     use std::path::Path;
 
@@ -2777,102 +2764,36 @@ mod tests {
         Ok(())
     }
 
-    /// 包一层 [`BufferWriter`](crate::io::BufferWriter)，把每次输出记为**字节数**
-    /// 并累加。
+    /// `mux` / `finish` 不再返回值：字节留在 writer 里，由调用方按需取。
     ///
-    /// `Out` 取 `usize` 而不是字节块，是为了能用一条不变量验收"header 与一帧的多个
-    /// packet 的输出都被累积返回"：所有 `mux`/`finish` 返回的字节数之和，必须等于
-    /// writer 实际写出的总字节数。任何一处"覆盖而非累积"都会让这个等式不成立。
-    struct CountingWriter {
-        inner: crate::io::BufferWriter,
-        total: usize,
-    }
-
-    impl CountingWriter {
-        fn new(format: &str) -> Result<Self> {
-            Ok(Self {
-                inner: crate::io::BufferWriter::new(format)?,
-                total: 0,
-            })
-        }
-
-        /// 计入本次写出的字节数，并把同样的大小作为本次的 `Out`。
-        fn count(&mut self, bytes: bytes::Bytes) -> usize {
-            self.total += bytes.len();
-            bytes.len()
-        }
-    }
-
-    impl Writer for CountingWriter {
-        type Out = usize;
-        type Accum = usize;
-
-        fn merge_out(acc: &mut usize, out: usize) {
-            *acc += out;
-        }
-
-        fn merge_accum(acc: &mut usize, other: usize) {
-            *acc += other;
-        }
-
-        fn write_header(&mut self) -> Result<usize> {
-            let bytes = self.inner.write_header()?;
-            Ok(self.count(bytes))
-        }
-
-        fn write_frame(&mut self, packet: &mut AVPacket) -> Result<usize> {
-            let bytes = self.inner.write_frame(packet)?;
-            Ok(self.count(bytes))
-        }
-
-        fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<usize> {
-            let bytes = self.inner.write_interleaved(packet)?;
-            Ok(self.count(bytes))
-        }
-
-        fn write_trailer(&mut self) -> Result<usize> {
-            let bytes = self.inner.write_trailer()?;
-            Ok(self.count(bytes))
-        }
-
-        fn output(&self) -> &AVFormatContextOutput {
-            self.inner.output()
-        }
-
-        fn output_mut(&mut self) -> &mut AVFormatContextOutput {
-            self.inner.output_mut()
-        }
-
-        fn is_header_written(&self) -> bool {
-            self.inner.is_header_written()
-        }
-    }
-
-    /// header 与一帧编出的多个 packet（B 帧重排序、编码器内部缓冲）的输出都必须
-    /// 累积进返回值；只留最后一个会让缓冲型 Writer 的调用方拿到缺头/截断的容器。
-    ///
-    /// 验收方式是一条总量不变量，而不是去数 packet：`mux`/`finish` 返回的字节数
-    /// 之和必须等于 writer 实际写出的总字节数。
+    /// 验收的是"不丢字节"这条不变量，而不是去数 packet：全程
+    /// [`take_written`](crate::io::BufferWriter::take_written) 取到的增量之和必须
+    /// 正好等于最终 [`into_bytes`](crate::io::BufferWriter::into_bytes) 的长度 ——
+    /// 少一分说明有字节被吞掉，多一分说明重复交付。
     #[test]
-    fn test_mux_returns_every_byte_it_wrote() -> Result<()> {
-        let mut muxer = Muxer::new_from_writer(CountingWriter::new("mp4")?);
+    fn test_mux_delivers_every_byte_to_the_writer() -> Result<()> {
+        let mut muxer = Muxer::new_from_writer(crate::io::BufferWriter::new("mp4")?);
         let encoder = Encoder::new_video(64, 64)?;
         let index = muxer.add_encoder(encoder)?;
 
-        let mut returned = 0usize;
+        let mut incremental = 0usize;
         for frame_index in 0..30i64 {
             let mut frame = generate_video_frame(64, 64, frame_index);
             frame.set_pts(frame_index);
-            returned += muxer.mux(frame, index)?;
+            muxer.mux(frame, index)?;
+            incremental += muxer.writer.take_written().len();
         }
-        returned += muxer.finish()?;
+        muxer.finish()?;
+        incremental += muxer.writer.take_written().len();
 
-        let written = muxer.writer.total;
-        assert!(written > 0, "the muxer wrote nothing at all");
+        let bytes = muxer.into_writer().into_bytes();
+        assert!(!bytes.is_empty(), "the muxer wrote nothing at all");
         assert_eq!(
-            returned, written,
-            "mux/finish handed back {returned} of the {written} bytes written: \
-             a header or packet output was overwritten instead of accumulated"
+            incremental,
+            bytes.len(),
+            "take_written() handed out {incremental} bytes in total, but the complete \
+             container is {} bytes",
+            bytes.len()
         );
         Ok(())
     }
