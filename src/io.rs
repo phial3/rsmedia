@@ -1783,7 +1783,11 @@ impl BufferWriter {
     ///
     /// # Arguments
     ///
-    /// * `format` - Container format to use.
+    /// * `format` - Container format to use: a **muxer name**, not a file
+    ///   extension — `"mp4"`, `"mpegts"`, `"matroska"`, `"adts"`, `"wav"`,
+    ///   `"flv"`. `"m4a"`, `"mkv"` and `"aac"` are extensions and are rejected
+    ///   with `AVERROR(EINVAL)`; [`Muxer::new`](crate::mux::Muxer::new) taking a
+    ///   path is what guesses the format from an extension.
     #[inline]
     pub fn new(format: &str) -> Result<Self> {
         BufferWriterBuilder::new(format).build()

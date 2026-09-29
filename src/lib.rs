@@ -30,6 +30,7 @@ pub mod subtitle;
 pub mod time;
 
 pub use bsf::Bsf;
+pub use bytes::Bytes;
 pub use codec::{AVCodecFlag, AVCodecFlag2, CodecConfig, FormatInfo, Profile, ThreadType};
 pub use colors::Color;
 pub use decode::{Decoder, DecoderBuilder, ErrRecognition, SkipFrame};

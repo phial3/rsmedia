@@ -97,6 +97,11 @@ fn main() -> Result<()> {
 
     // ---- cpal 侧：音频回调线程 --mpsc--> 主线程（PcmSink 非线程安全，留在主线程）----
     let (chunk_tx, chunk_rx) = mpsc::channel::<Chunk>();
+    // 累积每次 write_* 的输出。对 StreamWriter 这个类型就是 `()`（字节已直接落盘），
+    // 这里仍显式持有，是为了把 "必须累积" 的写法摆在明面上：把 writer 换成
+    // BufferWriter 时下面一行都不用改，否则会静默丢掉全部数据。
+    #[allow(clippy::let_unit_value)]
+    let mut recorded_out = <rsmedia::io::StreamWriter as Writer>::Accum::default();
     let stream = match sample_format {
         SampleFormat::F32 => build_input_stream::<f32>(&device, &config, chunk_tx.clone())?,
         SampleFormat::I16 => build_input_stream::<i16>(&device, &config, chunk_tx.clone())?,
@@ -123,7 +128,7 @@ fn main() -> Result<()> {
         }
         match chunk_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(chunk) => {
-                write_chunk(&mut sink, chunk)?;
+                write_chunk(&mut sink, chunk, &mut recorded_out)?;
                 if stop_rx.try_recv().is_ok() {
                     break;
                 }
@@ -146,13 +151,20 @@ fn main() -> Result<()> {
     // 停止采集后冲掉仍在途的块，避免尾部截断
     drop(stream);
     for chunk in chunk_rx.try_iter() {
-        write_chunk(&mut sink, chunk)?;
+        write_chunk(&mut sink, chunk, &mut recorded_out)?;
     }
 
     // ---- 收尾：冲刷重采样器尾样 + 编码器剩余样本 + 写 trailer ----
     // （忘记调用时 Drop 亦可兜底，但显式 finish 能感知错误）
     let recorded_samples = sink.input_samples();
+    // 输出侧计数（编码器采样率下）：输入经重采样后样本数可能不同
+    let out_samples = sink.output_samples();
+    let out_duration = sink.output_duration()?;
     sink.finish()?;
+    println!(
+        "输出侧：{out_samples} samples / {:.3}s（编码器采样率下）",
+        out_duration.as_secs_f64()
+    );
 
     let recorded_secs = recorded_samples as f64 / rate as f64;
     let size = std::fs::metadata(&output)?.len();
@@ -167,19 +179,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 按块写入 PcmSink；`write_f32/i16/u8` 的返回值（最后一次 mux 的输出）此处不关心。
-fn write_chunk<W: Writer>(sink: &mut PcmSink<W>, chunk: Chunk) -> Result<()> {
-    match chunk {
-        Chunk::F32(c) => {
-            let _ = sink.write_f32(&c)?;
-        }
-        Chunk::I16(c) => {
-            let _ = sink.write_i16(&c)?;
-        }
-        Chunk::U8(c) => {
-            let _ = sink.write_u8(&c)?;
-        }
-    }
+/// 按块写入 PcmSink。
+///
+/// ⚠️ `write_*` 返回的是 **writer 本次产生的新增输出**，只发一次，丢了就再也拿不到。
+/// 这里的目标 writer 是 `StreamWriter`，它的 `Accum` 是 `()`，所以丢弃无害；换成
+/// 缓冲型 writer（如 `BufferWriter`）就必须把每次的返回值累积起来，否则输出会被
+/// 静默截断。故此处显式累积，让这段示例代码可以直接改成 `BufferWriter` 而不踩坑。
+fn write_chunk<W: Writer>(sink: &mut PcmSink<W>, chunk: Chunk, out: &mut W::Accum) -> Result<()> {
+    let produced = match chunk {
+        Chunk::F32(c) => sink.write_f32(&c)?,
+        Chunk::I16(c) => sink.write_i16(&c)?,
+        Chunk::U8(c) => sink.write_u8(&c)?,
+    };
+    W::merge_accum(out, produced);
     Ok(())
 }
 
