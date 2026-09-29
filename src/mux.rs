@@ -88,7 +88,13 @@ impl Chapter {
 /// ```
 pub struct Muxer<W: Writer> {
     pub writer: W,
-    streams: Vec<MuxerStream>,
+    /// 持有 FFmpeg 资源 / 用户数据的字段，单独成组。
+    ///
+    /// 目的只有一个： [`Muxer::into_writer`] 要把 `writer` 从一个实现了 `Drop`
+    /// 的类型里取出来（Rust 不允许部分 move），只能先手工析构"除 writer 之外的
+    /// 全部字段"。收成一组后那里只需一次赋值即可掏空并析构，将来往这一组里加
+    /// 字段也不会被漏掉而静默泄漏。
+    resources: MuxerResources,
     interleaved: bool,
     /// `true` 时把提交进来的时间戳整体平移到 0 起点，见
     /// [`Muxer::set_normalize_timestamps`]。
@@ -99,6 +105,12 @@ pub struct Muxer<W: Writer> {
     pts_base_us: Option<i64>,
     have_written_header: bool,
     have_written_trailer: bool,
+}
+
+/// 见 [`Muxer::resources`]。
+#[derive(Default)]
+struct MuxerResources {
+    streams: Vec<MuxerStream>,
     /// Container-level metadata (e.g. "title", "artist"), applied to the
     /// format context right before the header is written.
     metadata: Metadata,
@@ -108,7 +120,7 @@ pub struct Muxer<W: Writer> {
     stream_metadata: HashMap<usize, Metadata>,
     /// Container chapters, applied right before the header is written.
     chapters: Vec<Chapter>,
-    /// `true` once [`Self::apply_chapters`] has transferred the chapter nodes to
+    /// `true` once [`Muxer::apply_chapters`] has transferred the chapter nodes to
     /// the format context, so a retried header write does not allocate a second
     /// set of nodes and leak the first one.
     chapters_applied: bool,
@@ -266,7 +278,7 @@ impl<W: Writer> Muxer<W> {
     pub fn new_from_writer(writer: W) -> Self {
         Self {
             writer,
-            streams: Vec::new(),
+            resources: MuxerResources::default(),
             // 默认交错写入，与 ffmpeg CLI（`av_interleaved_write_frame`）一致。
             // 编码器含 B 帧时 packet 按解码序输出（dts 先于 pts、首包 dts 为负），
             // 非交错直写会让 FLV 等容器报 "Packets poorly interleaved / not in
@@ -278,10 +290,6 @@ impl<W: Writer> Muxer<W> {
             pts_base_us: None,
             have_written_header: false,
             have_written_trailer: false,
-            metadata: Metadata::new(),
-            stream_metadata: HashMap::new(),
-            chapters: Vec::new(),
-            chapters_applied: false,
         }
     }
 
@@ -374,7 +382,8 @@ impl<W: Writer> Muxer<W> {
             .writer
             .add_stream(encoder.codecpar(), encoder.time_base())?;
         let stream_info = StreamInfo::from_writer(&self.writer, stream_idx)?;
-        self.streams
+        self.resources
+            .streams
             .push(MuxerStream::new_encoded(encoder, stream_info));
         Ok(stream_idx)
     }
@@ -487,7 +496,8 @@ impl<W: Writer> Muxer<W> {
             (*raw_codecpar).codec_tag = 0;
         }
         let stream_info = StreamInfo::from_writer(&self.writer, stream_idx)?;
-        self.streams
+        self.resources
+            .streams
             .push(MuxerStream::new_copy(stream_info, src_time_base, bsf));
         Ok(stream_idx)
     }
@@ -524,14 +534,16 @@ impl<W: Writer> Muxer<W> {
     }
 
     pub fn get_stream(&self, index: usize) -> Result<&MuxerStream> {
-        self.streams
+        self.resources
+            .streams
             .iter()
             .find(|s| s.stream_index == index)
             .ok_or_else(|| RsmediaError::invalid_config(format!("Stream index: {index} not found")))
     }
 
     pub fn get_stream_mut(&mut self, index: usize) -> Result<&mut MuxerStream> {
-        self.streams
+        self.resources
+            .streams
             .iter_mut()
             .find(|s| s.stream_index == index)
             .ok_or_else(|| RsmediaError::invalid_config(format!("Stream index: {index} not found")))
@@ -549,7 +561,7 @@ impl<W: Writer> Muxer<W> {
         if self.have_written_header {
             tracing::warn!("set_metadata after header write has no effect");
         }
-        self.metadata.set(key.into(), value.into());
+        self.resources.metadata.set(key.into(), value.into());
         Ok(self)
     }
 
@@ -578,7 +590,8 @@ impl<W: Writer> Muxer<W> {
                 "set_stream_metadata({stream_index}, {key:?}) after header write has no effect"
             );
         }
-        self.stream_metadata
+        self.resources
+            .stream_metadata
             .entry(stream_index)
             .or_default()
             .set(key, value);
@@ -591,13 +604,13 @@ impl<W: Writer> Muxer<W> {
     /// `set_metadata` 不再生效，因此这个视图与"文件里最终有什么"在
     /// header 之前是一致的。
     pub fn metadata(&self) -> &Metadata {
-        &self.metadata
+        &self.resources.metadata
     }
 
     /// 已排入第 `stream_index` 条流的元数据（[`Self::set_stream_metadata`] 的
     /// 读取侧）；该流没有排入任何条目时返回 `None`。
     pub fn stream_metadata(&self, stream_index: usize) -> Option<&Metadata> {
-        self.stream_metadata.get(&stream_index)
+        self.resources.stream_metadata.get(&stream_index)
     }
 
     /// Applies container-level and per-stream metadata to the raw format
@@ -610,7 +623,7 @@ impl<W: Writer> Muxer<W> {
     /// writer exclusively owns the context and no streams are added after
     /// this point.
     fn apply_metadata(&mut self) {
-        if self.metadata.is_empty() && self.stream_metadata.is_empty() {
+        if self.resources.metadata.is_empty() && self.resources.stream_metadata.is_empty() {
             return;
         }
         // SAFETY: rsmpeg 的 wrap 类型不实现 `DerefMut`，故走 `UnsafeDerefMut`；
@@ -619,11 +632,15 @@ impl<W: Writer> Muxer<W> {
 
         // SAFETY: `ctx.metadata` is a live dictionary slot owned by the format
         // context; `write_into_raw_dict` replaces it with our entries.
-        unsafe { self.metadata.write_into_raw_dict(&mut ctx.metadata) };
+        unsafe {
+            self.resources
+                .metadata
+                .write_into_raw_dict(&mut ctx.metadata)
+        };
 
         let streams =
             unsafe { std::slice::from_raw_parts_mut(ctx.streams, ctx.nb_streams as usize) };
-        for (idx, entries) in &self.stream_metadata {
+        for (idx, entries) in &self.resources.stream_metadata {
             let Some(stream) = streams.get_mut(*idx) else {
                 tracing::warn!(
                     "stream metadata: index {idx} out of range (nb_streams={})",
@@ -662,7 +679,7 @@ impl<W: Writer> Muxer<W> {
                 chapter.end, chapter.start
             )));
         }
-        self.chapters.push(Chapter {
+        self.resources.chapters.push(Chapter {
             id: chapter.id,
             title: chapter.title,
             start: chapter.start,
@@ -754,14 +771,14 @@ impl<W: Writer> Muxer<W> {
     /// 即置位，重试写 header（上一次 `write_header` 失败后再次 mux）不会重复
     /// 分配节点并覆盖 `ctx.chapters`（那会泄漏上一批节点）。
     fn apply_chapters(&mut self) {
-        if self.chapters.is_empty() || self.chapters_applied {
+        if self.resources.chapters.is_empty() || self.resources.chapters_applied {
             return;
         }
         // SAFETY: rsmpeg 的 wrap 类型不实现 `DerefMut`，故走 `UnsafeDerefMut`；
         // `&mut self` 保证这段借用是独占的。
         let ctx = unsafe { self.writer.output_mut().deref_mut() };
 
-        let count = self.chapters.len();
+        let count = self.resources.chapters.len();
 
         // 章节时间以整毫秒存储，故节点的 `time_base` = 1/1000。`AVChapter` 没有
         // rsmedia 侧的 setter，只能写裸字段；值本身仍由 [`Rational`] 在边界上生成
@@ -769,7 +786,7 @@ impl<W: Writer> Muxer<W> {
 
         // 1) 逐章分配节点。用 Rust Vec 暂存所有权，以便失败时统一释放。
         let mut chapter_nodes: Vec<*mut ffi::AVChapter> = Vec::with_capacity(count);
-        for (i, chapter) in self.chapters.iter().enumerate() {
+        for (i, chapter) in self.resources.chapters.iter().enumerate() {
             // Millisecond time base: times are stored as whole milliseconds.
             let start_ms = (chapter.start * 1000.0).round() as i64;
             let end_ms = (chapter.end * 1000.0).round() as i64;
@@ -820,7 +837,7 @@ impl<W: Writer> Muxer<W> {
         // 时统一释放数组与其内节点。
         ctx.chapters = chapters_ptr;
         ctx.nb_chapters = count as u32;
-        self.chapters_applied = true;
+        self.resources.chapters_applied = true;
     }
 
     /// 释放一组尚未转移所有权的 chapter 节点（`av_free` 对空指针安全）。
@@ -843,7 +860,7 @@ impl<W: Writer> Muxer<W> {
     /// truth, instead of some sites reading the cache while others query the
     /// writer — which is how the two silently disagree.
     fn refresh_stream_info(&mut self) -> Result<()> {
-        for mux_stream in self.streams.iter_mut() {
+        for mux_stream in self.resources.streams.iter_mut() {
             let stream_info = StreamInfo::from_writer(&self.writer, mux_stream.stream_index)?;
             let tb_changed = stream_info.time_base != mux_stream.stream_info.time_base;
             if tb_changed {
@@ -992,7 +1009,7 @@ impl<W: Writer> Muxer<W> {
         // 帧率/采样率补上，否则 MP4 等交错 muxer 无法推导**最后一帧**的
         // 时长，导致末帧被丢弃（与 Encoder::flush 的补全逻辑保持一致）。
         let duration_fallback = encoder.packet_duration();
-        // mux_stream 对 self.streams 的借用至此结束，之后可独占使用 self.writer
+        // mux_stream 对 self.resources.streams 的借用至此结束，之后可独占使用 self.writer
 
         // 一帧可能编出多个 packet（B 帧重排序、编码器内部缓冲），必须（连同
         // header 的输出一起）逐包累积而不能只留最后一个：缓冲型 Writer 的 `Out`
@@ -1158,9 +1175,9 @@ impl<W: Writer> Muxer<W> {
 
         // 先冲刷透传流的 bitstream filter：filter 内部可能缓冲（如 `aac_adtstoasc`
         // 需要看到足够数据才决定），不 flush 会丢掉尾部包。收集到局部 Vec 是因为
-        // 写包要独占 `self`，不能与 `self.streams` 的迭代借用共存。
+        // 写包要独占 `self`，不能与 `self.resources.streams` 的迭代借用共存。
         let mut bsf_pending: Vec<(usize, Rational, Vec<AVPacket>)> = Vec::new();
-        for mux_stream in self.streams.iter_mut() {
+        for mux_stream in self.resources.streams.iter_mut() {
             let Some(bsf) = mux_stream.bsf.as_mut() else {
                 continue;
             };
@@ -1179,7 +1196,7 @@ impl<W: Writer> Muxer<W> {
             }
         }
 
-        for mux_stream in self.streams.iter_mut() {
+        for mux_stream in self.resources.streams.iter_mut() {
             // flush the encoder to ensure all packets are sent to the muxer.
             // 透传流没有编码器延迟缓冲，无需 flush。
             let Some(encoder) = mux_stream.encoder.as_mut() else {
@@ -1230,17 +1247,15 @@ impl<W: Writer> Muxer<W> {
     pub fn into_writer(mut self) -> W {
         // 先补写 trailer，使 Drop 的自动 flush 逻辑成为空操作。
         self.flush_if_needed();
-        // SAFETY: `Muxer` 实现了 `Drop`，不能直接 move 字段。此处用
-        // `ManuallyDrop` 跳过 `Muxer::Drop`（此时其逻辑已是空操作），
-        // 取走 writer 后手动析构其余字段，保证 encoder 等资源正常释放。
+        // 除 writer 外的字段整组掏空（`resources` 可 `Default`）：赋值会立刻析构
+        // 旧值，编码器等 FFmpeg 资源就此释放，无需逐个 `drop_in_place`。
+        self.resources = MuxerResources::default();
+        // SAFETY: `self` 此刻只剩 `writer` 一个需要析构的字段，且它只被下面读走
+        // 一次；`ManuallyDrop` 抑制 `Muxer::drop`（其唯一的 `flush_if_needed()`
+        // 已在上面执行且幂等），因此不存在重复释放或泄漏。
         unsafe {
-            let mut this = std::mem::ManuallyDrop::new(self);
-            let writer = std::ptr::read(&this.writer);
-            std::ptr::drop_in_place(&mut this.streams);
-            std::ptr::drop_in_place(&mut this.metadata);
-            std::ptr::drop_in_place(&mut this.stream_metadata);
-            std::ptr::drop_in_place(&mut this.chapters);
-            writer
+            let this = std::mem::ManuallyDrop::new(self);
+            std::ptr::read(&this.writer)
         }
     }
 }

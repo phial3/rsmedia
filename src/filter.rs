@@ -17,6 +17,7 @@ use rsmpeg::ffi;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -2430,26 +2431,22 @@ const SINGLE_OUTPUT_LABEL: &str = "out";
 /// rsmpeg 只提供单节点构造，而 `avfilter_graph_parse_ptr` 要的是链表，节点顺序
 /// 无关紧要（配对按名字，见 [`FilterGraph::setup_endpoints`]），名字才是关键。
 ///
-/// 除头节点外的节点必须 `mem::forget`：rsmpeg 的 `Drop` 调的是
-/// `avfilter_inout_free`，它会顺着 `next` 释放**整条链**。因此只保留头节点的所有权
-/// 即可覆盖全部节点；若其余节点留在 `Vec` 里被逐个析构，就是把同一批节点重复释放。
-fn chain_inouts(mut nodes: Vec<AVFilterInOut>) -> Option<AVFilterInOut> {
-    if nodes.is_empty() {
-        return None;
-    }
-    let ptrs: Vec<*mut ffi::AVFilterInOut> = nodes.iter_mut().map(|n| n.as_mut_ptr()).collect();
-    // SAFETY: 所有指针都来自 `nodes`，且在 `nodes` 被消费前一直有效；
-    // `next` 是 `AVFilterInOut` 的普通字段。
+/// 一条链上只能有**一个** Rust 侧所有者：rsmpeg 的 `Drop` 调的是
+/// `avfilter_inout_free`，它会顺着 `next` 释放**整条链**。所以先把所有节点
+/// `into_raw()` 交出所有权（不析构），链接完成后只把头节点包回 RAII —— 其余节点
+/// 从此归头节点那一份所有者管，不再需要（也不能）逐个 `mem::forget`。
+fn chain_inouts(nodes: Vec<AVFilterInOut>) -> Option<AVFilterInOut> {
+    let ptrs: Vec<NonNull<ffi::AVFilterInOut>> =
+        nodes.into_iter().map(AVFilterInOut::into_raw).collect();
+    let head = *ptrs.first()?;
+    // SAFETY: 指针全部来自上面刚交出所有权的节点，此刻没有任何包装体持有它们，
+    // 且 `from_raw` 之前不会再有第二个所有者产生。`next` 是普通字段，写入独占。
     unsafe {
         for window in ptrs.windows(2) {
-            (*window[0]).next = window[1];
+            (*window[0].as_ptr()).next = window[1].as_ptr();
         }
+        Some(AVFilterInOut::from_raw(head))
     }
-    let head = nodes.swap_remove(0);
-    for node in nodes {
-        std::mem::forget(node);
-    }
-    Some(head)
 }
 
 const DEFAULT_ORDERING: Ordering = Ordering::SeqCst;

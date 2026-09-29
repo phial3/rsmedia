@@ -2878,10 +2878,10 @@ mod tests {
         let mut eagain = 0;
         while !encoder.is_flushed() {
             match encoder.receive_packet()? {
-                Some(pkt) => {
+                // 只统计包数：包本身用 `_` 匹配，就地释放。
+                Some(_) => {
                     packets += 1;
                     eagain = 0;
-                    drop(pkt);
                 }
                 None => {
                     // 与 `flush()` 同一防御：正常 draining 不会持续 EAGAIN，

@@ -611,9 +611,14 @@ fn open_input_with_interrupt(
         return Err(RsmediaError::msg("avformat_alloc_context failed"));
     }
     let fmt = format.map(|f| f.as_ptr()).unwrap_or(std::ptr::null());
+    // `avformat_open_input` 的文档：options "On return this parameter will be
+    // destroyed and replaced with a dict containing options that were not found"
+    // —— 传进去的字典由 FFmpeg 就地释放。因此先把所有权交给 C（`into_raw` 不运行
+    // Rust 析构），调用结束再接管它回写的指针：既不漏掉未识别的选项，也不会让
+    // Rust 去二次释放一个 C 已释放的句柄（旧写法正是"换出旧值再 forget"）。
     let mut opts = options
-        .as_mut()
-        .map(|d| d.as_mut_ptr())
+        .take()
+        .map(|dict| dict.into_raw().as_ptr())
         .unwrap_or(std::ptr::null_mut());
     let ret = unsafe {
         // SAFETY: `ctx` is a non-null pointer to a context from
@@ -625,15 +630,14 @@ fn open_input_with_interrupt(
         (*ctx).interrupt_callback = interrupt_cb(interrupt);
         ffi::avformat_open_input(&mut ctx, filename.as_ptr(), fmt, &mut opts)
     };
+    // 成功与失败都在这里接管回写结果：`av_dict_free` 会把槽位置空，失败路径拿回
+    // 的至多是 NULL 或原指针，不做"旧字典一定还活着"的假设。
+    // SAFETY: `opts` 要么为空，要么是 FFmpeg 刚写入的、尚未被 Rust 接管的字典指针。
+    *options = std::ptr::NonNull::new(opts).map(|ptr| unsafe { AVDictionary::from_raw(ptr) });
     if ret < 0 {
         // 文档保证 open 失败时用户提供的 context 已被释放、`ctx` 置空。
         return Err(RsmpegError::OpenInputError(ret).into());
     }
-    // 与 rsmpeg builder 一致：把 FFmpeg 回写的剩余选项接回 Rust 所有权
-    // （旧值已被 FFmpeg 就地消费/释放，必须整体换出后 forget，不能 drop）。
-    let mut leftover = unsafe { std::ptr::NonNull::new(opts).map(|p| AVDictionary::from_raw(p)) };
-    std::mem::swap(options, &mut leftover);
-    std::mem::forget(leftover);
 
     // SAFETY: ctx 非空（open 成功），所有权交给 RAII 包装（Drop: avformat_close_input，
     // 它会关闭并释放 pb），因此 io_context 留空即可。
