@@ -500,6 +500,28 @@ struct InterruptData {
     deadline: Mutex<Option<std::time::Instant>>,
 }
 
+impl InterruptData {
+    /// 是否已触发：`abort` 置位，或 deadline 已过。
+    ///
+    /// `deadline` 被 poison 时**必须照读里面的值**，不能当成"没到期"：poison 只说明
+    /// 曾有个 panic 发生在持锁期间（`set_timeout` 里 `Instant::now() + timeout`
+    /// 溢出就会 panic），数据本身仍是完好的。失败方向若取"没到期"，一次已经生效的
+    /// abort/超时就会被静默丢弃 —— 回调返回 0，FFmpeg 继续阻塞，读操作永远等下去，
+    /// 而且没有任何日志。所以这里和 [`Interrupt::set_timeout`] 一样用
+    /// `into_inner()` 恢复，宁可"过度触发"也不能"永不触发"。
+    fn is_set(&self) -> bool {
+        // `abort` 是原子的、不经过 `deadline` 锁，因此即使锁被 poison 也照常生效。
+        if self.abort.load(Ordering::Relaxed) {
+            return true;
+        }
+        let deadline = self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        deadline.is_some_and(|t| std::time::Instant::now() >= t)
+    }
+}
+
 impl Interrupt {
     /// 创建一个未触发、无超时的中断句柄。
     pub fn new() -> Self {
@@ -525,14 +547,7 @@ impl Interrupt {
 
     /// 是否已触发（abort 或超时到期）。
     pub fn triggered(&self) -> bool {
-        if self.data.abort.load(Ordering::Relaxed) {
-            return true;
-        }
-        self.data
-            .deadline
-            .lock()
-            .map(|d| d.is_some_and(|t| std::time::Instant::now() >= t))
-            .unwrap_or(false)
+        self.data.is_set()
     }
 }
 
@@ -548,13 +563,9 @@ impl Default for Interrupt {
 /// 覆盖整个 format context（context 先于数据 drop），回调期间指针有效。
 unsafe extern "C" fn interrupt_callback(opaque: *mut std::ffi::c_void) -> std::ffi::c_int {
     let data = unsafe { &*(opaque as *const InterruptData) };
-    let aborted = data.abort.load(Ordering::Relaxed);
-    let timed_out = data
-        .deadline
-        .lock()
-        .map(|d| d.is_some_and(|t| std::time::Instant::now() >= t))
-        .unwrap_or(false);
-    i32::from(aborted || timed_out)
+    // 与 [`Interrupt::triggered`] 共用同一个谓词，避免两处实现各自漂移
+    // （曾经一份在 poison 时恢复、一份当成"没到期"）。
+    i32::from(data.is_set())
 }
 
 /// 由 [`Interrupt`] 构造 FFmpeg 中断回调结构。
@@ -2183,6 +2194,74 @@ mod tests {
     use crate::pixel::PixelFormat;
     use crate::{DecoderBuilder, MediaType};
     use rsmpeg::avutil::AVFrame;
+
+    /// `deadline` 这个 mutex 被 poison 之后，`triggered()` 仍必须承认**已到期**的超时。
+    ///
+    /// 曾经读侧写的是 `.unwrap_or(false)`：一旦该 mutex 被 poison，已到期的 deadline
+    /// 就被读成"没到期" ⇒ abort/超时请求被静默丢弃，FFmpeg 侧拿到 0，阻塞读永远等
+    /// 下去且没有任何日志。poison 不是纯理论场景：`set_timeout` 里
+    /// `Instant::now() + timeout` 在溢出时会 panic。
+    #[test]
+    fn test_a_poisoned_deadline_mutex_still_reports_an_expired_timeout() {
+        let interrupt = Interrupt::new();
+        interrupt.set_timeout(std::time::Duration::from_millis(0));
+        assert!(
+            interrupt.triggered(),
+            "前置条件：已到期的 deadline 必须触发中断"
+        );
+
+        // 制造 poison：持锁期间 panic（静音 panic hook 以免污染测试输出）。
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let cloned = interrupt.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cloned.data.deadline.lock().unwrap();
+            panic!("poison the deadline mutex on purpose");
+        }));
+        std::panic::set_hook(hook);
+
+        assert!(outcome.is_err(), "用来制造 poison 的 panic 必须真的发生");
+        assert!(
+            interrupt.data.deadline.is_poisoned(),
+            "前置条件：mutex 必须真的被 poison，否则本测试证明不了任何东西"
+        );
+
+        assert!(
+            interrupt.triggered(),
+            "poison 之后过期 deadline 被当成'没到期'：阻塞读会永远等下去"
+        );
+
+        // FFmpeg 真正调用的是回调而不是 `triggered()`，两条路径都要成立。
+        let opaque = &*interrupt.data as *const InterruptData as *mut std::ffi::c_void;
+        assert_eq!(
+            unsafe { interrupt_callback(opaque) },
+            1,
+            "中断回调在 poison 之后同样必须返回非 0"
+        );
+    }
+
+    /// `abort()` 不经过 `deadline` 锁，因此即使 mutex 被 poison 也必须立刻生效。
+    #[test]
+    fn test_abort_is_honoured_even_when_the_deadline_mutex_is_poisoned() {
+        let interrupt = Interrupt::new();
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let cloned = interrupt.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cloned.data.deadline.lock().unwrap();
+            panic!("poison the deadline mutex on purpose");
+        }));
+        std::panic::set_hook(hook);
+        assert!(interrupt.data.deadline.is_poisoned());
+
+        assert!(
+            !interrupt.triggered(),
+            "前置条件：仅 poison、没有 abort 也没有超时时不该触发"
+        );
+        interrupt.abort();
+        assert!(interrupt.triggered(), "abort 必须绕过被 poison 的 mutex");
+    }
 
     /// `ffi_enum!` 生成的位集合能力：`|` 组合产出 [`FlagSet`]，再由 `Into<i32>` 落到 FFI 类型。
     #[test]
