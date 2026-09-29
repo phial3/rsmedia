@@ -16,6 +16,7 @@ use crate::subtitle::SubtitleSegment;
 use crate::time::{self, Rational, Rescale};
 use crate::{MediaType, SampleFormat};
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket, AVSubtitle};
 use rsmpeg::avutil::{self, AVAudioFifo, AVChannelLayout, AVChannelLayoutRef, AVFrame};
 use rsmpeg::ffi;
@@ -558,10 +559,11 @@ impl EncoderBuilder {
         // 来源给不同的诊断级别：负值只可能是调用方写错，用 `warn!`；显式 `0` 在文档
         // 里是"视为未设置"的合法写法（`max_bit_rate = 0` 即"不限瞬时码率"），只在
         // `debug!` 里留痕，免得把正常用法刷成警告。
+        // SAFETY: `encoder` 在此处独占（`&mut`），`deref_mut` 只在块内存活。
         unsafe {
-            let raw = encoder.as_mut_ptr();
+            let raw = encoder.deref_mut();
             match self.max_bit_rate {
-                Some(rate) if rate.is_positive() => (*raw).rc_max_rate = rate,
+                Some(rate) if rate.is_positive() => raw.rc_max_rate = rate,
                 Some(rate) if rate < 0 => tracing::warn!(
                     "max_bit_rate {rate} is negative and was not applied; \
                      rc_max_rate stays unset (no instantaneous rate cap)"
@@ -572,7 +574,7 @@ impl EncoderBuilder {
                 None => {}
             }
             match self.buffer_size {
-                Some(size) if size.is_positive() => (*raw).rc_buffer_size = size,
+                Some(size) if size.is_positive() => raw.rc_buffer_size = size,
                 Some(size) if size < 0 => tracing::warn!(
                     "buffer_size {size} is negative and was not applied; rc_buffer_size stays unset"
                 ),
@@ -1269,7 +1271,7 @@ impl Encoder {
         }
         // SAFETY: 见上；两个缓冲不重叠（一个来自 Vec，一个由 FFmpeg 分配）。
         unsafe {
-            std::ptr::copy_nonoverlapping(buf.as_ptr(), (*packet.as_mut_ptr()).data, len);
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), packet.deref_mut().data, len);
         }
 
         // 编码器 time_base 为 1/1000，pts/duration 直接使用毫秒值；
@@ -2200,10 +2202,6 @@ mod tests {
         Ok(())
     }
 
-    /// `width`/`height` 是 `u32`，却会以 `as i32` 写进 `AVCodecContext` 与
-    /// `FilterParams`：超过 `i32::MAX` 会回绕成负数，一直拖到 `avcodec_open2`
-    /// 才报一句不透明的错误；`0` 也不是合法画面尺寸。两者都必须在 `build()`
-    /// 里就报 `InvalidConfig`，且错误信息指到具体是哪一个参数。
     #[test]
     fn test_video_size_out_of_range_is_invalid_config() {
         // `Encoder` 没有 `Debug`，只能这样取错误。

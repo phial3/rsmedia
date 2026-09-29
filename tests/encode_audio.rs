@@ -4,6 +4,7 @@ mod common;
 use common::test_output_path;
 
 use rsmpeg::{
+    UnsafeDerefMut,
     avcodec::{AVCodec, AVCodecContext},
     avformat::AVFormatContextOutput,
     avutil::{self, AVChannelLayout, AVFrame},
@@ -114,13 +115,13 @@ fn process_sample_data<T: Copy>(
     generate_samples: impl Fn(&mut [f64], usize),
     scale: impl Fn(f64) -> T,
 ) {
-    let frame_ptr = frame.as_mut_ptr();
+    // SAFETY: `frame` 由 `&mut` 独占传入，块内无其他访问路径。
+    let frame_ptr = unsafe { frame.deref_mut() };
 
     if is_planar {
         // 平面格式处理
-        for channel in 0..channels {
-            let data_ptr = unsafe { (*frame_ptr).data[channel] };
-            assert!(!data_ptr.is_null(), "Channel {} data is null", channel);
+        for (channel, &data_ptr) in frame_ptr.data.iter().take(channels).enumerate() {
+            assert!(!data_ptr.is_null(), "Channel {channel} data is null");
 
             let buffer =
                 unsafe { std::slice::from_raw_parts_mut(data_ptr as *mut T, sample_count) };
@@ -135,7 +136,7 @@ fn process_sample_data<T: Copy>(
     } else {
         // 打包格式处理
         let buffer = unsafe {
-            std::slice::from_raw_parts_mut((*frame_ptr).data[0] as *mut T, sample_count * channels)
+            std::slice::from_raw_parts_mut(frame_ptr.data[0] as *mut T, sample_count * channels)
         };
 
         let mut float_buffer = vec![0.0; sample_count * channels];

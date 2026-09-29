@@ -50,6 +50,7 @@ use crate::resample::Resampler;
 use crate::stream::MediaType;
 use crate::time::Rational;
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
 
@@ -265,10 +266,11 @@ impl<W: Writer> PcmSink<W> {
         // `sample_format` 分配过缓冲，因此 `data[0]` 是 packed 格式的样本起点，
         // 可写 `nb_samples * channels == interleaved.len()` 个样本；上面已校验
         // `T` 与 `sample_format` 的元素宽度一致，读写范围完全落在缓冲内。`src`
-        // 是本函数的局部独占对象（引用计数 1）。
+        // 是本函数的局部独占对象（引用计数 1）。取 `data[0]` 走 `deref_mut`
+        // 而非裸指针：这里只读取字段本身，引用足够表达。
         unsafe {
             let dst = std::slice::from_raw_parts_mut(
-                (*src.as_mut_ptr()).data[0] as *mut T,
+                src.deref_mut().data[0] as *mut T,
                 interleaved.len(),
             );
             dst.copy_from_slice(interleaved);

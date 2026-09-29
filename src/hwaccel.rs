@@ -547,13 +547,15 @@ impl HWContext {
 
         let mut dst = AVFrame::new();
         let map_ret = unsafe {
-            let dst_ptr = dst.as_mut_ptr();
-            let src_ptr = src.as_ptr();
-            (*dst_ptr).format = (*src_ptr).format;
-            (*dst_ptr).width = (*src_ptr).width;
-            (*dst_ptr).height = (*src_ptr).height;
-            // av_buffer_ref：dst 持有独立引用，随 AVFrame 一起 unref，不影响 codec_ctx 那份。
-            (*dst_ptr).hw_frames_ctx = ffi::av_buffer_ref(dst_ref);
+            // `av_hwframe_map` 要裸指针，但**填字段不需要**：`deref_mut` 给出
+            // `&mut ffi::AVFrame`，只在调用处隐式转成 `*mut`（`&mut T -> *mut T`）。
+            // 读侧同理走安全的 `Deref`。
+            let dst_ptr = dst.deref_mut();
+            let src_ptr = &*src;
+            dst_ptr.format = src_ptr.format;
+            dst_ptr.width = src_ptr.width;
+            dst_ptr.height = src_ptr.height;
+            dst_ptr.hw_frames_ctx = ffi::av_buffer_ref(dst_ref);
             // flags 按 FFmpeg 文档传 0（当前未使用）。失败时 dst 由 Drop 负责
             // unref 上面那个 buffer ref，无需手工清理。
             ffi::av_hwframe_map(dst_ptr, src_ptr, 0)
@@ -715,16 +717,17 @@ impl HWContext {
         dst.set_time_base(src.time_base);
         dst.set_pict_type(src.pict_type);
 
+        // SAFETY: `dst` 由 `&mut` 独占；`src` 只经 `Deref` 读取，两者是不同对象。
         unsafe {
-            let dst_ptr = dst.as_mut_ptr();
-            (*dst_ptr).flags = src.flags;
+            let dst_raw = dst.deref_mut();
+            dst_raw.flags = src.flags;
             // 刻意**不**拷贝 `opaque`：它是 FFmpeg 留给应用层的私有指针，本 crate
             // 从不用它（见 `hwaccel_get_format`），而逐帧共享同一个 opaque 会让两个
             // 帧都指向调用者的同一份数据——新帧既不拥有它、也无法在其生命周期结束
             // 时做任何处理，调用者释放后即悬空。新帧的 `opaque` 保持 NULL。
-            (*dst_ptr).quality = src.quality;
-            (*dst_ptr).duration = src.duration;
-            (*dst_ptr).sample_aspect_ratio = src.sample_aspect_ratio;
+            dst_raw.quality = src.quality;
+            dst_raw.duration = src.duration;
+            dst_raw.sample_aspect_ratio = src.sample_aspect_ratio;
         }
 
         // 复制 side-data 与帧级元数据

@@ -382,11 +382,11 @@ fn fix_output_color_metadata(dst_frame: &mut AVFrame, dst_pix_fmt: PixelFormat) 
     if !dst_pix_fmt.is_full_range() {
         return;
     }
-    // Safety: dst_frame 由本模块新建/持有（引用计数为 1）
+    // Safety: dst_frame 由本模块新建/持有（引用计数为 1），`&mut` 保证这段借用独占。
     unsafe {
-        let raw = dst_frame.as_mut_ptr();
-        (*raw).color_range = ffi::AVCOL_RANGE_JPEG;
-        (*raw).chroma_location = ffi::AVCHROMA_LOC_UNSPECIFIED;
+        let raw = dst_frame.deref_mut();
+        raw.color_range = ffi::AVCOL_RANGE_JPEG;
+        raw.chroma_location = ffi::AVCHROMA_LOC_UNSPECIFIED;
     }
 }
 

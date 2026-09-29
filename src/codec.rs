@@ -3,6 +3,7 @@ use crate::stream::MediaType;
 use crate::strutils;
 use crate::time::Rational;
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecRef};
 use rsmpeg::ffi;
 
@@ -26,9 +27,9 @@ pub(crate) fn set_thread_count(context: &mut AVCodecContext, thread_count: i32) 
     if thread_count <= 0 {
         return;
     }
-    // SAFETY: `context` 由 `AVCodecContext::new` 分配、在借用期内一直有效；
+    // SAFETY: `context` 由 `AVCodecContext::new` 分配、在借用期内一直有效
     unsafe {
-        (*context.as_mut_ptr()).thread_count = thread_count;
+        context.deref_mut().thread_count = thread_count;
     }
 }
 
@@ -40,7 +41,7 @@ pub(crate) fn set_thread_count(context: &mut AVCodecContext, thread_count: i32) 
 pub(crate) fn set_thread_type(context: &mut AVCodecContext, thread_type: i32) {
     // SAFETY: 同 `set_thread_count`；`FF_THREAD_*` 各占一位，远在 `i32` 范围内。
     unsafe {
-        (*context.as_mut_ptr()).thread_type = thread_type;
+        context.deref_mut().thread_type = thread_type;
     }
 }
 
@@ -52,7 +53,7 @@ pub(crate) fn set_thread_type(context: &mut AVCodecContext, thread_type: i32) {
 pub(crate) fn set_flags2(context: &mut AVCodecContext, flags2: i32) {
     // SAFETY: 同 `set_thread_count`；`AV_CODEC_FLAG2_*` 是 `int` 位集。
     unsafe {
-        (*context.as_mut_ptr()).flags2 = flags2;
+        context.deref_mut().flags2 = flags2;
     }
 }
 

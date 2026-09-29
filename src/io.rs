@@ -1359,8 +1359,10 @@ fn write_header_with_options(
 
 /// Flush avio 内部缓冲，确保字节立即送达 write 回调（内存/流式 Writer 用）。
 fn flush_avio(output: &mut AVFormatContextOutput) {
+    // SAFETY: `output` 由 `&mut` 独占，`deref_mut` 只在块内存活；`pb` 由 format
+    // context 持有，非空时即有效的 `AVIOContext`。
     unsafe {
-        let pb = (*output.as_mut_ptr()).pb;
+        let pb = output.deref_mut().pb;
         if !pb.is_null() {
             ffi::avio_flush(pb);
         }

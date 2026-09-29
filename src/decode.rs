@@ -17,6 +17,7 @@ use crate::subtitle::SubtitleSegment;
 use crate::time::{Rational, Time};
 use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader};
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket, AVSubtitle};
 use rsmpeg::avformat::AVStream;
 use rsmpeg::avutil::{self, AVChannelLayoutRef, AVFrame};
@@ -349,13 +350,15 @@ impl DecoderBuilder {
         // 稳定性策略：rsmpeg 未生成 skip_frame / err_recognition 访问器，直接写字段
         // （encode.rs 写 rc_max_rate 同例）。两项都必须在 `avcodec_open2` 之前生效，
         // 否则不会进入解码器初始化。
+        //
+        // SAFETY: `decoder` 在此处独占（`&mut`），`deref_mut` 只在块内存活。
         unsafe {
-            let raw = decoder.as_mut_ptr();
+            let raw = decoder.deref_mut();
             if let Some(skip_frame) = self.skip_frame {
-                (*raw).skip_frame = skip_frame.into();
+                raw.skip_frame = skip_frame.into();
             }
             if let Some(err_recognition) = self.err_recognition {
-                (*raw).err_recognition = err_recognition.bits() as i32;
+                raw.err_recognition = err_recognition.bits() as i32;
             }
         }
 

@@ -12,6 +12,7 @@ use crate::{
     Decoder, DecoderBuilder, Encoder, EncoderBuilder, Location, StreamReader, StreamWriter,
 };
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::AVPacket;
 use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
@@ -499,7 +500,9 @@ impl<W: Writer> Muxer<W> {
     /// 调用方只应在 `write_header` 之前使用返回的指针（此时 context 由
     /// `self.writer` 独占，无并发访问），并在同一语句内完成修改。
     fn stream_ptr(&mut self, idx: usize) -> Result<*mut ffi::AVStream> {
-        let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
+        // SAFETY: rsmpeg 的 wrap 类型不实现 `DerefMut`，故走 `UnsafeDerefMut`；
+        // `&mut self` 保证这段借用是独占的。
+        let ctx = unsafe { self.writer.output_mut().deref_mut() };
         let nb_streams = ctx.nb_streams as usize;
         if idx >= nb_streams {
             return Err(RsmediaError::invalid_config(format!(
@@ -607,7 +610,9 @@ impl<W: Writer> Muxer<W> {
         if self.metadata.is_empty() && self.stream_metadata.is_empty() {
             return;
         }
-        let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
+        // SAFETY: rsmpeg 的 wrap 类型不实现 `DerefMut`，故走 `UnsafeDerefMut`；
+        // `&mut self` 保证这段借用是独占的。
+        let ctx = unsafe { self.writer.output_mut().deref_mut() };
 
         // SAFETY: `ctx.metadata` is a live dictionary slot owned by the format
         // context; `write_into_raw_dict` replaces it with our entries.
@@ -749,7 +754,9 @@ impl<W: Writer> Muxer<W> {
         if self.chapters.is_empty() || self.chapters_applied {
             return;
         }
-        let ctx = unsafe { &mut *self.writer.output_mut().as_mut_ptr() };
+        // SAFETY: rsmpeg 的 wrap 类型不实现 `DerefMut`，故走 `UnsafeDerefMut`；
+        // `&mut self` 保证这段借用是独占的。
+        let ctx = unsafe { self.writer.output_mut().deref_mut() };
 
         let count = self.chapters.len();
 
@@ -1847,7 +1854,7 @@ mod tests {
 
         for ch in 0..channels {
             let data_ptr = unsafe {
-                let ptr = (*frame.as_mut_ptr()).data[ch] as *mut f32;
+                let ptr = frame.deref_mut().data[ch] as *mut f32;
                 if ptr.is_null() {
                     return Err(RsmediaError::msg("Audio data pointer is null"));
                 }

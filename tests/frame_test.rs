@@ -15,6 +15,7 @@ use rsmedia::{
     DataLayout, FrameFormat, FrameSideData, MediaFrame, MediaType, PixelFormat, SampleFormat,
 };
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
 use yuv::YuvStandardMatrix;
@@ -677,15 +678,16 @@ fn test_avframe_metadata_roundtrip() -> Result<()> {
     av.set_width(TEST_WIDTH);
     av.set_height(TEST_HEIGHT);
     unsafe {
-        (*av.as_mut_ptr()).flags = ffi::AV_FRAME_FLAG_KEY as i32;
-        (*av.as_mut_ptr()).quality = 12;
-        (*av.as_mut_ptr()).repeat_pict = 1;
-        (*av.as_mut_ptr()).colorspace = ffi::AVCOL_SPC_BT709;
-        (*av.as_mut_ptr()).color_primaries = ffi::AVCOL_PRI_BT709;
-        (*av.as_mut_ptr()).color_trc = ffi::AVCOL_TRC_BT709;
-        (*av.as_mut_ptr()).color_range = ffi::AVCOL_RANGE_JPEG;
-        (*av.as_mut_ptr()).sample_aspect_ratio = Rational::new(4, 3).unwrap().into();
-        (*av.as_mut_ptr()).best_effort_timestamp = 42;
+        let raw = av.deref_mut();
+        raw.flags = ffi::AV_FRAME_FLAG_KEY as i32;
+        raw.quality = 12;
+        raw.repeat_pict = 1;
+        raw.colorspace = ffi::AVCOL_SPC_BT709;
+        raw.color_primaries = ffi::AVCOL_PRI_BT709;
+        raw.color_trc = ffi::AVCOL_TRC_BT709;
+        raw.color_range = ffi::AVCOL_RANGE_JPEG;
+        raw.sample_aspect_ratio = Rational::new(4, 3).unwrap().into();
+        raw.best_effort_timestamp = 42;
     }
     av.alloc_buffer()?;
 
@@ -1058,25 +1060,27 @@ fn test_avframe_roundtrip_preserves_all_modelled_fields() -> Result<()> {
     av.set_width(16);
     av.set_height(16);
     unsafe {
-        let p = av.as_mut_ptr();
-        (*p).pkt_dts = 1234;
-        (*p).duration = 7;
-        (*p).best_effort_timestamp = 99;
-        (*p).decode_error_flags = 0x2;
-        (*p).chroma_location = ffi::AVCHROMA_LOC_CENTER;
-        (*p).crop_top = 1;
-        (*p).crop_bottom = 2;
-        (*p).crop_left = 3;
-        (*p).crop_right = 4;
+        let p = av.deref_mut();
+        p.pkt_dts = 1234;
+        p.duration = 7;
+        p.best_effort_timestamp = 99;
+        p.decode_error_flags = 0x2;
+        p.chroma_location = ffi::AVCHROMA_LOC_CENTER;
+        p.crop_top = 1;
+        p.crop_bottom = 2;
+        p.crop_left = 3;
+        p.crop_right = 4;
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         {
-            (*p).alpha_mode = ffi::AVALPHA_MODE_STRAIGHT;
+            p.alpha_mode = ffi::AVALPHA_MODE_STRAIGHT;
         }
         assert_eq!(
-            ffi::av_dict_set(&mut (*p).metadata, c"title".as_ptr(), c"hello".as_ptr(), 0),
+            ffi::av_dict_set(&mut p.metadata, c"title".as_ptr(), c"hello".as_ptr(), 0),
             0
         );
-        let sd = ffi::av_frame_new_side_data(p, ffi::AV_FRAME_DATA_DISPLAYMATRIX, 4);
+        // `av_frame_new_side_data` 要的是 `*mut AVFrame`，只有这一步需要裸指针；
+        // 放在 `p` 最后一次使用之后，借用已结束。
+        let sd = ffi::av_frame_new_side_data(av.as_mut_ptr(), ffi::AV_FRAME_DATA_DISPLAYMATRIX, 4);
         assert!(!sd.is_null());
         std::ptr::copy_nonoverlapping([9u8, 8, 7, 6].as_ptr(), (*sd).data, 4);
     }
@@ -1156,7 +1160,7 @@ fn test_audio_roundtrip_preserves_duration() -> Result<()> {
     av.set_sample_rate(8000);
     av.set_ch_layout(AVChannelLayout::from_nb_channels(1).into_inner());
     unsafe {
-        (*av.as_mut_ptr()).duration = 111;
+        av.deref_mut().duration = 111;
     }
     av.alloc_buffer()?;
 
