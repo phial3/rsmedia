@@ -716,3 +716,58 @@ vs 裸 `Option<T>`（`HWDeviceConfig::new(options: Option<Options>)`、`with_har
 >
 > 注：批次 4 行里的 **A5/A6** 是**该批次内部的滤镜参数编号**（`afftdn.tr` / `anlmdn.patch`），
 > 与 §二 的缺陷编号**不是同一套**。
+
+> **修复记录（PcmSink 场景矩阵，2026-09-29）**
+>
+> 上一轮盘点出"录音 → 内存 → 回灌 `BufferReader`"这条链上的不合格项，逐条修：
+>
+> | 场景 | 原状态 | 修法 |
+> |---|---|---|
+> | 录到内存再回灌 | ❌ mp4 打不开、wav **能打开但解出 0 样本** | 新增 `PcmSink::finish_into_writer() -> Result<W>`：drain + `muxer.finish()` + `muxer.into_writer()`，之后 `BufferWriter::into_bytes()` 拿到最终镜像。为此**删掉 `PcmSink` 的空 `Drop`**（带 `Drop` 不能部分移动字段；收尾本来就由 `Muxer::Drop` 负责，语义不变） |
+> | — | ❌ `bytes::Bytes` 没重导出，调用方连 `Vec<Bytes>` 都命名不了 | `pub use bytes::Bytes;`（crate 根） |
+> | 每次 `write_*` 的输出被丢弃 | ⚠️ 静默丢掉 93% 字节（实测 mpegts 2068 vs 28576） | 类型级文档新增 "Every `write_*` returns output you must keep" + 每个 `write_*` 的文档；`examples/pcm_recorder.rs` 改成显式累积 |
+> | `BufferWriter::new("m4a")` 失败 | ⚠️ 参数是 muxer 名不是扩展名 | 文档写明合法取值与出错形式 |
+> | `PcmSink` 跨线程 | ⚠️ 没写 | 文档写明它 **不是 `Send`**（`AVChannelLayout` 含裸指针），示例的 mpsc 是必需而非风格 |
+> | 滤镜看到哪一侧规格 | ⚠️ 没写 | 文档写明：滤镜在 sink 的转换**之后**，看到的是编码器规格 |
+> | planar 输入 | ❌ 只有交错 | 新增 `PcmSink::write_planar_f32(&[&[f32]])`；`write_chunk` 的"转换+mux"尾巴抽成 `convert_and_mux` 与 planar 共用；元素宽度校验抽成 `check_element_width` |
+> | 输出侧没有计数 | ⚠️ 只有 `input_samples()` | 新增 `output_samples()` 与 `output_duration() -> Result<Time>` |
+> | 多声道布局 | ⚠️ 撞 A3（被 `from_nb_channels` 规范化） | `PcmSpec` 增加 `channel_mask: u64`（`0`=不指定）+ `with_channel_mask()`；新增 `input_layout()`：显式掩码优先，且掩码声道数必须等于 `channels` |
+> | 暂停/丢块后时间轴 | ❌（**原判定过严**） | 其实调用方投静音块即可对齐，不是 API 缺口 ⇒ 改为文档 + 示例（模块文档 "Pauses, dropouts and the timeline"） |
+> | 分段录制 | ⚠️ 每段重建、跨段相位不连续 | 文档给出骨架并说明取舍（每段尾部**不丢**，丢的是跨段 swr 滤波状态；要严格连续就录单文件后切割或用 `Muxer::new_segmented`）。未新增 API |
+>
+> 新增回归测试 5 条：`test_finish_into_writer_yields_a_readable_mp4`（mp4 完整往返，
+> 这是此前实测失败的那条路径）、`test_pcm_sink_planar_f32_to_aac`、
+> `test_planar_input_validation`、`test_channel_mask`、`test_output_samples_and_duration`。
+>
+> ⚠️ 过程中的自查：删除 `Drop` 那次编辑报了 success 但代码**回到了文件里**，本地
+> `cargo check` 当时确实是绿的，之后又变成 E0509 —— 直到上 VM 才暴露。教训见日志。
+>
+> 验证（退出码均直接取真值）：`cargo fmt --check` 0、clippy `-D warnings`（含/不含 `image`）0/0、
+> `RUSTDOCFLAGS="-D warnings" cargo doc` 0、lib **355** / doctest **72** / 集成 19 binary 全绿；
+> VM 6.1 / 7.1 / 8.1 = **354 / 355 / 356**（各 +5）；harness 293 pass / 0 fail / 2 xfail。
+
+> **修复记录（`mem::forget` / `ManuallyDrop` / `drop()` 审计，2026-09-29）**
+>
+> 全仓扫描只有 4 处 `forget`/`ManuallyDrop`/`drop_in_place`（第 5 处 `options.rs:170`
+> 只是注释里提到 rsmpeg 内部的 `ManuallyDrop`），加 29 处显式 `drop()`。逐处判定：
+>
+> | 位置 | 判定 | 处理 |
+> |---|---|---|
+> | `src/filter.rs` `chain_inouts` | **可消除**：N 个 `mem::forget` | 改为先把所有节点 `into_raw()` 交出所有权（不析构），链接后只把头节点 `from_raw()` 包回 RAII —— 链上从始至终只有一个 Rust 所有者，`forget` 全部消失 |
+> | `src/io.rs` `open_input_with_interrupt` | **可消除**，且旧写法在失败路径有二次释放风险 | `avformat_open_input` 会就地销毁传入的字典并回写未识别项。先 `options.take()` + `into_raw()` 把所有权交给 C，调用结束再接管回写指针（成功/失败都接管）。旧写法在 `ret < 0` 时仍让 Rust 持有旧句柄，若 FFmpeg 已在失败路径释放过就是二次释放 |
+> | `src/mux.rs` `into_writer` | **必须保留 unsafe**（`Muxer` 有 `Drop` + `pub writer: W`，Rust 不允许部分 move），但可从 5 个 unsafe 操作降到 1 个 | 把需要析构的字段收成私有 `MuxerResources`（`#[derive(Default)]`）：`self.resources = MuxerResources::default();` 一次赋值即掏空并析构（编码器等资源随之释放），之后只剩 `writer` 需要 `ManuallyDrop` + `ptr::read`。**顺带修掉一个隐患**：原来逐个 `drop_in_place` 四个字段，将来新增字段会被静默泄漏 |
+> | `src/encode.rs:2884` `drop(pkt)` | **冗余**（包在 match 臂末尾本来就会析构） | 改成 `Some(_) =>` |
+>
+> 判定为**有意保留**的 `drop()`（错删会改变语义）：
+> `io.rs:1816` / `:1970`（必须先把 format context 析构掉才能 `Arc::try_unwrap`）、
+> `hwaccel.rs:418`（锁外、且及时释放落败的重复硬件上下文）、
+> `filter.rs:2916-2917`（显式丢弃 `parse_ptr` 返回的未配对节点链表，配 8 行注释说明为何不会重复释放）、
+> `scale.rs` ×9 / `bsf.rs` ×2 / `pcm.rs:1067` / `hwaccel.rs:1468`（测试里"先归还缓冲 / 先关文件再删文件"的顺序依赖）、
+> `macros.rs:795`、`filter.rs:1484`（文档示例里的 `# drop(encoder);`）。
+>
+> 净效果：`mem::forget` 2 处 → **0**；`drop_in_place` 4 处 → **0**；
+> `ManuallyDrop` + `ptr::read` 保留 1 处（无法避免，已写明原因）。
+>
+> 验证（退出码均直接取真值）：`cargo fmt --check` 0、clippy `-D warnings`（含/不含 `image`）0/0、
+> `RUSTDOCFLAGS="-D warnings" cargo doc` 0、lib **355** / doctest **72** / 集成 19 binary 全绿；
+> VM 6.1 / 7.1 / 8.1 = **354 / 355 / 356**；harness 38 模式 **293 pass / 0 fail / 2 xfail**。
