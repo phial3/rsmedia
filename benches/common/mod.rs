@@ -21,8 +21,8 @@ use std::thread;
 
 /// Video job: 2 s of 320x240 @ 30 fps (60 frames, pts left unset so the
 /// encoder's automatic numbering is exercised).
-pub const WIDTH: u32 = 320;
-pub const HEIGHT: u32 = 240;
+pub const WIDTH: i32 = 320;
+pub const HEIGHT: i32 = 240;
 pub const FPS: f32 = 30.0;
 pub const VIDEO_FRAMES: usize = 60;
 pub const VIDEO_MEDIA_SECS: f64 = 2.0;

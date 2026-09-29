@@ -5,6 +5,7 @@ use anyhow::{Context, Error, Result, anyhow, bail};
 use common::test_output_path;
 use std::ffi::{CStr, CString};
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput};
 use rsmpeg::avutil::{self, AVFrame, AVHWDeviceContext, AVPixelFormat};
@@ -57,13 +58,14 @@ fn set_hwframe_ctx(
     codec_ctx.set_pix_fmt(hw_format);
 
     if is_decoder {
+        // SAFETY: `codec_ctx` 由 `&mut` 独占；`hw_device_ctx` 只是取其指针值存入
+        // 字段（不通过它访问），故 `as_ptr()` 足够。
         unsafe {
-            let hw_device_ctx_ptr = hw_device_ctx.as_ptr();
-            let codec_ctx_ptr = codec_ctx.as_mut_ptr();
-            (*codec_ctx_ptr).opaque = hw_format as *mut std::os::raw::c_void;
-            (*codec_ctx_ptr).get_format = Some(get_format);
-            (*codec_ctx_ptr).sw_pix_fmt = sw_format;
-            (*codec_ctx_ptr).hw_device_ctx = hw_device_ctx_ptr as *mut _;
+            let codec_ctx_ptr = codec_ctx.deref_mut();
+            codec_ctx_ptr.opaque = hw_format as *mut std::os::raw::c_void;
+            codec_ctx_ptr.get_format = Some(get_format);
+            codec_ctx_ptr.sw_pix_fmt = sw_format;
+            codec_ctx_ptr.hw_device_ctx = hw_device_ctx.as_ptr() as *mut _;
         }
     }
 
@@ -207,8 +209,10 @@ fn hw_upload(
     hw_frame.set_width(sw_frame.width);
     hw_frame.set_height(sw_frame.height);
     hw_frame.set_format(hw_format);
+    // SAFETY: `hw_frame` 是刚创建的局部帧、此处独占；右端的 `as_mut_ptr()` 取的
+    // 是指针值（要存进 `AVFrame.hw_frames_ctx` 字段），不是对它的访问。
     unsafe {
-        (*hw_frame.as_mut_ptr()).hw_frames_ctx = hw_frames_ctx.as_mut_ptr();
+        hw_frame.deref_mut().hw_frames_ctx = hw_frames_ctx.as_mut_ptr();
     }
 
     hw_frames_ctx

@@ -114,14 +114,19 @@ impl Options {
         let mut dict: Option<AVDictionary> = None;
         for (k, v) in entries {
             let (k, v) = (k.as_ref(), v.as_ref());
-            if k.contains('\0') || v.contains('\0') {
-                tracing::warn!("Skip option with interior NUL: {k:?}={v:?}");
+            // One check per string, right where the string is converted: a
+            // pre-flight `contains('\0')` test that lives a few lines above its
+            // `unwrap()` is the shape of bug where the two drift apart. Skipping
+            // the entry matches every other "unusable key or value" policy here —
+            // an option FFmpeg cannot even be handed is not one it can apply.
+            let Ok(key) = strutils::str_to_cstring(k) else {
+                tracing::warn!("Skip option with interior NUL in its key: {k:?}={v:?}");
                 continue;
-            }
-            let (key, value) = (
-                strutils::str_to_cstring(k).unwrap(),
-                strutils::str_to_cstring(v).unwrap(),
-            );
+            };
+            let Ok(value) = strutils::str_to_cstring(v) else {
+                tracing::warn!("Skip option with interior NUL in its value: {k:?}={v:?}");
+                continue;
+            };
             dict = match dict {
                 Some(dict) => Some(dict.set(&key, &value, 0)),
                 None => Some(AVDictionary::new(&key, &value, 0)),
@@ -161,9 +166,8 @@ impl Options {
         let Some(ptr) = NonNull::new(dict) else {
             return Self::new();
         };
-        // SAFETY: the reference is non-owning (`wrap_ref_pure` wraps the pointer in
-        // `ManuallyDrop`) and is dropped before this function returns; the caller
-        // guarantees the dictionary outlives the call.
+        // SAFETY: the reference is non-owning and is dropped before this function returns;
+        // the caller guarantees the dictionary outlives the call.
         let borrowed = unsafe { AVDictionaryRef::from_raw(ptr) };
         Self::from_dict(&borrowed)
     }
@@ -190,10 +194,11 @@ impl Options {
 
     /// Creates options such that ffmpeg will prefer TCP transport when reading RTSP stream (over
     /// the default UDP format). It also adds some options to reduce the socket and I/O timeouts to
-    /// 4 seconds.
+    /// 16 seconds.
     ///
     /// This sets the `rtsp_transport` to `tcp` in ffmpeg options,
-    /// it also sets `rw_timeout` and `stimeout` to lower (more sane) values.
+    /// it also sets `rw_timeout` and `stimeout` to lower (more sane) values. Both are protocol
+    /// options carrying **microseconds**, so the value below is 16 s, not 16.
     pub fn preset_avformat_rtsp_transport_tcp() -> Self {
         let mut opts = Self::new();
         opts
@@ -220,14 +225,17 @@ impl Options {
     }
 
     /// Creates options for a FLV muxer.
+    ///
+    /// Every key below is one FFmpeg actually reads: `live` and `write_metaf` are **not** AVOptions
+    /// of the FLV muxer (nor of `AVFormatContext`), so setting them silently did nothing — "no
+    /// metadata" is a `flvflags` value, not a separate key.
     pub fn preset_avformat_flv() -> Self {
         let mut opts = Self::new();
-        opts.set("flvflags", "no_duration_filesize")
+        opts
+            // 实时流：不写 duration/filesize 占位、不写 metadata（两者都是 `flvflags`
+            // 的取值，不是独立选项）
+            .set("flvflags", "no_duration_filesize+no_metadata")
             .set("fflags", "nobuffer+flush_packets")
-            // 添加实时流标志
-            .set("live", "1")
-            // 完全禁用元数据更新
-            .set("write_metaf", "0")
             // 设置较小的chunk大小以减少延迟
             .set("chunk_size", "4096");
         opts
@@ -610,6 +618,23 @@ mod tests {
         // SAFETY: `dest` 指向刚转移的合法字典。
         unsafe { Options::new().write_into_raw_dict(&mut dest) };
         assert!(dest.is_null());
+    }
+
+    #[test]
+    fn test_interior_nul_entries_are_skipped_not_panicking() {
+        // An entry FFmpeg cannot be handed (no C string can carry an interior
+        // NUL) is dropped with a warning. The point of the test is the shape of
+        // the fix: the conversion itself decides, so there is no second,
+        // drifting `contains('\0')` check whose removal could turn this into a
+        // panic.
+        let mut opts = Options::new();
+        opts.set("bad\0key", "value").set("preset", "ba\0d");
+        opts.set("threads", "4");
+
+        let dict = opts.to_dict().expect("a surviving entry must materialize");
+        let back = Options::from_dict(&dict);
+        assert_eq!(back.len(), 1, "only the well-formed entry survives");
+        assert_eq!(back.get("threads"), Some("4"));
     }
 
     #[test]

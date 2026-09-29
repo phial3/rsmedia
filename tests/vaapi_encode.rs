@@ -51,8 +51,7 @@ fn set_hwframe_ctx(
 /// not ship; the resulting `ENOENT` made all three hardware tests unrunnable
 /// even on a machine that has the device. Generating the input instead keeps
 /// the tests faithful to the example while depending on nothing but a device.
-fn write_nv12_input(path: &Path, width: i32, height: i32, frames: usize) -> Result<()> {
-    let (w, h) = (width as usize, height as usize);
+fn write_nv12_input(path: &Path, w: usize, h: usize, frames: usize) -> Result<()> {
     let mut file = File::create(path).context("Fail to create input file")?;
     let uv = vec![128u8; w * h / 2];
     for frame in 0..frames {
@@ -195,8 +194,8 @@ fn vaapi_encode_test_vaapi() {
     hw_encode(&HwEncodeConfig {
         input: &input,
         output: &output_path,
-        width,
-        height,
+        width: width as i32,
+        height: height as i32,
         encode_codec: c"h264_vaapi",
         device_type: AV_HWDEVICE_TYPE_VAAPI,
         hw_format: AV_PIX_FMT_VAAPI,
@@ -224,8 +223,8 @@ fn nvenc_encode_test_nvenc() {
     hw_encode(&HwEncodeConfig {
         input: &input,
         output: &output_path,
-        width,
-        height,
+        width: width as i32,
+        height: height as i32,
         encode_codec: c"h264_nvenc",
         device_type: AV_HWDEVICE_TYPE_CUDA,
         hw_format: AV_PIX_FMT_CUDA,
@@ -245,8 +244,8 @@ fn toolbox_encode_test_videotoolbox() {
     hw_encode(&HwEncodeConfig {
         input: &input,
         output: &output_path,
-        width,
-        height,
+        width: width as i32,
+        height: height as i32,
         encode_codec: c"h264_videotoolbox",
         device_type: AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
         hw_format: AV_PIX_FMT_VIDEOTOOLBOX,

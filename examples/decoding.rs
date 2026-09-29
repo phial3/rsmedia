@@ -33,8 +33,8 @@ async fn main() -> Result<()> {
     let source = "/tmp/test.mp4";
 
     let filters = vec![
-        filter::video::scale(640, 360, None),
-        filter::video::fps(30.0),
+        filter::video::scale(640, 360, None)?,
+        filter::video::fps(30.0)?,
     ];
 
     let mut reader = StreamReader::new(source)?;
@@ -104,8 +104,8 @@ fn process_frame(yuv_frame: MediaFrame<u8>) -> Result<()> {
     let rgb_frame = yuv_frame.convert_yuv420p_to_rgb24()?;
 
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(
-        yuv_frame.width,
-        yuv_frame.height,
+        yuv_frame.width as u32,
+        yuv_frame.height as u32,
         rgb_frame
             .data
             .as_packed()

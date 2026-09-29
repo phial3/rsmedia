@@ -32,8 +32,8 @@ use rsmedia::{
 };
 
 /// 合成模式源图尺寸：故意用非 295:413 比例的底图，验证裁剪。
-const SRC_W: u32 = 600;
-const SRC_H: u32 = 800;
+const SRC_W: i32 = 600;
+const SRC_H: i32 = 800;
 /// 合成图的蓝底颜色
 const SYNTH_BG_RGB: (u8, u8, u8) = (215, 139, 67);
 
@@ -156,7 +156,7 @@ fn swap_background(
     similarity: f32,
     new_bg: (u8, u8, u8),
 ) -> Result<MediaFrame<u8>> {
-    let (w, h) = (photo.width as i32, photo.height as i32);
+    let (w, h) = (photo.width, photo.height);
     let endpoint = rgb_endpoint(w, h);
 
     let mut builder = FilterGraphBuilder::new();
@@ -168,13 +168,13 @@ fn swap_background(
             &format!("0x{:02X}{:02X}{:02X}", key_rgb.0, key_rgb.1, key_rgb.2),
             similarity,
             0.1,
-        ))
+        )?)
         .with_inputs(["photo"])
         .with_label("keyed"),
     );
     // overlay 输入 0 = 主画面（新底色），输入 1 = 叠加层（抠像后的照片，
     // 原底色处已透明，透出白底；人像处不透明，盖在白底上）。
-    builder.add_node(FilterNode::new(video::overlay("0", "0", None)).with_inputs(["bg", "keyed"]));
+    builder.add_node(FilterNode::new(video::overlay("0", "0")?).with_inputs(["bg", "keyed"]));
     builder.add_output_tail(endpoint);
     let mut graph = builder
         .build()
@@ -214,25 +214,25 @@ fn crop_scale(
     let (w, h) = (photo.width, photo.height);
     // 居中裁剪框：源更宽则裁宽，更高则裁高。
     let (cw, ch) = if (w as f64 / h as f64) > target_ratio {
-        ((h as f64 * target_ratio) as u32, h)
+        ((h as f64 * target_ratio) as i32, h)
     } else {
-        (w, (w as f64 / target_ratio) as u32)
+        (w, (w as f64 / target_ratio) as i32)
     };
     let cw = cw.min(w);
     let ch = ch.min(h);
-    let cx = ((w - cw) / 2) as i32;
-    let cy = ((h - ch) / 2) as i32;
+    let cx = (w - cw) / 2;
+    let cy = (h - ch) / 2;
 
-    let endpoint = rgb_endpoint(w as i32, h as i32);
+    let endpoint = rgb_endpoint(w, h);
     let out_endpoint = rgb_endpoint(tw as i32, th as i32);
     let mut chain: Vec<Filter> = vec![
-        video::crop(cx, cy, cw, ch),
-        video::scale(tw as u32, th as u32, Some("lanczos")),
+        video::crop(cx, cy, cw as u32, ch as u32),
+        video::scale(tw as u32, th as u32, Some("lanczos"))?,
     ];
     if beautify {
         // 磨皮 + 轻微提亮 + 锐化，证件照标准美颜三连（有画质损失，默认关）。
         chain.push(video::smartblur(0.1, 3.0));
-        chain.push(video::lutyuv(Some("val+8"), None, None));
+        chain.push(video::lutyuv(Some("val+8"), None, None)?);
         chain.push(video::unsharp());
     }
 
@@ -334,19 +334,15 @@ fn encode_jpeg(frame: &MediaFrame<u8>, qscale: u32) -> Result<Vec<u8>> {
 
 /// 证件照统一用的 RGB24 视频端点（25fps，时间基 1/25）。
 fn rgb_endpoint(width: i32, height: i32) -> VideoEndpoint {
-    VideoEndpoint::new(
-        width,
-        height,
-        PixelFormat::RGB24,
-        Rational::new(1, 25).unwrap(),
-        Rational::new(25, 1).unwrap(),
-    )
+    VideoEndpoint::new(width, height, PixelFormat::RGB24)
+        .with_time_base(Rational::new(1, 25).unwrap())
+        .with_frame_rate(Rational::new(25, 1).unwrap())
 }
 
 /// 校验合成模式的结果：尺寸正确；开了换底则再校验新底色生效且人像未被盖住。
 fn verify(frame: &MediaFrame<u8>, tw: usize, th: usize, swapped: bool) -> Result<()> {
     anyhow::ensure!(
-        (frame.width, frame.height) == (tw as u32, th as u32),
+        (frame.width, frame.height) == (tw as i32, th as i32),
         "unexpected size {}x{}",
         frame.width,
         frame.height

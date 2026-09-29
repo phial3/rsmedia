@@ -1,11 +1,11 @@
-//! FFI wrapper macros.
+//! The crate's macros: three FFI wrappers plus one builder generator.
 //!
 //! Three macros cover everything the crate needs from FFmpeg's constants. Pick between them by
 //! asking "can two values be meaningfully combined?", not by which FFmpeg version the constants
 //! come from. Full capability matrix:
 //!
-//! | capability | `ffi_enum_wrap_from!` | `ffi_enum_wrap!` | `ffi_enum!` |
-//! |------------|-----------------------|------------------|-------------|
+//! | capability | `ffi_enum_from!` | `ffi_enum_typed!` | `ffi_enum!` |
+//! |------------|------------------|-------------------|-------------|
 //! | intended for | mutually exclusive IDs | bit sets | bit sets |
 //! | declares the named FFI type | yes | yes, plus an explicit `size_of` check | no — constants may be bare integers *or* named types, normalised by `as` |
 //! | `as_raw()` | no | yes | yes |
@@ -16,20 +16,50 @@
 //! | test one bit in a set | no | no | yes ([`FlagSet::contains`](crate::FlagSet::contains), or `set & Enum::A`) |
 //! | fallback for an unlisted value | panics; every table fails fast (the expression form is still supported but unused) | n/a | n/a |
 //!
-//! In practice the split is mostly by kind: the `ffi_enum!` call sites are bit sets
-//! (`AVCodecFlag`, `AVCodecFlag2`, `AVFormatFlag`, `AVPixFmtFlag`, `AVSeekFlag`) and the
-//! `ffi_enum_wrap_from!` call sites are IDs (`PixelFormat`, `SampleFormat`, `MediaType`,
-//! `HWDeviceType`, plus the swscale value sets in `scale.rs`: `SwsDither`, `AlphaBlend`,
-//! `ScalerFlags`, `Intent`, `Backend`).
+//! The suffixes are the whole naming scheme, and each one names the capability it adds on top of
+//! `ffi_enum!`:
 //!
-//! One table is an ID **and** sits with bit sets: `ScaleAlgorithm` (`scale.rs`) is a mutually
-//! exclusive choice ("only one may be active at a time" per FFmpeg's header) whose members are
-//! `SWS_*` bits — it is therefore an `ffi_enum!` bit-set table even though callers pick one
-//! value, and combining two of its bits is a caller error FFmpeg rejects rather than something
-//! the type prevents.
+//! - `ffi_enum!` — the base case: an enum over FFmpeg flag constants, its conversions and the bit
+//!   operators. It declares no FFI type, because its constants may be bare integers on some
+//!   FFmpeg versions and a named alias on others.
+//! - `ffi_enum_typed!` — the same, **plus** the named FFI type alias is declared and checked at
+//!   compile time (`size_of::<$ffi>()`). Forward conversion only.
+//! - `ffi_enum_from!` — the same, **plus** the reverse conversion (`From<ffi> for Enum`, and
+//!   `from_ffi_checked`). That is why it is the ID-table macro: a combination such as
+//!   `BACKWARD | ANY` is not any single variant, so there would be nothing to convert back to.
 //!
-//! `ffi_enum_wrap!` currently has no user — see the note on the macro itself for why the need
+//! In practice the split is mostly by kind.
+//!
+//! The `ffi_enum!` call sites are bit sets — `AVCodecFlag` / `AVCodecFlag2` / `ThreadType`
+//! (`codec.rs`), `AVFormatFlag` (`fmt.rs`), `AVPixFmtFlag` (`pixel.rs`), `AVSeekFlag`
+//! (`io.rs`), `ErrRecognition` (`decode.rs`), `ScaleQuality` (`scale.rs`), `AVLogFlag`
+//! (`init.rs`) — plus two tables that are really IDs: `ScaleAlgorithm` (`scale.rs`, a
+//! mutually exclusive choice — "only one may be active at a time" per FFmpeg's header —
+//! whose members are `SWS_*` bits) and `AVLogLevel` (`init.rs`, an ordered level, not a
+//! mask). Neither of those two can reject a combination at the type level, so combining
+//! their values is a caller error FFmpeg rejects rather than something the type prevents.
+//!
+//! The `ffi_enum_from!` call sites are IDs: `PixelFormat` (`pixel.rs`), `SampleFormat`
+//! (`fmt.rs`), `MediaType` (`stream.rs`), `HWDeviceType` (`hwaccel.rs`), `SkipFrame`
+//! (`decode.rs`), plus the swscale value sets in `scale.rs`: `SwsDither`, `SwsAlphaBlend`,
+//! `SwsScaler`, `SwsIntent`, `SwsBackend`.
+//!
+//! The two tables above that are IDs yet cannot use `ffi_enum_from!` — `ScaleAlgorithm` and
+//! `AVLogLevel` — are the reason the split is "declared shape" and not "semantics": that macro
+//! needs a named FFI type alias to put after `=>`, and their constants are bare integers on the
+//! older FFmpeg versions. They are declared with `ffi_enum!` and carry the caveat in their own
+//! documentation instead.
+//!
+//! `ffi_enum_typed!` currently has no user — see the note on the macro itself for why the need
 //! for it disappeared.
+//!
+//! The fourth macro, [`impl_codec_builder_setters!`], is not an FFI wrapper: it expands into the
+//! `impl` block that
+//! [`EncoderBuilder`](crate::encode::EncoderBuilder) and
+//! [`DecoderBuilder`](crate::decode::DecoderBuilder) share, so a codec option common to both
+//! sides has one definition and one copy of its documentation. It lives here because it is a
+//! macro like the others, and because `#[macro_use] mod macros;` (in `lib.rs`) is what puts every
+//! macro in this file in scope crate-wide — which is why no call site imports any of them.
 //!
 //! Points worth remembering, because they are easy to get wrong:
 //!
@@ -90,7 +120,7 @@
 /// # Panicking fallback
 ///
 /// ```ignore
-/// ffi_enum_wrap_from!(
+/// ffi_enum_from!(
 ///     /// Pixel format definitions in bindings.
 ///     #[allow(non_camel_case_types)]
 ///     PixelFormat => ffi::AVPixelFormat,
@@ -106,7 +136,7 @@
 /// # Custom fallback (falls back to `Self::NONE`)
 ///
 /// ```ignore
-/// ffi_enum_wrap_from!(
+/// ffi_enum_from!(
 ///     /// Pixel format definitions in bindings.
 ///     #[allow(non_camel_case_types)]
 ///     PixelFormat => ffi::AVPixelFormat,
@@ -146,7 +176,7 @@
 ///
 /// `@expand` is an implementation detail: it matches only the two entry rules above and is not
 /// part of the macro's interface.
-macro_rules! ffi_enum_wrap_from {
+macro_rules! ffi_enum_from {
     // panic 版：fallback = panic { 变体列表 }
     (
         $(#[$em:meta])*
@@ -156,7 +186,7 @@ macro_rules! ffi_enum_wrap_from {
             $( $(#[$m:meta])* $variant:ident => $const:path; )*
         }
     ) => {
-        ffi_enum_wrap_from!(
+        ffi_enum_from!(
             @expand
             $(#[$em])*
             $enum => $ffi,
@@ -177,7 +207,7 @@ macro_rules! ffi_enum_wrap_from {
             $( $(#[$m:meta])* $variant:ident => $const:path; )*
         }
     ) => {
-        ffi_enum_wrap_from!(
+        ffi_enum_from!(
             @expand
             $(#[$em])*
             $enum => $ffi,
@@ -276,15 +306,15 @@ macro_rules! ffi_enum_wrap_from {
 /// Where it sits in the macro family:
 /// - [`ffi_enum!`]: bit sets. The constants may be bare integers or a named FFI type in the
 ///   bindings; the macro normalises them and adds `Into<repr>` plus `BitOr`/`BitAnd`.
-/// - `ffi_enum_wrap!` (this macro): the constants are a **named FFI type alias** in the bindings
+/// - `ffi_enum_typed!` (this macro): the constants are a **named FFI type alias** in the bindings
 ///   (e.g. `ffi::SwsFlags`). Declares the type, converts **only** variant → raw.
-/// - [`ffi_enum_wrap_from!`]: named FFI type **plus** the reverse direction as well (`From<ffi>`,
+/// - [`ffi_enum_from!`]: named FFI type **plus** the reverse direction as well (`From<ffi>`,
 ///   which needs mutually exclusive values, and `from_ffi_checked`).
 ///
 /// # Which of the two directions is possible
 ///
 /// **Variant → raw is a total function, so it is generated** (`impl From<$enum> for $ffi`, the
-/// same shape [`ffi_enum_wrap_from!`] produces): a variant is one constant, and it maps to
+/// same shape [`ffi_enum_from!`] produces): a variant is one constant, and it maps to
 /// exactly one FFI value no matter how combinable the table's members are.
 ///
 /// **Raw → variant is not**, which is why it is absent: this shape is for **combinable bit
@@ -304,7 +334,7 @@ macro_rules! ffi_enum_wrap_from {
 /// # Example
 ///
 /// ```ignore
-/// ffi_enum_wrap!(
+/// ffi_enum_typed!(
 ///     /// Sws scale filter flags (SWS_*)
 ///     #[allow(non_camel_case_types)]
 ///     SwsFlags => ffi::SwsFlags,
@@ -326,7 +356,7 @@ macro_rules! ffi_enum_wrap_from {
 /// alias of FFmpeg 8+, so a single table covers every supported version — whereas the
 /// `size_of::<$ffi>()` check here requires the alias to exist in all of them.
 #[allow(unused_macros)]
-macro_rules! ffi_enum_wrap {
+macro_rules! ffi_enum_typed {
     (
         $(#[$em:meta])*
         $enum:ident => $ffi:ty,
@@ -595,6 +625,230 @@ macro_rules! ffi_enum {
     };
 }
 
+/// Generates the setters that [`EncoderBuilder`](crate::encode::EncoderBuilder) and
+/// [`DecoderBuilder`](crate::decode::DecoderBuilder) **share**.
+///
+/// The options common to both sides — codec name and private options, filters, hardware
+/// acceleration and its frame pool, threads and flags, scaling policy — have the **same field
+/// name** in both builders, so one definition expands verbatim into each `impl` block: the
+/// semantics and the documentation of a shared option exist once, one edit reaches both sides,
+/// and a drift such as "the encoder grew `with_flags2`, the decoder did not" cannot happen.
+/// Options that belong to one side only (the encoder's bit rate / quality / profile, the
+/// decoder's output format / discard granularity, …) stay in their own file.
+///
+/// To add a shared option: add the method and its documentation here, then add a field of the
+/// same name to both builders and to their `Default`. If the setter's AVOption key can also
+/// arrive through `with_options`, list that key in `with_options`'s documentation — a duplicate
+/// key is resolved in the dictionary's favour, as documented there.
+macro_rules! impl_codec_builder_setters {
+    () => {
+        /// Set the codec name — the encoder or decoder to use (`"libx264"`,
+        /// `"aac"`, `"mov_text"`, `"h264_nvenc"`, `"h264_cuvid"`).
+        ///
+        /// Takes anything that converts into a `String`, so a string literal, a
+        /// `&str` and a `String` are all passed directly: no `.to_string()`, no
+        /// `Some(...)` wrapper.
+        ///
+        /// * decoder — follow the codec the input stream declares (chosen by the
+        ///   container);
+        /// * encoder — take the default for the media type (`libx264` / `aac` /
+        ///   `subrip`).
+        ///
+        /// # Example
+        ///
+        /// ```ignore
+        /// let builder = EncoderBuilder::new_video(640, 480).with_codec_name("libx264");
+        /// ```
+        pub fn with_codec_name(mut self, codec_name: impl Into<String>) -> Self {
+            self.codec_name = Some(codec_name.into());
+            self
+        }
+
+        /// Set the thread count.
+        ///
+        /// 与 FFmpeg 的 `AVCodecContext.thread_count` 同为 `i32`，直接写该字段。
+        /// 未设置时取 `num_cpus::get()`；同名 AVOption 若经 `with_options` 透传，
+        /// 以透传值为准（见 [`Self::with_options`]）。`0` 表示交给 codec 自行推导，
+        /// 负数没有合法含义：两者都不写字段、由 FFmpeg 自己决定（负数另打 `warn!`）。
+        pub fn with_thread_count(mut self, thread_count: i32) -> Self {
+            self.thread_count = Some(thread_count);
+            self
+        }
+
+        /// Set `AVCodecContext.flags` (`AV_CODEC_FLAG_*`).
+        ///
+        /// Takes a [`FlagSet<AVCodecFlag>`](crate::FlagSet): a single flag
+        /// (`AVCodecFlag::LOW_DELAY`) or any `|` combination of them
+        /// (`AVCodecFlag::CLOSED_GOP | AVCodecFlag::LOW_DELAY`) — both are the same parameter,
+        /// so no `Some(...)` wrapper and no raw integer is involved. A mask that arrives from
+        /// elsewhere as a bare `u32` goes through
+        /// [`FlagSet::from_bits`](crate::FlagSet::from_bits), which keeps the conversion
+        /// visible.
+        ///
+        /// 解码器未设置时取 `AVCodecFlag::LOW_DELAY`（rsmedia 的解码默认值）。
+        /// 编码器侧则是在上下文既有 flags 上按位合并：FFmpeg 的默认位（如
+        /// `CLOSED_GOP`）与 `with_global_header` 的 `GLOBAL_HEADER` 都保留，
+        /// 因此同时设置不会互相覆盖。
+        ///
+        /// # Example
+        ///
+        /// ```ignore
+        /// use rsmedia::codec::AVCodecFlag;
+        /// // Closed GOP + low latency, e.g. for a low-latency stream.
+        /// let builder = EncoderBuilder::new_video(640, 480)
+        ///     .with_flags(AVCodecFlag::CLOSED_GOP | AVCodecFlag::LOW_DELAY);
+        /// ```
+        pub fn with_flags(mut self, flags: impl Into<crate::flags::FlagSet<AVCodecFlag>>) -> Self {
+            self.flags = Some(flags.into());
+            self
+        }
+
+        /// Set `AVCodecContext.flags2` (`AV_CODEC_FLAG2_*`).
+        ///
+        /// Same shape as [`Self::with_flags`]: a single flag or a `|` combination, as a
+        /// [`FlagSet<AVCodecFlag2>`](crate::FlagSet).
+        pub fn with_flags2(
+            mut self,
+            flags2: impl Into<crate::flags::FlagSet<AVCodecFlag2>>,
+        ) -> Self {
+            self.flags2 = Some(flags2.into());
+            self
+        }
+
+        /// Set `AVCodecContext.thread_type` (`FF_THREAD_*`).
+        ///
+        /// Chooses the multithreading granularity: [`ThreadType::FRAME`](crate::ThreadType::FRAME)
+        /// (frame-level, best compression, more latency) or
+        /// [`ThreadType::SLICE`](crate::ThreadType::SLICE) (slice-level, lower
+        /// latency, needs codec support). Same shape as [`Self::with_flags`], so both
+        /// granularities can be requested: `ThreadType::FRAME | ThreadType::SLICE`.
+        /// Left unset, FFmpeg picks its default.
+        pub fn with_thread_type(
+            mut self,
+            thread_type: impl Into<crate::flags::FlagSet<ThreadType>>,
+        ) -> Self {
+            self.thread_type = Some(thread_type.into());
+            self
+        }
+
+        /// Codec (private) options used for this stream.
+        ///
+        /// 只用于 builder 未建模的**编解码器私有参数**（编码器如 `preset`、`tune`、
+        /// `x264-params`；解码器如 `threads` 之外的各种解码开关）。
+        ///
+        /// 同一个 AVOption 若同时由 typed setter 与这里给出，**以这里为准**：typed
+        /// setter 写的是 `AVCodecContext` 字段，而 `avcodec_open2` 在处理完字段之后
+        /// 才应用本字典，同名的键因此覆盖 setter（写进同一个字典的 `crf`/`profile`/
+        /// `level` 也是本字典后合并）。想让 setter 生效，就不要把同名键放进这里。
+        ///
+        /// 与 typed setter 同名的键：`threads`/`flags`/`flags2`/`thread_type`（对应
+        /// [`Self::with_thread_count`]/[`Self::with_flags`]/[`Self::with_flags2`]/
+        /// [`Self::with_thread_type`]）；编码器另有 `b`/`maxrate`/`bufsize`/`crf`/
+        /// `profile`/`level`/`g`/`bf`，解码器另有 `skip_frame`/`err_detect`。
+        pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+            self.codec_opts = options.into();
+            self
+        }
+
+        /// Set the filters applied to frames on their way to/from this codec.
+        ///
+        /// 解码器：作用于**解码后**的帧（缩放/叠加/去噪…），滤镜输出即
+        /// [`decode`](crate::Decoder::decode) 交付的帧。编码器：作用于**编码前**的帧。
+        pub fn with_filters(mut self, filters: impl Into<Option<Vec<Filter>>>) -> Self {
+            self.filters = filters.into();
+            self
+        }
+
+        /// Enable hardware acceleration with the specified device type.
+        ///
+        /// * `device_config` - Device to use for hardware acceleration. Accepts a
+        ///   [`HWDeviceConfig`] directly, or `None` to decode/encode on the CPU —
+        ///   the same `impl Into<Option<_>>` shape [`Self::with_options`] uses, so
+        ///   a device chosen at runtime needs no `Some(...)` wrapper.
+        pub fn with_hardware_device(
+            mut self,
+            device_config: impl Into<Option<HWDeviceConfig>>,
+        ) -> Self {
+            self.hw_device_config = device_config.into();
+            self
+        }
+
+        /// 设置硬件帧池的预分配表面数（`AVHWFramesContext::initial_pool_size`）。
+        ///
+        /// 只在启用了硬件加速时有效。默认 `DEFAULT_HW_POOL_SIZE`（[`crate::hwaccel`]
+        /// 里的常量，20 张）对 1080p 是够用的启发值，但表面数是**预分配**的、直接
+        /// 决定显存占用：4K 一张 NV12 面约 12MB，20 张就是约 240MB。高分辨率、
+        /// 多路并发或显存紧张时按需调小；传 `0` 表示交给后端按需分配（FFmpeg 默认行为）。
+        ///
+        /// 解码器侧池子还要容纳 DPB（参考帧窗口），调到 1~2 张会限制参考帧复用、
+        /// 影响压缩效率，建议至少留够 `refs + 2`。
+        ///
+        /// ```no_run
+        /// # use rsmedia::encode::EncoderBuilder;
+        /// # use rsmedia::hwaccel::HWDeviceConfig;
+        /// # fn main() -> rsmedia::Result<()> {
+        /// let config = HWDeviceConfig::auto_platform()?;
+        /// let encoder = EncoderBuilder::new_video(3840, 2160)
+        ///     .with_hardware_device(Some(config))
+        ///     .with_hw_pool_size(4) // 4K 下只预占约 48MB 显存
+        ///     .build()?;
+        /// # drop(encoder);
+        /// # Ok(())
+        /// # }
+        /// ```
+        pub fn with_hw_pool_size(mut self, pool_size: i32) -> Self {
+            self.hw_pool_size = Some(pool_size);
+            self
+        }
+
+        /// Set the scaling algorithm used when converting frames to the target
+        /// pixel format (encoder: input frames -> the encoder's format; decoder:
+        /// decoded frames -> the output format, e.g. NV12 -> RGBA).
+        ///
+        /// The algorithm picks the scaling kernel and is **mutually exclusive** —
+        /// FFmpeg's header states *"Scaler selection options. Only one may be active
+        /// at a time."* Defaults to [`crate::scale::ScaleAlgorithm::BICUBIC`]; the
+        /// quality/behaviour bits are set separately with [`Self::with_scale_quality`].
+        pub fn with_scale_algorithm(mut self, algorithm: ScaleAlgorithm) -> Self {
+            self.scale_algorithm = algorithm;
+            self
+        }
+
+        /// Set the scaling quality/behaviour bits used when converting frames to
+        /// the target pixel format.
+        ///
+        /// Unlike the algorithm (exactly one bit), the quality flags are a set, given as a
+        /// [`FlagSet<ScaleQuality>`](crate::FlagSet) like [`Self::with_flags`] — one bit
+        /// (`ScaleQuality::BITEXACT`), several combined with `|`
+        /// (`ScaleQuality::FULL_CHR_H_INT | ScaleQuality::ACCURATE_RND`), or
+        /// [`FlagSet::EMPTY`](crate::FlagSet::EMPTY) for none. Defaults to
+        /// [`ScaleQuality::default_mask`](crate::scale::ScaleQuality::default_mask).
+        pub fn with_scale_quality(
+            mut self,
+            quality: impl Into<crate::flags::FlagSet<ScaleQuality>>,
+        ) -> Self {
+            self.scale_quality = quality.into();
+            self
+        }
+
+        /// Enable (`true`) or disable (`false`) pooled allocation of the scaler's
+        /// destination frames (see [`Scaler::with_buffer_pool`]).
+        ///
+        /// Off by default. With it on, frames this codec scales are allocated from an
+        /// internal `AVBufferPool` instead of being freshly allocated per frame, so a
+        /// steady stream of same-geometry conversions stops allocating after a couple
+        /// of frames. Note that the pool only zeroes the bytes swscale never writes
+        /// (alignment offset, stride slack, plane gaps, tail padding) — it does **not**
+        /// zero the visible pixels, and `AVFrame::alloc_buffer` does not zero anything
+        /// either (it goes through `av_frame_get_buffer` → `av_buffer_alloc` →
+        /// `av_malloc`).
+        pub fn with_scale_pool(mut self, enabled: bool) -> Self {
+            self.scale_pool = enabled;
+            self
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     //! One test per macro, pinning the capabilities in the module-level matrix and using the
@@ -655,7 +909,7 @@ mod tests {
 
         // The first `|` yields the set, and `set | Enum` / `Enum | set` both continue it, so
         // `A | B | C` reads as written and stays a `FlagSet`. The reverse direction
-        // (raw -> variant) does not exist here at all; that is `ffi_enum_wrap_from!`'s job.
+        // (raw -> variant) does not exist here at all; that is `ffi_enum_from!`'s job.
         let three = AVSeekFlag::BACKWARD | AVSeekFlag::ANY | AVSeekFlag::FRAME;
         assert_eq!(three.bits(), 1 | 4 | 8);
         assert_eq!(three, two | AVSeekFlag::FRAME);
@@ -681,7 +935,7 @@ mod tests {
         assert_eq!(sws, ffi::SWS_BICUBIC as u32);
     }
 
-    /// `ffi_enum_wrap_from!` is for **mutually exclusive IDs**. It is the only macro that
+    /// `ffi_enum_from!` is for **mutually exclusive IDs**. It is the only macro that
     /// converts in the reverse direction (raw value -> variant), and it has no bit operators
     /// because an ID is not a bit set.
     ///
@@ -689,7 +943,7 @@ mod tests {
     /// raw value with `Into`, so an `as_raw()` method would just be a second spelling of the
     /// same thing.
     #[test]
-    fn ffi_enum_wrap_from_provides_two_way_conversion() {
+    fn ffi_enum_from_provides_two_way_conversion() {
         use crate::pixel::PixelFormat;
 
         // Variant -> FFI value (`Into`, not `as_raw`).
@@ -758,7 +1012,7 @@ mod tests {
     /// up producing a subtly wrong file instead of an error.
     #[test]
     fn expression_fallback_rule_is_still_supported() {
-        ffi_enum_wrap_from!(
+        ffi_enum_from!(
             #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
             ProbeId => ffi::AVPixelFormat,
             repr = i32,
@@ -778,7 +1032,7 @@ mod tests {
         assert_eq!(ProbeId::from(i32::MIN), ProbeId::NONE);
     }
 
-    // `ffi_enum_wrap!` declares the named FFI type (checked at compile time via `size_of`) and
+    // `ffi_enum_typed!` declares the named FFI type (checked at compile time via `size_of`) and
     // converts **variant → raw** only: no reverse conversion and no bit operators, so combining
     // two of its flags requires manual `as_raw()` arithmetic.
     //
@@ -787,7 +1041,7 @@ mod tests {
     // normalised with `as` to stay compatible with 6/7, which `ffi_enum!` already does.
     // The probe is declared over `ffi::AVPixelFormat` only because that alias exists in every
     // supported version — `ffi::SwsFlags` would not compile on 6/7.
-    ffi_enum_wrap!(
+    ffi_enum_typed!(
         /// Test-only probe: a flag table declared over a named FFI type.
         #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
         ProbeWrapFlags => ffi::AVPixelFormat,
@@ -798,12 +1052,12 @@ mod tests {
     );
 
     #[test]
-    fn ffi_enum_wrap_provides_as_raw_and_a_forward_conversion() {
+    fn ffi_enum_typed_provides_as_raw_and_a_forward_conversion() {
         // Same `as_raw()` as its siblings.
         assert_eq!(ProbeWrapFlags::BE.as_raw(), ffi::AV_PIX_FMT_FLAG_BE as i32);
 
         // The forward conversion is total, so it exists — `Into<$ffi>`, exactly like the one
-        // `ffi_enum_wrap_from!` generates (here `$ffi` is `ffi::AVPixelFormat` = `c_int`).
+        // `ffi_enum_from!` generates (here `$ffi` is `ffi::AVPixelFormat` = `c_int`).
         let raw: ffi::AVPixelFormat = ProbeWrapFlags::BE.into();
         assert_eq!(raw, ffi::AV_PIX_FMT_FLAG_BE as i32);
 

@@ -7,7 +7,7 @@
 
 use rsmedia::error::{Result, RsmediaError};
 use rsmedia::{
-    DecoderBuilder, EncoderBuilder, MediaType, Muxer, PixelFormat, Scaler, StreamReader,
+    DecoderBuilder, EncoderBuilder, MediaType, Muxer, PixelFormat, Scaler, StreamReader, VideoSpec,
 };
 use rsmpeg::avcodec::AVCodec;
 use rsmpeg::avutil::AVFrame;
@@ -92,7 +92,7 @@ fn test_pooled_scaler_encode_roundtrip() -> Result<()> {
     let mut first_ptr = 0usize;
     for i in 0..frames {
         let src = make_source_frame(64, 64, i as u8 * 7)?;
-        let mut dst = scaler.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?;
+        let mut dst = scaler.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?;
         // 稳态复用：从第二帧起数据指针必须与首帧相同（缓冲被池回收复用）。
         if first_ptr == 0 {
             first_ptr = dst.data[0] as usize;
@@ -140,9 +140,9 @@ fn test_pooled_and_plain_frames_interleave() -> Result<()> {
     for (i, pts) in (0..8).enumerate() {
         let src = make_source_frame(64, 64, i as u8 * 11)?;
         let mut dst = if i % 2 == 0 {
-            pooled.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?
+            pooled.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?
         } else {
-            plain.scale_frame(&src, 32, 32, PixelFormat::YUV420P)?
+            plain.scale_frame(&src, VideoSpec::new(32, 32, PixelFormat::YUV420P))?
         };
         dst.set_pts(pts as i64);
         dst.set_time_base(enc_time_base.into());
@@ -214,11 +214,11 @@ fn test_encoder_with_scale_pool_roundtrip() -> Result<()> {
             // 源帧格式 ≠ 编码器目标格式时，编码器内部 scaler（池化）转换。
             0 => {
                 let mut s = Scaler::new().with_buffer_pool(true);
-                s.scale_frame(&rgb, 32, 32, PixelFormat::YUV420P)?
+                s.scale_frame(&rgb, VideoSpec::new(32, 32, PixelFormat::YUV420P))?
             }
             _ => {
                 let mut s = Scaler::new();
-                s.scale_frame(&rgb, 32, 32, PixelFormat::YUV420P)?
+                s.scale_frame(&rgb, VideoSpec::new(32, 32, PixelFormat::YUV420P))?
             }
         };
         yuv.set_pts(i as i64);

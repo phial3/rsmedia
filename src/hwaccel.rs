@@ -29,57 +29,74 @@ pub struct HWDeviceConfig {
 }
 
 impl HWDeviceConfig {
-    /// create a new HWDeviceConfig with the given parameters
+    /// Create a config for `device_type`, with that type's default format mapping.
     ///
-    /// # Arguments
+    /// The two pixel formats (hardware side / software side) are the same type and
+    /// always appear as a pair, so a positional constructor lets them be swapped
+    /// without the compiler noticing — the mistake only surfaces when the device
+    /// is opened. They are therefore not positional: this takes the type's
+    /// default mapping, the same one [`Self::cuda`] / [`Self::vaapi`] / … use, and
+    /// [`Self::with_hw_pixel_format`] / [`Self::with_sw_pixel_format`] override it
+    /// by name. `HWDeviceType::default_hw_pixel_format` and
+    /// `HWDeviceType::default_sw_pixel_format` are the single source of truth for
+    /// the mapping, so there is no second place that could disagree with it.
     ///
-    /// * `device_type` - The type of hardware device
-    /// * `hw_pixel_format` - The pixel format of the hardware device
-    /// * `sw_pixel_format` - The pixel format of the software device
-    /// * `device_id` - The type-specific string identifying of the GPU device,
-    ///   e.g. for NVIDIA CUDA, device_id should be explicitly the GPU ID  "0" or "1",
-    ///   for VAAPI: device_id should be set like "/dev/dri/renderD128"
-    /// * `options` - Additional (type-specific) options to use in opening the device
-    ///
-    /// Both optional arguments take an `impl Into<Option<_>>`, so a value that is
-    /// always present is passed bare and "no value" is spelled `None`: no
-    /// `Some(...)` wrapper at the call site.
-    pub fn new(
-        device_type: HWDeviceType,
-        hw_pixel_format: PixelFormat,
-        sw_pixel_format: PixelFormat,
-        device_id: impl Into<Option<String>>,
-        options: impl Into<Option<Options>>,
-    ) -> Self {
+    /// `device_id` and `options` are set the same way, with
+    /// [`Self::with_device_id`] / [`Self::with_options`].
+    pub fn new(device_type: HWDeviceType) -> Self {
         Self {
             device_type,
-            hw_pixel_format,
-            sw_pixel_format,
-            device_id: device_id.into(),
-            options: options.into(),
+            hw_pixel_format: device_type.default_hw_pixel_format(),
+            sw_pixel_format: device_type.default_sw_pixel_format(),
+            device_id: None,
+            options: None,
         }
     }
 
-    /// 按设备类型的**默认格式映射**构造配置。
+    /// 覆盖硬件侧像素格式（如把 CUDA 的 NV12 换成别的 surface 格式）。
+    pub fn with_hw_pixel_format(mut self, hw_pixel_format: PixelFormat) -> Self {
+        self.hw_pixel_format = hw_pixel_format;
+        self
+    }
+
+    /// 覆盖软件侧像素格式（硬件帧下载到内存后的格式）。
+    pub fn with_sw_pixel_format(mut self, sw_pixel_format: PixelFormat) -> Self {
+        self.sw_pixel_format = sw_pixel_format;
+        self
+    }
+
+    /// 设备标识：NVIDIA CUDA 用 GPU 编号字符串（如 `"0"`），VAAPI 用 DRM 渲染节点
+    /// 路径（如 `"/dev/dri/renderD128"`），QSV 用设备序号。
     ///
-    /// [`Self::default_hw_pixel_format`]/[`Self::default_sw_pixel_format`]（定义在
-    /// [`HWDeviceType`] 上）是格式映射的唯一真相源：构造器与平台自动选择
+    /// 参数取 `impl Into<Option<_>>`，因此"总是有值"时裸传值即可、"无值"写 `None`
+    /// （表示让后端自选默认设备），都不需要 `Some(...)` 包装。
+    pub fn with_device_id(mut self, device_id: impl Into<Option<String>>) -> Self {
+        self.device_id = device_id.into();
+        self
+    }
+
+    /// 打开设备时的附加（设备类型相关）选项。
+    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.options = options.into();
+        self
+    }
+
+    /// 按设备类型的**默认格式映射**构造配置，只额外指定设备标识。
+    ///
+    /// [`HWDeviceType::default_hw_pixel_format`]/[`HWDeviceType::default_sw_pixel_format`]
+    /// 是格式映射的唯一真相源：本构造器、[`Self::new`] 与平台自动选择
     /// （[`Self::auto_platform`]）都走这里，避免同一设备类型出现两套说法。
     fn default_for(device_type: HWDeviceType, device_id: Option<String>) -> Self {
-        Self::new(
-            device_type,
-            device_type.default_hw_pixel_format(),
-            device_type.default_sw_pixel_format(),
-            device_id,
-            None,
-        )
+        Self::new(device_type).with_device_id(device_id)
     }
 
     /// build CUDA HWDeviceConfig
     ///
-    /// `device_id` 为 GPU 编号字符串（如 `"0"`、`"1"`），与其他设备构造器
-    /// 的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。也可以直接传
-    /// 一个 `&str`；`None` 表示让后端自选默认设备。
+    /// `device_id` 为 GPU 编号字符串（如 `Some("0".to_string())`），与其他设备
+    /// 构造器的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。
+    /// 该参数是 `impl Into<Option<String>>`，因此 `None` 表示让后端自选默认设备
+    /// （CUDA 即 0 号卡），但要传值必须给 **`String`** —— `&str` 不会自动转换，
+    /// 需 `.to_string()`。
     pub fn cuda(device_id: impl Into<Option<String>>) -> Self {
         Self::default_for(HWDeviceType::CUDA, device_id.into())
     }
@@ -103,9 +120,14 @@ impl HWDeviceConfig {
 
     /// build AMD AMF HWDeviceConfig（Windows 平台，基于 D3D11 设备）。
     ///
-    /// FFmpeg 的 AMF 编码器（`h264_amf`/`hevc_amf`/`av1_amf`）没有独立的
-    /// hw_context 类型，挂在 `AV_HWDEVICE_TYPE_D3D11VA` 下：软件帧（NV12）
-    /// 先上传到 D3D11 surface，再由 AMF 编码。
+    /// 落在 [`HWDeviceType::D3D11VA`] 上：AMF 编码器
+    /// （`h264_amf`/`hevc_amf`/`av1_amf`）的 `pix_fmts` 同时列了
+    /// `AV_PIX_FMT_D3D11` 与 `AV_PIX_FMT_AMF_SURFACE`，所以把软件帧（NV12）先
+    /// 上传成 D3D11 surface 再交给 AMF 编码是可行的。
+    ///
+    /// 注意 FFmpeg 8 起 AMF 也有**独立**的设备类型 [`HWDeviceType::AMF`]
+    /// （本 crate 仅在 `ffmpeg8`/`ffmpeg9` feature 下建模它）；要直接用那条路径，
+    /// 请用 [`Self::new`] 自行指定 `HWDeviceType::AMF` + `PixelFormat::AMF_SURFACE`。
     #[cfg(target_os = "windows")]
     pub fn amf(device_id: impl Into<Option<String>>) -> Self {
         Self::default_for(HWDeviceType::D3D11VA, device_id.into())
@@ -248,7 +270,7 @@ const HW_CTX_CACHE_MAX_ENTRIES: usize = 8;
 /// [`EncoderBuilder::with_hw_pool_size`](crate::encode::EncoderBuilder::with_hw_pool_size)
 /// 或 [`DecoderBuilder::with_hw_pool_size`](crate::decode::DecoderBuilder::with_hw_pool_size)；
 /// 传 `0` 表示交给后端自己决定（FFmpeg 的默认行为：按需分配，不预占）。
-pub(crate) const DEFAULT_HW_POOL_SIZE: u32 = 20;
+pub(crate) const DEFAULT_HW_POOL_SIZE: i32 = 20;
 
 /// 无锁地收集缓存中**当前未被使用**（引用计数为 1，仅缓存自身持有）的条目键。
 fn unused_hw_ctx_configs() -> Vec<HWDeviceConfig> {
@@ -407,7 +429,11 @@ impl HWContext {
     /// Besides creating and attaching the `AVHWFramesContext`, this also:
     /// - installs the `hwaccel_get_format` callback so the decoder picks the
     ///   hardware surface format during `avcodec_open2`;
-    /// - sets `sw_pix_fmt` to the configured software format;
+    /// - sets `sw_pix_fmt` to the configured software format — note that FFmpeg's
+    ///   `ff_get_format` (run during `avcodec_open2`, i.e. *after* this call)
+    ///   overwrites it with the last entry of the codec's own `pix_fmts` list
+    ///   whenever that entry is not a hardware format, so this write only
+    ///   survives for codecs whose candidate list ends in a hardware format;
     /// - holds an independent reference (`av_buffer_ref`) to the hardware
     ///   device context, so the decoder owns its own ref and unrefs it on
     ///   close — no manual teardown needed in `Decoder::Drop`.
@@ -423,7 +449,7 @@ impl HWContext {
         codec_ctx: &mut AVCodecContext,
         width: i32,
         height: i32,
-        pool_size: u32,
+        pool_size: i32,
     ) -> Result<()> {
         let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
         codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
@@ -434,12 +460,12 @@ impl HWContext {
         // `codec_ctx` is a `&mut` borrow held for the whole block, so no other
         // reference to the context exists. `get_format` is set to an `extern "C"`
         // function whose signature is exactly `AVCodecContext.get_format` (so the
-        // ABI matches and FFmpeg may call it), and `sw_pix_fmt` is the software
-        // format that same callback falls back to.
+        // ABI matches and FFmpeg may call it), and `sw_pix_fmt` is a plain
+        // enum write of this device type's software format.
         unsafe {
-            let ctx_mut_ptr = codec_ctx.deref_mut();
-            ctx_mut_ptr.get_format = Some(hwaccel_get_format);
-            ctx_mut_ptr.sw_pix_fmt = self.get_format(false);
+            let ctx_raw = codec_ctx.deref_mut();
+            ctx_raw.get_format = Some(hwaccel_get_format);
+            ctx_raw.sw_pix_fmt = self.get_format(false);
         }
         // clone 即 av_buffer_ref：codec_ctx 拥有独立引用，析构时正确 unref，
         // 无需 Decoder::Drop 手动置空防 double-free。
@@ -466,7 +492,7 @@ impl HWContext {
         codec_ctx: &mut AVCodecContext,
         width: i32,
         height: i32,
-        pool_size: u32,
+        pool_size: i32,
     ) -> Result<()> {
         let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
         codec_ctx.set_hw_frames_ctx(hw_frames_ctx);
@@ -479,18 +505,21 @@ impl HWContext {
     ///
     /// 仅共享访问 device_ctx：`hwframe_ctx_alloc` 内部只做 av_buffer_ref（原子），
     /// 每次调用都新建独立的 AVHWFramesContext，由调用方（codec_ctx）独占持有。
+    /// `pool_size` is [`i32`] — the type of `AVHWFramesContext::initial_pool_size` —
+    /// so it reaches FFmpeg exactly as the caller wrote it, with no narrowing and
+    /// therefore no way for a value to be silently reinterpreted on the way in.
     pub(crate) fn create_hw_frames_ctx(
         &self,
         width: i32,
         height: i32,
-        pool_size: u32,
+        pool_size: i32,
     ) -> Result<rsmpeg::avutil::AVHWFramesContext> {
         let mut hw_frames_ctx = self.device_ctx.hwframe_ctx_alloc();
         hw_frames_ctx.data().format = self.get_format(true);
         hw_frames_ctx.data().sw_format = self.get_format(false);
         hw_frames_ctx.data().width = width;
         hw_frames_ctx.data().height = height;
-        hw_frames_ctx.data().initial_pool_size = pool_size as i32;
+        hw_frames_ctx.data().initial_pool_size = pool_size;
 
         hw_frames_ctx
             .init()
@@ -533,16 +562,18 @@ impl HWContext {
 
         let mut dst = AVFrame::new();
         let map_ret = unsafe {
-            let dst_ptr = dst.as_mut_ptr();
-            let src_ptr = src.as_ptr();
-            (*dst_ptr).format = (*src_ptr).format;
-            (*dst_ptr).width = (*src_ptr).width;
-            (*dst_ptr).height = (*src_ptr).height;
-            // av_buffer_ref：dst 持有独立引用，随 AVFrame 一起 unref，不影响 codec_ctx 那份。
-            (*dst_ptr).hw_frames_ctx = ffi::av_buffer_ref(dst_ref);
+            // `av_hwframe_map` 要裸指针，但**填字段不需要**：`deref_mut` 给出
+            // `&mut ffi::AVFrame`，只在调用处隐式转成 `*mut`（`&mut T -> *mut T`）。
+            // 读侧同理走安全的 `Deref`。
+            let dst_raw = dst.deref_mut();
+            let src_raw = &*src;
+            dst_raw.format = src_raw.format;
+            dst_raw.width = src_raw.width;
+            dst_raw.height = src_raw.height;
+            dst_raw.hw_frames_ctx = ffi::av_buffer_ref(dst_ref);
             // flags 按 FFmpeg 文档传 0（当前未使用）。失败时 dst 由 Drop 负责
             // unref 上面那个 buffer ref，无需手工清理。
-            ffi::av_hwframe_map(dst_ptr, src_ptr, 0)
+            ffi::av_hwframe_map(dst_raw, src_raw, 0)
         };
         if map_ret < 0 {
             if map_ret != -(ffi::ENOSYS as i32) {
@@ -563,8 +594,8 @@ impl HWContext {
         }
 
         tracing::debug!(
-            "Mapped HW frame into the codec frames context: {:?} {}x{}",
-            PixelFormat::from(dst.format),
+            "Mapped HW frame into the codec frames context: {} {}x{}",
+            PixelFormat::name_of(dst.format),
             dst.width,
             dst.height
         );
@@ -613,8 +644,8 @@ impl HWContext {
         self.copy_frame_props(hw_frame, &mut sw_frame)?;
 
         tracing::debug!(
-            "Downloaded from GPU: format={:?}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
-            PixelFormat::from(sw_frame.format),
+            "Downloaded from GPU: format={}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
+            PixelFormat::name_of(sw_frame.format),
             sw_frame.width,
             sw_frame.height,
             sw_frame.linesize[0],
@@ -679,8 +710,8 @@ impl HWContext {
         self.copy_frame_props(sw_frame, &mut hw_frame)?;
 
         tracing::debug!(
-            "Uploaded to GPU: format={:?}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
-            PixelFormat::from(hw_frame.format),
+            "Uploaded to GPU: format={}, size={}x{}, linesize=[{}, {}], cost={:?}ms",
+            PixelFormat::name_of(hw_frame.format),
             hw_frame.width,
             hw_frame.height,
             hw_frame.linesize[0],
@@ -701,16 +732,17 @@ impl HWContext {
         dst.set_time_base(src.time_base);
         dst.set_pict_type(src.pict_type);
 
+        // SAFETY: `dst` 由 `&mut` 独占；`src` 只经 `Deref` 读取，两者是不同对象。
         unsafe {
-            let dst_ptr = dst.as_mut_ptr();
-            (*dst_ptr).flags = src.flags;
+            let dst_raw = dst.deref_mut();
+            dst_raw.flags = src.flags;
             // 刻意**不**拷贝 `opaque`：它是 FFmpeg 留给应用层的私有指针，本 crate
             // 从不用它（见 `hwaccel_get_format`），而逐帧共享同一个 opaque 会让两个
             // 帧都指向调用者的同一份数据——新帧既不拥有它、也无法在其生命周期结束
             // 时做任何处理，调用者释放后即悬空。新帧的 `opaque` 保持 NULL。
-            (*dst_ptr).quality = src.quality;
-            (*dst_ptr).duration = src.duration;
-            (*dst_ptr).sample_aspect_ratio = src.sample_aspect_ratio;
+            dst_raw.quality = src.quality;
+            dst_raw.duration = src.duration;
+            dst_raw.sample_aspect_ratio = src.sample_aspect_ratio;
         }
 
         // 复制 side-data 与帧级元数据
@@ -760,7 +792,7 @@ impl HWContext {
 unsafe impl Send for HWContext {}
 unsafe impl Sync for HWContext {}
 
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Hardware device type (FFmpeg `AV_HWDEVICE_TYPE_*`).
     ///
     /// Generated from one `variant => constant` table with a two-way `From`. A value the table
@@ -881,10 +913,13 @@ impl HWDeviceType {
     /// 当前平台的硬件加速优先级（从高到低）。
     ///
     /// 排序依据与 FFmpeg CLI / 主流转码器的默认习惯一致：
-    /// - macOS: VideoToolbox（Apple Silicon/Intel 均原生支持）
-    /// - Windows: D3D11VA（承载 AMD AMF 及通用 D3D11 hwaccel）> QSV > CUDA > Vulkan
-    /// - Linux: VAAPI（Intel/AMD 开箱即用）> CUDA > Vulkan
-    /// - Android: MediaCodec
+    /// - macOS: VideoToolbox > Vulkan
+    /// - Windows: D3D11VA（承载 AMD AMF 及通用 D3D11 hwaccel）> QSV > CUDA >
+    ///   Vulkan > DXVA2（末位是旧 API 兜底）
+    /// - Linux: VAAPI（Intel/AMD 开箱即用）> CUDA > Vulkan > VDPAU > OpenCL > DRM
+    ///   （后三者是 NVIDIA 老卡 / 通用 GPU / 无 X 的 DRM 渲染节点兜底）
+    /// - Android: MediaCodec（只有这一项）
+    /// - 其它平台：空列表（`auto_platform*` 随即报错）
     pub fn platform_preference() -> Vec<HWDeviceType> {
         match std::env::consts::OS {
             "macos" => vec![HWDeviceType::VIDEOTOOLBOX, HWDeviceType::VULKAN],
@@ -944,13 +979,7 @@ impl HWDeviceType {
                 ))
             })?;
         tracing::info!("Auto-selected hardware device: {device:?}");
-        Ok(HWDeviceConfig::new(
-            device,
-            device.default_hw_pixel_format(),
-            device.default_sw_pixel_format(),
-            None,
-            None,
-        ))
+        Ok(HWDeviceConfig::new(device))
     }
 
     /// List available hardware acceleration device types on this system.
@@ -1467,12 +1496,12 @@ mod tests {
             .config
             .device_type
             .is_available(ProbeDepth::SurfaceAlloc);
-        for pool_size in [0u32, 1, 7, DEFAULT_HW_POOL_SIZE] {
+        for pool_size in [0, 1, 7, DEFAULT_HW_POOL_SIZE] {
             let is_d3d11_zero = pool_size == 0 && ctx.config.device_type == HWDeviceType::D3D11VA;
             match ctx.create_hw_frames_ctx(64, 64, pool_size) {
                 Ok(mut frames) => assert_eq!(
                     frames.data().initial_pool_size,
-                    pool_size as i32,
+                    pool_size,
                     "requested pool size {pool_size} must reach AVHWFramesContext"
                 ),
                 // D3D11VA 的 frames_init 对 0 无条件 ENOMEM：后端硬约束，非透传缺陷。

@@ -19,25 +19,32 @@
 //! use rsmedia::bsf::Bsf;
 //! use rsmedia::mux::Demuxer;
 //!
-//! # fn main() -> rsmedia::error::Result<()> {
-//! # let mut demuxer = Demuxer::new("assets/mp4.mp4")?;
-//! # let video_index: usize = todo!("视频流在输入容器中的下标");
-//! # let (codecpar, time_base) = todo!("视频流的 codecpar 与 time_base");
-//! let mut bsf = Bsf::new("h264_mp4toannexb", &codecpar, time_base)?;
+//! fn main() -> rsmedia::Result<()> {
+//!     let mut demuxer = Demuxer::new("in.mp4")?;
 //!
-//! // 逐包过滤：一个输入包可能产出零或多个输出包
-//! # let mut packet = todo!("demuxer.demux_packet() 的视频包");
-//! for out in bsf.filter_packet(&mut packet)? {
-//!     let _ = out; // 交给 Muxer::mux_packet
-//! }
+//!     // The source codecpar tells the filter whether it applies to this codec,
+//!     // and the time base goes into `AVBSFContext.time_base_in`.
+//!     let info = demuxer.stream_info(0)?;
+//!     let mut bsf = Bsf::new("h264_mp4toannexb", &info.codec_parameters, info.time_base)?;
 //!
-//! // EOF 冲刷剩余输出；此后输出流参数以 `bsf.par_out()` 为准（avcC 已移除）
-//! for mut out in bsf.flush_packets()? {
-//!     let _ = out;
-//! #   let _ = demuxer.nb_streams();
+//!     // Filter packet by packet: one input packet yields zero or more output
+//!     // packets. `packet` is consumed - FFmpeg unrefs it on send.
+//!     while let Some((index, mut packet)) = demuxer.demux_packet()? {
+//!         if index != 0 {
+//!             continue;
+//!         }
+//!         for mut out in bsf.filter_packet(&mut packet)? {
+//!             let _ = &mut out; // hand `out` to `Muxer::mux_packet`
+//!         }
+//!     }
+//!
+//!     // Flush the buffered tail. From here on the output stream's parameters
+//!     // are `bsf.par_out()` - the avcC extradata is gone.
+//!     for mut out in bsf.flush_packets()? {
+//!         let _ = &mut out;
+//!     }
+//!     Ok(())
 //! }
-//! # Ok(())
-//! # }
 //! ```
 
 use crate::error::{Context, Result, RsmediaError};
@@ -188,10 +195,10 @@ impl Bsf {
                     }
                     out.push(owned);
                 }
-                // 需要更多输入
-                Err(RsmpegError::BitstreamDrainError) => return Ok(out),
-                // 已无更多输出
-                Err(RsmpegError::BitstreamFlushedError) => return Ok(out),
+                // 要更多输入，或已排空。
+                Err(RsmpegError::BitstreamDrainError) | Err(RsmpegError::BitstreamFlushedError) => {
+                    return Ok(out);
+                }
                 Err(e) => return Err(e.into()),
             }
         }

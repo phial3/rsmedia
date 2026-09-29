@@ -21,7 +21,7 @@ ffi_enum!(
     XYZ => ffi::AV_PIX_FMT_FLAG_XYZ;
 });
 
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Pixel format (FFmpeg `AV_PIX_FMT_*`): how a picture is laid out in memory.
     ///
     /// Generated from one `variant => constant` table with a two-way `From`. A value the table
@@ -358,7 +358,9 @@ ffi_enum_wrap_from!(
 /// address a separate palette, and hardware formats keep their samples on the
 /// device. Both [`PixelFormat::data_layout`] and
 /// [`PixelFormat::is_plane_storable`] turn on this one predicate, so the two
-/// cannot disagree about which formats are storable.
+/// never disagree about *this* part of the answer — but `data_layout` has
+/// further reasons to return `None`, so `is_plane_storable` is a necessary,
+/// not a sufficient, condition (see that method).
 fn has_no_sample_planes(desc: &AVPixFmtDescriptorRef) -> bool {
     const UNSUPPORTED: u32 =
         ffi::AV_PIX_FMT_FLAG_BITSTREAM | ffi::AV_PIX_FMT_FLAG_PAL | ffi::AV_PIX_FMT_FLAG_HWACCEL;
@@ -379,13 +381,34 @@ impl PixelFormat {
     /// 获取像素格式名称。FFmpeg 对已知格式返回静态字符串，这里复制成拥有的
     /// `String` 返回（未知格式为 `"unknown"`）。
     pub fn get_pix_fmt_name(&self) -> String {
+        Self::raw_name((*self).into()).unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// 任意 `AVPixelFormat` 值的可读名字，用于日志与诊断。
+    ///
+    /// 与 [`Self::get_pix_fmt_name`] 的区别是它收**原始值**而不是 [`PixelFormat`]：
+    /// 帧的 `format` 字段来自解码器/硬件后端，完全可能落在本 crate 收录范围之外，
+    /// 而 `PixelFormat::from` 对未收录值是 **panic** —— 一条 debug 日志不该中止
+    /// 进程。这里走 FFmpeg 自己的 `av_get_pix_fmt_name`，于是未收录但 FFmpeg 认得
+    /// 的格式照样打出真名（`yuv422p12le` 之类，比枚举的 `Debug` 名更有用），
+    /// 只有 FFmpeg 也不认的值才退化成 `pix_fmt <n>`。
+    ///
+    /// （本构建实测 `AV_PIX_FMT_NB` = 267，`PixelFormat` 恰好收录了其中每一个值；
+    /// 6.1 / 7.1 上存在版本门控差异，那时这条"未收录也能取名"的能力才真正用得上。）
+    pub(crate) fn name_of(raw: ffi::AVPixelFormat) -> String {
+        Self::raw_name(raw).unwrap_or_else(|| format!("pix_fmt {raw}"))
+    }
+
+    /// FFmpeg 给 `raw` 的名字；没有名字（`NULL`）时为 `None`。
+    ///
+    /// 唯一调用 `av_get_pix_fmt_name` 的地方，两个"没名字怎么办"的策略
+    /// （`get_pix_fmt_name` 报 `"unknown"`、`name_of` 退化成数字）都建立在它之上，
+    /// 因此不会各自漂移。
+    fn raw_name(raw: ffi::AVPixelFormat) -> Option<String> {
+        // SAFETY: `av_get_pix_fmt_name` 返回静态字符串或 NULL，不接管所有权。
         unsafe {
-            let name = ffi::av_get_pix_fmt_name((*self).into());
-            if name.is_null() {
-                "unknown".to_string()
-            } else {
-                strutils::c_char_to_str(name)
-            }
+            let name = ffi::av_get_pix_fmt_name(raw);
+            (!name.is_null()).then(|| strutils::c_char_to_str(name))
         }
     }
 
@@ -401,12 +424,51 @@ impl PixelFormat {
 
     /// Whether this format can be stored as whole sample planes at all.
     ///
-    /// The size-independent counterpart of [`Self::data_layout`], for callers
-    /// judging a format before a frame size is known: bitstream, paletted and
-    /// hardware formats have no host samples per plane whatever the size, while
-    /// every other format does at every non-zero size.
+    /// [`Self::data_layout`] 的与尺寸无关版本，供还没拿到帧尺寸时判断格式用。
+    /// 它是 `data_layout` 能给出布局的**必要条件而非充分条件**：位流、调色板、
+    /// 硬件格式恒为 `false`；其余格式为 `true`，但其中一部分 `data_layout` 仍会
+    /// 返回 `None` —— 水平二次采样的打包格式可能每个像素占**分数个**样本
+    /// （`uyyvyy411`：4 像素 6 字节），整像素数组表达不了。
     pub fn is_plane_storable(self) -> bool {
         AVPixFmtDescriptorRef::get(self.into()).is_some_and(|desc| !has_no_sample_planes(&desc))
+    }
+
+    /// Whether samples of this format are full range *by definition*, so that a
+    /// frame of it must be tagged `AVCOL_RANGE_JPEG` regardless of what the
+    /// source frame declared.
+    ///
+    /// This mirrors FFmpeg's own decision — `range_override_needed()` in
+    /// `libswscale/utils.c`, which is what forces the range of a scaler's input
+    /// or output:
+    ///
+    /// ```text
+    /// isYUV  = !(flags & AV_PIX_FMT_FLAG_RGB) && nb_components >= 2
+    /// isGray = !(flags & AV_PIX_FMT_FLAG_PAL) && !(flags & AV_PIX_FMT_FLAG_HWACCEL)
+    ///          && nb_components <= 2 && fmt != MONOBLACK && fmt != MONOWHITE
+    /// full   = !isYUV && !isGray
+    /// ```
+    ///
+    /// The consequence callers care about: **gray is _not_ full range**. FFmpeg
+    /// has no `AV_PIX_FMT_FLAG_GRAY` constant (`gray` and `gray16le` report
+    /// `flags == 0`), and it keeps gray in the same bucket as YUV — a gray frame
+    /// carries `16..235` luma when its range tag says limited, so tagging it
+    /// `AVCOL_RANGE_JPEG` would mislabel it. RGB/BGR/GBR families are the ones
+    /// whose samples always fill `0..2^n-1`.
+    ///
+    /// Formats without host samples (bitstream, paletted, hardware) are
+    /// excluded: a range is meaningless for them, and it is what keeps the
+    /// `MONOBLACK`/`MONOWHITE` special cases of `isGray` from leaking in as
+    /// "full range" (both are bitstream formats).
+    pub(crate) fn is_full_range(self) -> bool {
+        AVPixFmtDescriptorRef::get(self.into()).is_some_and(|desc| {
+            if has_no_sample_planes(&desc) {
+                return false;
+            }
+            let is_yuv =
+                desc.flags & ffi::AV_PIX_FMT_FLAG_RGB as u64 == 0 && desc.nb_components >= 2;
+            let is_gray = desc.nb_components <= 2;
+            !is_yuv && !is_gray
+        })
     }
 
     /// The data layout this pixel format uses at `width` x `height`.
@@ -424,15 +486,14 @@ impl PixelFormat {
     /// * a **planar** format is one array per plane, each chroma plane carrying
     ///   its own subsampled size, taken from `log2_chroma_w` / `log2_chroma_h`.
     ///
-    /// `None` means the format cannot be expressed as whole sample arrays at
-    /// this size: bitstream, paletted and hardware formats (whose components are
-    /// not whole samples), or a zero dimension.
-    pub fn data_layout(self, width: u32, height: u32) -> Option<DataLayout> {
+    /// `None` 有三种情形：位流/调色板/硬件格式（分量不是整样本）、任一维度为 0、
+    /// 以及该格式无法用整像素元素表达（水平二次采样的打包格式会出现分数个元素
+    /// 每像素，如 `uyyvyy411` 的 4 像素 6 字节）。前两种可由
+    /// [`Self::is_plane_storable`] 预判，第三种不行。
+    pub fn data_layout(self, width: usize, height: usize) -> Option<DataLayout> {
         if width == 0 || height == 0 {
             return None;
         }
-        // 布局本身用 `ndarray` 的维度表示，几何运算一律按 `usize` 做。
-        let (width, height) = (width as usize, height as usize);
         let desc = AVPixFmtDescriptorRef::get(self.into())?;
         if has_no_sample_planes(&desc) {
             return None;
@@ -513,7 +574,10 @@ impl PixelFormat {
     /// This is the element size a [`MediaFrame`](crate::frame::MediaFrame)'s type
     /// parameter has to match.
     ///
-    /// `None` for formats without host samples (hardware formats).
+    /// `None` 表示拿不到"每分量字节数"：未知/无效的格式值（`av_pix_fmt_desc_get`
+    /// 返回 NULL）、`nb_components == 0`（硬件格式在描述子里根本没有分量）、
+    /// 以及所有分量的深度都是 0。位流/调色板格式**不在**此列——它们有分量深度
+    /// （`pal8` 给 1），只是不能当整样本平面用（见 [`Self::is_plane_storable`]）。
     pub fn bytes_per_component(self) -> Option<usize> {
         let desc = AVPixFmtDescriptorRef::get(self.into())?;
         element_bytes(&desc)
@@ -679,6 +743,92 @@ mod tests {
         assert_eq!(PixelFormat::UYYVYY411.data_layout(8, 7), None);
 
         Ok(())
+    }
+
+    /// `name_of` 是给日志/诊断用的：任何 `AVPixelFormat` 值都能得到可读文本，
+    /// **绝不 panic** —— 而 `PixelFormat::from` 对未收录值是 panic。
+    #[test]
+    fn test_name_of_prints_any_ffmpeg_value_without_panicking() {
+        // 收录在枚举里的格式：与公开方法 `get_pix_fmt_name` 完全一致
+        for fmt in [
+            PixelFormat::GRAY8,
+            PixelFormat::YUV420P,
+            PixelFormat::NV12,
+            PixelFormat::RGB24,
+            PixelFormat::Y210LE,
+        ] {
+            assert_eq!(
+                PixelFormat::name_of(fmt.into()),
+                fmt.get_pix_fmt_name(),
+                "{fmt:?} 两种取名的口径必须一致"
+            );
+        }
+        assert_eq!(PixelFormat::name_of(PixelFormat::GRAY8.into()), "gray");
+
+        // FFmpeg 认得、但本 crate 未收录的值（本构建 0..AV_PIX_FMT_NB 恰好全部收录，
+        // 6.1/7.1 上有版本门控差异时会出现）：打出 FFmpeg 的真名而不是"pix_fmt N"。
+        // 这些值用 `PixelFormat::from` 会 panic，枚举的 `Debug` 也打不出来。
+        if let Some(unlisted) =
+            (0..ffi::AV_PIX_FMT_NB).find(|raw| PixelFormat::from_ffi_checked(*raw).is_none())
+        {
+            assert!(
+                !PixelFormat::name_of(unlisted).starts_with("pix_fmt"),
+                "FFmpeg 认得 {unlisted}，就该给出它的真名"
+            );
+        }
+
+        // 连 FFmpeg 都不认的值（含负数）：退化为数字而不是 panic
+        let bogus = PixelFormat::name_of(-1234);
+        assert!(
+            bogus.starts_with("pix_fmt"),
+            "连 FFmpeg 都不认的值退回数字而不是 panic: {bogus}"
+        );
+        assert!(!PixelFormat::name_of(ffi::AV_PIX_FMT_NONE).is_empty());
+
+        // 契约：整个取值域都不 panic、都有非空输出
+        for raw in -8..=ffi::AV_PIX_FMT_NB {
+            assert!(
+                !PixelFormat::name_of(raw).is_empty(),
+                "raw {raw} 必须给出可读文本"
+            );
+        }
+    }
+
+    /// 「按定义就是 full range」的判据必须与 FFmpeg 的 `range_override_needed`
+    /// 一致 —— **灰度不在其中**。
+    ///
+    /// FFmpeg 没有 `AV_PIX_FMT_FLAG_GRAY` 常量（`gray` / `gray16le` 的 `flags`
+    /// 实测为 0），且 `libswscale` 把 gray 与 YUV 放在同一档（`range_override_needed
+    /// = !isYUV && !isGray`），即灰度帧的实际范围由 `color_range` 决定：标成
+    /// limited 时它的黑是 16 而不是 0。把 GRAY 也判成 full range，等于给
+    /// 16..235 的 luma 打上 `AVCOL_RANGE_JPEG`，下游会按错的黑电平再压一次。
+    #[test]
+    fn test_is_full_range_follows_ffmpeg_and_excludes_gray() {
+        for full in [
+            PixelFormat::RGB24,
+            PixelFormat::BGR24,
+            PixelFormat::RGBA,
+            PixelFormat::GBRP,
+            PixelFormat::GBRAP,
+        ] {
+            assert!(full.is_full_range(), "{full:?} samples fill 0..2^n-1");
+        }
+        for ranged in [
+            PixelFormat::GRAY8,
+            PixelFormat::GRAY16LE,
+            PixelFormat::YUV420P,
+            PixelFormat::NV12,
+            PixelFormat::YUVA420P,
+        ] {
+            assert!(
+                !ranged.is_full_range(),
+                "{ranged:?} takes its range from `color_range`, it is not full range by definition"
+            );
+        }
+        // 没有主机样本的格式谈不上范围：调色板 / 比特流 / 硬件格式都不是。
+        assert!(!PixelFormat::PAL8.is_full_range());
+        assert!(!PixelFormat::MONOWHITE.is_full_range());
+        assert!(!PixelFormat::NONE.is_full_range());
     }
 
     #[test]

@@ -38,7 +38,7 @@ ffi_enum!(
 });
 
 // 枚举 doc 写在宏调用括号内（`#[$em]` 转发到生成的枚举）。
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// Audio sample format (FFmpeg `AV_SAMPLE_FMT_*`).
     ///
     /// Generated from one `variant => constant` table with a two-way `From`. A value the table
@@ -139,9 +139,11 @@ impl SampleFormat {
 /// (e.g. `YUV420P`) and a planar audio format (e.g. `FLTP`) are both
 /// [`Planar`](Self::Planar). Nothing here distinguishes the two media kinds.
 ///
-/// Every plane is a row-major `rows x cols` block, with the component axis
-/// folded into the columns for an interleaved layout. Audio layouts are always
-/// one row tall, so the row stride never takes effect for them.
+/// Every plane is a row-major `rows x cols` block; an interleaved layout
+/// additionally carries a `components` axis, which [`Self::shapes`] keeps
+/// separate and [`Self::plane_row_extent`] folds into the columns. Audio
+/// layouts are always one row tall, so the row stride never takes effect
+/// for them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataLayout {
     /// One interleaved array of shape `(rows, cols, components)`.

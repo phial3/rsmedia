@@ -17,6 +17,7 @@ use rsmpeg::ffi;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -87,11 +88,12 @@ impl Filter {
 /// ```
 /// use rsmedia::{filter, MediaType};
 ///
+/// # fn main() -> rsmedia::Result<()> {
 /// // 线性节点：不写接线，自动接在链尾
-/// let node = filter::FilterNode::new(filter::video::scale(1280, 720, None));
+/// let node = filter::FilterNode::new(filter::video::scale(1280, 720, None)?);
 ///
 /// // 多输入节点：显式指定两路来源（图输入标签或前序节点的输出标签）
-/// let node = filter::FilterNode::new(filter::video::overlay("10", "10", None))
+/// let node = filter::FilterNode::new(filter::video::overlay("10", "10")?)
 ///     .with_inputs(["base", "logo"])
 ///     .with_label("composed");
 ///
@@ -100,6 +102,8 @@ impl Filter {
 ///     .with_inputs(["in0"])
 ///     .with_outputs(["copy_a", "copy_b"]);
 /// # let _ = (node, MediaType::VIDEO);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct FilterNode {
@@ -107,8 +111,10 @@ pub struct FilterNode {
     /// 各路输入分别接到哪个上游标签，顺序即滤镜的输入 pad 顺序。
     /// 空 = 自动接线（接在链尾；链首接图的首个输入）。
     inputs: Vec<String>,
-    /// 各输出 pad 的标签，顺序即滤镜的输出 pad 顺序；空 = 由构建器自动分配
-    /// （仅对**恰好一个**输出 pad 的滤镜成立，多输出滤镜必须显式标注）。
+    /// 各输出 pad 的标签，顺序即滤镜的输出 pad 顺序；空 = 由构建器自动分配一个
+    /// `n{序号}`（自动分配**只给一个**标签：单输出 pad 的滤镜正好够用；多输出滤镜
+    /// 不标注的话，静态 pad 会在建图时因个数不符报 `InvalidConfig`，而动态 pad 的
+    /// `split`/`asplit` 会安静地只生成 1 路输出）。
     outputs: Vec<String>,
 }
 
@@ -125,8 +131,10 @@ impl FilterNode {
     /// 绑定本节点的输入到指定的上游标签，顺序即滤镜的输入 pad 顺序。
     ///
     /// 上游可以是图输入（[`FilterGraphBuilder::add_input_with`] 声明的标签）或前序
-    /// 节点的输出（[`FilterNode::with_label`]）。多输入滤镜必须逐个指全；只给部分
-    /// 标签会在建图时报 [`RsmediaError::InvalidConfig`]，不会静默接错。
+    /// 节点的输出（[`FilterNode::with_label`]）。**静态**输入 pad 的滤镜必须逐个指全：
+    /// 只给部分标签会在建图时报 [`RsmediaError::InvalidConfig`]，不会静默接错。
+    /// 动态输入 pad 的滤镜（`hstack`/`amix`/`concat`…）不校验个数，路数是否与滤镜
+    /// 自己的 `inputs=` / `n=` 选项一致由 FFmpeg 在 `config()` 阶段核对。
     pub fn with_inputs<I, S>(mut self, inputs: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -138,9 +146,10 @@ impl FilterNode {
 
     /// 给本节点的输出打标签，供下游节点或图输出引用。
     ///
-    /// 标签是滤镜图内的接线标识，只能包含 ASCII 字母、数字与下划线；不设置时由
-    /// 构建器自动分配（因此不写标签的节点无法被 [`FilterGraphBuilder::add_output`]
-    /// 直接引用）。
+    /// 标签是滤镜图内的接线标识，只能包含 ASCII 字母、数字与下划线。不设置时
+    /// [`FilterGraphBuilder::build`] 会按节点序号自动分配 `n0`、`n1`…，所以即便
+    /// 不写标签也能被 [`FilterGraphBuilder::add_output`] 引用（写 `n0` 即可），只是
+    /// 这种标签会随节点增删而移位；要稳定引用就显式写一个。
     ///
     /// 这是单输出滤镜的简写；多输出 pad 的滤镜（`split` / `asplit`）请改用
     /// [`with_outputs`](Self::with_outputs) 逐个 pad 标注，否则未被标注的 pad
@@ -153,17 +162,19 @@ impl FilterNode {
     /// 逐个输出 pad 绑定标签，顺序即滤镜的输出 pad 顺序。
     ///
     /// 用于多输出 pad 的滤镜（`split` / `asplit`）把一路输入复制成多路：每个标签
-    /// 各接一条下游链路或声明为一个图输出。标签个数必须与滤镜的输出 pad 数一致
-    /// （多输出滤镜的动态 pad 数由这里的标签个数决定），否则 [`FilterGraphBuilder::build`]
-    /// 报 [`RsmediaError::InvalidConfig`]。
+    /// 各接一条下游链路或声明为一个图输出。标签个数必须与滤镜的输出 pad 数一致，
+    /// 否则 [`FilterGraphBuilder::build`] 报 [`RsmediaError::InvalidConfig`]；
+    /// **动态**输出 pad 的滤镜（`split`/`asplit`，即带 `AVFILTER_FLAG_DYNAMIC_OUTPUTS`
+    /// 的那些）不参与这个校验——它们的 pad 数正是由这里的标签个数决定的。
     ///
     /// ```no_run
     /// # use rsmedia::filter::{self, FilterGraphBuilder, FilterNode, VideoEndpoint};
     /// # use rsmedia::Rational;
     /// # use rsmedia::PixelFormat;
     /// # fn main() -> rsmedia::Result<()> {
-    /// # let endpoint = VideoEndpoint::new(320, 240, PixelFormat::YUV420P,
-    /// #     Rational::new(1, 25).unwrap(), Rational::new(25, 1).unwrap());
+    /// # let endpoint = VideoEndpoint::new(320, 240, PixelFormat::YUV420P)
+    /// #     .with_time_base(Rational::new(1, 25).unwrap())
+    /// #     .with_frame_rate(Rational::new(25, 1).unwrap());
     /// let mut builder = FilterGraphBuilder::new();
     /// builder.add_input_with("src", endpoint);
     /// // 一路输入复制成两路：一路原样输出、一路水平翻转后输出。
@@ -229,129 +240,127 @@ pub fn get_by_name(name: &str) -> Result<Option<AVFilterRef<'static>>> {
     Ok(AVFilter::get_by_name(&filter_name))
 }
 
-/// Escapes characters that are special within FFmpeg filtergraph descriptions.
+/// 第一级（**选项级**）要转义的字符：选项分隔符 `:` `=`、选项值的括号 `{` `}`，以及
+/// 全部图级分隔符。
 ///
-/// This function uses FFmpeg's native av_escape function to properly escape
-/// characters that have special meaning in filter graphs.
+/// 之所以把图级分隔符也算进来，是因为第一级还要单独用于**引号内**的值（见
+/// [`escape_option_level`]）：那种位置没有第二级可选，多转义几个字符是无害的
+/// （第二遍 unescape 会把它们还原），漏转义则会让值被拆开。
+const OPTION_SPECIALS: &str = "\\':,[]={};";
+
+/// 第二级（**图级**）要转义的字符：图级分隔符与链路括号。
+const GRAPH_SPECIALS: &str = "\\'[],;";
+
+/// 走 FFmpeg 自己的 `av_escape`（BACKSLASH 模式，不带 `AV_ESCAPE_FLAG_STRICT`）。
 ///
-/// # Arguments
+/// `av_escape` 只有两种失败，两种都如实报出，**没有任何降级**：
 ///
-/// * `input` - The string to escape
+/// * 入参含内部 NUL —— 它无法成为 C 字符串，也不可能是滤镜描述的一部分；
+///   [`NulError`](std::ffi::NulError) 经 `From` 变成 [`RsmediaError::InvalidConfig`]，
+///   错误消息会指出是 NUL 的问题。
+/// * 分配失败（`av_escape` 返回负值）—— 带上 `AVERROR` 变体与上下文报出。
 ///
-/// # Returns
-///
-/// A new string with special characters escaped according to FFmpeg rules
-fn escape_filter_str(input: &str) -> String {
-    // Early return for empty strings
-    if input.is_empty() {
-        return String::new();
-    }
+/// 以前这里失败时会 `input.replace('\0', "")` 然后原样放行：滤镜描述会悄悄少几个字符
+/// 却照常建图成功，调用方完全看不出自己给的值没被用上。这就是"掩盖问题"。
+fn escape_backslash(input: &str, specials: &str, all_whitespace: bool) -> Result<String> {
+    let c_input = CString::new(input)?;
+    // `specials` 是 crate 里的常量，NUL 是编译期就能排除的；这里不是降级，是不变量。
+    let c_specials = CString::new(specials).expect("a crate constant cannot contain a NUL byte");
+    let flags = if all_whitespace {
+        ffi::AV_ESCAPE_FLAG_WHITESPACE as i32
+    } else {
+        0
+    };
 
-    // FFmpeg 无法处理 NUL 字节；同时在 `av_escape` 失败/返回空指针时，
-    // 退化为「剥离 NUL 后原样放行」。这是有意的降级：宁可未转义，也不拒绝输出。
-    let fallback = || input.replace('\0', "");
-
-    unsafe {
-        // Create a C string from our input
-        let c_input = match CString::new(input) {
-            Ok(s) => s,
-            Err(_) => return fallback(), // Handle null bytes
-        };
-
-        // Characters that need escaping in filtergraph descriptions
-        let special_chars = CString::new("\\':,[]={};").unwrap();
-
-        // Pointer that will receive the escaped string
-        let mut escaped_ptr = std::ptr::null_mut();
-
-        // FFmpeg `av_escape` function flags:
-        // AV_ESCAPE_MODE_BACKSLASH (0) - escape with backslashes
-        // AV_ESCAPE_FLAG_STRICT (1) - be strict about escaping
-        let result = ffi::av_escape(
+    let mut escaped_ptr = std::ptr::null_mut();
+    // SAFETY: 两个入参都是本函数内构造、在调用期间一直有效的 NUL 结尾 C 字符串；`escaped_ptr`
+    // 是可写的本地变量，成功后由 FFmpeg 填入一块 `av_malloc` 的缓冲（本函数随后释放）。
+    let ret = unsafe {
+        ffi::av_escape(
             &mut escaped_ptr,
             c_input.as_ptr(),
-            special_chars.as_ptr(),
-            ffi::AV_ESCAPE_MODE_AUTO,
-            ffi::AV_ESCAPE_FLAG_WHITESPACE as i32,
-        );
-
-        // 检查返回值是否为错误
-        if result < 0 {
-            tracing::warn!("av_escape failed with error code: {result}");
-            // 使用安全的回退方案
-            return fallback();
-        }
-
-        // 检查返回的指针是否为空
-        if escaped_ptr.is_null() {
-            tracing::warn!("av_escape returned null pointer");
-            // 使用安全的回退方案
-            return fallback();
-        }
-
-        // Convert back to Rust String and free the memory
-        let escaped_cstr = std::ffi::CStr::from_ptr(escaped_ptr);
-        let escaped_string = escaped_cstr.to_string_lossy().into_owned();
-
-        // Free memory allocated by FFmpeg
-        ffi::av_free(escaped_ptr as *mut _);
-
-        escaped_string
-    }
-}
-
-/// filtergraph 的「图级」转义：对**已经过** [`escape_filter_str`] 选项级转义的
-/// 字符串再转义一层。
-///
-/// FFmpeg 对滤镜描述做两级解析：先在整条描述上按 `,` `;` `[` `]` 拆分滤镜与
-/// 链路（图级），再在每个滤镜的参数串上按 `:` `=` 拆分选项（选项级）。所以一个
-/// 不带引号直接写进描述的值必须转义两层：只转一层时，值里的 `,` / `;` / `[]`
-/// 会被图级解析吃掉（如 `movie=/tmp/a,b.mp4` 会被拆成两个滤镜）。
-fn escape_filter_graph_str(input: &str) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
-    // 与 `escape_filter_str` 同样的降级策略：av_escape 失败时剥离 NUL 原样放行。
-    let fallback = || input.replace('\0', "");
-
-    unsafe {
-        let c_input = match CString::new(input) {
-            Ok(s) => s,
-            Err(_) => return fallback(),
-        };
-
-        // 图级特殊字符：`\` `'` `[` `]` `,` `;`
-        let special_chars = CString::new("\\'[],;").unwrap();
-        let mut escaped_ptr = std::ptr::null_mut();
-
-        let result = ffi::av_escape(
-            &mut escaped_ptr,
-            c_input.as_ptr(),
-            special_chars.as_ptr(),
+            c_specials.as_ptr(),
             ffi::AV_ESCAPE_MODE_BACKSLASH,
-            // 不设 AV_ESCAPE_FLAG_WHITESPACE：空格已在选项级转义过，
-            // 再转一次会多出一层反斜杠（值会被解析成前导 `\`）。
-            0,
-        );
-
-        if result < 0 || escaped_ptr.is_null() {
-            tracing::warn!("av_escape failed while escaping filtergraph characters");
-            return fallback();
-        }
-
-        let escaped_string = std::ffi::CStr::from_ptr(escaped_ptr)
-            .to_string_lossy()
-            .into_owned();
-        ffi::av_free(escaped_ptr as *mut _);
-
-        escaped_string
+            flags,
+        )
+    };
+    if ret < 0 {
+        return Err(RsmediaError::av_error(ret).with_context("Failed to escape a filter value"));
     }
+    if escaped_ptr.is_null() {
+        // 成功却拿不到缓冲说明不变量被破坏（`av_escape` 成功时必然写回一块 `av_malloc`
+        // 的内存）—— 如实报出，而不是当成"未转义"继续往下走。
+        return Err(RsmediaError::msg(
+            "av_escape reported success but returned no buffer",
+        ));
+    }
+
+    // SAFETY: 成功路径上 `escaped_ptr` 是 `av_escape` 写入的 NUL 结尾 C 字符串。
+    let escaped = unsafe { CStr::from_ptr(escaped_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: `escaped_ptr` 由 `av_escape` 用 `av_malloc` 分配，必须用 `av_free` 释放。
+    unsafe { ffi::av_free(escaped_ptr as *mut _) };
+
+    Ok(escaped)
 }
 
-/// 把调用者提供的值安全地写进滤镜描述（值外层不加引号时使用）：依次做
-/// **选项级**（[`escape_filter_str`]）与**图级**（[`escape_filter_graph_str`]）转义。
-fn escape_filter_option(input: &str) -> String {
-    escape_filter_graph_str(&escape_filter_str(input))
+/// 第一级：把一个值写进**选项值**位置。
+///
+/// 两种调用方式：
+/// * 作为 [`escape_filter_value`] 的第一步（未经引号的值）；
+/// * **单独**用于外层已经有 `'` 引号的值（`drawtext` 的 `text='…'` / `fontfile='…'`）：
+///   `av_get_token` 在引号内原样拷贝、不处理反斜杠，所以那种位置只需要一级 —— 恰好
+///   一个 `\` 会被第二遍 unescape 吃掉。这也是唯一"只转一级"合法的场合。
+///
+/// # Errors
+///
+/// 见 [`escape_backslash`]：值含 NUL 字节时报 [`RsmediaError::InvalidConfig`]，
+/// `av_escape` 自身失败时报对应的 [`RsmediaError`]。
+fn escape_option_level(input: &str) -> Result<String> {
+    escape_backslash(input, OPTION_SPECIALS, true)
+}
+
+/// 第二级：把第一级的输出再护一层，供**未经引号**直接写进滤镜描述的值使用。
+///
+/// 它的作用不是"再转义一批新字符"（图级字符在第一级里已经转过了），而是把第一级留下的
+/// 反斜杠**翻倍**，让它们在 FFmpeg 的第一遍 unescape 之后仍然存在。
+///
+/// # Errors
+///
+/// 见 [`escape_backslash`]。
+fn escape_graph_level(input: &str) -> Result<String> {
+    escape_backslash(input, GRAPH_SPECIALS, false)
+}
+
+/// 把一个调用方提供的值安全地写进滤镜描述（值外层**不加引号**时使用）：依次做
+/// **选项级**（[`escape_option_level`]）与**图级**（[`escape_graph_level`]）转义。
+///
+/// # 为什么是两级
+///
+/// FFmpeg 对滤镜描述做两次 unescape，顺序与转义相反：
+///
+/// 1. 图级 —— `graphparser.c` 的 `av_get_token(filter, "[],;")` 拆滤镜与链路；
+/// 2. 选项级 —— `avfilter.c::ff_filter_opt_parse` → `av_opt_get_key_value(&args, "=", ":")`
+///    → `av_get_token(opts, ":")` 拆选项。
+///
+/// 所以判据不是"哪些字符被转义了"，而是**每个字符最后留下几个反斜杠**（`movie=<path>`
+/// 的报错会回显解析后的路径，用它实测过）：
+///
+/// | 输入字符 | 第一级后 | 最终 | 依据 |
+/// |---|---|---|---|
+/// | `,` `;` `[` `]` | 1 个 | **3 个** | 第 1 遍后必须落到"第 2 遍不当作分隔符"的状态；实测 2 个时 `,` 会在第 1 遍变成裸分隔符，图被拆开（`No such filter: 'b.mp4'`） |
+/// | `:` `=` `{` `}` | 1 个 | **2 个** | 第 1 遍后必须**仍是**转义态，否则第 2 遍把 `:` 当分隔符、值被截断（实测 1 个时 `/tmp/a:b.mp4` 变成 `/tmp/a`） |
+/// | `'` | 1 个 | **3 个** | 同图级：第 1 遍后必须还是 `\'`，否则 `av_get_token` 会进入引号模式把后面整段吞掉 |
+/// | `\` | 2 个 | **4 个** | 每级都把自己翻倍 |
+/// | 空白 | 1 个 | **2 个** | 第 1 遍后必须仍是 `\ ` |
+///
+/// # Errors
+///
+/// 见 [`escape_backslash`]。值里的 NUL 报 [`RsmediaError::InvalidConfig`] —— 滤镜描述
+/// 本来就是 C 字符串，NUL 无法表示，也没有"丢掉几个字符继续"的余地。
+fn escape_filter_value(input: &str) -> Result<String> {
+    escape_graph_level(&escape_option_level(input)?)
 }
 
 /// A filter option that FFmpeg **evaluates**, i.e. one declared `<string>` in
@@ -392,20 +401,23 @@ pub enum Expr<'a> {
 
 impl Expr<'_> {
     /// The option value as it must appear in a filter description.
-    fn to_filter_value(self) -> String {
+    ///
+    /// # Errors
+    ///
+    /// [`Expr::Const`] never fails. [`Expr::Expression`] goes through
+    /// the filter-value escaping path, so it reports a [`RsmediaError::InvalidConfig`]
+    /// when the expression contains a NUL byte — a filter description is a C string and
+    /// cannot carry one.
+    ///
+    /// This replaces the `Display` impl this type used to have: rendering an option value
+    /// is fallible now, and `Display` has no way to report that (its only failure exit is
+    /// `fmt::Error`, which makes `format!` panic). Constructors call this method and
+    /// propagate the error instead.
+    pub fn to_filter_value(self) -> Result<String> {
         match self {
-            Self::Const(value) => format!("{value}"),
-            Self::Expression(expr) => escape_filter_option(expr),
+            Self::Const(value) => Ok(format!("{value}")),
+            Self::Expression(expr) => escape_filter_value(expr),
         }
-    }
-}
-
-impl std::fmt::Display for Expr<'_> {
-    /// Renders the option value exactly as it is written into the filter
-    /// description, so a `format!` over it produces the same text the
-    /// constructors emit.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_filter_value())
     }
 }
 
@@ -466,23 +478,75 @@ fn number(value: impl Into<f64>) -> String {
 /// 转义文本，但保留 FFmpeg 的 `%{...}` 展开块（如 `%{localtime}`、`%{pts:hms}`）。
 ///
 /// 用于 `drawtext` 等需要显示动态时间/帧号的场景，避免 `{` `}` 被转义后无法展开。
-fn escape_filter_expr(input: &str) -> String {
+/// 转义文本，但保留 FFmpeg 的 `%{...}` 展开块（如 `%{localtime}`、`%{pts:hms}`）。
+///
+/// 用于 `drawtext` 等需要显示动态时间/帧号的场景，避免 `{` `}` 被转义后无法展开。
+///
+/// # Errors
+///
+/// 见 [`escape_backslash`]。
+fn escape_filter_expr(input: &str) -> Result<String> {
     let mut result = String::new();
     let mut rest = input;
     while let Some(pos) = rest.find("%{") {
         // 转义 `%{` 之前的部分
-        result.push_str(&escape_filter_str(&rest[..pos]));
+        result.push_str(&escape_option_level(&rest[..pos])?);
         // 找到匹配的 `}`，整体保留
         if let Some(end_rel) = rest[pos..].find('}') {
             result.push_str(&rest[pos..pos + end_rel + 1]);
             rest = &rest[pos + end_rel + 1..];
         } else {
-            result.push_str(&escape_filter_str(&rest[pos..]));
+            result.push_str(&escape_option_level(&rest[pos..])?);
             rest = "";
         }
     }
-    result.push_str(&escape_filter_str(rest));
-    result
+    result.push_str(&escape_option_level(rest)?);
+    Ok(result)
+}
+
+/// 校验一个**闭集**滤镜选项：值必须是 `names` 之一，或 `0..=max` 里的整数。
+///
+/// FFmpeg 这类选项在绑定里是 `<int>` 加一组具名常量 —— `ffmpeg -h filter=yadif`
+/// 里 `mode` 声明 `from 0 to 3`，同时给四个值起了 `send_frame`、`send_field`…
+/// 的名字。**名字和数字都合法**，只按名字收会把 FFmpeg 认的值挡在门外，只按整数
+/// 收同理，所以两边都要收。
+///
+/// 不做校验的话，拼错的名字会被原样写进滤镜串，直到建图才变成一句 FFmpeg 的解析
+/// 错误（"Unable to parse \"mode\" option value \"…\""），既没有本 crate 的上下文、
+/// 也定位不到是哪个参数；在这里前置拦下，是 `InvalidConfig` 且点名了候选值。
+///
+/// `max` 是 FFmpeg 声明的上界（含），取自 `ffmpeg -h filter=<name>` 的范围。
+fn check_closed_set(
+    filter: &str,
+    option: &str,
+    value: &str,
+    names: &[&str],
+    max: i32,
+) -> Result<()> {
+    let in_numeric_range = value.parse::<i32>().is_ok_and(|n| (0..=max).contains(&n));
+    if in_numeric_range || names.contains(&value) {
+        return Ok(());
+    }
+    let quoted: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
+    Err(RsmediaError::invalid_config(format!(
+        "{filter} {option} must be one of {} (or an integer in 0..={max}), got '{value}'",
+        quoted.join(", ")
+    )))
+}
+
+/// `amix` 的 `duration`（如何判定流结束）只认三个档位。
+///
+/// 单独抽出来是因为它有两个入口 —— [`audio::amix`] 与 [`FilterGraphBuilder::amix`]
+/// —— 之前只有后者校验，于是同一个概念在一个入口拼错立刻报错、在另一个入口静默写进
+/// 滤镜串直到建图才炸。
+fn check_amix_duration(duration: &str) -> Result<()> {
+    check_closed_set(
+        "amix",
+        "duration",
+        duration,
+        &["longest", "shortest", "first"],
+        2,
+    )
 }
 
 pub mod video {
@@ -515,17 +579,21 @@ pub mod video {
     ///     - `bitexact`: Enable bitexact output.
     ///
     /// See: <https://ffmpeg.org/ffmpeg-scaler.html#Scaler-Options>
-    pub fn scale<'a>(width: u32, height: u32, flags: impl Into<Option<&'a str>>) -> Filter {
+    /// # Errors
+    ///
+    /// [`RsmediaError::InvalidConfig`] when `flags` contains a NUL byte, or whatever
+    /// Anything `av_escape` fails with is propagated as well.
+    pub fn scale<'a>(width: u32, height: u32, flags: impl Into<Option<&'a str>>) -> Result<Filter> {
         let flags: Option<&str> = flags.into();
         // 默认与 FFmpeg `scale` 滤镜一致，也与本 crate 的 `Scaler::default()`
         // 一致（BICUBIC）；早先这里是 `fast_bilinear`，与上方文档矛盾。
-        let flags_str = escape_filter_option(flags.unwrap_or("bicubic"));
+        let flags_str = escape_filter_value(flags.unwrap_or("bicubic"))?;
 
-        Filter::new(
+        Ok(Filter::new(
             "scale",
             MediaType::VIDEO,
             format!("scale=w={width}:h={height}:flags={flags_str}"),
-        )
+        ))
     }
 
     /// Converts video pixel format.
@@ -579,7 +647,9 @@ pub mod video {
         box_enabled: bool,
         box_color: String,
         box_border_w: u32,
-        raw_text: bool,
+        /// `text` holds an FFmpeg expression (`%{localtime}`, `%{frame_num}`, …)
+        /// rather than a literal string; `%{...}` must survive escaping intact.
+        text_is_expression: bool,
     }
 
     impl DrawText {
@@ -600,7 +670,7 @@ pub mod video {
                 box_enabled: false,
                 box_color: "black@0.5".to_string(),
                 box_border_w: 0,
-                raw_text: false,
+                text_is_expression: false,
             }
         }
 
@@ -633,16 +703,20 @@ pub mod video {
         /// ```
         pub fn time_text(mut self, fmt: &str) -> Self {
             self.text = fmt.to_string();
-            self.raw_text = true;
+            self.text_is_expression = true;
             self
         }
 
         /// 生成最终的 [`Filter`]。
-        pub fn build(self) -> Filter {
-            let text_spec = if self.raw_text {
-                escape_filter_expr(&self.text)
+        /// # Errors
+        ///
+        /// A NUL byte in any of the values is [`RsmediaError::InvalidConfig`]: a filter
+        /// description is a C string and cannot carry one.
+        pub fn build(self) -> Result<Filter> {
+            let text_spec = if self.text_is_expression {
+                escape_filter_expr(&self.text)?
             } else {
-                escape_filter_str(&self.text)
+                escape_option_level(&self.text)?
             };
             let mut spec = format!(
                 "drawtext=text='{}':x={}:y={}:fontsize={}:fontcolor={}",
@@ -650,7 +724,7 @@ pub mod video {
                 self.x,
                 self.y,
                 self.fontsize,
-                escape_filter_option(&self.fontcolor)
+                escape_filter_value(&self.fontcolor)?
             );
             // 缺省使用项目自带字体，避免依赖 system fontconfig（Windows 等平台没有
             // fontconfig 配置会在查字体时崩溃）；用户显式指定字体时优先用用户的。
@@ -658,26 +732,31 @@ pub mod video {
             let fontfile = self
                 .fontfile
                 .unwrap_or_else(|| "fonts/Arial.ttf".to_string());
-            spec.push_str(&format!(":fontfile='{}'", escape_filter_str(&fontfile)));
+            spec.push_str(&format!(":fontfile='{}'", escape_option_level(&fontfile)?));
             if self.box_enabled {
                 spec.push_str(&format!(
                     ":box=1:boxcolor={}:boxborderw={}",
-                    escape_filter_option(&self.box_color),
+                    escape_filter_value(&self.box_color)?,
                     self.box_border_w
                 ));
             }
-            Filter::new("drawtext", MediaType::VIDEO, spec)
+            Ok(Filter::new("drawtext", MediaType::VIDEO, spec))
         }
     }
 
     /// 画矩形框
-    pub fn drawbox(x: i32, y: i32, w: u32, h: u32, color: &str, thickness: i32) -> Filter {
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn drawbox(x: i32, y: i32, w: u32, h: u32, color: &str, thickness: i32) -> Result<Filter> {
         if thickness < 0 {
             // FFmpeg 't=fill' is also possible
             tracing::warn!("Box thickness is negative ({thickness}), using absolute value.",);
         }
-        let color = escape_filter_option(color);
-        Filter::new(
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "drawbox",
             MediaType::VIDEO,
             format!(
@@ -689,7 +768,7 @@ pub mod video {
                 color,
                 thickness.abs()
             ),
-        )
+        ))
     }
 
     /// 去除水印
@@ -790,33 +869,68 @@ pub mod video {
     ///
     /// `zoom`/`x`/`y` 均为 FFmpeg 表达式（如 `"1.5"`、`"iw/2-(iw/zoom/2)"`），
     /// 内部会做选项级 + 图级转义。
-    pub fn zoompan(zoom: &str, x: &str, y: &str, duration: impl Into<Option<i32>>) -> Filter {
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn zoompan(
+        zoom: &str,
+        x: &str,
+        y: &str,
+        duration: impl Into<Option<i32>>,
+    ) -> Result<Filter> {
         let duration: Option<i32> = duration.into();
         let (zoom, x, y) = (
-            escape_filter_option(zoom),
-            escape_filter_option(x),
-            escape_filter_option(y),
+            escape_filter_value(zoom)?,
+            escape_filter_value(x)?,
+            escape_filter_value(y)?,
         );
         let mut params = format!("zoompan=z={zoom}:x={x}:y={y}");
         if let Some(d) = duration {
             params.push_str(&format!(":d={d}"));
         }
-        Filter::new("zoompan", MediaType::VIDEO, params)
+        Ok(Filter::new("zoompan", MediaType::VIDEO, params))
     }
 
-    /// transpose - 用于快速 90°/180°/270° 视频画面旋转、水平翻转或镜像翻转（无插值，高性能）
-    /// mode: 0=逆时针90度/垂直翻转, 1=顺时针90度, 2=逆时针90度, 3=顺时针90度/垂直翻转
+    /// Rotates by a multiple of 90°, optionally with a vertical flip.
     ///
-    /// Transposes video (rotates by multiples of 90 degrees and/or flips).
-    /// See `ffmpeg -filters` (search transpose) for valid modes.
+    /// No interpolation is involved, so this is much cheaper than [`rotate`] —
+    /// but it can only express the four quarter turns.
+    ///
+    /// | `mode` | direction                | effect                                     |
+    /// |--------|--------------------------|--------------------------------------------|
+    /// | `0`    | `cclock_flip`            | 90° counter-clockwise, then flip vertically |
+    /// | `1`    | `clock`                  | 90° clockwise                              |
+    /// | `2`    | `cclock`                 | 90° counter-clockwise                      |
+    /// | `3`    | `clock_flip`             | 90° clockwise, then flip vertically        |
+    ///
+    /// # Why 4..=7 is rejected
+    ///
+    /// FFmpeg's `dir` option declares the range `0..=7`, so it *accepts* 4..=7
+    /// without complaint — and then passes every frame through untouched.
+    /// `transpose=5` is byte-for-byte identical to applying no filter at all
+    /// (verified with `ffmpeg -vf transpose=N` on FFmpeg 9.0). Handing that back
+    /// as a working filter would turn "the video silently did not rotate" into a
+    /// value this crate appears to vouch for, so those modes are rejected here.
     ///
     /// See: <https://ffmpeg.org/ffmpeg-filters.html#transpose-1>
-    pub fn transpose(mode: i32) -> Filter {
-        // Common range is 0-3, but ffmpeg might support more
-        if !(0..=7).contains(&mode) {
-            tracing::warn!("Transpose mode {mode} might be invalid.");
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `mode` is outside `0..=3`.
+    pub fn transpose(mode: i32) -> Result<Filter> {
+        if !(0..=3).contains(&mode) {
+            return Err(RsmediaError::invalid_config(format!(
+                "transpose mode must be in 0..=3 (0=cclock_flip, 1=clock, 2=cclock, 3=clock_flip), \
+                 got {mode}: FFmpeg accepts 4..=7 but passes frames through unchanged"
+            )));
         }
-        Filter::new("transpose", MediaType::VIDEO, format!("transpose={mode}"))
+        Ok(Filter::new(
+            "transpose",
+            MediaType::VIDEO,
+            format!("transpose={mode}"),
+        ))
     }
 
     /// rotate - 任意角度旋转滤镜（支持动画表达式）
@@ -873,13 +987,17 @@ pub mod video {
     /// `radius`: Radius of the luma blur — a constant, or an expression such as
     /// `"min(cw/2,ch/2)"` (`boxblur`'s `luma_radius` is declared `<string>`
     /// because FFmpeg evaluates it).
-    pub fn blur<'a>(radius: impl Into<Expr<'a>>) -> Filter {
+    /// # Errors
+    ///
+    /// [`Expr::to_filter_value`] is fallible, so this constructor is too.
+    pub fn blur<'a>(radius: impl Into<Expr<'a>>) -> Result<Filter> {
         // Consider adding other boxblur params: luma_power, chroma_radius, chroma_power, alpha_radius, alpha_power
-        Filter::new(
+        let radius = radius.into().to_filter_value()?;
+        Ok(Filter::new(
             "boxblur",
             MediaType::VIDEO,
-            format!("boxblur=luma_radius={}", radius.into()),
-        )
+            format!("boxblur=luma_radius={radius}"),
+        ))
     }
 
     /// 亮度/对比度调节
@@ -887,16 +1005,22 @@ pub mod video {
     /// `brightness` / `contrast` are FFmpeg `<string>` options: constants work
     /// (`eq(0.1, 1.2)`), and so do expressions (`eq("sin(t)", "1.2")`), which is
     /// what `eval=frame` needs. See [`Expr`].
-    pub fn eq<'a>(brightness: impl Into<Expr<'a>>, contrast: impl Into<Expr<'a>>) -> Filter {
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn eq<'a>(
+        brightness: impl Into<Expr<'a>>,
+        contrast: impl Into<Expr<'a>>,
+    ) -> Result<Filter> {
+        let brightness = brightness.into().to_filter_value()?;
+        let contrast = contrast.into().to_filter_value()?;
+        Ok(Filter::new(
             "eq",
             MediaType::VIDEO,
-            format!(
-                "eq=brightness={}:contrast={}",
-                brightness.into(),
-                contrast.into()
-            ),
-        )
+            format!("eq=brightness={brightness}:contrast={contrast}"),
+        ))
     }
 
     /// 帧率控制
@@ -905,41 +1029,83 @@ pub mod video {
     /// rationals a float cannot represent (`"30000/1001"`) and `"source"`.
     /// A rate that has to be exact should be given as a rational expression —
     /// the same caveat as [`crate::EncoderBuilder::with_fps`].
-    pub fn fps<'a>(fps: impl Into<Expr<'a>>) -> Filter {
-        Filter::new("fps", MediaType::VIDEO, format!("fps={}", fps.into()))
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn fps<'a>(fps: impl Into<Expr<'a>>) -> Result<Filter> {
+        let fps = fps.into().to_filter_value()?;
+        Ok(Filter::new("fps", MediaType::VIDEO, format!("fps={fps}")))
     }
 
     /// 去交错（Deinterlace），将隔行扫描转为逐行扫描。
     /// `mode`: `send_frame`(默认), `send_field`, `send_frame_nospatial`, `send_field_nospatial`.
-    pub fn yadif(mode: &str) -> Filter {
-        let mode = escape_filter_option(mode);
-        Filter::new("yadif", MediaType::VIDEO, format!("yadif=mode={mode}"))
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `mode` is not one of the four
+    /// directions FFmpeg names (`send_frame`, `send_field`, `send_frame_nospatial`,
+    /// `send_field_nospatial`) or an integer in `0..=3`, or when a value contains a NUL
+    /// byte — a filter description is a C string and cannot carry one. Anything
+    /// `av_escape` fails with is propagated too.
+    pub fn yadif(mode: &str) -> Result<Filter> {
+        check_closed_set(
+            "yadif",
+            "mode",
+            mode,
+            &[
+                "send_frame",
+                "send_field",
+                "send_frame_nospatial",
+                "send_field_nospatial",
+            ],
+            3,
+        )?;
+        let mode = escape_filter_value(mode)?;
+        Ok(Filter::new(
+            "yadif",
+            MediaType::VIDEO,
+            format!("yadif=mode={mode}"),
+        ))
     }
 
     /// 补边（Pad），在视频周围添加指定颜色的边。
     ///
-    /// * `w` / `h` - 输出尺寸（不包含负值表达式）。
+    /// 参数顺序 `(x, y, w, h)` 与 [`crop`] / [`delogo`] / [`Delogo::add_region`] 一致 ——
+    /// 四者都是"先位置、后尺寸"，顺序反着写（`w, h, x, y`）编译得过但画出来是错的。
+    ///
     /// * `x` / `y` - 原视频在输出画布上的偏移。
+    /// * `w` / `h` - 输出尺寸（不包含负值表达式）。
     /// * `color` - 填充颜色，如 `"black"`。
-    pub fn pad(w: u32, h: u32, x: i32, y: i32, color: &str) -> Filter {
-        let color = escape_filter_option(color);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn pad(x: i32, y: i32, w: u32, h: u32, color: &str) -> Result<Filter> {
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "pad",
             MediaType::VIDEO,
             format!("pad=w={w}:h={h}:x={x}:y={y}:color={color}"),
-        )
+        ))
     }
 
     /// 烧录字幕（Subtitles）。
     /// `path`: 字幕文件路径（`srt`/`ass` 等）；路径中的转义字符（如 `,`/`;`/`[]`）
     /// 会被自动转义，调用者传原始路径即可。
-    pub fn subtitles(path: &str) -> Filter {
-        let escaped = escape_filter_option(path);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn subtitles(path: &str) -> Result<Filter> {
+        let escaped = escape_filter_value(path)?;
+        Ok(Filter::new(
             "subtitles",
             MediaType::VIDEO,
             format!("subtitles={escaped}"),
-        )
+        ))
     }
 
     /// 设置显示宽高比（DAR）。
@@ -972,8 +1138,9 @@ pub mod video {
 
     /// 视频降噪（hqdn3d），减少亮度/色度噪声。
     ///
-    /// * `luma` - 亮度空间降噪强度（0-4，默认 4）。
-    /// * `chroma` - 色度空间降噪强度（0-3，默认 3）。
+    /// * `luma` - 亮度空间降噪强度（`luma_spatial`，FFmpeg: 0~DBL_MAX，默认 0；
+    ///   常用 4）。
+    /// * `chroma` - 色度空间降噪强度（`chroma_spatial`，同上，常用 3）。
     ///
     /// `hqdn3d.luma_spatial` / `chroma_spatial` 在 FFmpeg 里是 `<double>`，因此这里
     /// 收 `f64`：包一层 `f32` 会比 FFmpeg 实际接受的域更窄。
@@ -1009,10 +1176,13 @@ pub mod video {
     ///
     /// * `luma_strength` - 亮度平滑强度（-1~1）。**正值 = 平滑/磨皮**，
     ///   负值 = 锐化；证件照建议 `0.05~0.2`。
-    /// * `luma_radius` - 平滑半径（0.1~5），越大越柔和，证件照建议 `3` 左右。
+    /// * `luma_radius` - 平滑半径（0.1~5，默认 1），越大越柔和，证件照建议 `3` 左右。
     ///
-    /// 色度通道默认与亮度同参数（`chroma_mode=me`）；如需单独控制请用
-    /// [`Filter::new`] 逃生舱传完整 spec。
+    /// 色度/alpha 无需单独设置：FFmpeg 的 `smartblur` **没有** `chroma_mode` 这类选项，
+    /// 而是在 `init` 里把低于合法下限的 `chroma_radius` / `chroma_strength` /
+    /// `chroma_threshold`（默认值 `-0.9` / `-2` / `-31`，即各自下限减一）直接替换成
+    /// 对应的 luma 值——所以不显式指定时色度就是跟随亮度。若要让色度与亮度不同，
+    /// 请用 [`Filter::new`] 逃生舱传完整 spec。
     pub fn smartblur(luma_strength: impl Into<f64>, luma_radius: impl Into<f64>) -> Filter {
         Filter::new(
             "smartblur",
@@ -1032,22 +1202,35 @@ pub mod video {
     /// **版本差异**：FFmpeg 8+ 移除了独立的 `gamma` 滤镜，该功能并入 `eq`
     /// （`eq=gamma=…`）。为在新版本上可用，这里直接生成 `eq` 滤镜，
     /// 语义与旧 `gamma` 滤镜一致。
-    pub fn gamma<'a>(gamma: impl Into<Expr<'a>>) -> Filter {
-        Filter::new("eq", MediaType::VIDEO, format!("eq=gamma={}", gamma.into()))
+    /// # Errors
+    ///
+    /// See [`Expr::to_filter_value`].
+    pub fn gamma<'a>(gamma: impl Into<Expr<'a>>) -> Result<Filter> {
+        let gamma = gamma.into().to_filter_value()?;
+        Ok(Filter::new(
+            "eq",
+            MediaType::VIDEO,
+            format!("eq=gamma={gamma}"),
+        ))
     }
 
     /// 饱和度调节（画质增强）。
     /// `saturation` 为饱和度倍数（1.0 表示不变，0 为黑白），也可以是表达式。
-    pub fn saturation<'a>(saturation: impl Into<Expr<'a>>) -> Filter {
-        Filter::new(
+    /// # Errors
+    ///
+    /// See [`Expr::to_filter_value`].
+    pub fn saturation<'a>(saturation: impl Into<Expr<'a>>) -> Result<Filter> {
+        let saturation = saturation.into().to_filter_value()?;
+        Ok(Filter::new(
             "eq",
             MediaType::VIDEO,
-            format!("eq=saturation={}", saturation.into()),
-        )
+            format!("eq=saturation={saturation}"),
+        ))
     }
 
     /// 鲜艳度调节（画质增强）。
-    /// `vibrance` 为鲜艳度（-1.0 ~ 1.0，0 表示不变），对应 FFmpeg `vibrance=intensity`。
+    /// `vibrance` 为鲜艳度（FFmpeg: -2.0 ~ 2.0，默认 0 表示不变），对应
+    /// `vibrance=intensity`。
     pub fn vibrance(vibrance: impl Into<f64>) -> Filter {
         Filter::new(
             "vibrance",
@@ -1078,13 +1261,18 @@ pub mod video {
     ///
     /// 注意：`blur(radius)` 是 convenience 版，只设 `luma_radius`；
     /// 这里保留 boxblur 完整参数供精细控制。
-    pub fn boxblur(luma_radius: &str, luma_power: u32) -> Filter {
-        let luma_radius = escape_filter_option(luma_radius);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn boxblur(luma_radius: &str, luma_power: u32) -> Result<Filter> {
+        let luma_radius = escape_filter_value(luma_radius)?;
+        Ok(Filter::new(
             "boxblur",
             MediaType::VIDEO,
             format!("boxblur=luma_radius={luma_radius}:luma_power={luma_power}"),
-        )
+        ))
     }
 
     /// 叠加（overlay），将一个视频流（overlay）叠加到主视频流上。
@@ -1096,21 +1284,26 @@ pub mod video {
     /// * `x` / `y` - 叠加层在基底上的偏移（支持表达式，如 `"main_w-overlay_w-10"`）。
     ///   表达式可含 `,`（如 `"if(eq(t,0),0,W-w)"`），会按滤镜语法转义，
     ///   直接照写即可，无需自己加反斜杠。
-    /// * `opacity` - 叠加层不透明度（0~1）。
-    pub fn overlay(x: &str, y: &str, opacity: impl Into<Option<f32>>) -> Filter {
-        let opacity: Option<f32> = opacity.into();
+    ///
+    /// ⚠️ 这里**没有**不透明度参数：`overlay` 的 `alpha` 是"alpha 格式"枚举
+    /// （`auto` / `straight` / `premultiplied`，取值 0~2），不是不透明度 ——
+    /// 把 0~1 的透明度写进 `alpha=` 会被 FFmpeg 静默取整成一个格式档位。
+    /// 要给叠加层做半透明，先用 [`FilterGraphBuilder`] 在该路上接一个
+    /// `colorchannelmixer=aa=<0~1>`（或 `format=rgba` + `colorchannelmixer`）。
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn overlay(x: &str, y: &str) -> Result<Filter> {
         // x/y 是表达式，`,` 等字符会被滤镜语法解析吃掉（整条描述先按 `,` 拆分
         // 滤镜），报出来的错与真实原因无关，因此与其它 `&str` 参数一致地转义。
-        let (x, y) = (escape_filter_option(x), escape_filter_option(y));
-        let alpha = match opacity {
-            Some(a) => format!(":alpha={a}"),
-            None => String::new(),
-        };
-        Filter::new(
+        let (x, y) = (escape_filter_value(x)?, escape_filter_value(y)?);
+        Ok(Filter::new(
             "overlay",
             MediaType::VIDEO,
-            format!("overlay=x={x}:y={y}{alpha}"),
-        )
+            format!("overlay=x={x}:y={y}"),
+        ))
     }
 
     /// 横向并排（hstack）：把多路视频并成一行。
@@ -1154,18 +1347,30 @@ pub mod video {
     /// **多输出**滤镜：用 [`FilterNode::with_outputs`] 给每个输出 pad 标名，每个名字
     /// 各接一条下游链路——同一个标签被两处消费会被建图期拒绝，正是提示在这里插一个
     /// `split`。复制的是同一份像素（后续各链路互不影响）。
-    /// `outputs` 必须 ≥ 2（FFmpeg 的 `split` 族下限）。
+    ///
+    /// `outputs` 取值范围是 FFmpeg 的 `split.outputs`：**1~INT_MAX**，默认 2。
+    /// 传 `1` 是合法的（等价于直连，只是多一层拷贝）。本函数**不校验**该值，
+    /// 传 `0` 或超过 `INT_MAX` 的数会原样写进 spec，由建图时的 FFmpeg 报错。
     pub fn split(outputs: u32) -> Filter {
         Filter::new("split", MediaType::VIDEO, format!("split={outputs}"))
     }
 
     /// 色度键抠像（chromakey），将指定颜色转为透明。
     /// * `color` - 要抠掉的颜色，如 `"green@0.5"`。
-    /// * `similarity` - 颜色相似度阈值（0~0.01，越大越宽松）。
+    /// * `similarity` - 颜色相似度阈值（FFmpeg: 1e-05~1，默认 0.01，越大越宽松）。
     /// * `blend` - 混合比例（0~1）。
-    pub fn chromakey(color: &str, similarity: impl Into<f64>, blend: impl Into<f64>) -> Filter {
-        let color = escape_filter_option(color);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn chromakey(
+        color: &str,
+        similarity: impl Into<f64>,
+        blend: impl Into<f64>,
+    ) -> Result<Filter> {
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "chromakey",
             MediaType::VIDEO,
             format!(
@@ -1173,14 +1378,23 @@ pub mod video {
                 number(similarity),
                 number(blend)
             ),
-        )
+        ))
     }
 
     /// RGB 色键（colorkey），将指定 RGB 颜色转为透明。
     /// `color` - 如 `"black"` 或 `"0x000000"`。
-    pub fn colorkey(color: &str, similarity: impl Into<f64>, blend: impl Into<f64>) -> Filter {
-        let color = escape_filter_option(color);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn colorkey(
+        color: &str,
+        similarity: impl Into<f64>,
+        blend: impl Into<f64>,
+    ) -> Result<Filter> {
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "colorkey",
             MediaType::VIDEO,
             format!(
@@ -1188,30 +1402,50 @@ pub mod video {
                 number(similarity),
                 number(blend)
             ),
-        )
+        ))
     }
 
     /// 曲线调节（curves），通过控制点微调 R/G/B 通道色调。
     /// `preset`/`points` 二选一；`points` 形如 `"0/0 0.5/0.5 1/1"`（无需自行转义）。
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
     pub fn curves<'a>(
         preset: impl Into<Option<&'a str>>,
         points: impl Into<Option<&'a str>>,
-    ) -> Filter {
+    ) -> Result<Filter> {
         let preset: Option<&str> = preset.into();
         let points: Option<&str> = points.into();
         let spec = match (preset, points) {
-            (Some(p), _) => format!("curves=preset={}", escape_filter_option(p)),
-            (None, Some(pt)) => format!("curves=all={}", escape_filter_option(pt)),
+            (Some(p), _) => format!("curves=preset={}", escape_filter_value(p)?),
+            (None, Some(pt)) => format!("curves=all={}", escape_filter_value(pt)?),
             _ => "curves".to_string(),
         };
-        Filter::new("curves", MediaType::VIDEO, spec)
+        Ok(Filter::new("curves", MediaType::VIDEO, spec))
     }
 
     /// 逐行/隔行转换（bwdif）去隔行，现代去隔行替代方案。
-    /// `mode`: `send_frame`(默认) / `send_field` / `send_frame_nospatial`。
-    pub fn bwdif(mode: &str) -> Filter {
-        let mode = escape_filter_option(mode);
-        Filter::new("bwdif", MediaType::VIDEO, format!("bwdif=mode={mode}"))
+    /// `mode`: `send_frame` / `send_field`(默认)。FFmpeg 的 `bwdif` 只有这两档
+    /// （取值 0~1），没有 `send_frame_nospatial`。
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `mode` is not one of the two
+    /// directions FFmpeg names (`send_frame`, `send_field`) or an integer in `0..=1`, or
+    /// when a value contains a NUL byte — a filter description is a C string and cannot
+    /// carry one. Anything `av_escape` fails with is propagated too.
+    ///
+    /// Note the range is narrower than [`yadif`]'s: `bwdif` has no
+    /// `*_nospatial` variants.
+    pub fn bwdif(mode: &str) -> Result<Filter> {
+        check_closed_set("bwdif", "mode", mode, &["send_frame", "send_field"], 1)?;
+        let mode = escape_filter_value(mode)?;
+        Ok(Filter::new(
+            "bwdif",
+            MediaType::VIDEO,
+            format!("bwdif=mode={mode}"),
+        ))
     }
 
     /// GIF 单遍调色板滤镜链（palettegen/paletteuse），输出 pal8 帧供 `gif`
@@ -1231,28 +1465,40 @@ pub mod video {
     /// 输入为 RGB 帧：滤镜声明了 RGB24 输入格式，编码器侧自动把输入帧转到
     /// RGB24 再进图；输出 pal8 与 `gif` 编码器原生格式一致。
     ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// use rsmedia::{EncoderBuilder, filter::video};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
     /// let encoder = EncoderBuilder::new_video(320, 240)
     ///     .with_codec_name("gif")
     ///     .with_fps(10.0)
-    ///     .with_filters(vec![video::gif_palette(10.0, None)])
-    ///     .build()
-    ///     .unwrap();
+    ///     .with_filters(vec![video::gif_palette(10.0, None)?])
+    ///     .build()?;
+    /// # drop(encoder);
+    /// # Ok(())
+    /// # }
     /// ```
-    pub fn gif_palette<'a>(fps: f32, dither: impl Into<Option<&'a str>>) -> Filter {
+    pub fn gif_palette<'a>(fps: f32, dither: impl Into<Option<&'a str>>) -> Result<Filter> {
         let dither: Option<&str> = dither.into();
-        let dither_part = dither
-            .map(|d| format!(":dither={}", escape_filter_option(d)))
-            .unwrap_or_default();
-        Filter::new(
+        // 不能用 `map(...)`：闭包里没法用 `?`，而转义现在是可能失败的。
+        let dither_part = match dither {
+            Some(d) => format!(":dither={}", escape_filter_value(d)?),
+            None => String::new(),
+        };
+        Ok(Filter::new(
             "paletteuse",
             MediaType::VIDEO,
             format!("fps={fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse{dither_part}"),
         )
-        .with_input_format(PixelFormat::RGB24)
+        .with_input_format(PixelFormat::RGB24))
     }
 
     /// LUT 调色（lutyuv）：按亮度/色度查找表逐通道映射，证件照"美白"常用
@@ -1262,55 +1508,73 @@ pub mod video {
     ///   `"if(lt(val,100),val,val+20)"`），传 `None` 表示该通道不变。
     ///   表达式中的逗号会被自动转义。
     ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    ///
     /// # Examples
     ///
     /// ```
     /// use rsmedia::filter::video;
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
     /// // 亮度整体 +10（简单提亮美白），色度不动
-    /// let _f = video::lutyuv(Some("val+10"), None, None);
+    /// let _f = video::lutyuv(Some("val+10"), None, None)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn lutyuv<'a>(
         y: impl Into<Option<&'a str>>,
         u: impl Into<Option<&'a str>>,
         v: impl Into<Option<&'a str>>,
-    ) -> Filter {
+    ) -> Result<Filter> {
         let y: Option<&str> = y.into();
         let u: Option<&str> = u.into();
         let v: Option<&str> = v.into();
         let mut parts = Vec::new();
         if let Some(y_expr) = y {
-            parts.push(format!("y={}", escape_filter_option(y_expr)));
+            parts.push(format!("y={}", escape_filter_value(y_expr)?));
         }
         if let Some(u) = u {
-            parts.push(format!("u={}", escape_filter_option(u)));
+            parts.push(format!("u={}", escape_filter_value(u)?));
         }
         if let Some(v) = v {
-            parts.push(format!("v={}", escape_filter_option(v)));
+            parts.push(format!("v={}", escape_filter_value(v)?));
         }
         let spec = if parts.is_empty() {
             "lutyuv".to_string()
         } else {
             format!("lutyuv={}", parts.join(":"))
         };
-        Filter::new("lutyuv", MediaType::VIDEO, spec)
+        Ok(Filter::new("lutyuv", MediaType::VIDEO, spec))
     }
 
     /// 拼版（tile）：把多帧按 `cols x rows` 网格排成一张图，证件照"一张 6 寸
     /// 相纸排 8 张一寸"即此滤镜。
     ///
     /// * `cols` / `rows` - 网格行列数（总格数 = cols*rows，输入帧数不足时
-    ///   最后一格用 `padding` 色填充）。
-    /// * `padding` - 格子间距像素（0~100）。
-    /// * `color` - 背景/填充颜色，如 `"white"`。
+    ///   未填满的格子用 `color` 填充）。
+    /// * `padding` - **内边框厚度**（每格四周各加这么多像素），FFmpeg 取值
+    ///   0~1024（默认 0）；它不是"格与格之间的间距"。整图外边框另有 `margin`，
+    ///   本函数不暴露。
+    /// * `color` - 未使用区域的颜色（"set the color of the unused area"，
+    ///   默认 `black`）：既填未填满的格子，也填 `padding` 留出的内边框，如 `"white"`。
     ///
     /// 注意：tile 是**攒帧**滤镜——每 cols*rows 帧吐 1 帧，EOF 时输出残余格。
-    pub fn tile(cols: u32, rows: u32, padding: u32, color: &str) -> Filter {
-        let color = escape_filter_option(color);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
+    pub fn tile(cols: u32, rows: u32, padding: u32, color: &str) -> Result<Filter> {
+        let color = escape_filter_value(color)?;
+        Ok(Filter::new(
             "tile",
             MediaType::VIDEO,
             format!("tile={cols}x{rows}:padding={padding}:color={color}"),
-        )
+        ))
     }
 }
 
@@ -1353,7 +1617,7 @@ pub mod audio {
     }
 
     /// 把通道数解析为 FFmpeg 通道布局描述；失败时回退到数字通道数，避免 panic。
-    /// 滤镜图源/汇（`FilterGraph::setup_audio_filters`）也复用同一逻辑。
+    /// 音频端点建图（[`FilterGraph::create_audio_source`]）也复用同一逻辑。
     pub(super) fn audio_channel_desc(nb_channels: i32) -> String {
         AVChannelLayout::from_nb_channels(nb_channels)
             .describe()
@@ -1368,12 +1632,16 @@ pub mod audio {
     /// reachable: a linear multiplier (`volume(0.5)`), a **dB** value — which no
     /// numeric type could carry — (`volume("-6dB")`), and an expression
     /// (`volume("if(gt(t,10),0,1)")`). See [`Expr`].
-    pub fn volume<'a>(volume: impl Into<Expr<'a>>) -> Filter {
-        Filter::new(
+    /// # Errors
+    ///
+    /// See [`Expr::to_filter_value`].
+    pub fn volume<'a>(volume: impl Into<Expr<'a>>) -> Result<Filter> {
+        let volume = volume.into().to_filter_value()?;
+        Ok(Filter::new(
             "volume",
             MediaType::AUDIO,
-            format!("volume={}", volume.into()),
-        )
+            format!("volume={volume}"),
+        ))
     }
 
     /// loudnorm - EBU R128音量标准化
@@ -1537,9 +1805,14 @@ pub mod audio {
     /// 创建高级FFT降噪过滤器
     /// Applies FFT noise reduction (advanced).
     ///
-    /// * `noise_reduction`: Noise reduction in dB（`afftdn.nr`，`<float>`）。
-    /// * `noise_floor`: Noise floor in dB（`afftdn.nf`，`<float>`）。
-    /// * `noise_type`: `'w'`/`'v'`/`'p'`/`'c'`/`'s'`，默认 `'w'`。
+    /// * `noise_reduction`: Noise reduction in dB（`afftdn.nr`，`<float>`，
+    ///   FFmpeg 取值 0.01~97，默认 12）。
+    /// * `noise_floor`: Noise floor in dB（`afftdn.nf`，`<float>`，
+    ///   FFmpeg 取值 -80~-20，默认 -50）。
+    /// * `noise_type`: `afftdn.nt`，`'w'`（white，默认）/ `'v'`（vinyl）/ `'s'`（shellac）/
+    ///   `'c'`（custom）。FFmpeg 只认这四个枚举值（0~3），本函数**不做校验**：
+    ///   传别的值（例如 `'p'`）会原样写进 spec，最终在建图时报错。
+    ///   `'c'` 还要配合 `band_noise` 才有意义，本函数不暴露该选项。
     /// * `track_residual`: `afftdn.tr`，FFmpeg 声明为 **`<boolean>`**：跟踪残余噪声
     ///   （`track_residual`），不是"时间平滑系数"。
     ///
@@ -1548,16 +1821,21 @@ pub mod audio {
     /// `Unable to parse "tr" option value "0.5" as boolean`。也就是说**只要传入
     /// 任何非整数，`advanced_fft_denoise` 都会让 `FilterGraph` 建不起来**；
     /// 名字与类型都指向"一个浮点系数"，掩盖了真实的选项语义。
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
     pub fn advanced_fft_denoise<'a>(
         noise_reduction: impl Into<f64>,
         noise_floor: impl Into<f64>,
         noise_type: impl Into<Option<&'a str>>,
         track_residual: bool,
-    ) -> Filter {
+    ) -> Result<Filter> {
         let noise_type: Option<&str> = noise_type.into();
-        let nt = escape_filter_option(noise_type.unwrap_or("w"));
+        let nt = escape_filter_value(noise_type.unwrap_or("w"))?;
         let tr = u8::from(track_residual);
-        Filter::new(
+        Ok(Filter::new(
             "afftdn",
             MediaType::AUDIO,
             format!(
@@ -1565,14 +1843,18 @@ pub mod audio {
                 number(noise_reduction),
                 number(noise_floor)
             ),
-        )
+        ))
     }
 
     /// 创建自适应非局部均值降噪过滤器
     /// Applies Non-Local Means de-noising (anlmdn).
     /// `strength`: Denoising strength (0 to inf, default 1e-05).
-    /// `patch_size`: Patch size (default 7).
-    /// `search_range`: Research range (default 15).
+    /// `patch_size`: Patch **duration** (FFmpeg's `p`, `<duration>`, default 0.002 = 2 ms).
+    /// `search_range`: Research **duration** (FFmpeg's `r`, `<duration>`, default 0.006 = 6 ms).
+    ///
+    /// `p` / `r` are `<duration>` options, not sample counts — FFmpeg rejects anything outside
+    /// `[0.001, 0.1]` / `[0.002, 0.3]`, so they are typed [`Duration`] here (like `afade` and
+    /// `trim`) rather than `i32`.
     ///
     /// # Known upstream issue (FFmpeg <= 9.0)
     ///
@@ -1584,21 +1866,21 @@ pub mod audio {
     /// 的整数倍，或改用 `Filter::fft_denoise` / `Filter::denoise`。
     pub fn anlm_denoise(
         strength: impl Into<Option<f64>>,
-        patch_size: impl Into<Option<i32>>,
-        search_range: impl Into<Option<i32>>,
+        patch_size: impl Into<Option<Duration>>,
+        search_range: impl Into<Option<Duration>>,
     ) -> Filter {
         let strength: Option<f64> = strength.into();
-        let patch_size: Option<i32> = patch_size.into();
-        let search_range: Option<i32> = search_range.into();
+        let patch_size: Option<Duration> = patch_size.into();
+        let search_range: Option<Duration> = search_range.into();
         let mut params = Vec::new();
         if let Some(s) = strength {
             params.push(format!("s={s}"));
         }
         if let Some(p) = patch_size {
-            params.push(format!("p={p}"));
+            params.push(format!("p={}", duration_literal(p)));
         }
         if let Some(r) = search_range {
-            params.push(format!("r={r}"));
+            params.push(format!("r={}", duration_literal(r)));
         }
         let spec = if params.is_empty() {
             "anlmdn".to_string()
@@ -1628,9 +1910,16 @@ pub mod audio {
     /// 量纲（时间），也接受 `"1.5s"`、`"00:00:01.5"` 这样的时长字面量。
     /// 用 [`Duration`] 表达"这是一段时间"，比 `f32` 秒更贴近语义，也免掉了
     /// `f32` 在 10⁴ 秒量级上约 1 ms 的 ULP 误差。
-    pub fn afade(fade_type: &str, start: Duration, duration: Duration) -> Filter {
-        let fade_type = escape_filter_option(fade_type);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `fade_type` is neither `in` nor `out`
+    /// (nor the integers `0`/`1` FFmpeg maps them to), or when a value contains a NUL
+    /// byte — a filter description is a C string and cannot carry one. Anything
+    /// `av_escape` fails with is propagated too.
+    pub fn afade(fade_type: &str, start: Duration, duration: Duration) -> Result<Filter> {
+        check_closed_set("afade", "type", fade_type, &["in", "out"], 1)?;
+        let fade_type = escape_filter_value(fade_type)?;
+        Ok(Filter::new(
             "afade",
             MediaType::AUDIO,
             format!(
@@ -1638,21 +1927,26 @@ pub mod audio {
                 duration_literal(start),
                 duration_literal(duration)
             ),
-        )
+        ))
     }
 
     /// 回声（aecho）。
     /// * `in_gain` / `out_gain` - 输入/输出增益。
     /// * `delays` - 延迟序列（ms，如 `"60|30"`）。
     /// * `decays` - 衰减系数（如 `"0.4|0.3"`）。
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+    /// description is a C string and cannot carry one. Anything `av_escape` fails with is
+    /// propagated too.
     pub fn aecho(
         in_gain: impl Into<f64>,
         out_gain: impl Into<f64>,
         delays: &str,
         decays: &str,
-    ) -> Filter {
-        let (delays, decays) = (escape_filter_option(delays), escape_filter_option(decays));
-        Filter::new(
+    ) -> Result<Filter> {
+        let (delays, decays) = (escape_filter_value(delays)?, escape_filter_value(decays)?);
+        Ok(Filter::new(
             "aecho",
             MediaType::AUDIO,
             format!(
@@ -1660,7 +1954,7 @@ pub mod audio {
                 number(in_gain),
                 number(out_gain)
             ),
-        )
+        ))
     }
 
     /// 混音（amix），将多路输入混成一路。
@@ -1670,20 +1964,30 @@ pub mod audio {
     /// 接进自定义的多输入图。各路采样率 / 采样格式 / 通道布局不同时，FFmpeg 会在
     /// 链路协商阶段自动插入 `aresample`。
     /// `inputs`: 输入路数；`duration`: `longest`/`shortest`/`first`。
-    pub fn amix(inputs: u32, duration: &str) -> Filter {
-        let duration = escape_filter_option(duration);
-        Filter::new(
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `duration` is not one of `longest`,
+    /// `shortest`, `first` (nor the integers `0`/`1`/`2` FFmpeg maps them to), or when a
+    /// value contains a NUL byte — a filter description is a C string and cannot carry
+    /// one. Anything `av_escape` fails with is propagated too.
+    pub fn amix(inputs: u32, duration: &str) -> Result<Filter> {
+        check_amix_duration(duration)?;
+        let duration = escape_filter_value(duration)?;
+        Ok(Filter::new(
             "amix",
             MediaType::AUDIO,
             format!("amix=inputs={inputs}:duration={duration}"),
-        )
+        ))
     }
 
     /// 把一路音频复制成 `outputs` 路相同内容（`asplit`），是音频 fan-out 的显式手段。
     ///
     /// **多输出**滤镜：用 [`FilterNode::with_outputs`] 给每个输出 pad 标名，每个名字
     /// 各接一条下游链路（同一个标签接两处会被建图期拒绝）。
-    /// `outputs` 必须 ≥ 2（FFmpeg 的 `split` 族下限）。
+    ///
+    /// `outputs` 取值范围是 FFmpeg 的 `(a)split.outputs`：**1~INT_MAX**，默认 2。
+    /// 传 `1` 是合法的（等价于直连）。本函数**不校验**该值，`0` 或超过 `INT_MAX`
+    /// 的数会原样写进 spec，由建图时的 FFmpeg 报错。
     pub fn asplit(outputs: u32) -> Filter {
         Filter::new("asplit", MediaType::AUDIO, format!("asplit={outputs}"))
     }
@@ -1755,10 +2059,19 @@ fn audio_or_video_filter_name(
 /// 修改时间戳表达式（加速、减速、对齐等）。
 /// 典型值：`"0.5*PTS"`（2倍速）、`"1.5*PTS"`（慢放）、`"PTS-STARTPTS"`。
 /// `expr`: FFmpeg expression (e.g., "0.5*PTS", "PTS-STARTPTS").
-pub fn setpts(media_type: MediaType, expr: &str) -> Filter {
+/// # Errors
+///
+/// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
+/// description is a C string and cannot carry one. Anything `av_escape` fails with is
+/// propagated too.
+pub fn setpts(media_type: MediaType, expr: &str) -> Result<Filter> {
     let name = audio_or_video_filter_name("asetpts", "setpts", media_type);
-    let escaped_expr = escape_filter_option(expr);
-    Filter::new(name, media_type, format!("{name}={escaped_expr}"))
+    let escaped_expr = escape_filter_value(expr)?;
+    Ok(Filter::new(
+        name,
+        media_type,
+        format!("{name}={escaped_expr}"),
+    ))
 }
 
 /// 将视频/音频裁剪到指定的时间范围。
@@ -1910,9 +2223,16 @@ impl From<AudioEndpoint> for Endpoint {
 
 /// Format declaration for a video endpoint.
 ///
-/// Like [`VideoParams`], the sizes mirror FFmpeg's own field shapes and stay
-/// `i32` (FFmpeg's `int`) while the high-level API uses `u32`; the rational
-/// fields are plain [`Rational`].
+/// Like [`VideoParams`], the sizes stay `i32` — FFmpeg's `int` — and so does the
+/// rest of this crate's size API: a value has to reach `AVFrame.width` and
+/// `AVCodecContext.width` unchanged, so `u32` would only add a narrowing step in
+/// which an out-of-range value wraps silently. The rational fields are plain
+/// [`Rational`].
+///
+/// The three rationals share a type and sit next to each other, so both a struct
+/// literal and a positional constructor can swap them without the compiler
+/// noticing. Build the value with [`VideoEndpoint::new`] plus the `with_*`
+/// setters, where each one is named by what it sets.
 #[derive(Debug, Clone, Copy)]
 pub struct VideoEndpoint {
     /// Width in pixels
@@ -1930,25 +2250,37 @@ pub struct VideoEndpoint {
 }
 
 impl VideoEndpoint {
-    /// 用尺寸、像素格式、时间基与帧率建一个视频端点（像素宽高比取 1:1）。
-    pub fn new(
-        width: i32,
-        height: i32,
-        format: PixelFormat,
-        time_base: Rational,
-        frame_rate: Rational,
-    ) -> Self {
+    /// 用尺寸与像素格式建一个视频端点。
+    ///
+    /// 三个有理数**不**走位置参数：它们类型相同、含义又相近（时间基与帧率还互为
+    /// 倒数），写反了编译得过、要到出片才看得出错。用下面的 `with_*` 逐个按名字设置。
+    ///
+    /// 默认值：时间基与帧率 [`Rational::ZERO`]（`buffer` 源会直接拒绝 `time_base=0/1`，
+    /// 不会静默建出一个错的图）、像素宽高比 [`Rational::ONE`]（1:1，最常见的情形）。
+    pub fn new(width: i32, height: i32, format: PixelFormat) -> Self {
         Self {
             width,
             height,
             format,
-            time_base,
-            frame_rate,
+            time_base: Rational::ZERO,
+            frame_rate: Rational::ZERO,
             pixel_aspect: Rational::ONE,
         }
     }
 
-    /// 覆盖像素宽高比。
+    /// 设置时间基。同一张图内各路输入应当一致，否则画面会错位。
+    pub fn with_time_base(mut self, time_base: Rational) -> Self {
+        self.time_base = time_base;
+        self
+    }
+
+    /// 设置帧率。
+    pub fn with_frame_rate(mut self, frame_rate: Rational) -> Self {
+        self.frame_rate = frame_rate;
+        self
+    }
+
+    /// 设置像素宽高比。
     pub fn with_pixel_aspect(mut self, pixel_aspect: Rational) -> Self {
         self.pixel_aspect = pixel_aspect;
         self
@@ -2098,25 +2430,23 @@ const SINGLE_OUTPUT_LABEL: &str = "out";
 ///
 /// rsmpeg 只提供单节点构造，而 `avfilter_graph_parse_ptr` 要的是链表，节点顺序
 /// 无关紧要（配对按名字，见 [`FilterGraph::setup_endpoints`]），名字才是关键。
-/// 链表所有权交给 FFmpeg（`parse_ptr` 成功时会释放整条链），因此除头节点外的节点
-/// 必须 `mem::forget`，否则 rsmpeg 的 `Drop` 会二次释放。
-fn chain_inouts(mut nodes: Vec<AVFilterInOut>) -> Option<AVFilterInOut> {
-    if nodes.is_empty() {
-        return None;
-    }
-    let ptrs: Vec<*mut ffi::AVFilterInOut> = nodes.iter_mut().map(|n| n.as_mut_ptr()).collect();
-    // SAFETY: 所有指针都来自 `nodes`，且在 `nodes` 被消费前一直有效；
-    // `next` 是 `AVFilterInOut` 的普通字段。
+///
+/// 一条链上只能有**一个** Rust 侧所有者：rsmpeg 的 `Drop` 调的是
+/// `avfilter_inout_free`，它会顺着 `next` 释放**整条链**。所以先把所有节点
+/// `into_raw()` 交出所有权（不析构），链接完成后只把头节点包回 RAII —— 其余节点
+/// 从此归头节点那一份所有者管
+fn chain_inouts(nodes: Vec<AVFilterInOut>) -> Option<AVFilterInOut> {
+    let ptrs: Vec<NonNull<ffi::AVFilterInOut>> =
+        nodes.into_iter().map(AVFilterInOut::into_raw).collect();
+    let head = *ptrs.first()?;
+    // SAFETY: 指针全部来自上面刚交出所有权的节点，此刻没有任何包装体持有它们，
+    // 且 `from_raw` 之前不会再有第二个所有者产生。`next` 是普通字段，写入独占。
     unsafe {
         for window in ptrs.windows(2) {
-            (*window[0]).next = window[1];
+            (*window[0].as_ptr()).next = window[1].as_ptr();
         }
+        Some(AVFilterInOut::from_raw(head))
     }
-    let head = nodes.swap_remove(0);
-    for node in nodes {
-        std::mem::forget(node);
-    }
-    Some(head)
 }
 
 const DEFAULT_ORDERING: Ordering = Ordering::SeqCst;
@@ -2214,6 +2544,8 @@ impl FilterGraph {
         self.output_labels.clear();
         self.src_names.clear();
         self.sink_names.clear();
+        // 输入描述随 `input_labels` 一起重建：留着旧值会让错误信息指向上一张图。
+        self.input_specs.clear();
         self.init(params, filters)
     }
 
@@ -2223,11 +2555,15 @@ impl FilterGraph {
 
     /// 建一张已初始化的滤镜图（`new` + [`init`](Self::init) 的合并入口）。
     ///
-    /// 解码与编码两条流水线都用它建图，转义、媒体类型校验、滤镜可用性校验
+    /// 解码与编码两条流水线都用它建图，媒体类型校验、滤镜可用性校验
     /// （本构建没编入该滤镜 → [`Unsupported`](crate::RsmediaError::Unsupported)，
     /// 媒体类型不符 → [`InvalidConfig`](crate::RsmediaError::InvalidConfig)）
     /// 因此只有 [`init`](Self::init) 一处实现——调用方不需要在门外再抄一遍这些
     /// 检查，两份检查只会随 FFmpeg 版本漂移。
+    ///
+    /// **转义不在这一层**：滤镜描述里的特殊字符在构造 `Filter` 时（各便捷构造函数
+    /// 内部走 `escape_filter_value`）就已经转义好了，`init` 只负责把 spec 用 `,`
+    /// 拼成线性链。
     pub(crate) fn build(params: &FilterParams, filters: &[Filter]) -> Result<FilterGraph> {
         let mut graph = Self::new();
         graph
@@ -2238,9 +2574,10 @@ impl FilterGraph {
 
     /// 主输出（下标 0）是否正在排空（EOF 已送出，图里还有缓冲帧要出）。
     ///
-    /// 判据是"EOF 已送到每一路输入"，**不是** `av_buffersink_get_frame` 返回过
-    /// `EAGAIN`：流中段的 `EAGAIN`（还在等其它输入、滤镜缓冲未攒够）不改变状态，
-    /// 否则它在流中段就永久为真（契约见 `state::ProcessState`）。
+    /// 判据是"EOF 已送到每一路输入"（最后一路 EOF 推送成功的那一刻置位），
+    /// **不是** `av_buffersink_get_frame` 返回过 `EAGAIN`：流中段的 `EAGAIN`
+    /// （还在等其它输入、滤镜缓冲未攒够）不改变状态，否则它在流中段就永久为真
+    /// （契约见 `state::ProcessState`）。
     pub fn is_drained(&self) -> bool {
         self.is_drained_at(0)
     }
@@ -2299,6 +2636,13 @@ impl FilterGraph {
         // （见 `SINGLE_INPUT_LABEL` 的说明），端点名与实例名都用这两个名字。
         self.input_labels = vec![SINGLE_INPUT_LABEL.to_string()];
         self.output_labels = vec![SINGLE_OUTPUT_LABEL.to_string()];
+        // 与 `FilterGraphBuilder::build` 一样登记输入描述：`init` 这条路径
+        // （解码/编码流水线用的单输入线性链）同样会在取帧失败时打印它，漏了就只剩
+        // 一句没有上下文的 `EINVAL`。
+        self.input_specs = vec![format!(
+            "{SINGLE_INPUT_LABEL}={}",
+            describe_endpoint(&input)
+        )];
         self.eof_sent = vec![false];
         self.states = vec![ProcessState::Normal];
 
@@ -2557,12 +2901,15 @@ impl FilterGraph {
                 )
             })?;
 
-        // 返回值实测是入参指针的原样回显（成功路径上 FFmpeg 既不改写、也不接管所有权，
-        // 节点仍归调用方），因此这里原样释放我们自己的链表即可——`parse_ptr` 已对入参
-        // `into_raw()`，释放由这对返回值唯一完成，不会重复释放。
+        // 返回值是**配对后剩余**的节点链表，不是入参指针的原样回显：
+        // `avfilter_graph_parse_ptr` 会把按名字配上的那些节点自己 `av_free` 掉
+        // （节点由 `avfilter_inout_alloc` 分配，由 FFmpeg 释放才是对称的），
+        // 没配上名字的节点才留在这对返回值里。全部配对成功时两个返回值都是 `None`；
+        // 非空则意味着有端点没接上（名字写错正是这种情形），后续 `config()` 会以
+        // "pad not connected" 失败。
         //
-        // 注意：**不要**用这个返回值判断"有没有多余的开放端点"，它恒为传入值；
-        // 端点数量不匹配会由 FFmpeg 自身在 `config()` 时报错（pad 未连接）。
+        // rsmpeg 侧在成功路径上对传入的链表做了 `into_raw()`（不析构），仅失败路径才
+        // 析构，所以这里只释放这对返回值即可，不会重复释放。
         drop(rest_inputs);
         drop(rest_outputs);
 
@@ -2594,18 +2941,38 @@ impl FilterGraph {
                 self.eof_sent.len()
             )));
         }
-        if frame.is_none() {
-            if self.eof_sent[input] {
-                return Ok(());
-            }
-            self.eof_sent[input] = true;
+        let is_eof = frame.is_none();
+        if is_eof && self.eof_sent[input] {
+            return Ok(());
         }
 
-        // src_ctx 在本块结束时释放借用
-        let mut src_ctx = self.get_src_context(input)?;
-        src_ctx
-            .buffersrc_add_frame(frame, None)
-            .context("Error submitting the frame to the filter graph.")
+        // src_ctx 在本块结束时释放借用（它借的是 `self.graph`，下面的状态记账
+        // 因此必须等它释放之后再做）
+        {
+            let mut src_ctx = self.get_src_context(input)?;
+            src_ctx
+                .buffersrc_add_frame(frame, None)
+                .context("Error submitting the frame to the filter graph.")?;
+        }
+
+        // EOF 只在**推送成功之后**才记账：失败的推送并没有让图进入 EOF，若先置位，
+        // 这一路输入就被永久"毒化"——后面再推（含重试）都会被上面的短路直接跳过，
+        // 帧静默丢失而调用方看到的是一路 `Ok(())`。
+        if is_eof {
+            self.eof_sent[input] = true;
+            // `Drained` 的判据是"EOF 已送到每一路输入"，与 `state::ProcessState`
+            // 的定义一致，因此在这里推进，而不是等取帧拿到 `EAGAIN`：后者会让
+            // "刚推完 EOF、一次 `EAGAIN` 都没遇到过"的图仍停在 `Normal`。
+            // 多输入图里只喂了一路时不会触发（还有输入没送 EOF）。
+            if self.eof_sent.iter().all(|sent| *sent) {
+                for state in &mut self.states {
+                    if state.is_normal() {
+                        *state = ProcessState::Drained;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 从第 `output` 路输出取一帧：`Ok(Some)` 是产出帧，`Ok(None)` 表示这一刻没有帧
@@ -2631,12 +2998,8 @@ impl FilterGraph {
             Err(rsmpeg::error::RsmpegError::BufferSinkDrainError) => {
                 // `EAGAIN` 只说明**这一刻**没有帧：流中段同样会出现（帧同步类滤镜
                 // 还在等其它输入、滤镜自身的缓冲未攒够），并不等于已经在排空。
-                // 因此只有"EOF 已送到每一路输入"时才推进到 `Drained`——否则多输入图
-                // 里只喂了一路的一次 `EAGAIN` 就会让 `is_drained()` 在流中段永久为真
-                // （契约见 `state::ProcessState`）。
-                if self.eof_sent.iter().all(|sent| *sent) {
-                    self.states[output] = ProcessState::Drained;
-                }
+                // 推进到 `Drained` 由 `push_frame_to` 在"EOF 已送到每一路输入"时完成
+                // （契约见 `state::ProcessState`）；这里只记日志。
                 tracing::debug!(
                     "filter graph: output {output} has no frame available (EAGAIN, eof sent: {})",
                     self.eof_sent.iter().all(|sent| *sent)
@@ -2776,37 +3139,91 @@ impl FilterGraph {
         self.sink_names.len()
     }
 
-    /// 主输出链路的帧率（`av_buffersink_get_frame_rate`），无滤镜或不可用时返回 `None`。
-    pub fn output_frame_rate(&mut self) -> Option<Rational> {
+    /// Frame rate of the primary (index `0`) output link, as reported by
+    /// `av_buffersink_get_frame_rate`.
+    ///
+    /// A filter such as `fps` or `framerate` rewrites the frame rate, and an
+    /// encoder fed from this graph has to follow it: a time base derived from
+    /// the *input* parameters no longer matches the pts the graph emits.
+    ///
+    /// When no frame rate has been negotiated the sink reports `0/0`, which
+    /// folds to [`Rational::ZERO`] — the spelling every consumer in this crate
+    /// already reads as "unset". That is a *value*, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when the graph declares no
+    /// output, or when the sink is missing from the graph.
+    pub fn output_frame_rate(&mut self) -> Result<Rational> {
         self.output_frame_rate_at(0)
     }
 
-    /// 第 `output` 路输出链路的帧率。
-    pub fn output_frame_rate_at(&mut self, output: usize) -> Option<Rational> {
-        let sink = self.get_sink_context(output).ok()?;
-        Some(sink.get_frame_rate().into())
+    /// Frame rate of the `output`-th output link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `output` is out of range, or
+    /// when the sink is missing from the graph. An out-of-range index is a
+    /// programming error and is deliberately *not* folded into "no frame rate":
+    /// callers must be able to tell the two apart.
+    pub fn output_frame_rate_at(&mut self, output: usize) -> Result<Rational> {
+        Ok(self.get_sink_context(output)?.get_frame_rate().into())
     }
 
-    /// 主输出链路的时间基（`av_buffersink_get_time_base`），无滤镜或不可用时返回 `None`。
-    pub fn output_time_base(&mut self) -> Option<Rational> {
+    /// Time base of the primary (index `0`) output link, as reported by
+    /// `av_buffersink_get_time_base`.
+    ///
+    /// A frame's pts comes out of the graph in *this* time base, not in the one
+    /// the input endpoint declared, so anything consuming filter output has to
+    /// rescale against it.
+    ///
+    /// An unnegotiated sink reports `0/0`, which folds to [`Rational::ZERO`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when the graph declares no
+    /// output, or when the sink is missing from the graph.
+    pub fn output_time_base(&mut self) -> Result<Rational> {
         self.output_time_base_at(0)
     }
 
-    /// 第 `output` 路输出链路的时间基。
-    pub fn output_time_base_at(&mut self, output: usize) -> Option<Rational> {
-        let sink = self.get_sink_context(output).ok()?;
-        Some(sink.get_time_base().into())
+    /// Time base of the `output`-th output link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `output` is out of range, or
+    /// when the sink is missing from the graph.
+    pub fn output_time_base_at(&mut self, output: usize) -> Result<Rational> {
+        Ok(self.get_sink_context(output)?.get_time_base().into())
     }
 
-    /// 主输出链路的尺寸 `(width, height)`（`av_buffersink_get_w/h`），无滤镜或不可用时返回 `None`。
-    pub fn output_size(&mut self) -> Option<(i32, i32)> {
+    /// Size `(width, height)` of the primary (index `0`) output link, as
+    /// reported by `av_buffersink_get_w` / `av_buffersink_get_h`.
+    ///
+    /// `scale`, `crop`, `pad`, `rotate` and `transpose` all change the size, and
+    /// an encoder fed from this graph has to be opened with the *filter's*
+    /// size — sending a frame of a different size fails.
+    ///
+    /// A sink that has not negotiated a size reports `(0, 0)`; an audio sink has
+    /// no size at all and reports the same. Both are values, not errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when the graph declares no
+    /// output, or when the sink is missing from the graph.
+    pub fn output_size(&mut self) -> Result<(i32, i32)> {
         self.output_size_at(0)
     }
 
-    /// 第 `output` 路输出链路的尺寸。
-    pub fn output_size_at(&mut self, output: usize) -> Option<(i32, i32)> {
-        let sink = self.get_sink_context(output).ok()?;
-        Some((sink.get_w(), sink.get_h()))
+    /// Size `(width, height)` of the `output`-th output link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `output` is out of range, or
+    /// when the sink is missing from the graph.
+    pub fn output_size_at(&mut self, output: usize) -> Result<(i32, i32)> {
+        let sink = self.get_sink_context(output)?;
+        Ok((sink.get_w(), sink.get_h()))
     }
 
     /// 运行时给图里的滤镜发一条命令（`avfilter_graph_send_command`）。
@@ -2935,9 +3352,13 @@ impl std::fmt::Debug for FilterGraph {
 /// # fn main() -> rsmedia::Result<()> {
 /// let tb = Rational::new(1, 25).unwrap();
 /// let fps = Rational::new(25, 1).unwrap();
-/// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps);
+/// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P)
+///     .with_time_base(tb)
+///     .with_frame_rate(fps);
 /// // 叠加层不必与主画面同尺寸、同像素格式：FFmpeg 会自动插 scale。
-/// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA, tb, fps);
+/// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA)
+///     .with_time_base(tb)
+///     .with_frame_rate(fps);
 ///
 /// let mut graph = FilterGraphBuilder::overlay(main, logo, "W-w-20", "H-h-20", main)?;
 /// // 图输入 0 = 主画面、图输入 1 = 叠加层；唯一的输出是合成结果。
@@ -3006,9 +3427,11 @@ impl FilterGraphBuilder {
 
     /// 追加一个滤镜节点。
     ///
-    /// 节点的接线为空（[`FilterNode::new`]）时自动接链尾：第一个节点接图输入 `in0`，
-    /// 其余接上一个节点的输出。多输入滤镜必须用 [`FilterNode::with_inputs`] 显式
-    /// 接线，否则建图时以「接线数与 pad 数不符」报错。
+    /// 节点的接线为空（[`FilterNode::new`]）时自动接链尾：第一个节点接**第一路**
+    /// 图输入（用 [`Self::add_input`] 声明时它的标签是 `in0`；用
+    /// [`Self::add_input_with`] 时就是给定的那个标签），其余接上一个节点的**末位**
+    /// 输出 pad。多输入滤镜必须用 [`FilterNode::with_inputs`] 显式接线，否则建图时
+    /// 以「接线数与 pad 数不符」报错。
     pub fn add_node(&mut self, node: impl Into<FilterNode>) -> &mut Self {
         self.nodes.push(node.into());
         self
@@ -3030,8 +3453,9 @@ impl FilterGraphBuilder {
         self
     }
 
-    /// 组装并协商整张图：校验接线、生成带标签的滤镜图描述、按标签建
-    /// `buffer`/`abuffersink` 端点，最后由 `avfilter_graph_config` 完成格式协商。
+    /// 组装并协商整张图：校验接线与标签、生成带标签的滤镜图描述、按标签建
+    /// `buffer`/`abuffer` 源与 `buffersink`/`abuffersink` 汇，最后由
+    /// `avfilter_graph_config` 完成格式协商。
     ///
     /// 校验都在触碰 FFmpeg 之前完成，接线错误报的是 [`RsmediaError::InvalidConfig`]，
     /// 而不是一句难以定位的 FFmpeg 解析错误。
@@ -3329,8 +3753,12 @@ impl FilterGraphBuilder {
     /// # fn main() -> rsmedia::Result<()> {
     /// let tb = Rational::new(1, 25).unwrap();
     /// let fps = Rational::new(25, 1).unwrap();
-    /// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps);
-    /// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA, tb, fps);
+    /// let main = VideoEndpoint::new(1280, 720, PixelFormat::YUV420P)
+    ///     .with_time_base(tb)
+    ///     .with_frame_rate(fps);
+    /// let logo = VideoEndpoint::new(160, 90, PixelFormat::RGBA)
+    ///     .with_time_base(tb)
+    ///     .with_frame_rate(fps);
     /// let mut graph = FilterGraphBuilder::overlay(main, logo, "W-w-20", "H-h-20", main)?;
     /// # Ok(())
     /// # }
@@ -3346,7 +3774,7 @@ impl FilterGraphBuilder {
         builder.add_input_with("base", base);
         builder.add_input_with("over", over);
         builder.add_node(
-            FilterNode::new(video::overlay(x, y, None))
+            FilterNode::new(video::overlay(x, y)?)
                 .with_inputs(["base", "over"])
                 .with_label("overlay"),
         );
@@ -3365,12 +3793,18 @@ impl FilterGraphBuilder {
     /// # fn main() -> rsmedia::Result<()> {
     /// let tb = Rational::new(1, 25).unwrap();
     /// let fps = Rational::new(25, 1).unwrap();
-    /// let left = VideoEndpoint::new(640, 720, PixelFormat::YUV420P, tb, fps);
-    /// let right = VideoEndpoint::new(640, 720, PixelFormat::YUV420P, tb, fps);
+    /// let left = VideoEndpoint::new(640, 720, PixelFormat::YUV420P)
+    ///     .with_time_base(tb)
+    ///     .with_frame_rate(fps);
+    /// let right = VideoEndpoint::new(640, 720, PixelFormat::YUV420P)
+    ///     .with_time_base(tb)
+    ///     .with_frame_rate(fps);
     /// // 图输入 0 / 1 分别对应 left / right，输出是 1280x720。
     /// let mut graph = FilterGraphBuilder::hstack(
     ///     &[left, right],
-    ///     VideoEndpoint::new(1280, 720, PixelFormat::YUV420P, tb, fps),
+    ///     VideoEndpoint::new(1280, 720, PixelFormat::YUV420P)
+    ///         .with_time_base(tb)
+    ///         .with_frame_rate(fps),
     /// )?;
     /// # Ok(())
     /// # }
@@ -3445,11 +3879,7 @@ impl FilterGraphBuilder {
         duration: &str,
         output: AudioEndpoint,
     ) -> Result<FilterGraph> {
-        if !matches!(duration, "longest" | "shortest" | "first") {
-            return Err(RsmediaError::invalid_config(format!(
-                "amix duration must be one of 'longest', 'shortest', 'first', got '{duration}'"
-            )));
-        }
+        check_amix_duration(duration)?;
         Self::stack_audio(inputs, output, duration)
     }
 
@@ -3472,7 +3902,7 @@ impl FilterGraphBuilder {
         if (output.width, output.height) != natural {
             let (width, height) = (output.width, output.height);
             self.add_node(
-                FilterNode::new(video::scale(width as u32, height as u32, None))
+                FilterNode::new(video::scale(width as u32, height as u32, None)?)
                     .with_label("scale"),
             );
         }
@@ -3562,7 +3992,7 @@ impl FilterGraphBuilder {
         }
         let labels = builder.input_labels_upto(inputs.len());
         builder.add_node(
-            FilterNode::new(audio::amix(inputs.len() as u32, duration))
+            FilterNode::new(audio::amix(inputs.len() as u32, duration)?)
                 .with_inputs(labels)
                 .with_label("amix"),
         );
@@ -3580,6 +4010,24 @@ mod tests {
         Rational::new(num, den).unwrap()
     }
 
+    /// `Result<Filter>.spec()`，供那些只关心描述字符串的测试使用。
+    ///
+    /// 构造器改成返回 [`Result`] 之后（值可能含 NUL，见 [`escape_filter_value`]），
+    /// 这些测试里全是字面量、不可能失败，也就没必要为它们逐个改签名加 `?`：失败即测试
+    /// 本身写错，直接 panic 并把错误打出来更省事。
+    trait SpecOf {
+        fn spec(self) -> String;
+    }
+
+    impl SpecOf for Result<Filter> {
+        fn spec(self) -> String {
+            match self {
+                Ok(filter) => filter.spec(),
+                Err(e) => panic!("filter construction failed: {e}"),
+            }
+        }
+    }
+
     /// D6：可选参数统一为 `impl Into<Option<T>>` 后，"传值"与"不传"两种写法都直接
     /// 可用 —— 值不需要包 `Some`，`None` 也仍能被推断出正确的类型。这里逐个钉住
     /// 那些把 `Option<T>` 收窄成 `impl Into<Option<T>>` 的构造器，避免以后有人
@@ -3592,11 +4040,9 @@ mod tests {
                 .spec()
                 .contains("flags=neighbor")
         );
-        assert!(
-            video::overlay("0", "0", 0.5f32)
-                .spec()
-                .contains("alpha=0.5")
-        );
+        // `overlay` 不再接受"不透明度"：`alpha` 是 0~2 的格式枚举，不是透明度，
+        // 所以这个位置改用 `curves` 之类的占位断言没有意义 —— 直接断言 x/y 转义。
+        assert_eq!(video::overlay("0", "0").spec(), "overlay=x=0:y=0");
         assert!(
             video::gif_palette(10.0, "bayer")
                 .spec()
@@ -3623,12 +4069,21 @@ mod tests {
                 .spec()
                 .contains("nt=v")
         );
-        assert!(audio::anlm_denoise(0.001, 7, 15).spec().contains("p=7"));
+        // `p` / `r` 是 `<duration>`（秒），不是样本数：2 ms / 6 ms
+        assert!(
+            audio::anlm_denoise(
+                0.001,
+                Duration::from_micros(2000),
+                Duration::from_micros(6000)
+            )
+            .spec()
+            .contains("p=0.002")
+        );
         assert!(video::zoompan("1.5", "0", "0", 25).spec().contains("d=25"));
 
         // 不传值仍然可用
         assert!(video::scale(64, 64, None).spec().contains("flags=bicubic"));
-        assert_eq!(video::overlay("0", "0", None).spec(), "overlay=x=0:y=0");
+        assert_eq!(video::overlay("0", "0").spec(), "overlay=x=0:y=0");
         assert_eq!(video::lutyuv(None, None, None).spec(), "lutyuv");
         assert_eq!(audio::anlm_denoise(None, None, None).spec(), "anlmdn");
     }
@@ -3694,34 +4149,34 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_filter_str() {
+    fn test_escape_option_level() {
         // Test case 1: Empty string
         assert_eq!(
-            escape_filter_str(""),
+            escape_option_level("").unwrap(),
             "",
             "Empty string should return empty string"
         );
 
         // Test case 2: String with no special characters but with spaces
-        // FFmpeg appears to escape spaces as well
+        // 空白也在选项级的转义集里（`AV_ESCAPE_FLAG_WHITESPACE`）。
         assert_eq!(
-            escape_filter_str("normal text"),
+            escape_option_level("normal text").unwrap(),
             "normal\\ text",
-            "Spaces are also escaped by av_escape"
+            "whitespace is escaped at the option level"
         );
 
         // Test case 3: String with special characters
         assert_eq!(
-            escape_filter_str("text with [brackets]"),
+            escape_option_level("text with [brackets]").unwrap(),
             "text\\ with\\ \\[brackets\\]",
             "Brackets should be escaped and spaces too"
         );
 
         // Test case 4: 选项级转义只保证"值里的 `:` 不会截断选项"，不负责图级
         // 分隔符——`file:///...` 作为**不带引号**的选项值还必须再经过图级转义
-        // （见 test_escape_filter_option_two_levels）。
+        // （见 test_escape_filter_value_two_levels）。
         assert_eq!(
-            escape_filter_str("file:///path/to/video.mp4"),
+            escape_option_level("file:///path/to/video.mp4").unwrap(),
             "file\\:///path/to/video.mp4",
             "Single-level (option) escaping escapes the colon"
         );
@@ -3730,14 +4185,14 @@ mod tests {
         let input = "filter=value,'text',[in],[out],key=val;next:filter\\backslash";
         let expected = "filter\\=value\\,\\'text\\'\\,\\[in\\]\\,\\[out\\]\\,key\\=val\\;next\\:filter\\\\backslash";
         assert_eq!(
-            escape_filter_str(input),
+            escape_option_level(input).unwrap(),
             expected,
             "All special characters should be escaped"
         );
 
         // Test case 6: String with escaped characters already
         assert_eq!(
-            escape_filter_str("already\\escaped"),
+            escape_option_level("already\\escaped").unwrap(),
             "already\\\\escaped",
             "Backslashes should be escaped even if they're escaping something else"
         );
@@ -3747,7 +4202,7 @@ mod tests {
         let complex_filter = "drawtext=text='Hello, World!':x=10:y=10";
         let expected = "drawtext\\=text\\=\\'Hello\\,\\ World!\\'\\:x\\=10\\:y\\=10";
         assert_eq!(
-            escape_filter_str(complex_filter),
+            escape_option_level(complex_filter).unwrap(),
             expected,
             "Complex filter string should be properly escaped with spaces and exclamation marks escaped too"
         );
@@ -3755,13 +4210,13 @@ mod tests {
         // Test case 8: Test with exclamation marks specifically
         // Note character!
         assert_eq!(
-            escape_filter_str("Warning!"),
+            escape_option_level("Warning!").unwrap(),
             "Warning!",
             "Exclamation marks should be escaped"
         );
 
         // Test case 9: Unicode characters - using pattern matching instead of exact comparison
-        let unicode_result = escape_filter_str("Unicode: こんにちは");
+        let unicode_result = escape_option_level("Unicode: こんにちは").unwrap();
         assert!(
             unicode_result.contains("Unicode"),
             "Result should contain the word 'Unicode'"
@@ -3772,7 +4227,7 @@ mod tests {
         );
 
         // Test case 10: Unicode with special characters - using pattern matching
-        let unicode_special_result = escape_filter_str("Unicode: こんにちは[世界]");
+        let unicode_special_result = escape_option_level("Unicode: こんにちは[世界]").unwrap();
         assert!(
             unicode_special_result.contains("\\[") && unicode_special_result.contains("\\]"),
             "Unicode string with special characters should have brackets escaped"
@@ -3780,7 +4235,7 @@ mod tests {
 
         // Test case 11: Very long string - only check that it ends correctly
         let long_string = "x".repeat(1000) + "=[]:";
-        let long_result = escape_filter_str(&long_string);
+        let long_result = escape_option_level(&long_string).unwrap();
         assert!(
             long_result.ends_with("\\=\\[\\]\\:"),
             "Long strings should have special characters at the end properly escaped"
@@ -3788,47 +4243,170 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_filter_option_two_levels() {
+    fn test_escape_filter_value_two_levels() {
         // 普通值不受影响：scale/pad/yadif/adelay 等生成的 spec 依赖"简单值原样保留"。
         for plain in ["lanczos", "send_frame", "black@0.5", "16/9"] {
-            assert_eq!(escape_filter_option(plain), plain, "plain value changed");
-        }
-
-        // `:` 是**选项级**分隔符：第一层转义后带一个反斜杠；第二层必须把该反斜杠
-        // 自身再转义（`\\`），否则图级解析会把它吃掉，值里的 `:` 又变成分隔符。
-        let path = escape_filter_option("file:///path/to/video.mp4");
-        assert!(
-            path.starts_with(r"file\\"),
-            "option-level backslash must be escaped for the graph level: {path}"
-        );
-        assert!(
-            path.contains(r"\:"),
-            "colon must stay escaped after graph-level escaping: {path}"
-        );
-
-        // `,` `;` `[` `]` 是**图级**分隔符（`movie=`/`subtitles=` 这类路径值必须防住，
-        // 否则值会被拆成多个滤镜/链路）。两层转义后每个字符前都应留有反斜杠。
-        let tricky = escape_filter_option("/tmp/a,b;c[d].mp4");
-        for ch in [',', ';', '[', ']'] {
-            assert!(
-                tricky.contains(&format!("\\{ch}")),
-                "{ch} must be escaped for the graph level: {tricky}"
+            assert_eq!(
+                escape_filter_value(plain).unwrap(),
+                plain,
+                "plain value changed"
             );
         }
+
+        // 断言**精确**的反斜杠个数，而不是 `contains`：起作用的是个数，不是"有没有"。
+        // 图级字符要奇数个（第 1 遍 unescape 后必须是裸字符），选项级要 2 个
+        // （第 1 遍后必须仍是转义态）。2 个反斜杠能让 `contains("\\,")` 通过，
+        // 但实测会把图拆开 —— 旧断言恰好漏掉了这个坏值。
+        assert_eq!(
+            escape_filter_value("/tmp/a,b;c[d].mp4").unwrap(),
+            r"/tmp/a\\\,b\\\;c\\\[d\\\].mp4",
+            "graph-level separators need an odd number of backslashes"
+        );
+        assert_eq!(
+            escape_filter_value("file:///path/to/video.mp4").unwrap(),
+            r"file\\:///path/to/video.mp4",
+            "a colon needs exactly two backslashes to survive both passes"
+        );
+        assert_eq!(
+            escape_filter_value(r"a'b\c").unwrap(),
+            r"a\\\'b\\\\c",
+            "quote and backslash: 3 and 4 backslashes respectively"
+        );
+        assert_eq!(
+            escape_filter_value("a b").unwrap(),
+            r"a\\ b",
+            "whitespace: escaped once, then the backslash is doubled"
+        );
+    }
+
+    /// 新的 Rust 实现在**每个输入上**都必须与 `ffi::av_escape` 逐字节一致。
+    ///
+    /// 生产代码不再调用 `av_escape`（它会把"分配失败"变成一条不存在的可恢复错误，
+    /// 而这正是之前那个 fallback 的来源），但 FFmpeg 才是转义语义的出处，所以这里保留
+    /// 一次差分对照：同一组 `specials` / flags 下两者输出必须相等。`av_escape` 只在本测试里出现。
+    #[test]
+    fn test_rust_escaping_matches_av_escape() {
+        fn reference(input: &str, specials: &str, flags: i32) -> String {
+            let c_input = CString::new(input).expect("corpus has no interior NUL");
+            let c_specials = CString::new(specials).unwrap();
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: all three arguments are valid NUL-terminated C strings that outlive
+            // the call, and `ptr` is a live local; on success FFmpeg hands back an
+            // `av_malloc`ed buffer that this function frees.
+            let ret = unsafe {
+                ffi::av_escape(
+                    &mut ptr,
+                    c_input.as_ptr(),
+                    c_specials.as_ptr(),
+                    ffi::AV_ESCAPE_MODE_BACKSLASH,
+                    flags,
+                )
+            };
+            assert!(ret >= 0 && !ptr.is_null(), "av_escape failed on {input:?}");
+            let escaped = unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned();
+            // SAFETY: `ptr` came from `av_escape`, which allocates with `av_malloc`.
+            unsafe { ffi::av_free(ptr as *mut _) };
+            escaped
+        }
+
+        let corpus = [
+            "",
+            "plain",
+            "black@0.5",
+            "16/9",
+            "a,b",
+            "a;b",
+            "a[b]c",
+            "a:b",
+            "a=b",
+            "a'b",
+            r"a\b",
+            "a{b}c",
+            "a,b;c[d]e:f=g'h\\i",
+            "file:///path/to/video.mp4",
+            "/tmp/a,b;c[d].mp4",
+            " leading",
+            "trailing ",
+            "mid dle",
+            "a b\tc\nd\re",
+            "Unicode: こんにちは[世界]",
+            "100%",
+            "%{pts:hms}",
+        ];
+
+        for input in corpus {
+            assert_eq!(
+                escape_backslash(input, OPTION_SPECIALS, true).unwrap(),
+                reference(
+                    input,
+                    OPTION_SPECIALS,
+                    ffi::AV_ESCAPE_FLAG_WHITESPACE as i32
+                ),
+                "option level diverged on {input:?}"
+            );
+            assert_eq!(
+                escape_backslash(input, GRAPH_SPECIALS, false).unwrap(),
+                reference(input, GRAPH_SPECIALS, 0),
+                "graph level diverged on {input:?}"
+            );
+        }
+    }
+
+    /// 值里的 NUL 不再被静默丢弃，而是在**转义这一层**就报错。
+    ///
+    /// `av_escape` 要的是 NUL 结尾的 C 字符串，所以含 NUL 的值根本进不了转义 —— 这也
+    /// 正合语义：滤镜描述本身就是 C 字符串，NUL 表示不出来。错误是
+    /// [`RsmediaError::InvalidConfig`]，能一眼看出是 NUL 的问题。
+    ///
+    /// 旧实现把它 `replace('\0', "")` 掉然后照常成功，产出一条少几个字符、却看起来
+    /// 完全正常的滤镜描述 —— 那正是"掩盖问题"。手写 spec 里的 NUL 同样被拒
+    /// （`FilterGraph::build` 把描述变成 C 字符串那一步），两个入口行为一致。
+    #[test]
+    fn test_nul_in_a_filter_value_is_reported_not_dropped() {
+        for err in [
+            escape_option_level("a\0b").unwrap_err(),
+            escape_filter_value("a\0b").unwrap_err(),
+        ] {
+            assert!(err.is_invalid_config(), "{err}");
+            assert!(err.to_string().contains("NUL"), "{err}");
+        }
+
+        // 构造器亦然：返回 `Err`，既不 panic，也不静默把字符丢掉。
+        let err = video::pad(0, 0, 8, 8, "black\0").unwrap_err();
+        assert!(err.is_invalid_config(), "{err}");
+
+        let params = FilterParams::Video(VideoParams {
+            width: 8,
+            height: 4,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: rat(1, 25),
+            frame_rate: rat(25, 1),
+            pixel_aspect: Rational::ONE,
+        });
+        let poisoned = Filter::new("null", MediaType::VIDEO, "null=a\0b".to_string());
+        let err = match FilterGraph::build(&params, &[poisoned]) {
+            Ok(_) => panic!("a NUL byte in a filter value must be reported, not dropped"),
+            Err(e) => e,
+        };
+        assert!(err.is_invalid_config(), "{err}");
+        assert!(err.to_string().contains("NUL"), "{err}");
     }
 
     #[test]
     fn test_real_world_filter_strings() {
         // Test case 1: Scale filter
         assert_eq!(
-            escape_filter_str("scale=width=1280:height=720"),
+            escape_option_level("scale=width=1280:height=720").unwrap(),
             "scale\\=width\\=1280\\:height\\=720",
             "Scale filter string should be properly escaped"
         );
 
         // Test case 2: Overlay filter
         assert_eq!(
-            escape_filter_str("overlay=x=10:y=10"),
+            escape_option_level("overlay=x=10:y=10").unwrap(),
             "overlay\\=x\\=10\\:y\\=10",
             "Overlay filter string should be properly escaped"
         );
@@ -3837,7 +4415,7 @@ mod tests {
         let drawtext = "drawtext=text='Copyright © 2023':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.5:x=(w-text_w)/2:y=h-th-10";
 
         // Instead of checking the exact string, check for key patterns
-        let drawtext_result = escape_filter_str(drawtext);
+        let drawtext_result = escape_option_level(drawtext).unwrap();
 
         // Check presence of escaped key components
         assert!(
@@ -3859,7 +4437,7 @@ mod tests {
 
         // Test case 4: Filter with square brackets for pad names
         assert_eq!(
-            escape_filter_str("[in1][in2]overlay=format=rgb[out]"),
+            escape_option_level("[in1][in2]overlay=format=rgb[out]").unwrap(),
             "\\[in1\\]\\[in2\\]overlay\\=format\\=rgb\\[out\\]",
             "Filter with pad names should be properly escaped"
         );
@@ -3869,25 +4447,25 @@ mod tests {
     fn test_escape_filter_expr() {
         // 保留 `%{localtime}` 展开块，其余部分正常转义
         assert_eq!(
-            escape_filter_expr("%{localtime}"),
+            escape_filter_expr("%{localtime}").unwrap(),
             "%{localtime}",
             "Time expansion block should be preserved"
         );
         assert_eq!(
-            escape_filter_expr("T %{pts:hms}"),
+            escape_filter_expr("T %{pts:hms}").unwrap(),
             "T\\ %{pts:hms}",
             "Surrounding text should be escaped but block preserved"
         );
         // 多个展开块
         assert_eq!(
-            escape_filter_expr("%{frame_num}/%{n}"),
+            escape_filter_expr("%{frame_num}/%{n}").unwrap(),
             "%{frame_num}/%{n}",
             "Multiple expansion blocks should be preserved"
         );
         // 无展开块时退化为普通转义
         assert_eq!(
-            escape_filter_expr("plain: text"),
-            escape_filter_str("plain: text"),
+            escape_filter_expr("plain: text").unwrap(),
+            escape_option_level("plain: text").unwrap(),
             "Without expansion blocks it should match plain escaping"
         );
     }
@@ -3968,7 +4546,7 @@ mod tests {
             ),
             (
                 "pad=w=1280:h=720:x=0:y=0:color=black".into(),
-                video::pad(1280, 720, 0, 0, "black").spec(),
+                video::pad(0, 0, 1280, 720, "black").spec(),
                 VIDEO,
             ),
             (
@@ -4160,8 +4738,8 @@ mod tests {
 
         // 输出链路尺寸应与输入一致。
         assert_eq!(
-            graph.output_size(),
-            Some((w, h)),
+            graph.output_size()?,
+            (w, h),
             "output_size should match input size"
         );
 
@@ -4340,7 +4918,35 @@ mod tests {
     }
 
     fn video_endpoint(width: i32, height: i32) -> VideoEndpoint {
-        VideoEndpoint::new(width, height, PixelFormat::YUV420P, rat(1, 25), rat(25, 1))
+        VideoEndpoint::new(width, height, PixelFormat::YUV420P)
+            .with_time_base(rat(1, 25))
+            .with_frame_rate(rat(25, 1))
+    }
+
+    /// `with_*` 让三个有理数只能按名字设置，代价是"忘了设"变成可能 —— 那必须是
+    /// **响亮失败**，不能是静默建出一个时间基为 0 的图。
+    #[test]
+    fn test_a_video_endpoint_without_a_time_base_is_rejected() {
+        let endpoint = VideoEndpoint::new(320, 240, PixelFormat::YUV420P);
+        assert_eq!(endpoint.time_base, Rational::ZERO);
+        assert_eq!(endpoint.frame_rate, Rational::ZERO);
+        assert_eq!(endpoint.pixel_aspect, Rational::ONE);
+
+        let mut builder = FilterGraphBuilder::new();
+        builder.add_input_with("src", endpoint);
+        builder.add_node(FilterNode::new(Filter::new(
+            "hflip",
+            MediaType::VIDEO,
+            "hflip".to_string(),
+        )));
+        builder.add_output_tail(endpoint);
+        let err = builder
+            .build()
+            .expect_err("a buffer source with time_base 0/1 must not build");
+        assert!(
+            err.to_string().contains("buffer"),
+            "the failure should name the buffer source, got: {err}"
+        );
     }
 
     fn audio_endpoint(sample_rate: i32) -> AudioEndpoint {
@@ -4368,7 +4974,7 @@ mod tests {
             (2, 1),
             "hstack has 2 inputs and 1 output"
         );
-        assert_eq!(graph.output_size(), Some((8, 2)), "stacked size");
+        assert_eq!(graph.output_size()?, (8, 2), "stacked size");
 
         graph.push_frame_to(0, Some(make_yuv420p_frame(4, 2, 10)))?;
         graph.push_frame_to(1, Some(make_yuv420p_frame(4, 2, 200)))?;
@@ -4435,7 +5041,7 @@ mod tests {
             "2",
             video_endpoint(4, 4),
         )?;
-        assert_eq!(graph.output_size(), Some((4, 4)), "overlay keeps base size");
+        assert_eq!(graph.output_size()?, (4, 4), "overlay keeps base size");
 
         graph.push_frame_to(0, Some(make_yuv420p_frame(4, 4, 0)))?;
         graph.push_frame_to(1, Some(make_yuv420p_frame(2, 2, 255)))?;
@@ -4464,7 +5070,7 @@ mod tests {
         // 基底高 4 → x 取 2，叠加层落在 (2,0)-(3,1)。
         let expr = "if(eq(main_h,4),2,0)";
 
-        let spec = video::overlay(expr, "0", None).spec();
+        let spec = video::overlay(expr, "0").spec();
         assert!(
             spec.contains(r"\,"),
             "comma must stay escaped for the graph-level parse: {spec}"
@@ -4535,6 +5141,90 @@ mod tests {
         assert!(
             graph.is_flushed(),
             "after EOF the graph must end up flushed: {graph:?}"
+        );
+        Ok(())
+    }
+
+    /// `Drained` 在**最后一路 EOF 推送成功**的那一刻置位，而不等取帧拿到 `EAGAIN`
+    /// —— 判据是"EOF 已送到每一路输入"（`state::ProcessState` 里 `Drained` 的定义）。
+    ///
+    /// 旧实现把推进放在 `receive_frame_from` 的 `EAGAIN` 分支里，于是"刚推完 EOF、
+    /// 一次 `EAGAIN` 都还没遇到"的图仍报 `Normal`，与文档里的判据不符。
+    #[test]
+    fn test_eof_marks_the_graph_drained_before_any_eagain() -> Result<()> {
+        let (w, h) = (8, 4);
+        let params = FilterParams::Video(VideoParams {
+            width: w,
+            height: h,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: rat(1, 25),
+            frame_rate: rat(25, 1),
+            pixel_aspect: Rational::ONE,
+        });
+        let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
+        let mut graph = FilterGraph::build(&params, &[null])?;
+
+        graph.push_frame_to(0, Some(make_gray8_frame(w, h)))?;
+        assert!(!graph.is_drained(), "mid-stream is not draining");
+
+        graph.push_frame_to(0, None)?;
+        assert!(
+            graph.is_drained(),
+            "EOF sent to every input means draining — the state must not wait for an EAGAIN"
+        );
+        assert!(!graph.is_flushed(), "draining is not the end of the stream");
+
+        // 重复推 EOF 是 no-op，不会把阶段推过头（也不会报 AVERROR_EOF）。
+        graph.push_frame_to(0, None)?;
+        assert!(graph.is_drained());
+
+        let frames = graph.drain_output(0)?;
+        assert_eq!(frames.len(), 1, "the frame pushed before EOF comes out");
+        assert!(graph.is_flushed(), "after the drain the graph is flushed");
+        Ok(())
+    }
+
+    /// `init` 这条路径（解码/编码流水线用的单输入线性链）也必须登记输入描述：
+    /// 取帧失败时 FFmpeg 只回一句 `EINVAL`，错误信息全靠这份描述定位"声明的
+    /// 格式 vs 实际喂进去的格式"。以前只有 `FilterGraphBuilder::build` 登记它，
+    /// 于是解码/编码路径上的诊断恒为空。
+    #[test]
+    fn test_init_records_declared_input_specs() -> Result<()> {
+        let (w, h) = (8, 4);
+        let params = FilterParams::Video(VideoParams {
+            width: w,
+            height: h,
+            format: PixelFormat::GRAY8,
+            src_format: PixelFormat::GRAY8,
+            time_base: rat(1, 25),
+            frame_rate: rat(25, 1),
+            pixel_aspect: Rational::ONE,
+        });
+        let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
+        let mut graph = FilterGraph::build(&params, &[null])?;
+
+        assert_eq!(
+            graph.input_specs.len(),
+            1,
+            "a linear chain has exactly one input: {:?}",
+            graph.input_specs
+        );
+        let spec = &graph.input_specs[0];
+        assert!(spec.contains("8x4"), "must name the declared size: {spec}");
+        assert!(
+            spec.contains("GRAY8"),
+            "must name the declared format: {spec}"
+        );
+
+        // rebuild 不能留下旧图的描述（旧代码漏了这一步 ⇒ 描述会越攒越多并指向上一张图）
+        let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
+        graph.rebuild(&params, &[null])?;
+        assert_eq!(
+            graph.input_specs.len(),
+            1,
+            "rebuild must re-register, not append: {:?}",
+            graph.input_specs
         );
         Ok(())
     }
@@ -4730,7 +5420,7 @@ mod tests {
                 .with_outputs(["dry", "wet"]),
         );
         builder.add_node(
-            FilterNode::new(audio::amix(2, "longest"))
+            FilterNode::new(audio::amix(2, "longest")?)
                 .with_inputs(["dry", "wet"])
                 .with_label("mixed"),
         );
@@ -4780,7 +5470,7 @@ mod tests {
         // 第二个节点显式接 in1。音频侧用 `volume`（逐帧直通）而不是 `areverse`：
         // areverse 要缓存整个流、EOF 前吐不出帧，验证不了「推一帧取一帧」。
         builder.add_node(
-            FilterNode::new(audio::volume(1.0))
+            FilterNode::new(audio::volume(1.0)?)
                 .with_inputs(["in1"])
                 .with_label("level"),
         );
@@ -4790,9 +5480,7 @@ mod tests {
         assert_eq!(graph.output_count(), 2);
         assert_eq!(graph.input_count(), 2);
         // 输出 1 的时间基来自音频端点，说明 sink 与逻辑输出的映射正确。
-        let audio_tb = graph
-            .output_time_base_at(1)
-            .expect("output 1 is the audio sink");
+        let audio_tb = graph.output_time_base_at(1)?;
         assert_eq!(
             (audio_tb.num(), audio_tb.den()),
             (1, 48000),
@@ -4895,7 +5583,9 @@ mod tests {
         // 双输入滤镜塞进线性链：接线数（1）≠ pad 数（2）。
         let mut builder = FilterGraphBuilder::new();
         builder.add_input(video);
-        builder.add_node(FilterNode::new(video::overlay("0", "0", None)));
+        builder.add_node(FilterNode::new(
+            video::overlay("0", "0").expect("literal arguments cannot fail"),
+        ));
         builder.add_output_tail(video);
         let err = builder.build().unwrap_err();
         assert!(err.is_invalid_config(), "{err}");
@@ -5087,7 +5777,7 @@ mod tests {
             &[video_endpoint(4, 2), video_endpoint(4, 2)],
             video_endpoint(2, 2),
         )?;
-        assert_eq!(graph.output_size(), Some((2, 2)), "output收口到声明尺寸");
+        assert_eq!(graph.output_size()?, (2, 2), "output收口到声明尺寸");
 
         graph.push_frame_to(0, Some(make_yuv420p_frame(4, 2, 10)))?;
         graph.push_frame_to(1, Some(make_yuv420p_frame(4, 2, 200)))?;
@@ -5096,5 +5786,143 @@ mod tests {
             .expect("scaled frame should come out");
         assert_eq!((out.width, out.height), (2, 2));
         Ok(())
+    }
+
+    /// 输出索引越界必须是**错误**，不能被折叠成"这一路没有帧率/时间基/尺寸"。
+    ///
+    /// 这三个查询原先都用 `.ok()?` 吞掉 `get_sink_context` 的失败，于是
+    /// "调用方写错了索引"和"汇没协商出帧率"在返回类型上完全同形（`None`），
+    /// 前者被静默忽略。改成 `Result` 之后两者必须可区分，这里钉住这一点。
+    #[test]
+    fn test_output_index_out_of_range_is_an_error_not_a_missing_value() -> Result<()> {
+        let mut graph = FilterGraphBuilder::hstack(
+            &[video_endpoint(4, 2), video_endpoint(4, 2)],
+            video_endpoint(8, 2),
+        )?;
+        assert_eq!(graph.output_count(), 1, "hstack has exactly one output");
+
+        // 合法索引必须仍然拿到真实值（同时钉住"正常路径没被改坏"）。
+        assert_eq!(
+            graph.output_size_at(0)?,
+            (8, 2),
+            "sink 0 is the stacked output"
+        );
+        assert_eq!(
+            graph.output_frame_rate_at(0)?,
+            rat(25, 1),
+            "sink frame rate follows the endpoint's declared frame rate"
+        );
+        assert_eq!(
+            graph.output_time_base_at(0)?,
+            rat(1, 25),
+            "sink time base follows the endpoint's declared time base"
+        );
+
+        // 越界：三处都必须是 InvalidConfig，而且点名 out of range。
+        for err in [
+            graph.output_frame_rate_at(1).unwrap_err(),
+            graph.output_time_base_at(1).unwrap_err(),
+            graph.output_size_at(1).unwrap_err(),
+        ] {
+            assert!(err.is_invalid_config(), "not InvalidConfig: {err}");
+            assert!(err.to_string().contains("out of range"), "{err}");
+        }
+        Ok(())
+    }
+
+    /// 一张还没有任何输出的图，主输出查询同样报错而不是返回 `None`。
+    #[test]
+    fn test_output_queries_on_a_graph_without_outputs_are_an_error() {
+        let mut graph = FilterGraph::new();
+        assert_eq!(graph.output_count(), 0, "a fresh graph declares no output");
+        assert!(graph.output_size().unwrap_err().is_invalid_config());
+        assert!(graph.output_frame_rate().unwrap_err().is_invalid_config());
+        assert!(graph.output_time_base().unwrap_err().is_invalid_config());
+    }
+
+    /// `transpose` 只接受 0..=3。
+    ///
+    /// FFmpeg 的 `dir` 选项声明 0..=7：4..=7 能解析通过，但**静默直通** —— 实测
+    /// `transpose=4..7` 的输出与"不加滤镜"逐字节相同。把它们当作可用滤镜交出去，
+    /// 就会把"视频根本没转"伪装成一个正常工作的 `Filter`，所以必须在这里挡掉。
+    #[test]
+    fn test_transpose_rejects_the_modes_ffmpeg_applies_as_a_no_op() {
+        for mode in 0..=3 {
+            assert_eq!(
+                video::transpose(mode).unwrap().spec(),
+                format!("transpose={mode}"),
+                "mode {mode} is a real direction"
+            );
+        }
+        for mode in [-1, 4, 5, 6, 7, 8, i32::MAX] {
+            let err = video::transpose(mode).unwrap_err();
+            assert!(err.is_invalid_config(), "mode {mode}: {err}");
+            assert!(err.to_string().contains("0..=3"), "mode {mode}: {err}");
+        }
+    }
+
+    /// 闭集滤镜选项：名字与 FFmpeg 的数字写法都收，越界/拼错在**构造期**就拒绝。
+    ///
+    /// `yadif`/`bwdif`/`afade`/`amix` 原先**完全不校验**：拼错的名字被原样写进滤镜
+    /// 串，直到建图才变成一句 FFmpeg 的解析错误（"Unable to parse \"mode\" option
+    /// value \"…\""），既没有本 crate 的上下文也定位不到是哪个参数。`amix` 更糟——
+    /// 两个入口一个校验（`FilterGraphBuilder::amix`）一个不校验（`audio::amix`），
+    /// 同一个值在两个入口行为不同。
+    ///
+    /// 值集按 `ffmpeg -h filter=<name>` 实测：`yadif.mode` 声明 `from 0 to 3` 并给
+    /// 四个名字，`bwdif.mode` 是 `0..=1`（**没有** `*_nospatial`），`afade.t` 是
+    /// `in`/`out`，`amix.duration` 是三个名字对应 0/1/2。名字和数字**都**要收。
+    #[test]
+    fn test_closed_set_options_are_validated_at_construction_time() {
+        for mode in [
+            "send_frame",
+            "send_field",
+            "send_frame_nospatial",
+            "send_field_nospatial",
+            "0",
+            "3",
+        ] {
+            video::yadif(mode).unwrap_or_else(|err| panic!("yadif({mode:?}) rejected: {err}"));
+        }
+        for mode in ["4", "-1", "bogus", "send_frames", ""] {
+            let err = video::yadif(mode).unwrap_err();
+            assert!(err.is_invalid_config(), "yadif({mode:?}): {err}");
+            assert!(err.to_string().contains("yadif mode"), "{err}");
+        }
+
+        for mode in ["send_frame", "send_field", "0", "1"] {
+            video::bwdif(mode).unwrap_or_else(|err| panic!("bwdif({mode:?}) rejected: {err}"));
+        }
+        // `send_frame_nospatial` 是 yadif 的值，bwdif 没有这一档。
+        for mode in ["2", "send_frame_nospatial", "bogus"] {
+            let err = video::bwdif(mode).unwrap_err();
+            assert!(err.is_invalid_config(), "bwdif({mode:?}): {err}");
+        }
+
+        for fade in ["in", "out", "0", "1"] {
+            audio::afade(fade, Duration::from_secs(0), Duration::from_secs(1))
+                .unwrap_or_else(|err| panic!("afade({fade:?}) rejected: {err}"));
+        }
+        for fade in ["2", "In", "fadein", ""] {
+            let err =
+                audio::afade(fade, Duration::from_secs(0), Duration::from_secs(1)).unwrap_err();
+            assert!(err.is_invalid_config(), "afade({fade:?}): {err}");
+        }
+
+        // `amix` 的两个入口必须对同一个值给出同一个结论。
+        for duration in ["longest", "shortest", "first", "0", "1", "2"] {
+            audio::amix(2, duration)
+                .unwrap_or_else(|err| panic!("amix({duration:?}) rejected: {err}"));
+        }
+        for duration in ["long", "3", "-1", ""] {
+            let from_filter = audio::amix(2, duration).unwrap_err();
+            let endpoint = audio_endpoint(48000);
+            let from_builder =
+                FilterGraphBuilder::amix(&[endpoint, endpoint], duration, endpoint).unwrap_err();
+            for err in [&from_filter, &from_builder] {
+                assert!(err.is_invalid_config(), "amix({duration:?}): {err}");
+                assert!(err.to_string().contains("amix duration"), "{err}");
+            }
+        }
     }
 }

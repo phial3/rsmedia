@@ -152,7 +152,14 @@ fn main() -> Result<()> {
     // ---- 收尾：冲刷重采样器尾样 + 编码器剩余样本 + 写 trailer ----
     // （忘记调用时 Drop 亦可兜底，但显式 finish 能感知错误）
     let recorded_samples = sink.input_samples();
+    // 输出侧计数（编码器采样率下）：输入经重采样后样本数可能不同
+    let out_samples = sink.output_samples();
+    let out_duration = sink.output_duration()?;
     sink.finish()?;
+    println!(
+        "输出侧：{out_samples} samples / {:.3}s（编码器采样率下）",
+        out_duration.as_secs_f64()
+    );
 
     let recorded_secs = recorded_samples as f64 / rate as f64;
     let size = std::fs::metadata(&output)?.len();
@@ -167,19 +174,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 按块写入 PcmSink；`write_f32/i16/u8` 的返回值（最后一次 mux 的输出）此处不关心。
+/// 按块写入 PcmSink。
+///
+/// `write_*` 不返回字节：字节留在 writer 里。这里的 writer 是 `StreamWriter`
+/// （直接落盘），无需取数；换成缓冲型 writer（如 `BufferWriter`）时，在每次
+/// `write_*` 之后用 [`PcmSink::writer_mut`] 的
+/// [`take_written`](rsmedia::io::BufferWriter::take_written) 取增量即可——不取
+/// 也不会丢，最终 [`into_bytes`](rsmedia::io::BufferWriter::into_bytes) 仍是完整的。
 fn write_chunk<W: Writer>(sink: &mut PcmSink<W>, chunk: Chunk) -> Result<()> {
     match chunk {
-        Chunk::F32(c) => {
-            let _ = sink.write_f32(&c)?;
-        }
-        Chunk::I16(c) => {
-            let _ = sink.write_i16(&c)?;
-        }
-        Chunk::U8(c) => {
-            let _ = sink.write_u8(&c)?;
-        }
-    }
+        Chunk::F32(c) => sink.write_f32(&c)?,
+        Chunk::I16(c) => sink.write_i16(&c)?,
+        Chunk::U8(c) => sink.write_u8(&c)?,
+    };
     Ok(())
 }
 

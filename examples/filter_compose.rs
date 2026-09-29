@@ -23,8 +23,8 @@ use rsmedia::filter::{AudioEndpoint, FilterGraphBuilder, VideoEndpoint};
 use rsmedia::{EncoderBuilder, MediaFrame, Muxer, PixelFormat, SampleFormat};
 
 /// 合成用的单路画面尺寸：每一路输入都是 160x120（YUV420P 要求宽高为偶数）。
-const W: u32 = 160;
-const H: u32 = 120;
+const W: i32 = 160;
+const H: i32 = 120;
 /// 帧率，同时也是视频端点的时间基（1/25）。
 const FPS: i32 = 25;
 /// 输入音频：48kHz 单声道，每帧 1024 个采样点。
@@ -143,7 +143,7 @@ fn compose_vstack() -> Result<()> {
 fn compose_overlay() -> Result<()> {
     println!("== 3) overlay：小图叠到大图上（画中画 / 水印）==");
 
-    let (overlay_w, overlay_h) = (40u32, 30u32);
+    let (overlay_w, overlay_h) = (40, 30);
     let (x, y) = (100usize, 20usize);
     let mut graph = FilterGraphBuilder::overlay(
         video_endpoint(W, H),
@@ -265,14 +265,10 @@ fn compose_amix() -> Result<()> {
 }
 
 /// 这一批场景统一的视频端点：YUV420P、25fps、时间基 1/25。
-fn video_endpoint(width: u32, height: u32) -> VideoEndpoint {
-    VideoEndpoint::new(
-        width as i32,
-        height as i32,
-        PixelFormat::YUV420P,
-        Rational::new(1, FPS).unwrap(),
-        Rational::new(FPS, 1).unwrap(),
-    )
+fn video_endpoint(width: i32, height: i32) -> VideoEndpoint {
+    VideoEndpoint::new(width, height, PixelFormat::YUV420P)
+        .with_time_base(Rational::new(1, FPS).unwrap())
+        .with_frame_rate(Rational::new(FPS, 1).unwrap())
 }
 
 /// 统一的音频端点：48kHz 单声道 FLTP，时间基 1/48000。
@@ -286,7 +282,7 @@ fn audio_endpoint() -> AudioEndpoint {
 }
 
 /// 生成一张 YUV420P 纯色帧：亮度面全填 `luma`，两个色度面填中性 128。
-fn solid_frame(width: u32, height: u32, luma: u8, pts: i64) -> Result<MediaFrame<u8>> {
+fn solid_frame(width: i32, height: i32, luma: u8, pts: i64) -> Result<MediaFrame<u8>> {
     let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::YUV420P)?;
     {
         let planes = frame

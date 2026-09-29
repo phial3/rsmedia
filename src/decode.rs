@@ -1,4 +1,4 @@
-use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType, impl_codec_builder_setters};
+use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::flags::FlagSet;
@@ -9,14 +9,15 @@ use crate::io::Reader;
 use crate::options::Options;
 use crate::resample;
 use crate::resize::Resize;
-use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler};
+use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler, VideoSpec};
 use crate::state::ProcessState;
 use crate::stream::StreamInfo;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
-use crate::time::Rational;
-use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader, Time};
+use crate::time::{Rational, Time};
+use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader};
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket, AVSubtitle};
 use rsmpeg::avformat::AVStream;
 use rsmpeg::avutil::{self, AVChannelLayoutRef, AVFrame};
@@ -25,7 +26,7 @@ use rsmpeg::ffi;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-ffi_enum_wrap_from!(
+ffi_enum_from!(
     /// 帧丢弃粒度（`AVCodecContext.skip_frame`，`AVDiscard`）。
     ///
     /// 只影响**解码器是否把解出的帧交出来**，不省去比特流解析/解码本身
@@ -57,9 +58,10 @@ ffi_enum!(
     /// 解码错误识别力度（`AVCodecContext.err_recognition`，`AV_EF_*` 位）。
     ///
     /// 决定解码器**把什么当错误**，以及发现后是"带伤继续"还是直接失败：
-    /// 默认（仅 [`CRCCHECK`](Self::CRCCHECK)）是宽松容错，损坏的码流会被掩盖
-    /// 成错帧/糊帧继续输出；要"宁可失败也不出错帧"就加上
-    /// [`EXPLODE`](Self::EXPLODE)，解码 API 会以 `Err` 报告而不是静默继续。
+    /// 默认是 `0`（一个位都不置，FFmpeg 的 `err_detect` 选项默认值），损坏的码流
+    /// 会被掩盖成错帧/糊帧继续输出；要"宁可失败也不出错帧"就置上
+    /// [`EXPLODE`](Self::EXPLODE)（通常连同 [`BUFFER`](Self::BUFFER) /
+    /// [`CRCCHECK`](Self::CRCCHECK) 一起），解码 API 会以 `Err` 报告而不是静默继续。
     ///
     /// 位可组合（`ErrRecognition::BUFFER | ErrRecognition::EXPLODE`，结果为
     /// [`FlagSet<ErrRecognition>`](crate::FlagSet)，可直接传给
@@ -69,7 +71,8 @@ ffi_enum!(
     /// FFmpeg 内部顺序决定，调用方不应同时给出。
     #[allow(non_camel_case_types)]
     ErrRecognition, u32 {
-        /// 校验 CRC 之类的校验和（默认开启，`AV_EF_CRCCHECK`）。
+        /// 校验 CRC 之类的校验和（`AV_EF_CRCCHECK`）。**默认并不开启**：
+        /// `err_recognition` 的默认值是 0，要校验就得显式置这一位。
         CRCCHECK => ffi::AV_EF_CRCCHECK;
         /// 把码流层（比特流语法）的异常当错误（`AV_EF_BITSTREAM`）。
         BITSTREAM => ffi::AV_EF_BITSTREAM;
@@ -106,7 +109,7 @@ pub struct DecoderBuilder {
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
     /// 硬件帧池的预分配表面数（`None` = [`crate::hwaccel::DEFAULT_HW_POOL_SIZE`]）。
-    hw_pool_size: Option<u32>,
+    hw_pool_size: Option<i32>,
     /// 缩放核选择（互斥，只取一个算法位）
     scale_algorithm: ScaleAlgorithm,
     /// 缩放质量位（可多位，见 [`ScaleQuality`]）。
@@ -119,9 +122,12 @@ pub struct DecoderBuilder {
     pix_fmt: Option<PixelFormat>,
     /// 解码输出目标采样格式（仅音频）。`None` 表示保留编解码器原生格式。
     sample_fmt: Option<SampleFormat>,
-    /// 帧丢弃粒度（`AVCodecContext.skip_frame`）。`None` = FFmpeg 默认（不丢弃）。
+    /// 帧丢弃粒度（`AVCodecContext.skip_frame`）。`None` = FFmpeg 默认
+    /// （[`SkipFrame::DEFAULT`]：只丢弃 AVI 里长度为 0 的"无用包"这类帧，
+    /// 不是 [`SkipFrame::NONE`]）。
     skip_frame: Option<SkipFrame>,
-    /// 错误识别位集（`AVCodecContext.err_recognition`）。`None` = FFmpeg 默认。
+    /// 错误识别位集（`AVCodecContext.err_recognition`）。`None` = FFmpeg 默认，
+    /// 即 `0`（**所有位都不置**，连 [`CRCCHECK`](ErrRecognition::CRCCHECK) 也没开）。
     err_recognition: Option<FlagSet<ErrRecognition>>,
 }
 
@@ -154,7 +160,7 @@ impl DecoderBuilder {
         }
     }
 
-    // 与 EncoderBuilder 共有的那批 setter：定义与文档在 `codec.rs` 的宏里，
+    // 与 EncoderBuilder 共有的那批 setter：定义与文档在 `macros.rs` 的宏里，
     // 改一次两端同时生效（见 `impl_codec_builder_setters` 的说明）。
     impl_codec_builder_setters!();
 
@@ -257,7 +263,7 @@ impl DecoderBuilder {
 
     /// 设置错误识别掩码（`AVCodecContext.err_recognition`）。
     ///
-    /// 默认只有 [`ErrRecognition::CRCCHECK`]，即**宽松容错**：损坏的码流会被
+    /// 默认一个位都不置（即**宽松容错**）：损坏的码流会被
     /// 解码器尽力掩盖（`error_concealment`）成错帧继续输出，调用方拿到的是
     /// "看起来正常"的画面。需要"宁可失败也不出错帧"时，把
     /// [`ErrRecognition::EXPLODE`] 加进来，解码 API 就会以 `Err` 报告损坏，
@@ -344,13 +350,15 @@ impl DecoderBuilder {
         // 稳定性策略：rsmpeg 未生成 skip_frame / err_recognition 访问器，直接写字段
         // （encode.rs 写 rc_max_rate 同例）。两项都必须在 `avcodec_open2` 之前生效，
         // 否则不会进入解码器初始化。
+        //
+        // SAFETY: `decoder` 在此处独占（`&mut`），`deref_mut` 只在块内存活。
         unsafe {
-            let raw = decoder.as_mut_ptr();
+            let ctx_raw = decoder.deref_mut();
             if let Some(skip_frame) = self.skip_frame {
-                (*raw).skip_frame = skip_frame.into();
+                ctx_raw.skip_frame = skip_frame.into();
             }
             if let Some(err_recognition) = self.err_recognition {
-                (*raw).err_recognition = err_recognition.bits() as i32;
+                ctx_raw.err_recognition = err_recognition.bits() as i32;
             }
         }
 
@@ -473,8 +481,7 @@ impl DecoderBuilder {
 
         // 输出像素格式：仅视频有效。任何能表示为数据平面的格式都接受
         // （布局由描述符推导，见 `PixelFormat::data_layout`）；位流 / 调色板 /
-        // 硬件格式在构建期快速失败，而不是拖到运行时。解码输出经 swscale
-        // 统一转换到目标格式。
+        // 硬件格式在构建期快速失败，而不是拖到运行时。解码输出经 swscale 统一转换到目标格式。
         // 非视频类型配置了 pix_fmt 视为调用方错误，快速失败而非静默忽略。
         let output_pix_fmt = match (media_type, self.pix_fmt) {
             (MediaType::VIDEO, Some(fmt)) => {
@@ -584,7 +591,7 @@ impl DecoderBuilder {
             output_pix_fmt,
             output_sample_fmt,
             filter_input_format,
-            audio_converter: resample::StreamingConverter::new(),
+            resampler: None,
             pending_frames: VecDeque::new(),
         })
     }
@@ -624,6 +631,9 @@ pub struct Decoder {
     stream_index: usize,
     media_type: MediaType,
     state: ProcessState,
+    /// 视频像素缩放器（改尺寸 + 换格式）。与 [`Self::resampler`] 不同，它**不是**
+    /// `Option`：`Scaler::new` 不需要输入规格（swscale 从帧属性推导源格式），而
+    /// `Resampler` 的输入规格只有第一帧才知道、因此惰性建在 `resample_if_needed` 里。
     scaler: Scaler,
     resize: Option<Resize>,
     /// 解码输出目标像素格式（仅视频）
@@ -633,8 +643,16 @@ pub struct Decoder {
     /// 滤镜链声明的**进图**格式（见 [`Filter::with_input_format`]）；`None` =
     /// 图输入就是解码输出格式（零额外转换）。有值时进图前的帧会被转成它。
     filter_input_format: Option<FrameFormat>,
-    /// 音频输出格式转换器；跨帧复用同一个 `SwrContext`，避免逐帧重建丢掉重采样延迟。
-    audio_converter: resample::StreamingConverter,
+    /// 音频输出格式重采样器（与视频的 `scaler` 一一对应；跨帧复用同一个 [`Resampler`]，
+    /// 避免逐帧重建丢掉重采样延迟）。
+    ///
+    /// `None` = 还没遇到过需要转换的帧：上下文的输入格式要到第一帧才知道，因此它由
+    /// [`Resampler::new`] 在第一次转换时建立（见 [`resample::resample_if_needed`]）。
+    ///
+    /// **不需要在流末排空**：它的目标布局与采样率都取自帧本身、只换采样格式（见
+    /// [`Self::convert_decoded_audio`]），上下文不做重采样因而没有延迟线 —— 与需要
+    /// 排空的那个（输出采样率取自编码器的 `Encoder` 侧重采样器）不同。
+    resampler: Option<resample::Resampler>,
     /// 解码器已经吐出、但还没交出去的帧（**未经归一化**：还没做 HW 下载、缩放与滤镜）
     ///
     /// 一个包可以解出**多帧**（H.264 场编码、MPEG-2 field picture…），而
@@ -687,16 +705,16 @@ impl Decoder {
     /// `AVCodecContext.width` field is an FFmpeg `int`; the conversion here can
     /// never see a negative value.
     #[inline(always)]
-    pub fn width(&self) -> u32 {
-        self.context.width as u32
+    pub fn width(&self) -> i32 {
+        self.context.width
     }
 
     /// Height of the decoder's input video frame, in pixels.
     ///
     /// Returned as `u32` for the same reason as [`Self::width`].
     #[inline(always)]
-    pub fn height(&self) -> u32 {
-        self.context.height as u32
+    pub fn height(&self) -> i32 {
+        self.context.height
     }
 
     /// `AVCodecContext.flags` 位集（`AV_CODEC_FLAG_*`，取值见 [`AVCodecFlag`]）。
@@ -1321,9 +1339,7 @@ impl Decoder {
                 };
                 self.scaler.scale_if_needed(
                     sw_frame,
-                    out_w as i32,
-                    out_h as i32,
-                    target_sw_pix_fmt,
+                    VideoSpec::new(out_w as i32, out_h as i32, target_sw_pix_fmt),
                 )?
             }
             MediaType::AUDIO => match self
@@ -1333,21 +1349,11 @@ impl Decoder {
             {
                 // 统一音频输出格式（由 `with_sample_fmt` 配置，或滤镜声明的输入
                 // 格式）。与视频侧一样在进滤镜图之前完成，图内因此按目标格式声明
-                // 输入（见 build_from_reader）。只在格式真的不同、且帧确实带样本时
-                // 转换：默认（未指定目标）与「目标 == 原生」两种情况都零开销，空帧
-                // 也无从转换。
-                Some(target)
-                    if target != SampleFormat::from(sw_frame.format) && sw_frame.nb_samples > 0 =>
-                {
-                    self.audio_converter
-                        .convert(
-                            &sw_frame,
-                            sw_frame.ch_layout,
-                            target.into(),
-                            sw_frame.sample_rate,
-                        )
-                        .context("Failed to convert decoded audio to the output sample format")?
-                }
+                // 输入（见 build_from_reader）。默认（未指定目标）时不进这里；
+                // 「目标 == 原生」与空帧两种情况由 `resample_if_needed` 判掉，零开销。
+                Some(target) => self
+                    .convert_decoded_audio(sw_frame, target.into())
+                    .context("Failed to convert decoded audio to the output sample format")?,
                 _ => sw_frame,
             },
             _ => {
@@ -1377,6 +1383,19 @@ impl Decoder {
             // 如果没有 Filter Graph，直接返回 CPU 帧
             Ok(Some(raw_frame))
         }
+    }
+
+    /// 把解码出的音频帧转成目标采样格式（声道布局与采样率不变）。
+    ///
+    /// 目标格式 = 帧自己的布局与采样率 + 由配置决定的采样格式；重采样器跨帧复用，
+    /// 因此重采样延迟缓冲里的尾巴不会每帧被丢掉（逐帧新建上下文就会）。
+    fn convert_decoded_audio(
+        &mut self,
+        frame: AVFrame,
+        out_sample_fmt: ffi::AVSampleFormat,
+    ) -> Result<AVFrame> {
+        let out_spec = resample::AudioSpec::from_frame(&frame).with_sample_fmt(out_sample_fmt);
+        resample::resample_if_needed(&mut self.resampler, frame, out_spec)
     }
 
     /// Pull a decoded frame from the decoder. This function also implements retry mechanism in case
@@ -1506,7 +1525,14 @@ impl Drop for Decoder {
         if !self.state.is_flushed() {
             let eos_sent = if self.state.is_normal() {
                 match self.send_packet_with_retry(None) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        // 与 `drain` 一致：EOS 送出即进入 draining。不置位的话下面
+                        // 的 `Ok(None)`（EAGAIN）会被当成"已到流末尾"立刻退出排空，
+                        // 而带帧级多线程的解码器在 EOS 之后完全可以先回一次 EAGAIN
+                        // 再吐帧 —— 尾部帧就是这么丢的。
+                        self.state = ProcessState::Drained;
+                        true
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "Failed to send flush packet to decoder during Decoder drop: {e}"
@@ -1587,7 +1613,7 @@ mod tests {
 
     #[test]
     fn test_decode_video() -> Result<()> {
-        let filters = vec![filter::video::scale(1280, 720, None)];
+        let filters = vec![filter::video::scale(1280, 720, None)?];
 
         let mut reader = StreamReader::new("assets/mp4.mp4")?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
@@ -1678,7 +1704,7 @@ mod tests {
     fn test_decode_audio() -> Result<()> {
         let filters = vec![
             filter::audio::resample(2, 48000, SampleFormat::FLTP),
-            filter::audio::volume(1.5),
+            filter::audio::volume(1.5)?,
         ];
 
         let mut reader = StreamReader::new("assets/wav.wav")?;
@@ -1878,7 +1904,7 @@ mod tests {
         eprintln!("[B] filter only");
         let mut reader_b = StreamReader::new(video_path)?;
         let mut dec_b = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(vec![filter::video::scale(320, 240, None)])
+            .with_filters(vec![filter::video::scale(320, 240, None)?])
             .build_from_reader(&reader_b)?;
         let mut b_dims = HashSet::new();
         while let Some(f) = dec_b.decode_raw(&mut reader_b)? {
@@ -1897,7 +1923,7 @@ mod tests {
         let mut reader_c = StreamReader::new(video_path)?;
         let mut dec_c = DecoderBuilder::new(MediaType::VIDEO)
             .with_resize(Resize::Exact(320, 240))
-            .with_filters(vec![filter::video::scale(640, 480, None)])
+            .with_filters(vec![filter::video::scale(640, 480, None)?])
             .build_from_reader(&reader_c)?;
         let mut c_dims = HashSet::new();
         while let Some(f) = dec_c.decode_raw(&mut reader_c)? {
@@ -1978,7 +2004,7 @@ mod tests {
         let video_path = "assets/mp4.mp4";
         let mut reader = StreamReader::new(video_path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(vec![crate::filter::video::fps(10.0)])
+            .with_filters(vec![crate::filter::video::fps(10.0)?])
             .build_from_reader(&reader)?;
 
         let mut first_pass = 0usize;
@@ -2049,7 +2075,7 @@ mod tests {
 
         let mut reader = StreamReader::new(&path)?;
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-            .with_filters(vec![crate::filter::video::fps(FILTER_FPS)])
+            .with_filters(vec![crate::filter::video::fps(FILTER_FPS)?])
             .build_from_reader(&reader)?;
 
         // 从头解几帧，让滤镜图里真正开始有缓冲
@@ -2205,8 +2231,13 @@ mod tests {
         Ok(())
     }
 
-    /// 造一段可预测的视频：`content` 为 `true` 时逐像素填噪声（损坏实验用，
-    /// 噪声让码流对字节翻转更敏感），否则留空（静态画面）。
+    /// 造一段可预测的视频：`noise` 为 `true` 时逐像素填噪声（损坏实验用，
+    /// 噪声让码流对字节翻转更敏感），否则填纯黑（静态画面）。
+    ///
+    /// ⚠️ "留空"必须**显式填**而不能省略：`AVFrame::alloc_buffer()` 走
+    /// `av_frame_get_buffer` → `av_buffer_alloc`（`av_malloc`），**不清零**。把未初始化
+    /// 的像素送进编码器，每次跑出来的码流都不一样 —— 依赖"同一份输入必得同一份输出"
+    /// 的损坏实验会间歇性失败。
     fn write_test_clip(path: &std::path::Path, frames: i64, gop: i32, noise: bool) -> Result<()> {
         let mut muxer = crate::Muxer::new(path)?;
         let encoder = crate::EncoderBuilder::new_video(160, 120)
@@ -2223,6 +2254,10 @@ mod tests {
             frame
                 .alloc_buffer()
                 .context("Failed to allocate frame buffer")?;
+            // 先整帧填黑，保证"留空"是确定的黑而不是脏内存。用 `fill_black` 而不
+            // 是 `fill_color`：后者底层 `av_image_fill_color` 自 FFmpeg 7.0 才有，
+            // 这里必须在所有受支持的版本上都能跑。
+            crate::imgutils::fill_black(&mut frame)?;
             if noise {
                 // 线性同余发生器：同样的序号得到同样的画面，损坏实验因此可复现。
                 let mut state = (i as u32 + 1) | 1;

@@ -43,11 +43,11 @@ fn main() -> Result<()> {
     // 缩放 -> 裁剪 -> 去水印 -> 视频降噪 -> 饱和度增强
     // 注意：delogo 区域必须离帧边界至少 band(默认1) 像素，故 x/y 从 10 开始。
     let filters = vec![
-        filter::video::scale(426, 240, None),  // 缩放到 426x240
+        filter::video::scale(426, 240, None)?, // 缩放到 426x240
         filter::video::crop(0, 0, 400, 200),   // 裁剪出 400x200 区域
         filter::video::delogo(10, 10, 60, 20), // 去除左上角水印
         filter::video::hqdn3d(3.0, 2.0),       // 视频降噪
-        filter::video::saturation(1.3),        // 画质增强：饱和度
+        filter::video::saturation(1.3)?,       // 画质增强：饱和度
     ];
 
     let filter_count = filters.len();
@@ -109,7 +109,7 @@ fn main() -> Result<()> {
     );
 
     // ---- 2) 打印滤镜 API 目录（仅展示 spec，不实际运行）----
-    print_filter_catalog();
+    print_filter_catalog()?;
 
     Ok(())
 }
@@ -118,8 +118,8 @@ fn main() -> Result<()> {
 fn save_frame(frame: &MediaFrame<u8>, index: usize) -> Result<()> {
     let rgb = frame.convert_yuv420p_to_rgb24()?;
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_raw(
-        frame.width,
-        frame.height,
+        frame.width as u32,
+        frame.height as u32,
         rgb.data
             .as_packed()
             .expect("RGB24 frames are interleaved")
@@ -135,12 +135,12 @@ fn save_frame(frame: &MediaFrame<u8>, index: usize) -> Result<()> {
 }
 
 /// 打印 `filter` 模块提供的滤镜 API 及其生成的 FFmpeg spec。
-fn print_filter_catalog() {
+fn print_filter_catalog() -> Result<()> {
     println!("\n===== video filters =====");
     let v = vec![
         (
             "scale(1280,720,None)",
-            filter::video::scale(1280, 720, None).spec(),
+            filter::video::scale(1280, 720, None)?.spec(),
         ),
         (
             "crop(x,y,w,h)",
@@ -149,19 +149,19 @@ fn print_filter_catalog() {
         ("fade_in(30)", filter::video::fade_in(30).spec()),
         ("fade_out(30,30)", filter::video::fade_out(30, 30).spec()),
         ("unsharp()", filter::video::unsharp().spec()),
-        ("blur(2.0)", filter::video::blur(2.0).spec()),
+        ("blur(2.0)", filter::video::blur(2.0)?.spec()),
         (
             "eq(brightness,contrast)",
-            filter::video::eq(0.1, 1.2).spec(),
+            filter::video::eq(0.1, 1.2)?.spec(),
         ),
-        ("fps(30)", filter::video::fps(30.0).spec()),
+        ("fps(30)", filter::video::fps(30.0)?.spec()),
         (
             "yadif(\"send_frame\")",
-            filter::video::yadif("send_frame").spec(),
+            filter::video::yadif("send_frame")?.spec(),
         ),
         (
-            "pad(w,h,x,y,color)",
-            filter::video::pad(1920, 1080, 0, 0, "black").spec(),
+            "pad(x,y,w,h,color)",
+            filter::video::pad(0, 0, 1920, 1080, "black")?.spec(),
         ),
         ("setdar(16,9)", filter::video::setdar(16, 9).spec()),
         ("setsar(1,1)", filter::video::setsar(1, 1).spec()),
@@ -170,17 +170,17 @@ fn print_filter_catalog() {
         ("noise(10)", filter::video::noise(10).spec()),
         ("hqdn3d(3.0,2.0)", filter::video::hqdn3d(3.0, 2.0).spec()),
         ("nlmeans(1.5)", filter::video::nlmeans(1.5).spec()),
-        ("gamma(1.2)", filter::video::gamma(1.2).spec()),
-        ("saturation(1.3)", filter::video::saturation(1.3).spec()),
+        ("gamma(1.2)", filter::video::gamma(1.2)?.spec()),
+        ("saturation(1.3)", filter::video::saturation(1.3)?.spec()),
         ("vibrance(0.4)", filter::video::vibrance(0.4).spec()),
         ("deblock()", filter::video::deblock().spec()),
         ("DrawText::new(...).time_text(\"%{localtime}\")", {
             filter::video::DrawText::new("", 10, 10, 24, "white")
                 .time_text("%{localtime}")
-                .build()
+                .build()?
                 .spec()
         }),
-        ("transpose(1)", filter::video::transpose(1).spec()),
+        ("transpose(1)", filter::video::transpose(1)?.spec()),
         (
             "delogo(0,0,100,50)",
             filter::video::delogo(0, 0, 100, 50).spec(),
@@ -204,7 +204,7 @@ fn print_filter_catalog() {
 
     println!("\n===== audio filters =====");
     let a = vec![
-        ("volume(1.5)", filter::audio::volume(1.5).spec()),
+        ("volume(1.5)", filter::audio::volume(1.5)?.spec()),
         ("loudnorm(-16.0)", filter::audio::loudnorm(-16.0).spec()),
         ("highpass(80)", filter::audio::highpass(80).spec()),
         ("lowpass(4000)", filter::audio::lowpass(4000).spec()),
@@ -223,4 +223,5 @@ fn print_filter_catalog() {
     for (name, spec) in a {
         println!("  {name}\n    -> {spec}");
     }
+    Ok(())
 }

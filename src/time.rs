@@ -68,9 +68,12 @@ impl Rational {
     /// representation as a pair of `i32`:
     ///
     /// * `den == 0` — `x / 0` is not a number;
-    /// * the normalised numerator or denominator would not fit in `i32`, which
-    ///   can only happen for `den == i32::MIN`, or for `num == i32::MIN` with
-    ///   `den == -1` (whose normalised form is `2^31 / 1`).
+    /// * the **reduced** numerator or denominator still does not fit in `i32`.
+    ///   Reduction happens *before* the range check, so this is narrower than it
+    ///   looks: it needs `den == i32::MIN` (whose absolute value is `2^31`) with a
+    ///   `num` that does not share enough factors to shrink it — `0 / i32::MIN`
+    ///   and `i32::MIN / i32::MIN` both reduce into range and are accepted — or
+    ///   `num == i32::MIN` with `den == -1`, whose normalised form is `2^31 / 1`.
     ///
     /// # Examples
     ///
@@ -336,16 +339,37 @@ impl Time {
         }
     }
 
-    /// Creates a new timestamp that reprsents `nth` of a second.
+    /// Creates a new timestamp that represents one `nth` of a second — the
+    /// instant `1 / nth` s, spelled as the tick `1` in a `1 / nth` time base
+    /// rather than as a rounded float.
     ///
     /// # Arguments
     ///
-    /// * `nth` - Denominator of the time in seconds as in `1 / nth`.
-    pub fn from_nth_of_a_second(nth: usize) -> Self {
-        Self {
+    /// * `nth` - Denominator of the time in seconds as in `1 / nth`. [`i32`]
+    ///   because that is the width of `AVRational`'s fields: the value the caller
+    ///   writes is the value FFmpeg reads, with no narrowing in between.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `nth == 0`: `1 / 0` is not a
+    /// number, and [`Rational`] cannot hold it. That is [`Rational::new`]'s own
+    /// rule, not an extra one — it is the only case this constructor has to
+    /// reject.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsmedia::Time;
+    ///
+    /// assert_eq!(Time::from_nth_of_a_second(4)?.as_secs_f64(), 0.25);
+    /// assert!(Time::from_nth_of_a_second(0).is_err());
+    /// # Ok::<(), rsmedia::RsmediaError>(())
+    /// ```
+    pub fn from_nth_of_a_second(nth: i32) -> Result<Self> {
+        Ok(Self {
             time: Some(1),
-            time_base: one_over(nth as i32),
-        }
+            time_base: Rational::new(1, nth)?,
+        })
     }
 
     /// Creates a new timestamp from a number of seconds.
@@ -376,13 +400,33 @@ impl Time {
     ///
     /// # Arguments
     ///
-    /// * `time` - Relative time in `time_base` units.
+    /// * `time` - Relative time in `time_base` units. [`i64`] because that is
+    ///   FFmpeg's own timestamp width (`AVFrame.pts`, `AVPacket.pts`).
     /// * `base_den` - Time base denominator i.e. time base is `1 / base_den`.
-    pub fn from_units(time: usize, base_den: usize) -> Self {
-        Self {
-            time: Some(time as i64),
-            time_base: one_over(base_den as i32),
-        }
+    ///   [`i32`], like `AVRational`'s fields.
+    ///
+    /// Both are the widths FFmpeg reads back, so neither is narrowed on the way
+    /// in — see [`Self::from_nth_of_a_second`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::InvalidConfig`] when `base_den == 0`, for the same
+    /// reason [`Self::from_nth_of_a_second`] does: `1 / 0` is not a number.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsmedia::Time;
+    ///
+    /// assert_eq!(Time::from_units(3, 2)?.as_secs_f64(), 1.5);
+    /// assert!(Time::from_units(1, 0).is_err());
+    /// # Ok::<(), rsmedia::RsmediaError>(())
+    /// ```
+    pub fn from_units(time: i64, base_den: i32) -> Result<Self> {
+        Ok(Self {
+            time: Some(time),
+            time_base: Rational::new(1, base_den)?,
+        })
     }
 
     /// Create a new zero-valued timestamp.
@@ -399,14 +443,19 @@ impl Time {
 
     /// Whether the [`Time`] carries a usable value at all.
     ///
-    /// Both "no time" spellings report `false`: no value whatsoever (`None`), and
-    /// the `AV_NOPTS_VALUE` sentinel FFmpeg writes when a stream simply has no
-    /// timestamp. This is the predicate to branch on before converting to seconds
-    /// — converting a NOPTS would yield ≈ -9.2e13 seconds.
-    /// [`Self::into_value`], the seconds conversions and the comparisons all
-    /// agree with it.
+    /// Three "no time" spellings report `false`: no value whatsoever (`None`); the
+    /// `AV_NOPTS_VALUE` sentinel FFmpeg writes when a stream simply has no
+    /// timestamp; and a **zero time base** ([`Rational::ZERO`], what FFmpeg's own
+    /// `0/0` folds to), which leaves a raw value nobody can interpret —
+    /// [`Self::as_secs_f64`], [`std::fmt::Display`] and the comparisons all treat
+    /// it as "nothing", so this predicate has to as well.
+    ///
+    /// This is the predicate to branch on before converting to seconds — converting
+    /// a NOPTS would yield ≈ -9.2e12 seconds.
+    /// [`Self::into_value`], the seconds conversions and the comparisons all agree
+    /// with it (every one of them funnels through the same private helper).
     pub fn has_value(&self) -> bool {
-        self.value().is_some()
+        self.instant().is_some()
     }
 
     /// The raw value, with the `AV_NOPTS_VALUE` sentinel filtered out.
@@ -419,11 +468,32 @@ impl Time {
         self.time.filter(|time| *time != ffi::AV_NOPTS_VALUE)
     }
 
+    /// The instant as an exact rational `(time, num, den)`, meaning
+    /// `time * num / den` seconds — or `None` when there is nothing to compare:
+    /// no value at all, or a zero time base.
+    ///
+    /// This is the key the comparison impls use (see [`compare_instants`]); the
+    /// seconds conversions and [`std::fmt::Display`] go through
+    /// [`Self::seconds_or_none`] instead, because printing wants a rounded
+    /// number.
+    ///
+    /// The old "degenerate `0/0`" case is gone as a *separate* case: a zero
+    /// denominator cannot exist in a [`Rational`], so the only degenerate time
+    /// base left is [`Rational::ZERO`], and one test covers it.
+    fn instant(&self) -> Option<(i64, i32, i32)> {
+        let time = self.value()?;
+        if self.time_base.is_zero() {
+            return None;
+        }
+        Some((time, self.time_base.num(), self.time_base.den()))
+    }
+
     /// The instant in seconds, or `None` when there is nothing to convert: no
     /// value at all, or a zero time base.
     ///
-    /// The comparison and formatting impls key off this, so "equal", "ordered"
-    /// and "printed" always refer to the same number.
+    /// Rounded to the nearest `f64`, so it is what [`Self::as_secs_f64`] and
+    /// [`std::fmt::Display`] want and **not** what the comparisons use — those
+    /// are exact (see [`Self::instant`]).
     ///
     /// The old "degenerate `0/0`" case is gone as a *separate* case: a zero
     /// denominator cannot exist in a [`Rational`], so the only degenerate time
@@ -468,8 +538,8 @@ impl Time {
     /// Get number of seconds as floating point value.
     ///
     /// Returns `0.0` when there is no usable value ([`Self::has_value`] is
-    /// `false`) or the time base is zero, which also keeps the result finite — a
-    /// NOPTS would otherwise turn into ≈ -9.2e13 seconds.
+    /// `false`, which covers a zero time base too), which also keeps the result
+    /// finite — a NOPTS would otherwise turn into ≈ -9.2e12 seconds.
     pub fn as_secs_f64(&self) -> f64 {
         self.seconds_or_none().unwrap_or(0.0)
     }
@@ -477,12 +547,13 @@ impl Time {
     /// Convert to underlying time to `i64` (the number of time units).
     ///
     /// Returns `None` when there is no usable value — including the
-    /// `AV_NOPTS_VALUE` sentinel — so it agrees with [`Self::has_value`].
+    /// `AV_NOPTS_VALUE` sentinel **and a zero time base** (a raw count nobody can
+    /// interpret) — so it agrees with [`Self::has_value`].
     ///
     /// Assumes that the caller knows the time base and applies it correctly when doing arithmetic
     /// operations on the time value.
     pub fn into_value(self) -> Option<i64> {
-        self.value()
+        self.instant().map(|(time, _, _)| time)
     }
 
     /// Align the timestamp along another `time_base`.
@@ -500,20 +571,6 @@ impl Time {
     }
 }
 
-/// `1 / den` as a time base.
-///
-/// A denominator of zero cannot be a time base, and [`Rational`] cannot hold one;
-/// such a value folds to [`Rational::ZERO`], so the resulting [`Time`] simply has
-/// no convertible value (see [`Time::as_secs_f64`]) instead of carrying an
-/// infinity around.
-fn one_over(den: i32) -> Rational {
-    if den > 0 {
-        Rational::unit(den)
-    } else {
-        Rational::ZERO
-    }
-}
-
 /////////////////////////////////
 /////////////////////////////////
 
@@ -524,9 +581,11 @@ pub const TIME_BASE: Rational = Rational::unit(1_000_000);
 
 /// Rescale a timestamp between two time bases.
 ///
-/// Implemented for every integer type, so a pts value can be rescaled in place:
-/// `pts.rescale(from, to)`. Both time bases are [`Rational`], like every other
-/// rational in this crate.
+/// Implemented for every integer type that converts into `i64`
+/// (`impl<T: Into<i64> + Clone>`), so a pts value can be rescaled in place:
+/// `pts.rescale(from, to)`. That covers `i8`…`i64` and `u8`…`u32`, but **not**
+/// `u64` / `usize` / `u128` / `i128` — cast those to `i64` first. Both time
+/// bases are [`Rational`], like every other rational in this crate.
 pub trait Rescale {
     fn rescale<S, D>(&self, source: S, destination: D) -> i64
     where
@@ -566,6 +625,31 @@ impl<T: Into<i64> + Clone> Rescale for T {
     }
 }
 
+/// 两个时刻的**精确**比较：`time * num / den` 是有理数，用 `i128` 交叉相乘比大小，
+/// 而不是先换算成 `f64`。
+///
+/// 浮点化过不了 [`Eq`] 的传递性：`9/15` 与 `3/5` 数学上相等，但两条不同的
+/// 计算路径各带一次舍入就可能相差一个 ulp，于是 `a == b`、`b == c` 而 `a != c`
+/// —— 放进 `HashSet`/排序里就是不稳定结果。[`Rational`] 保证 `den > 0`，故交叉
+/// 相乘不会翻转符号。
+///
+/// `i128` 装得下最坏情况：`i64::MAX * i32::MAX * i32::MAX ≈ 4.3e37 < i128::MAX ≈ 1.7e38`。
+///
+/// "无值"（`None` 或零时间基）排在**最前面**且彼此相等，与 [`Time::has_value`]
+/// 的语义一致。
+fn compare_instants(lhs: &Time, rhs: &Time) -> std::cmp::Ordering {
+    match (lhs.instant(), rhs.instant()) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some((lhs_time, lhs_num, lhs_den)), Some((rhs_time, rhs_num, rhs_den))) => {
+            let lhs = i128::from(lhs_time) * i128::from(lhs_num) * i128::from(rhs_den);
+            let rhs = i128::from(rhs_time) * i128::from(rhs_num) * i128::from(lhs_den);
+            lhs.cmp(&rhs)
+        }
+    }
+}
+
 impl PartialEq for Time {
     /// Compares the instants, **in seconds**, not the `(time, time_base)` pairs:
     /// `Time::from_units(1, 4)` and `Time::new(Some(2), Rational::new(1, 2).unwrap())`
@@ -575,8 +659,13 @@ impl PartialEq for Time {
     /// unequal whenever the time bases differed. Two "no value" times are equal
     /// (`None == None`); a "no value" time never equals a valued one. The result
     /// matches [`PartialOrd`]: `a == b` ⟺ `a.partial_cmp(&b) == Some(Equal)`.
+    ///
+    /// The comparison is exact — the two instants are cross-multiplied in `i128`
+    /// instead of being converted to `f64` first, so unreduced time bases such as
+    /// `9/15` and `3/5` compare equal even when the two floating-point paths
+    /// differ by an ulp.
     fn eq(&self, other: &Self) -> bool {
-        self.seconds_or_none() == other.seconds_or_none()
+        compare_instants(self, other) == std::cmp::Ordering::Equal
     }
 }
 
@@ -585,16 +674,10 @@ impl Eq for Time {}
 impl PartialOrd for Time {
     /// Orders by seconds, "no value" first; [`PartialEq`] uses the same key, so
     /// the `PartialOrd` contract holds. Always `Some`, since the key is always
-    /// comparable.
+    /// comparable — and total, being an exact rational comparison rather than a
+    /// floating-point one.
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(match (self.seconds_or_none(), other.seconds_or_none()) {
-            (None, None) => std::cmp::Ordering::Equal,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            // `den != 0` and a finite `time` cannot produce NaN; the fallback
-            // just keeps the ordering total if that ever changes.
-            (Some(lhs), Some(rhs)) => lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal),
-        })
+        Some(compare_instants(self, other))
     }
 }
 
@@ -833,12 +916,31 @@ mod tests {
     }
 
     #[test]
-    fn test_from_nth_of_a_second() {
-        let time = Time::from_nth_of_a_second(4);
+    fn test_from_nth_of_a_second() -> Result<()> {
+        let time = Time::from_nth_of_a_second(4)?;
         assert!(time.has_value());
         assert_eq!(time.as_secs(), 0.25);
         assert_eq!(time.as_secs_f64(), 0.25);
         assert_eq!(Duration::from(time), Duration::from_millis(250));
+        Ok(())
+    }
+
+    /// `1 / 0` is refused rather than folded into a "no time base" [`Time`].
+    ///
+    /// Everything else is now out of reach instead of checked: the denominator is
+    /// [`i32`] — `AVRational`'s own width — so there is no narrowing left for a
+    /// value to wrap in. `from_nth_of_a_second(2^31 + 5)` used to become `1 / 5`
+    /// at the `as i32` cast; it now does not compile.
+    #[test]
+    fn test_from_nth_of_a_second_rejects_a_zero_denominator() {
+        let zero = Time::from_nth_of_a_second(0).unwrap_err();
+        assert!(zero.is_invalid_config(), "{zero}");
+
+        // The whole i32 range is usable, and reaches FFmpeg unchanged.
+        let extreme =
+            Time::from_nth_of_a_second(i32::MAX).expect("i32::MAX is a valid denominator");
+        assert_eq!(extreme.time_base, Rational::new(1, i32::MAX).unwrap());
+        assert_eq!(extreme.time_base.den(), i32::MAX);
     }
 
     #[test]
@@ -858,11 +960,28 @@ mod tests {
     }
 
     #[test]
-    fn test_from_units() {
-        let time = Time::from_units(3, 5);
+    fn test_from_units() -> Result<()> {
+        let time = Time::from_units(3, 5)?;
         assert!(time.has_value());
         assert_eq!(time.as_secs(), 3.0 / 5.0);
         assert_eq!(Duration::from(time), Duration::from_millis(600));
+        Ok(())
+    }
+
+    /// Both arguments are FFmpeg's own widths (`int64_t` ticks, `int` denominator),
+    /// so the only case left to reject is `1 / 0`. Ticks used to be `usize`, which
+    /// wraps to `-1` past `i64::MAX` on a 64-bit target; they are `i64` now.
+    #[test]
+    fn test_from_units_rejects_a_zero_denominator() -> Result<()> {
+        assert!(Time::from_units(1, 0).unwrap_err().is_invalid_config());
+
+        // The whole range is usable and reaches FFmpeg unchanged — including
+        // negative ticks, which FFmpeg legitimately carries.
+        let extreme = Time::from_units(i64::MAX, i32::MAX).expect("in-range arguments");
+        assert_eq!(extreme.into_value(), Some(i64::MAX));
+        let negative = Time::from_units(-3, 2)?;
+        assert_eq!(negative.as_secs_f64(), -1.5);
+        Ok(())
     }
 
     #[test]
@@ -939,6 +1058,66 @@ mod tests {
         assert!(earlier < later_other_base);
     }
 
+    /// "无值"的三种写法必须口径一致：零时间基（FFmpeg 自己的 `0/0`）与
+    /// `None` / `AV_NOPTS_VALUE` 一样没有可用值 —— `has_value`、`into_value`、
+    /// 秒换算、`Display` 与比较全部以 [`Time::instant`] 为准。
+    #[test]
+    fn test_zero_time_base_is_no_value() {
+        let zero_base = Time::new(Some(5), Rational::ZERO);
+
+        assert!(
+            !zero_base.has_value(),
+            "a zero time base leaves nothing to interpret"
+        );
+        assert_eq!(zero_base.into_value(), None);
+        assert_eq!(zero_base.as_secs_f64(), 0.0);
+        assert_eq!(zero_base.to_string(), "none");
+        // 因此它与"完全没有值"是同一个时刻（排序上并列最前）
+        assert_eq!(zero_base, Time::new(None, TIME_BASE));
+
+        // 契约的另一半：正常时间基下 0 也是有值（0 秒），与"无值"不同。
+        let zero = Time::new(Some(0), TIME_BASE);
+        assert!(zero.has_value());
+        assert_ne!(zero, Time::new(None, TIME_BASE));
+    }
+
+    /// 比较必须是**精确**的：同一时刻的两条不同计算路径在 `f64` 下可能相差 1 ulp，
+    /// 而 `Eq` 要求传递性，浮点比较给不了。
+    ///
+    /// 这两组 `(time, time_base)` 在有理数上完全相等（后者 = 前者 × 43/43），
+    /// 但 `time as f64 * time_base.as_f64()` 的两次舍入让它们相差一个 ulp
+    /// （实测 `0x1.a653df01b3eb5p+27` vs `0x1.a653df01b3eb4p+27`）。
+    #[test]
+    fn test_equality_is_exact_not_floating_point() {
+        let a = Time::new(Some(502_765), rat(1_804_821_558, 4_098_075));
+        let b = Time::new(Some(21_618_895), rat(1_804_821_558, 176_217_225));
+
+        // 数学上同一个时刻（交叉相乘相等）
+        let lhs = i128::from(502_765) * i128::from(1_804_821_558) * i128::from(176_217_225);
+        let rhs = i128::from(21_618_895) * i128::from(1_804_821_558) * i128::from(4_098_075);
+        assert_eq!(lhs, rhs, "测试用的两组值必须真的表示同一时刻");
+        // 而换算成 f64 后并不相等 —— 这正是旧实现会判它们不等的原因
+        assert_ne!(
+            a.as_secs_f64(),
+            b.as_secs_f64(),
+            "这个断言是前提：两条路径的 f64 结果相差 1 ulp"
+        );
+
+        assert_eq!(a, b, "同一时刻即使 f64 相差 1 ulp 也必须相等");
+        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Equal));
+    }
+
+    /// `Eq` 的传递性：三条彼此相等的链，任一两两比较都必须相等（浮点键做不到）。
+    #[test]
+    fn test_equality_is_transitive() {
+        let a = Time::new(Some(1), rat(1, 3));
+        let b = Time::new(Some(2), rat(1, 6));
+        let c = Time::new(Some(3), rat(1, 9));
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert_eq!(a, c, "a == b 且 b == c ⇒ a == c");
+    }
+
     /// `Display` 打印秒数且不会因 `time * time_base.num` 溢出 `i64` 而 panic。
     #[test]
     fn test_display_prints_seconds_without_overflow() {
@@ -950,41 +1129,45 @@ mod tests {
     }
 
     #[test]
-    fn test_aligned_with() {
-        let a = Time::from_units(3, 16);
-        let b = Time::from_units(1, 8);
+    fn test_aligned_with() -> Result<()> {
+        let a = Time::from_units(3, 16)?;
+        let b = Time::from_units(1, 8)?;
         let aligned = a.aligned_with(b);
         assert_eq!(aligned.lhs, Some(3));
         assert_eq!(aligned.rhs, Some(2));
+        Ok(())
     }
 
     #[test]
-    fn test_into_aligned_with() {
-        let a = Time::from_units(2, 7);
-        let b = Time::from_units(2, 3);
+    fn test_into_aligned_with() -> Result<()> {
+        let a = Time::from_units(2, 7)?;
+        let b = Time::from_units(2, 3)?;
         let aligned = a.aligned_with(b);
         assert_eq!(aligned.lhs, Some(2));
         assert_eq!(aligned.rhs, Some(5));
+        Ok(())
     }
 
     #[test]
-    fn test_as_secs() {
-        let time = Time::from_nth_of_a_second(4);
+    fn test_as_secs() -> Result<()> {
+        let time = Time::from_nth_of_a_second(4)?;
         assert_eq!(time.as_secs(), 0.25);
         let time = Time::from_secs(0.3);
         assert_eq!(time.as_secs(), 0.3);
         let time = Time::new(None, rat(0, 0));
         assert_eq!(time.as_secs(), 0.0);
+        Ok(())
     }
 
     #[test]
-    fn test_as_secs_f64() {
-        let time = Time::from_nth_of_a_second(4);
+    fn test_as_secs_f64() -> Result<()> {
+        let time = Time::from_nth_of_a_second(4)?;
         assert_eq!(time.as_secs_f64(), 0.25);
         let time = Time::from_secs_f64(0.3);
         assert_eq!(time.as_secs_f64(), 0.3);
         let time = Time::new(None, rat(0, 0));
         assert_eq!(time.as_secs_f64(), 0.0);
+        Ok(())
     }
 
     #[test]
@@ -1018,15 +1201,16 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_different_time_bases() {
+    fn test_apply_different_time_bases() -> Result<()> {
         let a = Time::new(Some(3), rat(2, 32));
-        let b = Time::from_nth_of_a_second(4);
+        let b = Time::from_nth_of_a_second(4)?;
         assert!(
             (a.aligned_with(b).apply(|x, y| x + y).as_secs()
                 - Time::from_secs(7.0 / 16.0).as_secs())
             .abs()
                 < 0.001
         );
+        Ok(())
     }
 
     #[test]

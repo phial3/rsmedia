@@ -18,9 +18,11 @@ use crate::error::{Context, Result, RsmediaError};
 use crate::fmt::{DataLayout, FrameFormat, SampleFormat};
 use crate::options::Metadata;
 use crate::pixel::PixelFormat;
+use crate::scale::VideoSpec;
 use crate::time::Rational;
 
 use ndarray::{Array2, Array3, ArrayView2, ArrayViewMut2};
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
 
@@ -359,30 +361,25 @@ fn not_contiguous(plane: usize, layout: &str) -> RsmediaError {
 /// 转换结果的颜色范围与色度位置。
 ///
 /// 换了像素格式，源帧的色域元数据不能整套照搬——最典型的现象是 full range 的
-/// `RGB`/`GRAY` 样本沿用源帧的 limited range 标签，下游再压缩一次就发灰。
+/// RGB 样本沿用源帧的 limited range 标签，下游再压缩一次就发灰。
 ///
-/// * `AV_PIX_FMT_FLAG_RGB` 覆盖 RGB/BGR 与 GRAY 家族：这些格式的样本按定义就是
-///   full range（`0..2^n-1`），因此结果恒标 `AVCOL_RANGE_JPEG`；
-/// * YUV/NV 族的实际范围由 `color_range` 声明，转换以源帧声明的范围为输入，
-///   故随源帧保留（`UNSPECIFIED` 按 FFmpeg 约定等同 limited）；
+/// * RGB/BGR/GBR 家族的样本按定义铺满 `0..2^n-1`，因此结果恒标
+///   `AVCOL_RANGE_JPEG`（判据见 [`PixelFormat::is_full_range`]）；
+/// * YUV/NV **与 GRAY** 族的实际范围由 `color_range` 声明，转换以源帧声明的范围
+///   为输入，故随源帧保留（`UNSPECIFIED` 按 FFmpeg 约定等同 limited）。灰度与 YUV
+///   同档（FFmpeg 的 `range_override_needed` 只对非 YUV 且非 gray 的格式强制
+///   full range），把它也标成 JPEG 会给 16..235 的 luma 打上错误的标签；
 /// * `chroma_location` 描述色度采样点相对亮度栅格的位置，只对带色度平面的目标有意义。
 fn converted_color(
     dst: PixelFormat,
     color_range: ffi::AVColorRange,
     chroma_location: ffi::AVChromaLocation,
 ) -> (ffi::AVColorRange, ffi::AVChromaLocation) {
-    if is_full_range_format(dst) {
+    if dst.is_full_range() {
         (ffi::AVCOL_RANGE_JPEG, ffi::AVCHROMA_LOC_UNSPECIFIED)
     } else {
         (color_range, chroma_location)
     }
-}
-
-/// `format` 的样本是否按 full range 编码（RGB/BGR/GRAY 家族）。
-fn is_full_range_format(format: PixelFormat) -> bool {
-    format
-        .descriptor()
-        .is_ok_and(|desc| desc.flags as u32 & ffi::AV_PIX_FMT_FLAG_RGB != 0)
 }
 
 /// Converts a packed `RGB24` frame into a planar `YUV420P` frame.
@@ -543,16 +540,22 @@ pub struct FrameSideData {
 ///
 /// # Field coverage
 ///
-/// Every value-carrying field of `AVFrame` is mirrored here, so
+/// Every value-carrying field of `AVFrame` is mirrored here **except `ch_layout`**, so
 /// [`from_avframe`](MediaFrame::from_avframe) and [`to_avframe`](MediaFrame::to_avframe)
 /// form a lossless round trip for the modelled fields.
 ///
-/// The `AVFrame` fields that are *not* mirrored are the ones that cannot be carried as
-/// values: `data` / `linesize` / `extended_data` are what [`data`](Self::data) packs
-/// into planes, `buf` / `extended_buf` / `nb_extended_buf` / `opaque` /
-/// `opaque_ref` / `private_ref` are ownership handles, and `hw_frames_ctx` describes a
-/// hardware frame pool that has no meaning once the samples are copied into host
-/// memory. They are intentionally excluded rather than missing.
+/// The one lossy field is the audio channel **layout**: only its channel count is
+/// carried ([`nb_channels`](Self::nb_channels)), and `to_avframe` rebuilds the layout
+/// as `AVChannelLayout::from_nb_channels(..)`. A `FL+FC` frame therefore comes back as
+/// `stereo` — same count, different layout/order. Anything that depends on which
+/// channels these are (not merely how many) has to be handled on the `AVFrame` itself.
+///
+/// The other `AVFrame` fields that are *not* mirrored are the ones that cannot be
+/// carried as values: `data` / `linesize` / `extended_data` are what
+/// [`data`](Self::data) packs into planes, `buf` / `extended_buf` / `nb_extended_buf`
+/// / `opaque` / `opaque_ref` / `private_ref` are ownership handles, and `hw_frames_ctx`
+/// describes a hardware frame pool that has no meaning once the samples are copied into
+/// host memory. They are intentionally excluded rather than missing.
 ///
 /// # Parameters
 ///
@@ -609,9 +612,15 @@ pub struct MediaFrame<T> {
     pub media_type: MediaType,
     // Video
     /// 仅视频字段：图像宽度（像素）。
-    pub width: u32,
+    ///
+    /// `i32` — FFmpeg's `AVFrame.width` is an `int`, and the value goes straight to
+    /// `set_width`/the scaler unchanged (a width can never be negative in practice,
+    /// so the signed type only ever sees non-negative values).
+    pub width: i32,
     /// 仅视频字段：图像高度（像素）。
-    pub height: u32,
+    ///
+    /// `i32` for the same reason as [`width`](Self::width): it mirrors `AVFrame.height`.
+    pub height: i32,
     /// 仅视频字段：图像类型（I/P/B 帧等，`AVPictureType`）。
     pub pict_type: ffi::AVPictureType,
     // Audio
@@ -750,14 +759,16 @@ where
                 .format
                 .into_pixel()
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
-            format.data_layout(self.width, self.height).ok_or_else(|| {
-                RsmediaError::unsupported(format!(
-                    "pixel format {} cannot be stored as sample planes at {}x{}",
-                    format.get_pix_fmt_name(),
-                    self.width,
-                    self.height
-                ))
-            })
+            format
+                .data_layout(self.width as usize, self.height as usize)
+                .ok_or_else(|| {
+                    RsmediaError::unsupported(format!(
+                        "pixel format {} cannot be stored as sample planes at {}x{}",
+                        format.get_pix_fmt_name(),
+                        self.width,
+                        self.height
+                    ))
+                })
         } else {
             let format = self
                 .format
@@ -782,8 +793,8 @@ where
     /// pts（见 [`time_base`](Self::time_base)）。要按自己的时间基表达 pts 时再调
     /// [`set_time_base`](Self::set_time_base)。
     pub fn new_video(
-        width: u32,
-        height: u32,
+        width: i32,
+        height: i32,
         format: PixelFormat,
         data: impl Into<FrameData<T>>,
     ) -> Result<Self> {
@@ -801,13 +812,15 @@ where
     /// 创建视频帧（各平面零初始化）。
     ///
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
-    pub fn new_video_frame(width: u32, height: u32, format: PixelFormat) -> Result<Self> {
-        let layout = format.data_layout(width, height).ok_or_else(|| {
-            RsmediaError::unsupported(format!(
-                "pixel format {} cannot be stored as sample planes at {width}x{height}",
-                format.get_pix_fmt_name()
-            ))
-        })?;
+    pub fn new_video_frame(width: i32, height: i32, format: PixelFormat) -> Result<Self> {
+        let layout = format
+            .data_layout(width as usize, height as usize)
+            .ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "pixel format {} cannot be stored as sample planes at {width}x{height}",
+                    format.get_pix_fmt_name()
+                ))
+            })?;
         Self::new_video(width, height, format, FrameData::zeros(&layout))
     }
 
@@ -997,7 +1010,7 @@ where
             ));
         }
 
-        let (width, height) = (frame.width as u32, frame.height as u32);
+        let (width, height) = (frame.width, frame.height);
         let pts = frame.pts;
         let pkt_dts = frame.pkt_dts;
         let format = frame.format;
@@ -1122,46 +1135,50 @@ where
     /// 将 `MediaFrame` 的元数据字段写回 `AVFrame`，与 [`copy_avframe_meta`](Self::copy_avframe_meta)
     /// 构成对称的读写对——新增字段时两处需同步维护。
     ///
-    /// 相比 rsmpeg 的 setter，这里通过 owned 句柄的裸指针写入 setter 无法覆盖的字段
-    /// （`flags`/`quality`/`repeat_pict`/色彩元数据/`pkt_dts` 等），生命周期安全。
+    /// 相比 rsmpeg 的 setter，这里经 `UnsafeDerefMut::deref_mut` 直接写底层结构体上
+    /// setter 无法覆盖的字段（`flags`/`quality`/`repeat_pict`/色彩元数据/`pkt_dts` 等）。
+    ///
+    /// 用 `deref_mut`（`&mut ffi::AVFrame`）而不是 `as_mut_ptr()` 裸指针：写字段不需要
+    /// 裸指针，引用能让借用检查器管住这块独占访问的生命周期。
     fn write_metadata(&self, frame: &mut AVFrame) {
+        // SAFETY: rsmpeg 的 wrap 类型不实现 `DerefMut`，改 ffi 结构体成员只能走
+        // `UnsafeDerefMut::deref_mut`；`frame` 由 `&mut` 独占，块内无其他访问路径。
         unsafe {
-            let raw = frame.as_mut_ptr();
+            let frame_raw = frame.deref_mut();
             // `key_frame` 是 `AV_FRAME_FLAG_KEY` 的便捷镜像（读入方向见
             // `copy_avframe_meta`），因此写出时也要让它生效：否则
             // `frame.key_frame = true` 会被静默丢弃，两个字段互相矛盾。
             let key = ffi::AV_FRAME_FLAG_KEY as i32;
-            (*raw).flags = if self.key_frame {
+            frame_raw.flags = if self.key_frame {
                 self.flags | key
             } else {
                 self.flags & !key
             };
-            (*raw).quality = self.quality;
-            (*raw).repeat_pict = self.repeat_pict;
-            (*raw).colorspace = self.colorspace;
-            (*raw).color_primaries = self.color_primaries;
-            (*raw).color_trc = self.color_trc;
-            (*raw).color_range = self.color_range;
-            (*raw).chroma_location = self.chroma_location;
-            (*raw).sample_aspect_ratio = self.sample_aspect_ratio.into();
-            (*raw).crop_top = self.crop_top;
-            (*raw).crop_bottom = self.crop_bottom;
-            (*raw).crop_left = self.crop_left;
-            (*raw).crop_right = self.crop_right;
+            frame_raw.quality = self.quality;
+            frame_raw.repeat_pict = self.repeat_pict;
+            frame_raw.colorspace = self.colorspace;
+            frame_raw.color_primaries = self.color_primaries;
+            frame_raw.color_trc = self.color_trc;
+            frame_raw.color_range = self.color_range;
+            frame_raw.chroma_location = self.chroma_location;
+            frame_raw.sample_aspect_ratio = self.sample_aspect_ratio.into();
+            frame_raw.crop_top = self.crop_top;
+            frame_raw.crop_bottom = self.crop_bottom;
+            frame_raw.crop_left = self.crop_left;
+            frame_raw.crop_right = self.crop_right;
             #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
             {
-                (*raw).alpha_mode = self.alpha_mode;
+                frame_raw.alpha_mode = self.alpha_mode;
             }
-            // `duration` is the canonical field; `pkt_duration` is only a mirror, see
-            // the field docs.
-            (*raw).duration = self.duration;
+            // `duration` is the canonical field; `pkt_duration` is only a mirror
+            frame_raw.duration = self.duration;
             // `AVFrame::new()` leaves `pkt_dts` at `AV_NOPTS_VALUE`, so this is the
             // only place the frame's decode timestamp can come from.
-            (*raw).pkt_dts = self.pkt_dts;
-            (*raw).best_effort_timestamp = self.best_effort_timestamp;
-            (*raw).decode_error_flags = self.decode_error_flags;
-            // SAFETY: `(*raw).metadata` is a live dictionary slot owned by `frame`.
-            self.metadata.write_into_raw_dict(&mut (*raw).metadata);
+            frame_raw.pkt_dts = self.pkt_dts;
+            frame_raw.best_effort_timestamp = self.best_effort_timestamp;
+            frame_raw.decode_error_flags = self.decode_error_flags;
+            // SAFETY: `frame_raw.metadata` is a live dictionary slot owned by `frame`.
+            self.metadata.write_into_raw_dict(&mut frame_raw.metadata);
         }
         write_side_data(frame, &self.side_data);
     }
@@ -1267,8 +1284,8 @@ where
         let mut frame = AVFrame::new();
         frame.set_format(i32::from(self.format));
         if self.media_type == MediaType::VIDEO {
-            frame.set_width(self.width as i32);
-            frame.set_height(self.height as i32);
+            frame.set_width(self.width);
+            frame.set_height(self.height);
             frame.set_pict_type(self.pict_type);
         } else {
             frame.set_nb_samples(self.nb_samples as i32);
@@ -1464,34 +1481,36 @@ where
     ///
     /// Fails for audio frames, for a destination the source's element width or
     /// swscale cannot serve, and for `dst` formats with no sample planes.
-    pub fn convert_to(&self, dst: PixelFormat) -> Result<Self> {
+    pub fn convert_to(&self, dst_fmt: PixelFormat) -> Result<Self> {
         if self.media_type != MediaType::VIDEO {
             return Err(RsmediaError::invalid_config(
                 "converting pixel formats only applies to video frames, got an audio frame",
             ));
         }
-        if self.format == FrameFormat::Pixel(dst) {
+        if self.format == FrameFormat::Pixel(dst_fmt) {
             return Ok(self.clone());
         }
-        let dst_layout = dst.data_layout(self.width, self.height).ok_or_else(|| {
-            RsmediaError::unsupported(format!(
-                "pixel format {} cannot be stored as sample planes at {}x{}",
-                dst.get_pix_fmt_name(),
-                self.width,
-                self.height
-            ))
-        })?;
+        let dst_layout = dst_fmt
+            .data_layout(self.width as usize, self.height as usize)
+            .ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "pixel format {} cannot be stored as sample planes at {}x{}",
+                    dst_fmt.get_pix_fmt_name(),
+                    self.width,
+                    self.height
+                ))
+            })?;
         // `read_samples::<T>` reads `size_of::<T>()`-wide elements, so a target
         // with a different component width must be rejected here rather than
         // reinterpreted: asking for `YUV420P10LE` out of a `MediaFrame<u8>`
         // would otherwise read half a plane of garbage.
-        let element_bytes = dst.bytes_per_component().ok_or_else(|| {
+        let element_bytes = dst_fmt.bytes_per_component().ok_or_else(|| {
             RsmediaError::unsupported(format!(
                 "pixel format {} has no per-component size",
-                dst.get_pix_fmt_name()
+                dst_fmt.get_pix_fmt_name()
             ))
         })?;
-        validate_element_size::<T>(FrameFormat::Pixel(dst), element_bytes)?;
+        validate_element_size::<T>(FrameFormat::Pixel(dst_fmt), element_bytes)?;
 
         let src = self.to_avframe()?;
         // 尺寸不变，只换格式：swscale 的同一上下文即可完成格式与色彩空间转换。
@@ -1499,10 +1518,10 @@ where
         // 复用一个即可，不必为每帧新建上下文；缩放后的样本仍要拷回 `FrameData`，
         // 这是 `Scaler` 只吃 `AVFrame` 的接口所决定的。
         let converted = CONVERT_SCALER.with_borrow_mut(|scaler| {
-            scaler.scale_frame(&src, self.width as i32, self.height as i32, dst)
+            scaler.scale_frame(&src, VideoSpec::new(self.width, self.height, dst_fmt))
         })?;
         let data = read_samples::<T>(&converted, &dst_layout)?;
-        Ok(self.with_data(data, dst))
+        Ok(self.with_data(data, dst_fmt))
     }
 }
 
@@ -1570,7 +1589,7 @@ impl MediaFrame<u8> {
         };
         let array = Array3::from_shape_vec((height, width, 3), raw)
             .context("Failed to build ndarray from image")?;
-        Self::new_video(width as u32, height as u32, PixelFormat::RGB24, array)
+        Self::new_video(width as i32, height as i32, PixelFormat::RGB24, array)
     }
 }
 
@@ -1592,9 +1611,14 @@ fn plane_ptr(frame: &AVFrame, plane: usize) -> *mut u8 {
 ///
 /// `linesize` is a byte distance and negative for bottom-up frames, so it is
 /// divided by the element size only when that division is exact: a linesize that
-/// is not a whole number of elements (or cannot hold one row of `row_len`
-/// samples) would make the row-wise copy walk outside the plane. One-row planes —
-/// every audio plane — never apply the stride, so nothing is validated for them.
+/// is not a whole number of elements would make the row-wise copy walk outside
+/// the plane. That check applies to **every** plane, including one-row ones — a
+/// silently rounded stride is not a value any caller should be handed.
+///
+/// What one-row planes *are* exempt from is the "row fits" check below: a single
+/// row is read or written in one piece, so the stride is never traversed. Audio
+/// planes lean on that exemption: FFmpeg records no usable `linesize` for the
+/// channels past its inline array, and every audio plane is one row tall.
 fn plane_stride<T: ElementType>(
     frame: &AVFrame,
     plane: usize,
@@ -1607,16 +1631,13 @@ fn plane_stride<T: ElementType>(
     // past the array would panic, and those planes are one row tall anyway, so
     // the missing entry is treated as "no stride".
     let linesize = frame.linesize.get(plane).copied().unwrap_or(0) as i64;
-    if rows <= 1 {
-        return Ok(linesize / element_size);
-    }
     if linesize % element_size != 0 {
         return Err(RsmediaError::msg(format!(
             "Frame plane {plane} has linesize {linesize}, not a multiple of the {element_size}-byte element size"
         )));
     }
     let stride = linesize / element_size;
-    if row_len as i64 > stride.abs() {
+    if rows > 1 && row_len as i64 > stride.abs() {
         return Err(RsmediaError::msg(format!(
             "Frame plane {plane} holds {stride} samples per row, but {row_len} are needed"
         )));
@@ -1760,7 +1781,7 @@ fn rgb24_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
         RsmediaError::msg("RGB24 samples must be interleaved (packed), not planar")
     })?;
     let (height, width, _) = packed.dim();
-    check_layout(data, PixelFormat::RGB24, width as u32, height as u32)?;
+    check_layout(data, PixelFormat::RGB24, width as i32, height as i32)?;
     Ok((height, width))
 }
 
@@ -1774,7 +1795,7 @@ fn yuv420p_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
         .first()
         .map(|plane| plane.dim())
         .ok_or_else(|| RsmediaError::msg("YUV420P frame has no luma plane"))?;
-    check_layout(data, PixelFormat::YUV420P, width as u32, height as u32)?;
+    check_layout(data, PixelFormat::YUV420P, width as i32, height as i32)?;
     Ok((height, width))
 }
 
@@ -1782,15 +1803,17 @@ fn yuv420p_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
 fn check_layout<T>(
     data: &FrameData<T>,
     format: PixelFormat,
-    width: u32,
-    height: u32,
+    width: i32,
+    height: i32,
 ) -> Result<()> {
-    let layout = format.data_layout(width, height).ok_or_else(|| {
-        RsmediaError::unsupported(format!(
-            "pixel format {} has no data layout at {width}x{height}",
-            format.get_pix_fmt_name()
-        ))
-    })?;
+    let layout = format
+        .data_layout(width as usize, height as usize)
+        .ok_or_else(|| {
+            RsmediaError::unsupported(format!(
+                "pixel format {} has no data layout at {width}x{height}",
+                format.get_pix_fmt_name()
+            ))
+        })?;
     if data.matches(&layout) {
         Ok(())
     } else {
@@ -1916,11 +1939,49 @@ fn write_side_data(frame: &mut AVFrame, entries: &[FrameSideData]) {
 mod tests {
     use super::*;
     use crate::colors::Color;
+    use rsmpeg::UnsafeDerefMut;
     use std::error::Error as _;
     use std::time::Duration;
 
-    const TEST_WIDTH: u32 = 320;
-    const TEST_HEIGHT: u32 = 240;
+    /// 单行的平面同样要做"能整除"这道校验。
+    ///
+    /// `plane_stride` 曾对 `rows <= 1` 直接返回 `linesize / element_size`：当
+    /// `linesize` 不是元素大小的整数倍时得到的是一个**被截断**的 stride，虽然
+    /// 当前两处调用方的循环恰好用不到它（只有一行），但这个函数自身的契约是
+    /// "validated stride"，把截断值交出去就是在埋雷。
+    ///
+    /// 反过来，"一行放得下吗"对单行平面仍然免检：音频平面（以及高度为一的视频
+    /// 平面）从 FFmpeg 那里拿到的 `linesize` 未必衡量行宽——超过内联数组 8 个平面
+    /// 的多声道就没有条目。
+    #[test]
+    fn test_plane_stride_validates_one_row_planes() -> Result<()> {
+        let mut frame = AVFrame::new();
+        frame.set_format(i32::from(PixelFormat::RGB24));
+        frame.set_width(8);
+        frame.set_height(1);
+        frame.alloc_buffer()?;
+
+        // u8 元素：任何行数都能整除。
+        let even = frame.linesize[0];
+        assert_eq!(plane_stride::<u8>(&frame, 0, 1, 8)?, i64::from(even));
+
+        // u16 元素、奇数 linesize：过去会返回 被截断 的值，现在必须报错。
+        // Safety: `linesize` 是可写的本地帧字段，改成奇数只影响本探针。
+        unsafe { frame.deref_mut().linesize[0] = 65 };
+        let err = plane_stride::<u16>(&frame, 0, 1, 8).unwrap_err();
+        assert!(
+            err.to_string().contains("not a multiple of"),
+            "expected a divisibility error, got {err}"
+        );
+
+        // Safety: 负的 stride（bottom-up 帧）同样是判断整除，而不是判断正负。
+        unsafe { frame.deref_mut().linesize[0] = -128 };
+        assert_eq!(plane_stride::<u16>(&frame, 0, 1, 8)?, -64);
+        Ok(())
+    }
+
+    const TEST_WIDTH: i32 = 320;
+    const TEST_HEIGHT: i32 = 240;
     /// 30 fps, as a time base: `1/30`.
     fn time_base_30fps() -> Rational {
         Rational::new(1, 30).expect("1/30 is a rational")
@@ -1930,8 +1991,8 @@ mod tests {
     /// 返回 r/g/b 三个平面，方便调用方做断言。
     fn fill_rgb_data(
         frame: &mut MediaFrame<u8>,
-        width: u32,
-        height: u32,
+        width: i32,
+        height: i32,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let w = width as usize;
         let h = height as usize;
@@ -1968,7 +2029,7 @@ mod tests {
     /// 这里锁定一批代表性格式的布局。
     #[test]
     fn test_pixel_format_data_layout() {
-        let (width, height) = (64u32, 48u32);
+        let (width, height) = (64usize, 48usize);
 
         // 交错格式：单数组 `(height, width, 每像素元素数)`
         for (format, elements) in [
@@ -1983,8 +2044,8 @@ mod tests {
             assert_eq!(
                 format.data_layout(width, height),
                 Some(DataLayout::Interleaved {
-                    rows: height as usize,
-                    cols: width as usize,
+                    rows: height,
+                    cols: width,
                     components: elements,
                 }),
                 "{format:?}"
@@ -2356,8 +2417,8 @@ mod tests {
 
     #[test]
     fn test_create_rgb24_frame() -> Result<()> {
-        let width = 640u32;
-        let height = 360u32;
+        let width = 640i32;
+        let height = 360i32;
 
         let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::RGB24)?;
 
@@ -2661,7 +2722,7 @@ mod tests {
     #[cfg(feature = "image")]
     fn test_from_dynamic_image() -> Result<()> {
         // RGB8 输入（零拷贝路径）
-        let rgb = image::RgbImage::from_fn(TEST_WIDTH, TEST_HEIGHT, |x, y| {
+        let rgb = image::RgbImage::from_fn(TEST_WIDTH as u32, TEST_HEIGHT as u32, |x, y| {
             image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 233) as u8])
         });
         let frame = MediaFrame::<u8>::from_dynamic_image(rgb.clone())?;
@@ -2678,7 +2739,7 @@ mod tests {
         );
 
         // RGBA 输入（to_rgb8 转换路径）
-        let rgba = image::RgbaImage::from_fn(TEST_WIDTH, TEST_HEIGHT, |x, y| {
+        let rgba = image::RgbaImage::from_fn(TEST_WIDTH as u32, TEST_HEIGHT as u32, |x, y| {
             image::Rgba([(x % 251) as u8, (y % 241) as u8, ((x + y) % 233) as u8, 255])
         });
         let expected = image::DynamicImage::from(rgba.clone()).to_rgb8().into_raw();
@@ -2707,7 +2768,7 @@ mod tests {
     #[test]
     fn test_yuv_matrix_heuristic_boundaries() -> Result<()> {
         for (height, expected) in [
-            (480u32, YuvStandardMatrix::Bt601), // SD
+            (480i32, YuvStandardMatrix::Bt601), // SD
             (719, YuvStandardMatrix::Bt601),    // SD 上界（取 719 避开偶数约束）
             (720, YuvStandardMatrix::Bt709),    // HD 起点
             (1080, YuvStandardMatrix::Bt709),   // 最常见的 HD —— 旧代码在此错判
@@ -2752,7 +2813,7 @@ mod tests {
     #[test]
     fn test_yuv420p_to_rgb24_odd_dimensions() -> Result<()> {
         // 色度平面应为 ceil：(65/2, 49/2) = (33, 25)，而不是 floor 的 (32, 24)。
-        let (width, height) = (65u32, 49u32);
+        let (width, height) = (65i32, 49i32);
         let mut frame = MediaFrame::<u8>::new_video_frame(width, height, PixelFormat::YUV420P)?;
         assert_eq!(
             frame.data.shapes(),
