@@ -11,7 +11,7 @@ use rsmedia::frame::MediaFrame;
 use rsmedia::io::StreamWriter;
 use rsmedia::mux::Muxer;
 use rsmedia::pixel::PixelFormat;
-use rsmedia::subtitle::{SubtitleSegment, encode_subtitle_segments};
+use rsmedia::subtitle::SubtitleSegment;
 use rsmedia::{MediaType, SampleFormat};
 
 use std::path::{Path, PathBuf};
@@ -173,7 +173,7 @@ pub fn encode_subtitle(path: &Path, enc_threads: i32) -> Result<()> {
     // Subtitle encoding is a synchronous API without internal buffering, so the
     // thread count cannot parallelize a single job; it is set anyway for
     // uniformity, and job-level parallelism comes from the worker pool.
-    let mut encoder = EncoderBuilder::new_subtitle()
+    let encoder = EncoderBuilder::new_subtitle()
         .with_codec_name("mov_text")
         .with_subtitle_header(ASS_HEADER)
         .with_thread_count(enc_threads)
@@ -189,8 +189,8 @@ pub fn encode_subtitle(path: &Path, enc_threads: i32) -> Result<()> {
         })
         .collect();
 
-    let mut writer = StreamWriter::new(path)?;
-    encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
+    let writer = StreamWriter::new(path)?;
+    Muxer::new_from_writer(writer).encode_subtitle_segments(encoder, &segments)?;
     Ok(())
 }
 

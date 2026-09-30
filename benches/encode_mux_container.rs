@@ -5,7 +5,7 @@
 //! Subtitle packets cannot go through [`Muxer::mux`] (the subtitle encoder is a
 //! synchronous API, not `send_frame`/`receive_packet`), so this bench drives
 //! all three encoders through the [`StreamWriter`] directly — the same pattern
-//! as `subtitle::encode_subtitle_segments_to_file`, extended to video/audio.
+//! as [`Muxer::encode_subtitle_segments`], extended to video/audio.
 //!
 //! Run with:
 //!
