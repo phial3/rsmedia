@@ -1746,7 +1746,7 @@ mod tests {
         let mut unified_samples = 0u64;
         while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
             assert_eq!(
-                frame.format().and_then(|f| f.into_sample()),
+                frame.format().into_sample(),
                 Some(SampleFormat::FLTP),
                 "decoded frame was not converted to the requested sample format"
             );

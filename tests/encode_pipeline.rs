@@ -1911,7 +1911,7 @@ mod audio {
         while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
             assert_eq!(
                 frame.format(),
-                Some(FrameFormat::Sample(format)),
+                FrameFormat::Sample(format),
                 "sample format mismatch"
             );
             assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
@@ -2124,7 +2124,7 @@ mod audio {
         while let Some(frame) = out.decode::<f32>(&mut out_reader)? {
             assert_eq!(
                 frame.format(),
-                Some(FrameFormat::Sample(format)),
+                FrameFormat::Sample(format),
                 "sample format mismatch"
             );
             assert_eq!(frame.sample_rate, sample_rate, "sample rate mismatch");
@@ -2255,7 +2255,7 @@ mod audio {
                 );
                 assert_eq!(
                     frame.format(),
-                    Some(FrameFormat::Sample(format)),
+                    FrameFormat::Sample(format),
                     "{name}: sample format mismatch"
                 );
                 assert_eq!(

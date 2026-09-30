@@ -63,13 +63,10 @@ async fn main() -> Result<()> {
                     "decoded frame pts: {}, type: {:?}, format:{:?}",
                     yuv_frame.pts,
                     yuv_frame.media_type,
-                    yuv_frame
-                        .format()
-                        .map(|f| match f {
-                            FrameFormat::Pixel(p) => p.get_pix_fmt_name(),
-                            _ => "N/A".to_string(),
-                        })
-                        .unwrap_or("N/A".to_string())
+                    match yuv_frame.format() {
+                        FrameFormat::Pixel(p) => p.get_pix_fmt_name().to_string(),
+                        _ => "N/A".to_string(),
+                    }
                 );
 
                 process_frame(yuv_frame)?;

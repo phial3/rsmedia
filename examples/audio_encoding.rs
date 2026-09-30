@@ -73,13 +73,10 @@ fn decode_audio(source: &'static str) -> Result<()> {
     let mut frames = 0;
     let mut total_samples = 0i64;
     while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
-        let fmt = frame
-            .format()
-            .map(|f| match f {
-                FrameFormat::Sample(s) => s.get_sample_fmt_name().to_string(),
-                _ => "N/A".to_string(),
-            })
-            .unwrap_or_else(|| "N/A".to_string());
+        let fmt = match frame.format() {
+            FrameFormat::Sample(s) => s.get_sample_fmt_name().to_string(),
+            _ => "N/A".to_string(),
+        };
         println!(
             "[decode] pts={}, sample_rate={}, channels={}, samples={}, format={fmt}",
             frame.pts, frame.sample_rate, frame.nb_channels, frame.nb_samples

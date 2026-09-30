@@ -349,7 +349,7 @@ fn summarize<T: ElementType>(
         assert_eq!(frame.nb_channels, written.channels, "decoded channel count");
         if let Some(sample_fmt) = sample_fmt {
             assert_eq!(
-                frame.format().and_then(|f| f.into_sample()),
+                frame.format().into_sample(),
                 Some(sample_fmt),
                 "decoded frame was not converted to the requested sample format"
             );

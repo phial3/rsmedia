@@ -978,12 +978,18 @@ where
         self.key_frame = true;
     }
 
-    /// Returns the frame's unified format: [`FrameFormat::Pixel`] for video,
-    /// [`FrameFormat::Sample`] for audio; `None` for other media types.
+    /// Returns the frame's format: [`FrameFormat::Pixel`] for video,
+    /// [`FrameFormat::Sample`] for audio.
+    ///
+    /// DATA frames carry a placeholder `[`FrameFormat::Pixel(PixelFormat::NONE)`]`
+    /// as their format — see [`Default`](Self::default). `None` used to stand in
+    /// for that placeholder, but no documented constructor produces a DATA frame
+    /// (only `Default` does), so the `Option` merely hid a value that is always
+    /// present; callers like [`Self::data_layout`] already branch on
+    /// [`media_type`](Self#structfield.media_type) rather than on this getter.
     #[inline]
-    pub fn format(&self) -> Option<FrameFormat> {
-        (self.media_type == MediaType::VIDEO || self.media_type == MediaType::AUDIO)
-            .then_some(self.format)
+    pub fn format(&self) -> FrameFormat {
+        self.format
     }
 
     pub fn set_pkt_dts(&mut self, pkt_dts: i64) {
@@ -1472,7 +1478,7 @@ where
     /// use rsmedia::{MediaFrame, PixelFormat};
     /// # fn d(frame: MediaFrame<u8>) -> rsmedia::Result<()> {
     /// let nv12 = frame.convert_to(PixelFormat::NV12)?;
-    /// assert_eq!(nv12.format().unwrap(), rsmedia::FrameFormat::Pixel(PixelFormat::NV12));
+    /// assert_eq!(nv12.format(), rsmedia::FrameFormat::Pixel(PixelFormat::NV12));
     /// # Ok(())
     /// # }
     /// ```
@@ -2646,14 +2652,14 @@ mod tests {
         // 视频帧
         let video = MediaFrame::<u8>::new_video_frame(TEST_WIDTH, TEST_HEIGHT, PixelFormat::RGB24)?;
         match video.format() {
-            Some(FrameFormat::Pixel(PixelFormat::RGB24)) => {}
+            FrameFormat::Pixel(PixelFormat::RGB24) => {}
             other => panic!("video format = {other:?}"),
         }
 
         // 音频帧
         let audio = MediaFrame::<f32>::new_audio_frame(SampleFormat::FLTP, 2, 16, 48000)?;
         match audio.format() {
-            Some(FrameFormat::Sample(SampleFormat::FLTP)) => {}
+            FrameFormat::Sample(SampleFormat::FLTP) => {}
             other => panic!("audio format = {other:?}"),
         }
 
