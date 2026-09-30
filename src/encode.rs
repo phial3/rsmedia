@@ -3101,10 +3101,10 @@ mod tests {
             .build()?;
         assert!(encoder.scaler.quality().is_empty());
 
-        // 池化开关进入 Scaler：默认关闭，with_scale_pool(true) 打开。
+        // 池化开关进入 Scaler：默认关闭，with_buffer_pool(true) 打开。
         assert!(!encoder.scaler.pool_enabled());
         let encoder = EncoderBuilder::new_video(320, 240)
-            .with_scale_pool(true)
+            .with_buffer_pool(true)
             .build()?;
         assert!(encoder.scaler.pool_enabled());
         Ok(())

@@ -842,7 +842,7 @@ macro_rules! impl_codec_builder_setters {
         /// zero the visible pixels, and `AVFrame::alloc_buffer` does not zero anything
         /// either (it goes through `av_frame_get_buffer` → `av_buffer_alloc` →
         /// `av_malloc`).
-        pub fn with_scale_pool(mut self, enabled: bool) -> Self {
+        pub fn with_buffer_pool(mut self, enabled: bool) -> Self {
             self.scale_pool = enabled;
             self
         }

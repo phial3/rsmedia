@@ -187,21 +187,21 @@ fn make_rgb_frame(width: i32, height: i32, seed: u8) -> Result<AVFrame> {
     Ok(frame)
 }
 
-/// 编码器侧的池化（`EncoderBuilder::with_scale_pool`）：编码器内部 scaler
+/// 编码器侧的池化（`EncoderBuilder::with_buffer_pool`）：编码器内部 scaler
 /// 持有池（RGB24 → YUV420P 的逐帧转换走池化路径）。真实编码→MP4→解码回读，
 /// 帧数无损；帧内像素经缩放+编码仍有意义（图案随 seed 变化，逐帧求 luma
 /// 总和不应恒定，防止"编码了空内容"的假阳性）。
 #[test]
-fn test_encoder_with_scale_pool_roundtrip() -> Result<()> {
-    let out = std::env::temp_dir().join("rsmedia_encoder_scale_pool.mp4");
+fn test_encoder_with_buffer_pool_roundtrip() -> Result<()> {
+    let out = std::env::temp_dir().join("rsmedia_encoder_buffer_pool.mp4");
     let _ = std::fs::remove_file(&out);
 
-    if skip_without_default_video_encoder("test_encoder_with_scale_pool_roundtrip")? {
+    if skip_without_default_video_encoder("test_encoder_with_buffer_pool_roundtrip")? {
         return Ok(());
     }
     let encoder = EncoderBuilder::new_video(32, 32)
         .with_fps(30.0)
-        .with_scale_pool(true)
+        .with_buffer_pool(true)
         .build()?;
     let enc_time_base = encoder.time_base();
 
