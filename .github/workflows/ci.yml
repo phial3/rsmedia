@@ -178,6 +178,7 @@ jobs:
           components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
 
       - name: Remove system FFmpeg libraries
+        shell: bash
         run: |
           set -euo pipefail
           echo "==== System-visible FFmpeg shared libs (before cleanup) ===="
@@ -346,6 +347,7 @@ jobs:
           components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
 
       - name: Remove system FFmpeg libraries
+        shell: bash
         run: |
           set -euo pipefail
           echo "==== System-visible FFmpeg shared libs (before cleanup) ===="
