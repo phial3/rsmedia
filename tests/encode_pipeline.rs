@@ -140,7 +140,7 @@ impl SineSample for i32 {
 fn sine_audio_frame<T: SineSample>(
     freq: f32,
     channels: i32,
-    nb_samples: u32,
+    nb_samples: i32,
     sample_rate: i32,
 ) -> MediaFrame<T> {
     use rsmedia::frame::MediaFrame;
@@ -1506,9 +1506,9 @@ mod audio {
 
         // 2) 编码 5 秒正弦波（1024 采样/帧，末尾不足一帧的余数忽略）；
         //    帧数据类型种类按协商出的采样率格式自动匹配（FLTP/FLT→f32 / S16→S16P / S32P→i32）
-        const AUDIO_DURATION_SECS: u32 = 1;
-        let samples_per_frame = 1024u32;
-        let frames_to_write = AUDIO_DURATION_SECS * sample_rate as u32 / samples_per_frame;
+        const AUDIO_DURATION_SECS: i32 = 1;
+        let samples_per_frame = 1024i32;
+        let frames_to_write = AUDIO_DURATION_SECS * sample_rate / samples_per_frame;
         let input_samples = frames_to_write as u64 * samples_per_frame as u64;
         let mut total_pts: i64 = 0;
         {
@@ -1617,8 +1617,8 @@ mod audio {
 
         let sample_rate = 44_100i32;
         let channels = 2i32;
-        let samples_per_frame = 1024u32;
-        let frames_to_write = 10u32;
+        let samples_per_frame = 1024i32;
+        let frames_to_write = 10i32;
 
         let path = common::test_output_path("encode", "rsmedia_pcm_s16le.wav");
         common::remove_test_output(&path);
@@ -1686,8 +1686,8 @@ mod audio {
         let channels: i32 = 2;
         let frame_size: i64 = 1024;
         // 可变输入帧长，故意都不足/超过 1024，触发 fifo 的切分与合并。
-        let input_sizes = [700u32, 1300, 900, 1100, 1000];
-        let total_samples: u32 = input_sizes.iter().sum();
+        let input_sizes = [700i32, 1300, 900, 1100, 1000];
+        let total_samples: i32 = input_sizes.iter().sum();
 
         let path = common::test_output_path("encode", "rsmedia_no_pts_audio.mp4");
         common::remove_test_output(&path);
@@ -1869,8 +1869,8 @@ mod audio {
         let channels = 2i32;
         let format = SampleFormat::FLTP;
         // AAC 默认 frame_size = 1024 采样/帧
-        let samples_per_frame = 1024u32;
-        let frames_to_write = 10u32;
+        let samples_per_frame = 1024i32;
+        let frames_to_write = 10i32;
 
         let path = common::test_output_path("encode", "rsmedia_audio_roundtrip.m4a");
         common::remove_test_output(&path);
@@ -1942,7 +1942,7 @@ mod audio {
         let sample_rate = 44_100i32;
         let channels = 2i32;
         let format = SampleFormat::FLTP;
-        let samples_per_frame = 1024u32;
+        let samples_per_frame = 1024;
         let frames_to_write = 5u32;
 
         let path = common::test_output_path("encode", "rsmedia_audio_undeclared_rate.m4a");
@@ -2002,7 +2002,7 @@ mod audio {
         let channels = 2i32;
         let format = SampleFormat::FLTP;
         // AAC frame_size = 1024；故意发非整倍数：3×1000 = 3000 样本
-        let samples_per_frame = 1000u32;
+        let samples_per_frame = 1000;
         let frames_to_write = 3u32;
 
         let path = common::test_output_path("encode", "rsmedia_audio_partial.m4a");
@@ -2059,8 +2059,8 @@ mod audio {
         let sample_rate = 44_100i32;
         let channels = 2i32;
         let format = SampleFormat::FLTP;
-        let samples_per_frame = 1024u32;
-        let frames_to_write = 10u32;
+        let samples_per_frame = 1024i32;
+        let frames_to_write = 10i32;
 
         let src = common::test_output_path("encode", "rsmedia_audio_transcode_src.m4a");
         let dst = common::test_output_path("encode", "rsmedia_audio_transcode_dst.m4a");
@@ -2156,7 +2156,7 @@ mod audio {
         let sample_rate = 44_100i32;
         let channels = 2i32;
         let format = SampleFormat::FLTP;
-        let samples_per_frame = 1024u32;
+        let samples_per_frame = 1024;
         let frames_to_write = 12u32;
         let input_samples = frames_to_write as u64 * samples_per_frame as u64;
 

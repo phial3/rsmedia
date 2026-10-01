@@ -51,7 +51,7 @@ pub fn fill_linesizes(pix_fmt: PixelFormat, width: i32) -> Result<[i32; 4]> {
 /// * `plane` - The index of the plane to compute the size for.
 ///
 /// Returns The size of the image line in bytes for the specified plane.
-pub fn get_linesize(pix_fmt: PixelFormat, width: u32, plane: usize) -> Result<usize> {
+pub fn get_linesize(pix_fmt: PixelFormat, width: i32, plane: usize) -> Result<usize> {
     // 这一层必须自己卡边界：`av_image_get_linesize` 内部是
     // `image_get_linesize(width, plane, max_step[plane], max_step_comp[plane], desc)`，
     // 而 `max_step`/`max_step_comp` 是**长度 4 的栈数组**（由
@@ -66,7 +66,7 @@ pub fn get_linesize(pix_fmt: PixelFormat, width: u32, plane: usize) -> Result<us
     }
 
     // Safe because format is a valid format and this function is pure computation.
-    let ret = unsafe { ffi::av_image_get_linesize(pix_fmt.into(), width as _, plane as _) };
+    let ret = unsafe { ffi::av_image_get_linesize(pix_fmt.into(), width, plane as _) };
 
     // returns the computed size in bytes
     if ret < 0 {
@@ -96,10 +96,10 @@ pub fn get_linesize(pix_fmt: PixelFormat, width: u32, plane: usize) -> Result<us
 /// * `height` - The height of the image in pixels.
 ///
 /// Returns an array to be filled with the size of each image plane
-pub fn fill_plane_sizes<I: IntoIterator<Item = u32>>(
+pub fn fill_plane_sizes<I: IntoIterator<Item = i32>>(
     format: PixelFormat,
     linesizes: I,
-    height: u32,
+    height: i32,
 ) -> Result<Vec<usize>> {
     // 平面数由像素格式决定，而不是由传入的行步长个数决定：底层只读
     // `linesizes[0..planes]`，个数不符时多传的部分会被静默忽略、少传则读到未初始化值。
@@ -134,7 +134,7 @@ pub fn fill_plane_sizes<I: IntoIterator<Item = u32>>(
         ffi::av_image_fill_plane_sizes(
             plane_sizes_buf.as_mut_ptr(),
             format.into(),
-            height as _,
+            height,
             linesizes_buf.as_ptr(),
         )
     };
@@ -962,27 +962,24 @@ mod tests {
 
         // 步骤2：验证 av_image_line_size 返回值
         assert_eq!(
-            get_linesize(yuv_fmt, yuv_width as u32, 0)?,
+            get_linesize(yuv_fmt, yuv_width, 0)?,
             640,
             "Y plane linesize incorrect"
         );
         assert_eq!(
-            get_linesize(yuv_fmt, yuv_width as u32, 1)?,
+            get_linesize(yuv_fmt, yuv_width, 1)?,
             320,
             "U plane linesize incorrect"
         );
         assert_eq!(
-            get_linesize(yuv_fmt, yuv_width as u32, 2)?,
+            get_linesize(yuv_fmt, yuv_width, 2)?,
             320,
             "V plane linesize incorrect"
         );
 
         // 步骤3：计算平面大小
-        let plane_sizes = fill_plane_sizes(
-            yuv_fmt,
-            yuv_linesizes[..3].iter().map(|&x| x as u32),
-            yuv_height as u32,
-        )?;
+        let plane_sizes =
+            fill_plane_sizes(yuv_fmt, yuv_linesizes[..3].iter().copied(), yuv_height)?;
         // 预期结果：
         // Y: 640 * 480 = 307200
         // U: 320 * 240 = 76800
@@ -1007,14 +1004,13 @@ mod tests {
 
         // 步骤2：验证 av_image_line_size
         assert_eq!(
-            get_linesize(rgba_fmt, rgba_width as u32, 0)?,
+            get_linesize(rgba_fmt, rgba_width, 0)?,
             1280,
             "RGBA plane linesize incorrect"
         );
 
         // 步骤3：计算平面大小
-        let plane_sizes =
-            fill_plane_sizes(rgba_fmt, vec![rgba_linesizes[0] as u32], rgba_height as u32)?;
+        let plane_sizes = fill_plane_sizes(rgba_fmt, vec![rgba_linesizes[0]], rgba_height)?;
         // 预期结果：1280 * 720 = 921600
         assert_eq!(plane_sizes.len(), 1);
         assert_eq!(plane_sizes[0], 921600);
@@ -1036,27 +1032,27 @@ mod tests {
 
         // 步骤2：验证 av_image_line_size 返回值
         assert_eq!(
-            get_linesize(nv12_fmt, nv12_width as u32, 0)?,
+            get_linesize(nv12_fmt, nv12_width, 0)?,
             640,
             "NV12 Y plane linesize incorrect"
         );
         assert_eq!(
-            get_linesize(nv12_fmt, nv12_width as u32, 1)?,
+            get_linesize(nv12_fmt, nv12_width, 1)?,
             640,
             "NV12 UV plane linesize incorrect"
         );
 
         // 错误测试：访问不存在的平面（索引2）
         assert!(
-            get_linesize(nv12_fmt, nv12_width as u32, 2).is_err(),
+            get_linesize(nv12_fmt, nv12_width, 2).is_err(),
             "NV12 should reject plane index 2"
         );
 
         // 步骤3：计算平面大小
         let plane_sizes = fill_plane_sizes(
             nv12_fmt,
-            vec![linesizes[0] as u32, linesizes[1] as u32], // 传入两个平面
-            nv12_height as u32,
+            vec![linesizes[0], linesizes[1]], // 传入两个平面
+            nv12_height,
         )?;
 
         // 预期结果：

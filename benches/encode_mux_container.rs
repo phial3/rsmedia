@@ -85,7 +85,7 @@ fn encode_container(path: &Path, enc_threads: i32) -> Result<()> {
         a_tb.into(),
     );
     for i in 0..AUDIO_FRAMES {
-        let nb = 700u32 + ((i as u32 * 173) % 1200);
+        let nb = 700i32 + ((i as i32 * 173) % 1200);
         let frame = sine_audio_frame(nb).to_avframe()?;
         for mut pkt in a_enc.encode_raw(frame)? {
             write_packet(
@@ -167,7 +167,7 @@ fn rainbow_frame(p: f32) -> MediaFrame<u8> {
     frame
 }
 
-fn sine_audio_frame(nb_samples: u32) -> MediaFrame<f32> {
+fn sine_audio_frame(nb_samples: i32) -> MediaFrame<f32> {
     let mut frame =
         MediaFrame::<f32>::new_audio_frame(SampleFormat::FLT, CHANNELS, nb_samples, SAMPLE_RATE)
             .unwrap();

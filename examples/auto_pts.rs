@@ -60,10 +60,10 @@ fn encode_audio() -> anyhow::Result<()> {
     let a_idx = muxer.add_encoder(encoder)?;
 
     // Deliberately irregular sizes around the aac frame size (1024).
-    let sizes: Vec<u32> = (0..AUDIO_FRAMES)
-        .map(|i| 700u32 + ((i as u32 * 173) % 900))
+    let sizes: Vec<i32> = (0..AUDIO_FRAMES)
+        .map(|i| 700i32 + ((i as i32 * 173) % 900))
         .collect();
-    let total: u32 = sizes.iter().sum();
+    let total: i32 = sizes.iter().sum();
     println!("audio input: {AUDIO_FRAMES} frames, {total} samples");
 
     for &nb in &sizes {
@@ -92,7 +92,7 @@ fn rainbow_frame(p: f32) -> MediaFrame<u8> {
     frame
 }
 
-fn sine_audio_frame(nb_samples: u32) -> MediaFrame<f32> {
+fn sine_audio_frame(nb_samples: i32) -> MediaFrame<f32> {
     let mut frame =
         MediaFrame::<f32>::new_audio_frame(SampleFormat::FLT, CHANNELS, nb_samples, SAMPLE_RATE)
             .unwrap();

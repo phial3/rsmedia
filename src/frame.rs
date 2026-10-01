@@ -633,8 +633,10 @@ pub struct MediaFrame<T> {
     /// `int`), so it reaches `set_sample_rate`/the encoder's supported-rate list
     /// unchanged.
     pub sample_rate: i32,
-    /// 仅音频字段：本帧采样数（每通道）。
-    pub nb_samples: u32,
+    /// 仅音频字段：本帧采样数（每通道）。`i32`, FFmpeg's own width for a
+    /// sample count (`AVFrame.nb_samples` is an `int`), so it reaches
+    /// `set_nb_samples` unchanged.
+    pub nb_samples: i32,
     /// 仅音频字段：声道数。`i32` — FFmpeg's `AVChannelLayout.nb_channels` is a
     /// `c_int`, and the value goes straight to `AVChannelLayout::from_nb_channels`.
     /// [`MediaFrame::new_audio`] rejects a non-positive count.
@@ -840,7 +842,7 @@ where
     pub fn new_audio(
         format: SampleFormat,
         nb_channels: i32,
-        nb_samples: u32,
+        nb_samples: i32,
         sample_rate: i32,
         data: impl Into<FrameData<T>>,
     ) -> Result<Self> {
@@ -864,7 +866,7 @@ where
     pub fn new_audio_frame(
         format: SampleFormat,
         nb_channels: i32,
-        nb_samples: u32,
+        nb_samples: i32,
         sample_rate: i32,
     ) -> Result<Self> {
         // `nb_channels` is signed (FFmpeg's width), but a sample layout needs a
@@ -1063,7 +1065,7 @@ where
                 data: FrameData::default(),
                 media_type: MediaType::AUDIO,
                 sample_rate: frame.sample_rate,
-                nb_samples: frame.nb_samples as u32,
+                nb_samples: frame.nb_samples,
                 nb_channels: frame.ch_layout.nb_channels,
                 ..Self::default()
             };
@@ -1294,7 +1296,7 @@ where
             frame.set_height(self.height);
             frame.set_pict_type(self.pict_type);
         } else {
-            frame.set_nb_samples(self.nb_samples as i32);
+            frame.set_nb_samples(self.nb_samples);
             frame.set_sample_rate(self.sample_rate);
             frame.set_ch_layout(AVChannelLayout::from_nb_channels(self.nb_channels).into_inner());
         }

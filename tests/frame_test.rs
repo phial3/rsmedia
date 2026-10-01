@@ -446,7 +446,7 @@ fn test_audio_planar_frame_conversion() -> Result<()> {
         media_frame.data.shapes(),
         vec![(1, nb_samples as usize), (1, nb_samples as usize)]
     );
-    assert_eq!(media_frame.nb_samples, nb_samples as u32);
+    assert_eq!(media_frame.nb_samples, nb_samples);
     assert_eq!(media_frame.nb_channels, nb_channels);
 
     // 验证数据（每个声道首样本）
@@ -533,7 +533,7 @@ fn test_audio_interleaved_frame_conversion() -> Result<()> {
     assert_eq!(media_frame.data.num_planes(), 1);
     let packed = media_frame.data.as_packed().expect("FLT is interleaved");
     assert_eq!(packed.dim(), (1, nb_samples as usize, nb_channels as usize));
-    assert_eq!(media_frame.nb_samples, nb_samples as u32);
+    assert_eq!(media_frame.nb_samples, nb_samples);
     assert_eq!(media_frame.nb_channels, nb_channels);
 
     // 验证数据（首个采样点的两个声道）
@@ -986,7 +986,7 @@ fn test_video_yuv420p_data_roundtrip() -> Result<()> {
 /// 后，采样数据、采样率、采样数、声道数与格式均无损保留。
 #[test]
 fn test_audio_fltp_data_roundtrip() -> Result<()> {
-    let nb_samples = 256u32;
+    let nb_samples = 256;
     let nb_channels = 2i32;
     let sample_rate = 48000i32;
     let mut media =
@@ -1027,7 +1027,7 @@ fn test_audio_fltp_data_roundtrip() -> Result<()> {
 /// 交错音频（S16）往返：布局为单个 `(1, nb_samples, nb_channels)` 数组。
 #[test]
 fn test_audio_interleaved_data_roundtrip() -> Result<()> {
-    let (nb_samples, nb_channels) = (128u32, 2i32);
+    let (nb_samples, nb_channels) = (128, 2);
     let mut media =
         MediaFrame::<i16>::new_audio_frame(SampleFormat::S16, nb_channels, nb_samples, 48000)?;
     let packed = media.data.as_packed_mut().expect("S16 is interleaved");
