@@ -15,6 +15,7 @@
 
 use crate::MediaType;
 use crate::error::{Context, Result, RsmediaError};
+use crate::flags::FlagSet;
 use crate::fmt::{DataLayout, FrameFormat, SampleFormat};
 use crate::options::Metadata;
 use crate::pixel::PixelFormat;
@@ -530,6 +531,38 @@ pub struct FrameSideData {
     pub metadata: Metadata,
 }
 
+ffi_enum!(
+    /// The bits of `AVFrame.flags`, i.e. FFmpeg's `AV_FRAME_FLAG_*`.
+    ///
+    /// The frame-level counterpart of [`AVCodecFlag`](crate::AVCodecFlag): one flag is
+    /// a named variant, a combination is a [`FlagSet<AVFrameFlag>`](crate::FlagSet),
+    /// and [`MediaFrame::flags`] carries the raw mask. It is modelled as a type so the
+    /// bits of the convenience mirrors ([`MediaFrame::key_frame`],
+    /// [`MediaFrame::interlaced`], [`MediaFrame::top_field_first`]) are read and
+    /// written through one named table instead of raw `AV_FRAME_FLAG_*` arithmetic.
+    ///
+    /// Every variant exists from FFmpeg 6.1 on; `LOSSLESS` is the one exception, added
+    /// in 8.x, and is gated to match.
+    ///
+    /// ```
+    /// use rsmedia::{AVFrameFlag, FlagSet};
+    ///
+    /// let flags = AVFrameFlag::KEY | AVFrameFlag::INTERLACED;
+    /// assert!(flags.contains(AVFrameFlag::INTERLACED));
+    /// assert!(!flags.contains(AVFrameFlag::TOP_FIELD_FIRST));
+    /// ```
+    #[allow(non_camel_case_types)]
+    AVFrameFlag, u32 {
+        CORRUPT => ffi::AV_FRAME_FLAG_CORRUPT;
+        KEY => ffi::AV_FRAME_FLAG_KEY;
+        DISCARD => ffi::AV_FRAME_FLAG_DISCARD;
+        INTERLACED => ffi::AV_FRAME_FLAG_INTERLACED;
+        TOP_FIELD_FIRST => ffi::AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        LOSSLESS => ffi::AV_FRAME_FLAG_LOSSLESS;
+    }
+);
+
 /// One decoded or to-be-encoded audio/video frame.
 ///
 /// Metadata lives in the fields of this struct, samples in [`data`](Self::data);
@@ -641,14 +674,33 @@ pub struct MediaFrame<T> {
     /// `c_int`, and the value goes straight to `AVChannelLayout::from_nb_channels`.
     /// [`MediaFrame::new_audio`] rejects a non-positive count.
     pub nb_channels: i32,
-    /// 是否为关键帧（来自 AV_FRAME_FLAG_KEY）。
+    /// 是否为关键帧（`AV_FRAME_FLAG_KEY`）。
+    ///
+    /// A convenience mirror of the [`AVFrameFlag::KEY`] bit of [`flags`](Self::flags);
+    /// on write it forces that bit on or off, so the bool and the mask never
+    /// contradict each other.
     pub key_frame: bool,
-    /// 帧标志（AV_FRAME_FLAG_* 组合）。
+    /// 帧标志（`AV_FRAME_FLAG_*` 组合，见 [`AVFrameFlag`]）。
+    ///
+    /// The raw `AVFrame.flags` mirror (`i32`, FFmpeg's own width for the field). See
+    /// it through the typed table with [`FlagSet::from_bits`](crate::FlagSet::from_bits).
     pub flags: i32,
     /// 编码质量（1 ~ FF_LAMBDA_MAX，越小越好；未设置时默认 0）。
     pub quality: i32,
     /// 应重复的场数（interlace 相关，通常为 0）。
     pub repeat_pict: i32,
+    /// 是否为隔行帧（interlaced）。
+    ///
+    /// A convenience mirror of the [`AVFrameFlag::INTERLACED`] bit of
+    /// [`flags`](Self::flags). `AV_FRAME_FLAG_INTERLACED` exists from FFmpeg 6.1 on and
+    /// is the canonical representation — FFmpeg 6/7 derive their deprecated
+    /// `AVFrame.interlaced_frame` field from it — so the bit is read and written
+    /// uniformly without a per-version split.
+    pub interlaced: bool,
+    /// 顶场在前（`true`=TFF，即场序 顶→底）。
+    ///
+    /// A convenience mirror of the [`AVFrameFlag::TOP_FIELD_FIRST`] bit of [`flags`](Self::flags);
+    pub top_field_first: bool,
     /// YUV colorspace (`AVColorSpace`, e.g. BT709); named after `AVFrame.colorspace`.
     ///
     /// Note the asymmetry across FFmpeg structs: `AVFrame` spells it `colorspace`
@@ -725,6 +777,8 @@ impl<T: ElementType> Default for MediaFrame<T> {
             flags: 0,
             quality: 0,
             repeat_pict: 0,
+            interlaced: false,
+            top_field_first: false,
             // 色彩属性默认标记为“未知”（UNSPECIFIED/RANGE_UNSPECIFIED=0），
             // 避免把 0 误当成 AV_COL_SPC_RGB 写入 AVFrame，干扰滤镜/编码器的色彩判定。
             colorspace: ffi::AVCOL_SPC_UNSPECIFIED,
@@ -1115,8 +1169,11 @@ where
     /// The write counterpart is [`write_metadata`](Self::write_metadata); the two must
     /// stay in sync field by field.
     fn copy_avframe_meta(&mut self, frame: &AVFrame) {
-        self.key_frame = frame.flags & ffi::AV_FRAME_FLAG_KEY as i32 != 0;
+        let flags = FlagSet::<AVFrameFlag>::from_bits(frame.flags as u32);
         self.flags = frame.flags;
+        self.key_frame = flags.contains(AVFrameFlag::KEY);
+        self.interlaced = flags.contains(AVFrameFlag::INTERLACED);
+        self.top_field_first = flags.contains(AVFrameFlag::TOP_FIELD_FIRST);
         self.quality = frame.quality;
         self.repeat_pict = frame.repeat_pict;
         self.colorspace = frame.colorspace;
@@ -1153,15 +1210,11 @@ where
         // `UnsafeDerefMut::deref_mut`；`frame` 由 `&mut` 独占，块内无其他访问路径。
         unsafe {
             let frame_raw = frame.deref_mut();
-            // `key_frame` 是 `AV_FRAME_FLAG_KEY` 的便捷镜像（读入方向见
-            // `copy_avframe_meta`），因此写出时也要让它生效：否则
-            // `frame.key_frame = true` 会被静默丢弃，两个字段互相矛盾。
-            let key = ffi::AV_FRAME_FLAG_KEY as i32;
-            frame_raw.flags = if self.key_frame {
-                self.flags | key
-            } else {
-                self.flags & !key
-            };
+            frame_raw.flags = FlagSet::<AVFrameFlag>::from_bits(self.flags as u32)
+                .set(AVFrameFlag::KEY, self.key_frame)
+                .set(AVFrameFlag::INTERLACED, self.interlaced)
+                .set(AVFrameFlag::TOP_FIELD_FIRST, self.top_field_first)
+                .bits() as i32;
             frame_raw.quality = self.quality;
             frame_raw.repeat_pict = self.repeat_pict;
             frame_raw.colorspace = self.colorspace;
@@ -1214,6 +1267,8 @@ where
             flags,
             quality,
             repeat_pict,
+            interlaced,
+            top_field_first,
             colorspace,
             color_primaries,
             color_trc,
@@ -1257,6 +1312,8 @@ where
             flags: *flags,
             quality: *quality,
             repeat_pict: *repeat_pict,
+            interlaced: *interlaced,
+            top_field_first: *top_field_first,
             colorspace: *colorspace,
             color_primaries: *color_primaries,
             color_trc: *color_trc,
@@ -2336,6 +2393,52 @@ mod tests {
             assert!((actual_time - expected_time).as_secs_f32().abs() < 0.01);
         }
 
+        Ok(())
+    }
+
+    /// 隔行元数据往返：`MediaFrame` 的 `interlaced`/`top_field_first` 经
+    /// `to_avframe` → `from_avframe` 后应读回不变。
+    ///
+    /// 位走 `AVFrame.flags` 的 `AV_FRAME_FLAG_INTERLACED` /
+    /// `AV_FRAME_FLAG_TOP_FIELD_FIRST`，从 FFmpeg 6.1 起就存在且为规范表示，因此
+    /// 两侧都不按版本分流。另验证 `flags` 的写回与便捷 bool 不再互相矛盾（既置位、
+    /// 也清位），这是宽松"只置不清"实现会漏掉的一半。
+    #[test]
+    fn test_interlace_metadata_round_trip() -> Result<()> {
+        // 默认中性值：非隔行。
+        let default =
+            MediaFrame::<u8>::new_video_frame(TEST_WIDTH, TEST_HEIGHT, PixelFormat::RGB24)?;
+        assert!(!default.interlaced);
+        assert!(!default.top_field_first);
+
+        // 正向：隔行 + TFF → 经 AVFrame 往返 → 读回保持。
+        let mut frame =
+            MediaFrame::<u8>::new_video_frame(TEST_WIDTH, TEST_HEIGHT, PixelFormat::RGB24)?;
+        frame.interlaced = true;
+        frame.top_field_first = true;
+        let av = frame.to_avframe()?;
+        let av_flags = FlagSet::<AVFrameFlag>::from_bits(av.flags as u32);
+        assert!(av_flags.contains(AVFrameFlag::INTERLACED));
+        assert!(av_flags.contains(AVFrameFlag::TOP_FIELD_FIRST));
+        let back = MediaFrame::<u8>::from_avframe(&av)?;
+        assert!(back.interlaced);
+        assert!(back.top_field_first);
+
+        // 反向：顶场在后（BFF）→ 读回仍正确，且隔行位在、TFF 位不在。
+        let mut bff = frame;
+        bff.top_field_first = false;
+        let back_bff = MediaFrame::<u8>::from_avframe(&bff.to_avframe()?)?;
+        assert!(back_bff.interlaced);
+        assert!(!back_bff.top_field_first);
+
+        // `interlaced = false` 必须清掉已置的位（镜像语义要双向成立，否则
+        // 从 `av` 反向构造时 bool 与 mask 会各说各话）。
+        let mut progressive = MediaFrame::<u8>::from_avframe(&av)?;
+        progressive.interlaced = false;
+        progressive.top_field_first = false;
+        let cleared = FlagSet::<AVFrameFlag>::from_bits(progressive.to_avframe()?.flags as u32);
+        assert!(!cleared.contains(AVFrameFlag::INTERLACED));
+        assert!(!cleared.contains(AVFrameFlag::TOP_FIELD_FIRST));
         Ok(())
     }
 
