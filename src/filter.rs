@@ -2729,9 +2729,9 @@ impl FilterGraph {
             .alloc_filter_context(&buffersink, name)
             .context("Failed to allocate video buffer sink")?;
 
-        // 先分配再设置选项、最后初始化。FFmpeg 8 将 `pix_fmts`(binary) 废弃为数组选项
-        // `pixel_formats`，二者均为非运行时选项，须在 init 之前设置。
-        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        // 先分配再设置选项、最后初始化。FFmpeg 8 起 `pix_fmts`(binary) 废弃为数组选项
+        // `pixel_formats`，两者均为非运行时选项，须在 init 之前设置。
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         sink_ctx
             .opt_set_array(
                 c"pixel_formats",
@@ -2740,7 +2740,7 @@ impl FilterGraph {
                 ffi::AV_OPT_TYPE_PIXEL_FMT,
             )
             .context("Failed to set video sink filter context pixel format")?;
-        #[cfg(feature = "ffmpeg6")]
+        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         sink_ctx
             .opt_set_bin(c"pix_fmts", &(ffi::AVPixelFormat::from(format)))
             .context("Failed to set video sink filter context pixel format")?;
@@ -2802,7 +2802,7 @@ impl FilterGraph {
         // - buffersink ：新数组选项 pixel_formats （旧 pix_fmts 已废弃）
         // - abuffersink ：新数组选项 `sample_formats`/`samplerates`/`channel_layouts`
         // （旧 `sample_fmts`/`sample_rates`/`ch_layouts`(binary/string) 已废弃）
-        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         sink_ctx
             .opt_set_array(
                 c"sample_formats",
@@ -2811,9 +2811,9 @@ impl FilterGraph {
                 ffi::AV_OPT_TYPE_SAMPLE_FMT,
             )
             .context("Failed to set audio sink sample format")?;
-        #[cfg(feature = "ffmpeg6")]
+        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         sink_ctx.opt_set_bin(c"sample_fmts", &(endpoint.format as i32))?;
-        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         sink_ctx
             .opt_set_array(
                 c"samplerates",
@@ -2822,9 +2822,9 @@ impl FilterGraph {
                 ffi::AV_OPT_TYPE_INT,
             )
             .context("Failed to set audio sink sample rate")?;
-        #[cfg(feature = "ffmpeg6")]
+        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         sink_ctx.opt_set_bin(c"sample_rates", &endpoint.sample_rate)?;
-        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         {
             let layout = AVChannelLayout::from_nb_channels(endpoint.nb_channels).into_inner();
             sink_ctx
@@ -2836,7 +2836,7 @@ impl FilterGraph {
                 )
                 .context("Failed to set audio sink channel layout")?;
         }
-        #[cfg(feature = "ffmpeg6")]
+        #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         sink_ctx.opt_set(
             c"ch_layouts",
             &AVChannelLayout::from_nb_channels(endpoint.nb_channels).describe()?,
