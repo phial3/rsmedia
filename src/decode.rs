@@ -1746,7 +1746,7 @@ mod tests {
         let mut unified_samples = 0u64;
         while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
             assert_eq!(
-                frame.format().and_then(|f| f.into_sample()),
+                frame.format().into_sample(),
                 Some(SampleFormat::FLTP),
                 "decoded frame was not converted to the requested sample format"
             );
@@ -1938,7 +1938,7 @@ mod tests {
         Ok(())
     }
 
-    /// builder 的 `with_scale_pool` 必须进入解码器持有的 [`Scaler`]：
+    /// builder 的 `with_buffer_pool` 必须进入解码器持有的 [`Scaler`]：
     /// 默认关闭，显式开启后为真（真实 build 路径）。
     #[test]
     fn test_builder_scale_pool_reaches_decoder_scaler() -> Result<()> {
@@ -1949,11 +1949,11 @@ mod tests {
         assert!(!decoder.scaler.pool_enabled(), "池化默认关闭");
 
         let decoder = DecoderBuilder::new(MediaType::VIDEO)
-            .with_scale_pool(true)
+            .with_buffer_pool(true)
             .build_from_reader(&StreamReader::new(video_path)?)?;
         assert!(
             decoder.scaler.pool_enabled(),
-            "with_scale_pool 应进入 Scaler"
+            "with_buffer_pool 应进入 Scaler"
         );
         Ok(())
     }

@@ -273,7 +273,7 @@ fn negotiate_audio(codec: &str, preferred_rate: i32) -> Result<(SampleFormat, i3
 struct Written {
     /// Samples per audio frame as handed to the encoder (fixed-frame-size
     /// codecs re-chunk; lossy ones add padding, hence the tolerance below).
-    frame_samples: u32,
+    frame_samples: i32,
     audio_samples: u64,
     sample_rate: i32,
     channels: i32,
@@ -349,7 +349,7 @@ fn summarize<T: ElementType>(
         assert_eq!(frame.nb_channels, written.channels, "decoded channel count");
         if let Some(sample_fmt) = sample_fmt {
             assert_eq!(
-                frame.format().and_then(|f| f.into_sample()),
+                frame.format().into_sample(),
                 Some(sample_fmt),
                 "decoded frame was not converted to the requested sample format"
             );
@@ -393,11 +393,7 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
             // Fixed-frame-size codecs (AAC 1024, Opus 960, MP3 1152) want exactly
             // this many samples per frame; the rest take whole frames as they come.
             let frame_size = encoder.frame_size();
-            let frame_samples = if frame_size > 0 {
-                frame_size as u32
-            } else {
-                1024
-            };
+            let frame_samples = if frame_size > 0 { frame_size } else { 1024 };
             (
                 Some(muxer.add_encoder(encoder)?),
                 frame_samples,

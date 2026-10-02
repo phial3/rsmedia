@@ -19,6 +19,7 @@ use rsmpeg::ffi;
 
 pub use bytes::{BufMut, Bytes, BytesMut};
 
+use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -454,16 +455,14 @@ fn open_input_custom(
 
 /// 用自定义 AVIO 构建输出上下文。
 ///
-/// 构建阶段的 muxer 私有选项不会在此消费（FFmpeg 在
-/// `avformat_write_header` 时才读取），由各 Writer 的 `write_header`
-/// 经 [`write_header_with_options`] 透传。
+/// 构建阶段的 muxer 私有选项不会在此消费（FFmpeg 在 `avformat_write_header` 时才读取），
+/// 由各 Writer 的 `write_header` 经 [`write_header_with_options`] 透传
 fn build_output_custom(
     io_context: AVIOContextCustom,
-    format: &str,
+    format: &CStr,
 ) -> Result<AVFormatContextOutput> {
-    let format_cstr = strutils::str_to_cstring(format)?;
     AVFormatContextOutput::builder()
-        .format_name(&format_cstr)
+        .format_name(format)
         .io_context(AVIOContextContainer::Custom(io_context))
         .build()
         .context("Create output format context with custom IO failed.")
@@ -1602,22 +1601,25 @@ fn mem_seek(state: &Mutex<MemWriterState>, offset: i64, whence: i32) -> i64 {
 }
 
 /// Build a [`BufferWriter`].
-pub struct BufferWriterBuilder<'a> {
-    format: &'a str,
+pub struct BufferWriterBuilder {
+    format: CString,
     spec: WriterSpec,
 }
 
-impl<'a> BufferWriterBuilder<'a> {
+impl BufferWriterBuilder {
     /// Create a new writer that writes to a buffer.
     ///
     /// # Arguments
     ///
     /// * `format` - Container format to use.
-    pub fn new(format: &'a str) -> Self {
-        Self {
-            format,
+    ///
+    /// 将 `&str` 持有为 [`CString`] 以移除借用生命周期；格式名含内部 NUL 字节时
+    /// 返回编码错误（fail-fast），不 panic。
+    pub fn new(format: &str) -> Result<Self> {
+        Ok(Self {
+            format: strutils::str_to_cstring(format)?,
             spec: WriterSpec::default(),
-        }
+        })
     }
 
     impl_writer_builder_setters!();
@@ -1645,7 +1647,7 @@ impl<'a> BufferWriterBuilder<'a> {
             Some(write_packet),
             Some(seek),
         );
-        let output = build_output_custom(io_context, format)?;
+        let output = build_output_custom(io_context, &format)?;
         Ok(BufferWriter {
             core: WriterCore::new(output, spec.options.and_then(|opts| opts.into_dict()), true),
             state,
@@ -1694,7 +1696,7 @@ impl BufferWriter {
     ///   path is what guesses the format from an extension.
     #[inline]
     pub fn new(format: &str) -> Result<Self> {
-        BufferWriterBuilder::new(format).build()
+        BufferWriterBuilder::new(format)?.build()
     }
 
     /// 取出自上次取走之后新增的字节（增量），推进游标。
@@ -1772,25 +1774,28 @@ unsafe impl Send for BufferWriter {}
 ////////////////////////////////////////
 
 /// Builds a [`IoWriter`].
-pub struct IoWriterBuilder<'a, W> {
+pub struct IoWriterBuilder<W> {
     writer: W,
-    format: &'a str,
+    format: CString,
     spec: WriterSpec,
 }
 
-impl<'a, W: std::io::Write + Send + 'static> IoWriterBuilder<'a, W> {
+impl<W: std::io::Write + Send + 'static> IoWriterBuilder<W> {
     /// Create a new writer wrapping any [`std::io::Write`] implementor.
     ///
     /// # Arguments
     ///
     /// * `format` - Container format to use.
     /// * `writer` - Destination stream to write to (e.g. socket, pipe, encryptor).
-    pub fn new(format: &'a str, writer: W) -> Self {
-        Self {
+    ///
+    /// 将 `&str` 持有为 [`CString`] 以移除借用生命周期；格式名含内部 NUL 字节时
+    /// 返回编码错误（fail-fast），不 panic。
+    pub fn new(format: &str, writer: W) -> Result<Self> {
+        Ok(Self {
             writer,
-            format,
+            format: strutils::str_to_cstring(format)?,
             spec: WriterSpec::default(),
-        }
+        })
     }
 
     impl_writer_builder_setters!();
@@ -1828,7 +1833,7 @@ impl<'a, W: std::io::Write + Send + 'static> IoWriterBuilder<'a, W> {
             Some(write_packet),
             None,
         );
-        let output = build_output_custom(io_context, format)?;
+        let output = build_output_custom(io_context, &format)?;
         Ok(IoWriter {
             core: WriterCore::new(output, spec.options.and_then(|opts| opts.into_dict()), true),
             inner,
@@ -1853,7 +1858,7 @@ impl<W: std::io::Write + Send + 'static> IoWriter<W> {
     /// * `writer` - Destination stream to write to.
     #[inline]
     pub fn new(format: &str, writer: W) -> Result<Self> {
-        IoWriterBuilder::new(format, writer).build()
+        IoWriterBuilder::new(format, writer)?.build()
     }
 
     /// 消耗 writer 并取回底层 [`std::io::Write`] 实现（应在 `write_trailer` 之后调用）。

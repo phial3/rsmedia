@@ -70,13 +70,10 @@ fn main() -> Result<()> {
     loop {
         match decoder.decode_frame(&mut reader) {
             Ok(Some(frame)) => {
-                let fmt = frame
-                    .format()
-                    .map(|f| match f {
-                        FrameFormat::Pixel(p) => p.get_pix_fmt_name().to_string(),
-                        _ => "N/A".to_string(),
-                    })
-                    .unwrap_or_else(|| "N/A".to_string());
+                let fmt = match frame.format() {
+                    FrameFormat::Pixel(p) => p.get_pix_fmt_name().to_string(),
+                    _ => "N/A".to_string(),
+                };
                 println!(
                     "frame[{decoded}] pts={} size={}x{} fmt={}",
                     frame.pts, frame.width, frame.height, fmt

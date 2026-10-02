@@ -300,7 +300,7 @@ fn solid_frame(width: i32, height: i32, luma: u8, pts: i64) -> Result<MediaFrame
 
 /// 生成一帧 48kHz 单声道 FLTP 音频，所有采样点填同一个值。
 fn tone_frame(value: f32, pts: i64) -> Result<MediaFrame<f32>> {
-    let nb_samples = SAMPLES_PER_FRAME as u32;
+    let nb_samples = SAMPLES_PER_FRAME as i32;
     let mut frame =
         MediaFrame::<f32>::new_audio_frame(SampleFormat::FLTP, 1, nb_samples, SAMPLE_RATE)?;
     {

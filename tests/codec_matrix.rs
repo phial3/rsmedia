@@ -126,7 +126,7 @@ fn audio_roundtrip(
     codec_name: &str,
     container: &str,
     sample_rate: i32,
-    nb_samples: u32,
+    nb_samples: i32,
     quality: Option<Quality>,
 ) -> anyhow::Result<()> {
     if !encoder_available(codec_name) {

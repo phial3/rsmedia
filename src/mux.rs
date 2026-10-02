@@ -550,18 +550,26 @@ impl<W: Writer> Muxer<W> {
     }
 
     /// Sets a container-level metadata entry, e.g. `title`, `artist`,
-    /// `comment`. Applied when the container header is written, i.e. before
-    /// the first [`Self::mux`] call; entries set after the header is written
-    /// are ignored (with a warning).
+    /// `comment`.
+    ///
+    /// Applied when the container header is written, i.e. before the first
+    /// [`Self::mux`] call. Calling after the header is written returns
+    /// `Err(invalid_config)` instead of silently dropping the entry: because
+    /// metadata is only read by FFmpeg during `write_header`, a late call would
+    /// otherwise be silent data loss.
     pub fn set_metadata(
         &mut self,
         key: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<&mut Self> {
+        let key = key.into();
+        let value = value.into();
         if self.have_written_header {
-            tracing::warn!("set_metadata after header write has no effect");
+            return Err(RsmediaError::invalid_config(format!(
+                "set_metadata({key:?}, {value:?}) after header write has no effect"
+            )));
         }
-        self.resources.metadata.set(key.into(), value.into());
+        self.resources.metadata.set(key, value);
         Ok(self)
     }
 
@@ -571,7 +579,9 @@ impl<W: Writer> Muxer<W> {
     /// audio/subtitle tracks.
     ///
     /// Applied when the container header is written; entries containing
-    /// interior NUL bytes are skipped with a warning at that point.
+    /// interior NUL bytes are skipped with a warning at that point. Calling
+    /// after the header is written returns `Err(invalid_config)` instead of
+    /// silently dropping the entry.
     pub fn set_stream_metadata(
         &mut self,
         stream_index: usize,
@@ -586,9 +596,10 @@ impl<W: Writer> Muxer<W> {
             )));
         }
         if self.have_written_header {
-            tracing::warn!(
+            // metadata 只在 write_header 时写入；header 后调用是完全无效调用
+            return Err(RsmediaError::invalid_config(format!(
                 "set_stream_metadata({stream_index}, {key:?}) after header write has no effect"
-            );
+            )));
         }
         self.resources
             .stream_metadata
@@ -655,17 +666,18 @@ impl<W: Writer> Muxer<W> {
     }
 
     /// Adds a container chapter. Chapters are written when the container
-    /// header is written, i.e. before the first [`Self::mux`] call; chapters
-    /// added after the header is written are ignored (with a warning).
+    /// header is written, i.e. before the first [`Self::mux`] call; calling
+    /// after the header is written returns `Err(invalid_config)` instead of
+    /// silently dropping the chapter.
     ///
     /// Times are in seconds; internally stored on a millisecond time base.
     /// Requires a container with chapter support (MP4, MKV, ...).
     pub fn add_chapter(&mut self, chapter: Chapter) -> Result<&mut Self> {
         if self.have_written_header {
-            tracing::warn!(
+            return Err(RsmediaError::invalid_config(format!(
                 "add_chapter({:?}) after header write has no effect",
                 chapter.title
-            );
+            )));
         }
         if chapter.start < 0.0 {
             return Err(RsmediaError::invalid_config(format!(
@@ -1155,6 +1167,49 @@ impl<W: Writer> Muxer<W> {
         self.write_out_packet(packet, stream_idx, src_time_base)
     }
 
+    /// Encode a list of subtitle segments through a subtitle [`Encoder`] into the
+    /// container in one shot — a convenience entry point over
+    /// [`Self::add_encoder`] + [`Self::mux_subtitle_segment`] + [`Self::finish`].
+    ///
+    /// The encoder must be built for subtitles (see
+    /// [`EncoderBuilder::new_subtitle`](crate::encode::EncoderBuilder::new_subtitle))
+    /// with a subtitle header (see
+    /// [`EncoderBuilder::with_subtitle_header`](crate::encode::EncoderBuilder::with_subtitle_header)).
+    ///
+    /// Consumes `self`: the trailer (and any encoder drain) is written when this
+    /// returns, so no separate [`Self::finish`] call is needed.
+    ///
+    /// ```
+    /// use rsmedia::mux::Muxer;
+    /// use rsmedia::subtitle::SubtitleSegment;
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut muxer = Muxer::new("out.mp4")?;
+    /// let encoder = rsmedia::encode::EncoderBuilder::new_subtitle()
+    ///     .with_codec_name("mov_text")
+    ///     .with_subtitle_header("[Script Info]\nScriptType: v4.00+\n")
+    ///     .build()?;
+    /// let segments = [
+    ///     SubtitleSegment::new(0, 2000, "Hello World"),
+    ///     SubtitleSegment::new(2000, 4000, "Goodbye World"),
+    /// ];
+    /// muxer.encode_subtitle_segments(encoder, &segments)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn encode_subtitle_segments(
+        mut self,
+        encoder: Encoder,
+        segments: &[SubtitleSegment],
+    ) -> Result<()> {
+        let index = self.add_encoder(encoder)?;
+        for segment in segments {
+            self.mux_subtitle_segment(segment, index)?;
+        }
+        self.finish()?;
+        Ok(())
+    }
+
     /// Signal to the muxer that writing has finished. This will cause a trailer to be written if
     /// the container format has one.
     pub fn finish(&mut self) -> Result<()> {
@@ -1259,29 +1314,6 @@ impl<W: Writer> Drop for Muxer<W> {
         // 仅当已写过 header 时才处理，未 mux 过的空文件不做无意义写入。
         self.flush_if_needed();
     }
-}
-
-/// 校验 `writer` 尚未被写过 header（处女态）。
-///
-/// [`Writer`] 自己记录 header 状态（[`Writer::is_header_written`]），但该路径还要
-/// 建自己的流，因此判据是"输出上下文里没有任何流、也没写过 header"：header 一旦
-/// 写出，`AVFormatContext` 的流数组即固定，此时再 `add_stream` + `write_header`
-/// 会让 FFmpeg 内部仍持有的旧指针失效（实测 SIGSEGV）。
-///
-/// 绕开 [`Muxer`] 直接操作 writer 的辅助函数（见
-/// [`encode_subtitle_segments`](crate::subtitle::encode_subtitle_segments)）
-/// 必须显式确认这一点。
-pub(crate) fn ensure_writer_pristine<W: Writer>(writer: &W) -> Result<()> {
-    let nb_streams = writer.output().nb_streams as usize;
-    if writer.is_header_written() || nb_streams > 0 {
-        return Err(RsmediaError::invalid_config(format!(
-            "This writer is no longer pristine ({nb_streams} stream(s), header written: {}): \
-             direct container writing needs a fresh writer (pass one through Muxer to have \
-             header/trailer state tracked)",
-            writer.is_header_written()
-        )));
-    }
-    Ok(())
 }
 
 /// stream definition for demuxer
@@ -2045,6 +2077,16 @@ mod tests {
             total_samples += nb_samples as i64;
         }
         muxer.finish()?;
+
+        // header 已写：metadata/chapter 这三者此后完全无效，必须返回 Err，
+        // 而不是静默丢数据（静默丢远比报错危险）。
+        assert!(muxer.set_metadata("title", "too late").is_err());
+        assert!(
+            muxer
+                .set_stream_metadata(video_index, "language", "en")
+                .is_err()
+        );
+        assert!(muxer.add_chapter(Chapter::new("late", 0.0, 1.0)).is_err());
 
         // 回读验证：容器级 title/artist 与各流 language 标签。
         // 用 `Demuxer::metadata`/`stream_metadata`（本库的读取侧入口），而不是

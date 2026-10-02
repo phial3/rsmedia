@@ -336,8 +336,8 @@ pub struct Resampler {
     ///
     /// 留着是因为重建上下文时输出侧要原样恢复 —— `setup_resampler` 输入输出都得给全，
     /// 而重建发生在只拿得到新输入帧的地方（见 [`Self::convert_frame_owned`]）。也用于
-    /// [`Self::convert`] 的形参校验：输出缓冲必须按上下文真正使用的声道数分配，形参与之
-    /// 不一致时必须报错而不是越界写。
+    /// [`Self::convert`]：输出样本缓冲必须按上下文真正使用的声道数/采样格式分配，取这里
+    /// 的规格就不存在形参不一致的可能。
     out_spec: AudioSpec,
 }
 
@@ -463,35 +463,22 @@ impl Resampler {
     ///   (possible whenever the sample rate changes).
     ///
     /// A negative `swr_convert` result becomes an error, never a count.
-    pub fn convert(
-        &mut self,
-        src_frame: &AVFrame,
-        out_ch_layout: ffi::AVChannelLayout,
-        out_sample_fmt: ffi::AVSampleFormat,
-    ) -> Result<(AVSamples, i32)> {
-        let out_ch_layout = default_layout_for(out_ch_layout).unwrap_or(out_ch_layout);
-
-        // 输出样本缓冲必须按**上下文**的输出声道数/采样格式分配：`swr_convert`
-        // 始终按上下文（而非这里的形参）写数据。形参只用于分配缓冲，一旦不一致
-        // 就会按错误的大小分配 —— 声道数偏差会让 swr 越界写堆。这里快速失败。
-        if out_ch_layout.nb_channels != self.out_spec.nb_channels()
-            || out_sample_fmt != self.out_spec.sample_fmt
-        {
-            return Err(RsmediaError::invalid_config(format!(
-                "streaming resampler was built for {} channel(s) and {}, but convert() was \
-                 called with {} channel(s) and {}: the output buffer must match the context",
-                self.out_spec.nb_channels(),
-                sample_fmt_name(self.out_spec.sample_fmt),
-                out_ch_layout.nb_channels,
-                sample_fmt_name(out_sample_fmt),
-            )));
-        }
+    ///
+    /// The output buffer is allocated for the **output spec this resampler was
+    /// built with** (see [`Self::new`]) — there is no longer a way to pass a
+    /// mismatched layout/fmt, which previously was a runtime error here and a
+    /// potential heap overrun if it slipped through.
+    pub fn convert(&mut self, src_frame: &AVFrame) -> Result<(AVSamples, i32)> {
+        // 输出样本缓冲按**上下文**的输出声道数/采样格式分配：`swr_convert`
+        // 始终按上下文（而非调用方传入的形参）写数据。输出规格即 `new` 里归一化后
+        // 的 `out_spec`，分配因此总是与上下文一致，也消除了形参不一致的越界写隐患。
+        let ch_layout = self.out_spec.ch_layout;
 
         with_normalized_layout(src_frame, |src_frame| {
             // 容量按输出样本数的上界分配，避免上采样（in < out）时尾部样本被丢弃。
             let capacity = self.get_out_samples(src_frame.nb_samples);
             let mut out_samples =
-                AVSamples::new(out_ch_layout.nb_channels, capacity, out_sample_fmt, 0)
+                AVSamples::new(ch_layout.nb_channels, capacity, self.out_spec.sample_fmt, 0)
                     .context("Create samples buffer failed.")?;
 
             let converted = unsafe {
@@ -509,6 +496,27 @@ impl Resampler {
             // 单独返回，调用方无需猜测缓冲区里有多少是有效的。
             Ok((out_samples, converted))
         })
+    }
+
+    /// 分配一个符合本重采样器**输出规格**的帧，容量 `nb_samples` 样本/声道。
+    ///
+    /// 这是 [`Self::convert_frame`] / [`Self::flush`] 里那段"手动搭目标帧"
+    /// 的标准写法——按 `new` 时归一化后的输出规格设格式/布局/采样率/时基并分配缓冲。
+    /// 集中的意义：整个 crate 只有一个地方知道"输出帧长什么样"。
+    pub fn alloc_out_frame(&self, nb_samples: i32) -> Result<AVFrame> {
+        let mut dst = AVFrame::new();
+        dst.set_format(self.out_spec.sample_fmt);
+        dst.set_ch_layout(self.out_spec.ch_layout);
+        dst.set_sample_rate(self.out_spec.sample_rate);
+        dst.set_nb_samples(nb_samples.max(1));
+        dst.set_time_base(
+            Rational::new(1, self.out_spec.sample_rate)
+                .unwrap_or(Rational::ZERO)
+                .into(),
+        );
+        dst.alloc_buffer()
+            .context("Failed to allocate a frame for the resampler output")?;
+        Ok(dst)
     }
 
     /// Drain the remaining samples from the resampler (EOF flush).
@@ -541,17 +549,10 @@ impl Resampler {
     /// Whatever [`Self::flush`] reports, plus [`RsmediaError::Other`] if the delay line
     /// does not empty within the iteration bound.
     pub fn flush_frames(&mut self) -> Result<Vec<AVFrame>> {
-        let out_spec = self.out_spec;
-        let capacity = out_spec.sample_rate.max(1);
+        let capacity = self.out_spec.sample_rate.max(1);
         let mut frames = Vec::new();
         for _ in 0..crate::MAX_DRAIN_ITERATIONS {
-            let mut dst = AVFrame::new();
-            dst.set_format(out_spec.sample_fmt);
-            dst.set_ch_layout(out_spec.ch_layout);
-            dst.set_sample_rate(out_spec.sample_rate);
-            dst.set_nb_samples(capacity);
-            dst.alloc_buffer()
-                .context("Failed to allocate a frame to drain the resampler")?;
+            let mut dst = self.alloc_out_frame(capacity)?;
             self.flush(&mut dst)?;
             if dst.nb_samples <= 0 {
                 return Ok(frames);
@@ -958,7 +959,7 @@ mod tests {
         let mut produced = 0i64;
         for chunk in 0..chunks {
             let src = create_test_frame(&AUDIO_FORMATS[7], in_rate, channels, in_samples)?;
-            let (_, converted) = resampler.convert(&src, layout(), ffi::AV_SAMPLE_FMT_FLTP)?;
+            let (_, converted) = resampler.convert(&src)?;
             assert!(
                 converted >= 0,
                 "chunk {chunk}: swr_convert returned {converted}"

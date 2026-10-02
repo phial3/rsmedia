@@ -71,7 +71,7 @@ pub fn gradient_video_frame(width: i32, height: i32, phase: f32) -> rsmedia::Med
 pub fn sine_audio_frame(
     freq: f32,
     channels: i32,
-    nb_samples: u32,
+    nb_samples: i32,
     sample_rate: i32,
 ) -> rsmedia::MediaFrame<f32> {
     let mut frame = rsmedia::MediaFrame::<f32>::new_audio_frame(

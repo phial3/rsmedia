@@ -2,8 +2,9 @@
 //!
 //! FFmpeg exposes every "zero or more of these" tunable as a plain integer bit mask: the codec
 //! context's `flags` / `flags2` / `thread_type` / `err_recognition`, the scaler context's
-//! `flags`, the log flags, the seek flags. The crate models the individual bits of each mask as
-//! an enum ([`AVCodecFlag`](crate::AVCodecFlag), [`ScaleQuality`](crate::ScaleQuality),
+//! `flags`, the frame's `flags`, the log flags, the seek flags. The crate models the individual
+//! bits of each mask as an enum ([`AVCodecFlag`](crate::AVCodecFlag),
+//! [`AVFrameFlag`](crate::AVFrameFlag), [`ScaleQuality`](crate::ScaleQuality),
 //! [`ThreadType`](crate::ThreadType), …), but **an enum cannot hold a combination**: a fieldless
 //! Rust enum has one variant per value, and `LOW_DELAY | CLOSED_GOP` is not a variant of
 //! anything. That is why a *second* type is needed for the set.
@@ -139,6 +140,39 @@ impl<E> FlagSet<E> {
     pub fn contains_all(self, other: impl Into<Self>) -> bool {
         let other = other.into();
         self.bits & other.bits == other.bits
+    }
+
+    /// `self` with `flag`'s bits forced on (`on == true`) or off (`on == false`).
+    ///
+    /// The write-side counterpart of the per-table `contains`: where `contains`
+    /// reads one bit, this sets or clears it without disturbing any other bit,
+    /// including ones no variant of `E` names. It pairs with
+    /// [`from_bits`](Self::from_bits) when a mask read back out of FFmpeg has to
+    /// be edited one flag at a time — the case where a caller holds a raw mask
+    /// and a set of named overrides.
+    ///
+    /// ```
+    /// use rsmedia::{AVCodecFlag, FlagSet};
+    ///
+    /// let set = FlagSet::<AVCodecFlag>::EMPTY
+    ///     .set(AVCodecFlag::LOW_DELAY, true)
+    ///     .set(AVCodecFlag::CLOSED_GOP, true);
+    /// assert!(set.contains(AVCodecFlag::LOW_DELAY));
+    /// assert!(set.contains(AVCodecFlag::CLOSED_GOP));
+    ///
+    /// // Forcing one flag off clears only that bit.
+    /// let again = set.set(AVCodecFlag::LOW_DELAY, false);
+    /// assert!(!again.contains(AVCodecFlag::LOW_DELAY));
+    /// assert!(again.contains(AVCodecFlag::CLOSED_GOP));
+    /// ```
+    pub fn set(mut self, flag: impl Into<Self>, on: bool) -> Self {
+        let flag = flag.into();
+        self.bits = if on {
+            self.bits | flag.bits
+        } else {
+            self.bits & !flag.bits
+        };
+        self
     }
 }
 

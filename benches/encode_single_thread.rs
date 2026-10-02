@@ -47,7 +47,7 @@ fn bench_single_thread(c: &mut Criterion) {
     remove_file(&audio_path);
 
     // Subtitle: 30 mov_text segments written through the dedicated subtitle
-    // pipeline (StreamWriter + encode_subtitle_segments_to_file).
+    // pipeline (Muxer + Muxer::encode_subtitle_segments).
     let subtitle_path = dir.join("single_subtitle.mp4");
     group.throughput(Throughput::Elements(SUBTITLE_MEDIA_SECS as u64));
     group.bench_function("subtitle 30x mov_text, 60 s", |b| {

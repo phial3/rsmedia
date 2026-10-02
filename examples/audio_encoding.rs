@@ -15,7 +15,7 @@ use anyhow::Result;
 
 const SAMPLE_RATE: i32 = 44_100;
 const CHANNELS: i32 = 2;
-const NB_SAMPLES: u32 = 1024;
+const NB_SAMPLES: i32 = 1024;
 /// 编码时长（秒），>10s 便于用播放器/ffprobe 验证。
 const DURATION_SEC: u32 = 12;
 
@@ -45,7 +45,7 @@ fn encode_audio(output: &'static str) -> Result<()> {
     let mut muxer = Muxer::new(output)?;
     let a_idx = muxer.add_encoder(encoder)?;
 
-    let total_frames = SAMPLE_RATE as u32 * DURATION_SEC / NB_SAMPLES;
+    let total_frames = (SAMPLE_RATE * DURATION_SEC as i32) / NB_SAMPLES;
     let mut total_pts: i64 = 0;
     for _ in 0..total_frames {
         let frame = sine_frame(total_pts as f32 / SAMPLE_RATE as f32)?;
@@ -73,13 +73,10 @@ fn decode_audio(source: &'static str) -> Result<()> {
     let mut frames = 0;
     let mut total_samples = 0i64;
     while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
-        let fmt = frame
-            .format()
-            .map(|f| match f {
-                FrameFormat::Sample(s) => s.get_sample_fmt_name().to_string(),
-                _ => "N/A".to_string(),
-            })
-            .unwrap_or_else(|| "N/A".to_string());
+        let fmt = match frame.format() {
+            FrameFormat::Sample(s) => s.get_sample_fmt_name().to_string(),
+            _ => "N/A".to_string(),
+        };
         println!(
             "[decode] pts={}, sample_rate={}, channels={}, samples={}, format={fmt}",
             frame.pts, frame.sample_rate, frame.nb_channels, frame.nb_samples

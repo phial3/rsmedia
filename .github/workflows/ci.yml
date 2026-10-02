@@ -177,6 +177,27 @@ jobs:
           toolchain: nightly
           components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
 
+      - name: Remove system FFmpeg libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==== System-visible FFmpeg shared libs (before cleanup) ===="
+          ldconfig -p | grep -Ei 'libav(codec|device|format|util|filter)|libsw(scale|resample)' || echo "(none)"
+          echo "==== Locating apt FFmpeg library files under /usr (preserving /usr/local) ===="
+          find /usr \( -path /usr/local -o -path /proc -o -path /sys -o -path /dev \) -prune -o \
+            -type f \( -name 'libav*.so*' -o -name 'libav*.a' \
+                       -o -name 'libsw*.so*' -o -name 'libsw*.a' \) -print 2>/dev/null \
+            | tee /tmp/sys_ffmpeg_libs.txt
+          if [ -s /tmp/sys_ffmpeg_libs.txt ]; then
+            echo "--- Deleting the listed library files ---"
+            while IFS= read -r f; do echo "rm $f"; rm -f "$f"; done < /tmp/sys_ffmpeg_libs.txt
+          else
+            echo "(no apt FFmpeg library files found)"
+          fi
+          ldconfig
+          echo "==== Post-cleanup check: only the jrottenberg /usr/local FFmpeg should remain ===="
+          ldconfig -p | grep -Ei 'libav(codec|device|format|util|filter)|libsw(scale|resample)' || echo "(none)"
+
       - name: Verify FFmpeg version
         run: |
           ldconfig
@@ -325,6 +346,26 @@ jobs:
           toolchain: nightly
           components: rustfmt, clippy, rust-src, llvm-tools-preview, rust-analysis
 
+      - name: Remove system FFmpeg libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==== System-visible FFmpeg shared libs (before cleanup) ===="
+          ldconfig -p | grep -Ei 'libav(codec|device|format|util|filter)|libsw(scale|resample)' || echo "(none)"
+          echo "==== Locating apt FFmpeg library files under /usr (preserving /usr/local) ===="
+          find /usr \( -path /usr/local -o -path /proc -o -path /sys -o -path /dev \) -prune -o \
+            -type f \( -name 'libav*.so*' -o -name 'libav*.a' \
+                       -o -name 'libsw*.so*' -o -name 'libsw*.a' \) -print 2>/dev/null \
+            | tee /tmp/sys_ffmpeg_libs.txt
+          if [ -s /tmp/sys_ffmpeg_libs.txt ]; then
+            echo "--- Deleting the listed library files ---"
+            while IFS= read -r f; do echo "rm $f"; rm -f "$f"; done < /tmp/sys_ffmpeg_libs.txt
+          else
+            echo "(no apt FFmpeg library files found)"
+          fi
+          ldconfig
+          echo "==== Post-cleanup check: only the jrottenberg /usr/local FFmpeg should remain ===="
+
       - name: Verify FFmpeg version
         run: |
           ldconfig
@@ -386,7 +427,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install dependencies
-        run: brew update && brew install pkg-config ${{ matrix.brew_formula }}
+        run: brew install pkg-config ${{ matrix.brew_formula }}
 
       - name: Check
         run: cargo check --workspace --all-targets --no-default-features --features ${{ matrix.feature }}

@@ -11,7 +11,7 @@ use rsmedia::frame::MediaFrame;
 use rsmedia::io::StreamWriter;
 use rsmedia::mux::Muxer;
 use rsmedia::pixel::PixelFormat;
-use rsmedia::subtitle::{SubtitleSegment, encode_subtitle_segments};
+use rsmedia::subtitle::SubtitleSegment;
 use rsmedia::{MediaType, SampleFormat};
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub const VIDEO_MEDIA_SECS: f64 = 2.0;
 pub const SAMPLE_RATE: i32 = 44_100;
 pub const CHANNELS: i32 = 2;
 pub const AUDIO_FRAMES: usize = 100;
-pub const AUDIO_SAMPLES_MAX: u32 = 1200;
+pub const AUDIO_SAMPLES_MAX: i32 = 1200;
 pub const AUDIO_MEDIA_SECS: f64 = 3.0;
 
 /// Subtitle job: 30 mov_text segments, one cue every 2 s (60 s of media).
@@ -161,7 +161,7 @@ pub fn encode_audio(path: &Path, enc_threads: i32) -> Result<()> {
     // Variable input sizes on purpose: the encoder's sample FIFO splits and
     // merges them into fixed 1024-sample AAC frames.
     for i in 0..AUDIO_FRAMES {
-        let nb = 700u32 + ((i as u32 * 173) % AUDIO_SAMPLES_MAX);
+        let nb = 700i32 + ((i as i32 * 173) % AUDIO_SAMPLES_MAX);
         let frame = sine_audio_frame(nb);
         muxer.mux(frame.to_avframe()?, a_idx)?;
     }
@@ -173,7 +173,7 @@ pub fn encode_subtitle(path: &Path, enc_threads: i32) -> Result<()> {
     // Subtitle encoding is a synchronous API without internal buffering, so the
     // thread count cannot parallelize a single job; it is set anyway for
     // uniformity, and job-level parallelism comes from the worker pool.
-    let mut encoder = EncoderBuilder::new_subtitle()
+    let encoder = EncoderBuilder::new_subtitle()
         .with_codec_name("mov_text")
         .with_subtitle_header(ASS_HEADER)
         .with_thread_count(enc_threads)
@@ -189,8 +189,8 @@ pub fn encode_subtitle(path: &Path, enc_threads: i32) -> Result<()> {
         })
         .collect();
 
-    let mut writer = StreamWriter::new(path)?;
-    encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
+    let writer = StreamWriter::new(path)?;
+    Muxer::new_from_writer(writer).encode_subtitle_segments(encoder, &segments)?;
     Ok(())
 }
 
@@ -213,7 +213,7 @@ fn rainbow_frame(p: f32) -> MediaFrame<u8> {
     frame
 }
 
-fn sine_audio_frame(nb_samples: u32) -> MediaFrame<f32> {
+fn sine_audio_frame(nb_samples: i32) -> MediaFrame<f32> {
     let mut frame =
         MediaFrame::<f32>::new_audio_frame(SampleFormat::FLT, CHANNELS, nb_samples, SAMPLE_RATE)
             .unwrap();

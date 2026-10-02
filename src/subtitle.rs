@@ -79,50 +79,6 @@ pub fn copy_subtitle_stream<R: Reader, W: Writer>(
     Ok(count)
 }
 
-/// Encode a list of subtitle segments through a bare [`Encoder`](crate::encode::Encoder) into the
-/// container written by `writer` (see [`crate::io::StreamWriter`]).
-///
-/// 字幕编码走同步 API（`encode_subtitle_segment`，无 send/receive 缓冲），
-/// 不能复用 [`crate::mux::Muxer::mux`]（其内部调用 `encoder.encode_raw`
-/// 仅面向音视频编码流）。此处直接：
-///   1. 向 writer 添加字幕流（编码器 codec par + time_base）；
-///   2. 写 header；
-///   3. 逐段编码并把包 pts 从编码器 time_base 换算到输出流 time_base 后写盘；
-///   4. flush 编码器（字幕路径为 no-op）+ 写 trailer。
-///
-/// # 前置条件
-///
-/// `writer` 必须是**处女态**（尚未添加过流、也未写过 header）：本函数自己负责
-/// 建流并写 header，对已经用过的 writer 再走一遍会让 `AVFormatContext` 的流
-/// 数组变动而 FFmpeg 内部仍持有旧指针（实测 SIGSEGV）。这一条件由 `mux` 模块的
-/// `ensure_writer_pristine` 强制校验，违规时返回 `invalid_config` 而不是崩溃。
-pub fn encode_subtitle_segments(
-    writer: &mut impl Writer,
-    encoder: &mut crate::encode::Encoder,
-    segments: &[SubtitleSegment],
-) -> Result<()> {
-    crate::mux::ensure_writer_pristine(writer)?;
-    let enc_tb = encoder.time_base();
-    let index = writer.add_stream(encoder.codecpar(), enc_tb)?;
-    writer.write_header()?;
-    let out_tb = writer.stream_time_base(index)?;
-
-    for segment in segments {
-        for mut packet in encoder.encode_subtitle_segment(segment)? {
-            packet.set_stream_index(index as i32);
-            packet.set_pos(-1);
-            packet.rescale_ts(enc_tb.into(), out_tb.into());
-            writer.write_interleaved(&mut packet)?;
-        }
-    }
-
-    // 字幕编码器同步路径无内部缓冲，flush 为 no-op（置为 Flushed），但仍须
-    // 写 trailer 以封闭容器。
-    encoder.flush(writer, false, index, out_tb)?;
-    writer.write_trailer()?;
-    Ok(())
-}
-
 /// A single subtitle text segment with start/end times.
 #[derive(Debug, Clone)]
 pub struct SubtitleSegment {
@@ -300,12 +256,12 @@ mod tests {
 
         // 1) Encode: mov_text segments into an MP4
         let segments = sample_segments();
-        let mut encoder = EncoderBuilder::new_subtitle()
+        let encoder = EncoderBuilder::new_subtitle()
             .with_codec_name("mov_text")
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(&path)?;
-        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
+        let writer = crate::io::StreamWriter::new(&path)?;
+        crate::mux::Muxer::new_from_writer(writer).encode_subtitle_segments(encoder, &segments)?;
 
         // 2) Decode: via the generic Decoder subtitle channel
         let mut reader = crate::io::StreamReader::new(&path)?;
@@ -366,25 +322,33 @@ mod tests {
         Ok(())
     }
 
-    /// 用过的 writer（已建流/已写 header）必须被拒绝，而不是再走一遍
-    /// `add_stream` + `write_header`（那会让 FFmpeg 持有的流数组指针失效 →
-    /// SIGSEGV）。
+    /// header 写出后不能再加流（`Muxer::ensure_streams_open` 的守卫）：`AVFormatContext`
+    /// 的流数组就此固定，此时再加流会让 FFmpeg 内部仍持有的旧指针失效 → SIGSEGV。
     #[test]
-    fn test_encode_subtitle_segments_rejects_used_writer() -> Result<()> {
+    fn test_muxer_rejects_stream_after_header() -> Result<()> {
         let path = test_support::test_output_path("subtitle", "rsmedia_used_writer.srt");
         test_support::remove_test_output(&path);
 
         let segments = sample_segments();
-        let mut encoder = EncoderBuilder::new_subtitle()
+        let mut muxer = crate::mux::Muxer::new_from_writer(crate::io::StreamWriter::new(&path)?);
+        let first = EncoderBuilder::new_subtitle()
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(&path)?;
-        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
+        let index = muxer.add_encoder(first)?;
+        for segment in &segments {
+            muxer.mux_subtitle_segment(segment, index)?;
+        }
 
-        // 同一 writer 再次调用：必须在触碰到 writer 之前就报错
-        let err = encode_subtitle_segments(&mut writer, &mut encoder, &segments)
-            .expect_err("a non-fresh writer must be rejected");
+        // header 已写入：再 add 第二个编码流必须被拒绝，而不是触发 SIGSEGV。
+        let second = EncoderBuilder::new_subtitle()
+            .with_subtitle_header(ASS_HEADER)
+            .build()?;
+        let err = muxer
+            .add_encoder(second)
+            .expect_err("adding a stream after header write must fail");
         assert!(err.is_invalid_config(), "{err}");
+
+        muxer.finish()?;
 
         test_support::remove_test_output(&path);
         Ok(())
@@ -405,12 +369,12 @@ mod tests {
 
         // 1) Write: create an MP4 with a mov_text subtitle stream
         let segments = sample_segments();
-        let mut encoder = EncoderBuilder::new_subtitle()
+        let encoder = EncoderBuilder::new_subtitle()
             .with_codec_name("mov_text")
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(&path)?;
-        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
+        let writer = crate::io::StreamWriter::new(&path)?;
+        crate::mux::Muxer::new_from_writer(writer).encode_subtitle_segments(encoder, &segments)?;
 
         // 2) Read back: verify the subtitle stream exists
         let mut reader = StreamReader::new(&path)?;
@@ -477,11 +441,11 @@ mod tests {
         test_support::remove_test_output(&path);
 
         let segments = sample_segments();
-        let mut encoder = EncoderBuilder::new_subtitle()
+        let encoder = EncoderBuilder::new_subtitle()
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(&path)?;
-        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
+        let writer = crate::io::StreamWriter::new(&path)?;
+        crate::mux::Muxer::new_from_writer(writer).encode_subtitle_segments(encoder, &segments)?;
 
         let content = std::fs::read_to_string(&path)?;
         // 时间戳行：由 packet pts/duration（毫秒）端到端生成，验证整条时间戳链路
@@ -522,11 +486,11 @@ mod tests {
         test_support::remove_test_output(&input_path);
 
         let segments = sample_segments();
-        let mut encoder = EncoderBuilder::new_subtitle()
+        let encoder = EncoderBuilder::new_subtitle()
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(&input_path)?;
-        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
+        let writer = crate::io::StreamWriter::new(&input_path)?;
+        crate::mux::Muxer::new_from_writer(writer).encode_subtitle_segments(encoder, &segments)?;
 
         // 2) Read the MKV and copy the subtitle stream to another MKV
         let output_path = test_support::test_output_path("subtitle", "rsmedia_passthrough_out.mkv");
@@ -586,12 +550,12 @@ mod tests {
 
         // 1) Write: create an MKV with an ASS subtitle stream
         let segments = sample_segments();
-        let mut encoder = EncoderBuilder::new_subtitle()
+        let encoder = EncoderBuilder::new_subtitle()
             .with_codec_name("ass")
             .with_subtitle_header(ASS_HEADER)
             .build()?;
-        let mut writer = crate::io::StreamWriter::new(&path)?;
-        encode_subtitle_segments(&mut writer, &mut encoder, &segments)?;
+        let writer = crate::io::StreamWriter::new(&path)?;
+        crate::mux::Muxer::new_from_writer(writer).encode_subtitle_segments(encoder, &segments)?;
 
         // 2) Read back: verify the subtitle stream exists
         let mut reader = StreamReader::new(&path)?;

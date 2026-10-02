@@ -2729,8 +2729,8 @@ impl FilterGraph {
             .alloc_filter_context(&buffersink, name)
             .context("Failed to allocate video buffer sink")?;
 
-        // 先分配再设置选项、最后初始化。FFmpeg 8 将 `pix_fmts`(binary) 废弃为数组选项
-        // `pixel_formats`，二者均为非运行时选项，须在 init 之前设置。
+        // 先分配再设置选项、最后初始化。FFmpeg 8 起 `pix_fmts`(binary) 废弃为数组选项
+        // `pixel_formats`，两者均为非运行时选项，须在 init 之前设置。
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         sink_ctx
             .opt_set_array(
@@ -2800,7 +2800,8 @@ impl FilterGraph {
         // 先分配再设置选项、最后初始化，兼容 FFmpeg 8 中 sink 选项为非运行时选项的限制。
         // FFmpeg8 将如下参数废弃, 且新旧选项不能混用:
         // - buffersink ：新数组选项 pixel_formats （旧 pix_fmts 已废弃）
-        // - abuffersink ：新数组选项 `sample_formats`/`samplerates`/`channel_layouts` （旧 `sample_fmts`/`sample_rates`/`ch_layouts`(binary/string) 已废弃）
+        // - abuffersink ：新数组选项 `sample_formats`/`samplerates`/`channel_layouts`
+        // （旧 `sample_fmts`/`sample_rates`/`ch_layouts`(binary/string) 已废弃）
         #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
         sink_ctx
             .opt_set_array(
