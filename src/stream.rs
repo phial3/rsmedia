@@ -319,7 +319,16 @@ impl StreamInfo {
             color_primaries: codecpar.color_primaries,
             chroma_location: codecpar.chroma_location,
             field_order: codecpar.field_order,
-            rotation: Self::get_stream_display_rotation(stream, &metadata),
+            // 旋转是**视频专属**概念（来自 display matrix 侧数据，退化时读 `rotate`
+            // 元数据标签）。音频/字幕流没有它，但 `get_stream_display_rotation` 对
+            // 任意流都会退化到读 `rotate` 标签——一条带了杂散 `rotate` 标签的音轨
+            // 就会报出一个并不存在的角度。故非视频一律取 0。
+            rotation: if MediaType::from_ffi_checked(codecpar.codec_type) == Some(MediaType::VIDEO)
+            {
+                Self::get_stream_display_rotation(stream, &metadata)
+            } else {
+                0.0
+            },
             // Audio
             sample_rate: codecpar.sample_rate,
             channel_layout: codecpar.ch_layout().clone(),

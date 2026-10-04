@@ -302,14 +302,23 @@ impl DecoderBuilder {
         Ok(())
     }
 
-    /// 某个仅对视频解码器生效的配置项被用于其它媒体类型时构造的错误。
+    /// 某个仅对某一类解码器生效的配置项被用于其它媒体类型时构造的错误。
     ///
     /// 属于调用方错误（用了只对某类解码器生效的 setter），因此报 `InvalidConfig`，
     /// 而不是落到笼统的 `Other`。
-    fn option_only_for(opt: &'static str, value: String, media_type: MediaType) -> RsmediaError {
+    ///
+    /// `required` 是该选项**本来只对哪一类解码器生效**，`media_type` 是调用方实际
+    /// 把它用在了哪一类上。两者必须分开传：只传后者会说出"with_pix_fmt 只对音频
+    /// 解码器有效，而你用的就是音频"这种自相矛盾、也指不出该改成什么的文案。
+    fn option_only_for(
+        opt: &'static str,
+        value: String,
+        required: MediaType,
+        media_type: MediaType,
+    ) -> RsmediaError {
         RsmediaError::invalid_config(format!(
             "{opt}({value}) is only valid for {} decoders, got media type: {media_type:?}",
-            media_type.get_media_name()
+            required.get_media_name()
         ))
     }
 
@@ -391,6 +400,7 @@ impl DecoderBuilder {
             (media_type, Some(fmt)) => Err(Self::option_only_for(
                 "with_pix_fmt",
                 format!("{fmt:?}"),
+                MediaType::VIDEO,
                 media_type,
             )),
         }
@@ -411,6 +421,7 @@ impl DecoderBuilder {
             (media_type, Some(fmt)) => Err(Self::option_only_for(
                 "with_sample_fmt",
                 format!("{fmt:?}"),
+                MediaType::AUDIO,
                 media_type,
             )),
             (_, None) => Ok(None),
@@ -502,7 +513,18 @@ impl DecoderBuilder {
             })),
             MediaType::AUDIO => {
                 // sink 格式 = 解码输出采样格式（未指定则保留原生）。
-                let format = output_sample_fmt.unwrap_or(SampleFormat::from(ctx.sample_fmt));
+                // `ctx.sample_fmt` 是 FFmpeg 给的值，可能落在 rsmedia 未建模的枚举
+                // 上，而 `SampleFormat::from` 对未列出的值会 panic——故走
+                // `from_ffi_checked`，未建模时报错而不是中止进程。
+                let format = match output_sample_fmt {
+                    Some(fmt) => fmt,
+                    None => SampleFormat::from_ffi_checked(ctx.sample_fmt).ok_or_else(|| {
+                        RsmediaError::unsupported(format!(
+                            "codec reports sample format {} which rsmedia does not model",
+                            ctx.sample_fmt
+                        ))
+                    })?,
+                };
                 Ok(FilterParams::Audio(AudioParams {
                     nb_channels: ctx.ch_layout.nb_channels,
                     sample_rate: ctx.sample_rate,
@@ -826,7 +848,8 @@ impl Decoder {
     #[inline]
     pub fn sample_fmt(&self) -> SampleFormat {
         self.output_sample_fmt
-            .unwrap_or_else(|| SampleFormat::from(self.context.sample_fmt))
+            .or_else(|| SampleFormat::from_ffi_checked(self.context.sample_fmt))
+            .unwrap_or(SampleFormat::NONE)
     }
 
     #[inline]

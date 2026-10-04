@@ -810,31 +810,37 @@ where
     /// Derived from the format ([`PixelFormat::data_layout`] /
     /// [`SampleFormat::data_layout`]), so it applies to video and audio alike.
     pub fn data_layout(&self) -> Result<DataLayout> {
+        // `width` / `height` / `nb_channels` / `nb_samples` are all signed (FFmpeg's
+        // own width). A nonsensical negative must not turn into an enormous `usize`
+        // here — `nb_samples = -1` would otherwise ask for a 2^64-sized buffer and
+        // abort on capacity overflow instead of returning an error. Fold it to 0,
+        // which the layout check rejects cleanly. Construction already rejects
+        // these (`validated`); the fold keeps a hand-edited field from allocating.
         if self.media_type == MediaType::VIDEO {
             let format = self
                 .format
                 .into_pixel()
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
-            format
-                .data_layout(self.width as usize, self.height as usize)
-                .ok_or_else(|| {
-                    RsmediaError::unsupported(format!(
-                        "pixel format {} cannot be stored as sample planes at {}x{}",
-                        format.get_pix_fmt_name(),
-                        self.width,
-                        self.height
-                    ))
-                })
+            let (width, height) = (
+                usize::try_from(self.width).unwrap_or(0),
+                usize::try_from(self.height).unwrap_or(0),
+            );
+            format.data_layout(width, height).ok_or_else(|| {
+                RsmediaError::unsupported(format!(
+                    "pixel format {} cannot be stored as sample planes at {}x{}",
+                    format.get_pix_fmt_name(),
+                    self.width,
+                    self.height
+                ))
+            })
         } else {
             let format = self
                 .format
                 .into_sample()
                 .ok_or_else(|| RsmediaError::invalid_config("Audio frame needs a sample format"))?;
-            // `nb_channels` is signed; a nonsensical count must not turn into an
-            // enormous `usize` here. Construction already rejects it (`validated`),
-            // the fold keeps a hand-edited field from allocating.
             let channels = usize::try_from(self.nb_channels).unwrap_or(0);
-            Ok(format.data_layout(channels, self.nb_samples as usize))
+            let samples = usize::try_from(self.nb_samples).unwrap_or(0);
+            Ok(format.data_layout(channels, samples))
         }
     }
 
@@ -869,14 +875,18 @@ where
     ///
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
     pub fn new_video_frame(width: i32, height: i32, format: PixelFormat) -> Result<Self> {
-        let layout = format
-            .data_layout(width as usize, height as usize)
-            .ok_or_else(|| {
-                RsmediaError::unsupported(format!(
-                    "pixel format {} cannot be stored as sample planes at {width}x{height}",
-                    format.get_pix_fmt_name()
-                ))
-            })?;
+        // 同 `data_layout`：负尺寸折成 0，让 `data_layout` 返回 `None` 走错误分支，
+        // 而不是把 `-1` 当成 2^64 去分配。
+        let (w, h) = (
+            usize::try_from(width).unwrap_or(0),
+            usize::try_from(height).unwrap_or(0),
+        );
+        let layout = format.data_layout(w, h).ok_or_else(|| {
+            RsmediaError::unsupported(format!(
+                "pixel format {} cannot be stored as sample planes at {width}x{height}",
+                format.get_pix_fmt_name()
+            ))
+        })?;
         Self::new_video(width, height, format, FrameData::zeros(&layout))
     }
 
@@ -923,12 +933,13 @@ where
         nb_samples: i32,
         sample_rate: i32,
     ) -> Result<Self> {
-        // `nb_channels` is signed (FFmpeg's width), but a sample layout needs a
-        // real channel count. Fold a nonsensical one to 0 here so that
+        // `nb_channels` / `nb_samples` are signed (FFmpeg's width), but a sample
+        // layout needs real counts. Fold a nonsensical one to 0 here so that
         // `new_audio`'s shared validation rejects it with its own message,
         // instead of `as usize` turning `-1` into a request for 2^64 planes.
         let channels = usize::try_from(nb_channels).unwrap_or(0);
-        let layout = format.data_layout(channels, nb_samples as usize);
+        let samples = usize::try_from(nb_samples).unwrap_or(0);
+        let layout = format.data_layout(channels, samples);
         Self::new_audio(
             format,
             nb_channels,
@@ -946,10 +957,11 @@ where
     /// [`to_avframe`](Self::to_avframe)。
     fn validated(self) -> Result<Self> {
         // 音频的声道数/采样数必须为正。否则平面布局是空列表、`matches` 会接受，
-        // 一个"没有声道"的帧就能一路走到 FFmpeg。声道数是 `i32`（FFmpeg 的宽度），
-        // 所以判据是 `<= 0` 而不是 `== 0`。视频侧的等价约束由
+        // 一个"没有声道"的帧就能一路走到 FFmpeg。两者都是 `i32`（FFmpeg 的宽度），
+        // 所以判据是 `<= 0` 而不是 `== 0`——`nb_samples` 为负时同样要在这里被拒，
+        // 否则它会一路走到 `data_layout` 的 `as usize`。视频侧的等价约束由
         // `PixelFormat::data_layout` 对 0 尺寸返回 `None` 覆盖，无需在此重复。
-        if self.media_type == MediaType::AUDIO && (self.nb_channels <= 0 || self.nb_samples == 0) {
+        if self.media_type == MediaType::AUDIO && (self.nb_channels <= 0 || self.nb_samples <= 0) {
             return Err(RsmediaError::msg(format!(
                 "Audio frame needs a positive sample and channel count, got {} samples x {} channels",
                 self.nb_samples, self.nb_channels
