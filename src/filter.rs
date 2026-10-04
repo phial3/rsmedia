@@ -3378,6 +3378,12 @@ pub struct FilterGraphBuilder {
     nodes: Vec<FilterNode>,
 }
 
+/// 接线解析的结果：`(每个节点的上游标签, 每个标签被消费的次数)`。
+///
+/// 抽成别名只为让 `resolve_wiring` 的签名保持可读：分量含义见
+/// `FilterGraphBuilder::build` 里的注释。
+type Wiring = (Vec<Vec<String>>, HashMap<String, usize>);
+
 impl FilterGraphBuilder {
     /// 建一个空的构建器。
     pub fn new() -> Self {
@@ -3454,13 +3460,8 @@ impl FilterGraphBuilder {
         self
     }
 
-    /// 组装并协商整张图：校验接线与标签、生成带标签的滤镜图描述、按标签建
-    /// `buffer`/`abuffer` 源与 `buffersink`/`abuffersink` 汇，最后由
-    /// `avfilter_graph_config` 完成格式协商。
-    ///
-    /// 校验都在触碰 FFmpeg 之前完成，接线错误报的是 [`RsmediaError::InvalidConfig`]，
-    /// 而不是一句难以定位的 FFmpeg 解析错误。
-    pub fn build(&self) -> Result<FilterGraph> {
+    /// 校验图的三个必填部分（输入、节点、输出）都非空。
+    fn check_arity(&self) -> Result<()> {
         if self.inputs.is_empty() {
             return Err(RsmediaError::invalid_config(
                 "filter graph has no input: declare one with add_input",
@@ -3476,8 +3477,14 @@ impl FilterGraphBuilder {
                 "filter graph has no output: declare one with add_output/add_output_tail",
             ));
         }
+        Ok(())
+    }
 
-        // 图输入与节点输出共用一个标签命名空间：重名会让描述里的 `[label]` 指代不明。
+    /// 校验图输入标签，并把它们收进 `seen`。
+    ///
+    /// 图输入与节点输出共用**一个**标签命名空间：重名会让描述里的 `[label]`
+    /// 指代不明，所以这里回收的 `seen` 会被后续的节点标签解析继续使用。
+    fn collect_input_labels(&self) -> Result<HashSet<String>> {
         let mut seen: HashSet<String> = HashSet::new();
         for (label, _) in &self.inputs {
             if !is_valid_label(label) {
@@ -3489,9 +3496,14 @@ impl FilterGraphBuilder {
                 )));
             }
         }
+        Ok(seen)
+    }
 
-        // 节点输出标签：显式标签优先（多输出滤镜必须逐个标注），单输出滤镜没写标签时
-        // 按顺序自动分配 `n0`、`n1`…；标签个数必须与滤镜的输出 pad 数一致。
+    /// 解析每个节点的输出标签。
+    ///
+    /// 显式标签优先（多输出滤镜必须逐个标注），单输出滤镜没写标签时按顺序自动
+    /// 分配 `n0`、`n1`…；标签个数必须与滤镜的输出 pad 数一致。
+    fn resolve_node_labels(&self, seen: &mut HashSet<String>) -> Result<Vec<Vec<String>>> {
         let mut node_labels: Vec<Vec<String>> = Vec::with_capacity(self.nodes.len());
         for (index, node) in self.nodes.iter().enumerate() {
             let labels: Vec<String> = if node.outputs().is_empty() {
@@ -3531,9 +3543,14 @@ impl FilterGraphBuilder {
             }
             node_labels.push(labels);
         }
+        Ok(node_labels)
+    }
 
-        // 逐节点解析接线。上游必须是**已经声明过**的标签（图输入或前序节点的输出），
-        // 所以图是顺序搭起来的，不存在前向引用。
+    /// 逐节点解析接线，返回每个节点的上游标签，以及每个标签被消费的次数。
+    ///
+    /// 上游必须是**已经声明过**的标签（图输入或前序节点的输出），所以图是顺序
+    /// 搭起来的，不存在前向引用。
+    fn resolve_wiring(&self, node_labels: &[Vec<String>]) -> Result<Wiring> {
         let mut available: HashMap<String, MediaType> = self
             .inputs
             .iter()
@@ -3596,9 +3613,17 @@ impl FilterGraphBuilder {
             }
             wires.push(resolved);
         }
+        Ok((wires, consumers))
+    }
 
-        // 图输出必须由**节点**产出：图输入是数据入口，不能直接当输出（需要直通时
-        // 插一个 null / anull 节点）。
+    /// 解析图输出：每一路输出都必须落在**某个节点的输出标签**上。
+    ///
+    /// 图输入是数据入口，不能直接当输出（需要直通时插一个 `null`/`anull` 节点）。
+    fn resolve_outputs(
+        &self,
+        node_labels: &[Vec<String>],
+        consumers: &mut HashMap<String, usize>,
+    ) -> Result<Vec<(String, Endpoint)>> {
         let node_output_types: HashMap<&str, MediaType> = node_labels
             .iter()
             .enumerate()
@@ -3607,6 +3632,7 @@ impl FilterGraphBuilder {
                 labels.iter().map(move |label| (label.as_str(), media_type))
             })
             .collect();
+
         let mut resolved_outputs: Vec<(String, Endpoint)> = Vec::with_capacity(self.outputs.len());
         for (index, (upstream, endpoint)) in self.outputs.iter().enumerate() {
             let label = match upstream {
@@ -3633,9 +3659,16 @@ impl FilterGraphBuilder {
             *consumers.entry(label.clone()).or_insert(0) += 1;
             resolved_outputs.push((label, *endpoint));
         }
+        Ok(resolved_outputs)
+    }
 
-        // 每个标签恰好被消费一次：0 次是悬空（图里有死代码，或声明了没人用的输入），
-        // 多于 1 次是 fan-out（FFmpeg 一个输出 pad 只能接一个下游）。
+    /// 每个标签恰好被消费一次：0 次是悬空（图里有死代码，或声明了没人用的
+    /// 输入），多于 1 次是 fan-out（FFmpeg 一个输出 pad 只能接一个下游）。
+    fn check_consumers(
+        &self,
+        node_labels: &[Vec<String>],
+        consumers: &HashMap<String, usize>,
+    ) -> Result<()> {
         for (label, _) in &self.inputs {
             match consumers.get(label).copied().unwrap_or(0) {
                 1 => {}
@@ -3679,13 +3712,17 @@ impl FilterGraphBuilder {
                 }
             }
         }
+        Ok(())
+    }
 
-        // 生成描述：每段一个滤镜（用 `;` 分隔 filterchain，避免 `,` 把前一个滤镜未
-        // 连接的输出自动接到后一个滤镜上），段内先写这一路的输入标签、再写滤镜、最后
-        // 写本节点的输出标签。开放端点的名字就是这些标签，FFmpeg 按名字把它们与
-        // `buffer` / `buffersink` 端点配对（见 `setup_endpoints`）。
+    /// 生成带标签的滤镜图描述。
+    ///
+    /// 每段一个滤镜（用 `;` 分隔 filterchain，避免 `,` 把前一个滤镜未连接的输出
+    /// 自动接到后一个滤镜上），段内先写这一路的输入标签、再写滤镜、最后写本节
+    /// 点的输出标签。开放端点的名字就是这些标签，FFmpeg 按名字把它们与
+    /// `buffer` / `buffersink` 端点配对（见 `setup_endpoints`）。
+    fn build_spec(&self, node_labels: &[Vec<String>], wires: &[Vec<String>]) -> String {
         let mut segments = Vec::with_capacity(self.nodes.len());
-
         for (index, node) in self.nodes.iter().enumerate() {
             let mut segment = String::new();
             for label in &wires[index] {
@@ -3703,8 +3740,12 @@ impl FilterGraphBuilder {
             }
             segments.push(segment);
         }
-        let spec = segments.join(";");
+        segments.join(";")
+    }
 
+    /// 建 `buffer`/`buffersink` 端点、装好端点列表，并由
+    /// `avfilter_graph_config` 完成格式协商。
+    fn assemble(&self, resolved_outputs: &[(String, Endpoint)], spec: &str) -> Result<FilterGraph> {
         let endpoints_in: Vec<(String, Endpoint)> = self
             .inputs
             .iter()
@@ -3730,7 +3771,7 @@ impl FilterGraphBuilder {
         graph.states = vec![ProcessState::Normal; resolved_outputs.len()];
 
         graph
-            .setup_endpoints(&endpoints_in, &endpoints_out, &spec)
+            .setup_endpoints(&endpoints_in, &endpoints_out, spec)
             .with_context(|| format!("Failed to build filter graph: {spec}"))?;
         graph
             .graph
@@ -3738,6 +3779,27 @@ impl FilterGraphBuilder {
             .with_context(|| format!("Failed to configure filter graph: {spec}"))?;
         graph.initialized.store(true, DEFAULT_ORDERING);
         Ok(graph)
+    }
+
+    /// 组装并协商整张图：校验接线与标签、生成带标签的滤镜图描述、按标签建
+    /// `buffer`/`abuffer` 源与 `buffersink`/`abuffersink` 汇，最后由
+    /// `avfilter_graph_config` 完成格式协商。
+    ///
+    /// 校验都在触碰 FFmpeg 之前完成，接线错误报的是 [`RsmediaError::InvalidConfig`]，
+    /// 而不是一句难以定位的 FFmpeg 解析错误。
+    pub fn build(&self) -> Result<FilterGraph> {
+        self.check_arity()?;
+
+        // 图输入与节点输出共用一个标签命名空间：重名会让描述里的 `[label]` 指代
+        // 不明。`seen` 由输入标签起步，节点标签解析接着往里加。
+        let mut seen = self.collect_input_labels()?;
+        let node_labels = self.resolve_node_labels(&mut seen)?;
+        let (wires, mut consumers) = self.resolve_wiring(&node_labels)?;
+        let resolved_outputs = self.resolve_outputs(&node_labels, &mut consumers)?;
+        self.check_consumers(&node_labels, &consumers)?;
+
+        let spec = self.build_spec(&node_labels, &wires);
+        self.assemble(&resolved_outputs, &spec)
     }
 
     /// 画中画 / 水印：把 `over` 叠到 `base` 上（`overlay=x:y`）。
