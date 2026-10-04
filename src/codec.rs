@@ -360,11 +360,19 @@ impl CodecConfig {
 impl CodecConfig {
     /// Media type (video/audio/subtitle/...) this codec handles.
     pub fn media_type(&self) -> MediaType {
-        // `AVCodec::type_` 是 FFmpeg 给的值；`MediaType::from` 对未建模的
-        // `AVMEDIA_TYPE_*` 会 panic，而 `CodecConfig::all()` 会为**每一个**已注册
-        // 的编解码器构造 `CodecConfig`——一个未建模的类型就会让整次枚举中止。
-        // 故走 `from_ffi_checked`，未建模时退到 `UNKNOWN`。
-        MediaType::from_ffi_checked(self.codec.type_).unwrap_or(MediaType::UNKNOWN)
+        // `AVCodec::type_` 是 FFmpeg 给的值。`MediaType::from` 对未建模的取值会
+        // panic，而 `CodecConfig::all()` 会为**每一个**已注册的编解码器调用本方法，
+        // 一个未建模的类型不该让整次枚举中止 —— 但也不能静默退成 `UNKNOWN`：
+        // 那样调用方只会看到"未知类型"，无从知道是哪个编解码器、原始取值是多少。
+        // 故走 `from_ffi_checked`，退化时点名记录（同 `StreamInfo::from_stream`）。
+        MediaType::from_ffi_checked(self.codec.type_).unwrap_or_else(|| {
+            tracing::warn!(
+                "Codec {} reports an unmodelled media type {}; reporting it as unknown",
+                self.name().to_string_lossy(),
+                self.codec.type_
+            );
+            MediaType::UNKNOWN
+        })
     }
 
     /// Whether this is a hardware-accelerated implementation

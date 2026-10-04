@@ -801,6 +801,17 @@ impl<T: ElementType> Default for MediaFrame<T> {
     }
 }
 
+/// 把 FFmpeg 的有符号计数转成 `usize`，负值就地报错。
+///
+/// `as usize` 会把 `-1` 变成 2^64（下游随即申请一个天文数字的缓冲区，容量溢出直接
+/// 中止进程）；折成 `0` 则是拿默认值顶替，诊断只会看到"尺寸为 0"或"0 声道"，看不出
+/// 真正越界的是哪个字段。故在这里点名拒绝——排查时直接看到 `width = -1`。
+fn usize_count(value: i32, name: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        RsmediaError::invalid_config(format!("{name} must be a non-negative count, got {value}"))
+    })
+}
+
 impl<T> MediaFrame<T>
 where
     T: ElementType,
@@ -811,20 +822,16 @@ where
     /// [`SampleFormat::data_layout`]), so it applies to video and audio alike.
     pub fn data_layout(&self) -> Result<DataLayout> {
         // `width` / `height` / `nb_channels` / `nb_samples` are all signed (FFmpeg's
-        // own width). A nonsensical negative must not turn into an enormous `usize`
-        // here — `nb_samples = -1` would otherwise ask for a 2^64-sized buffer and
-        // abort on capacity overflow instead of returning an error. Fold it to 0,
-        // which the layout check rejects cleanly. Construction already rejects
-        // these (`validated`); the fold keeps a hand-edited field from allocating.
+        // own width). See [`usize_count`]: a negative is rejected here by name
+        // instead of being folded to 0, so the message points at the field that is
+        // actually out of range rather than at "size 0".
         if self.media_type == MediaType::VIDEO {
             let format = self
                 .format
                 .into_pixel()
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
-            let (width, height) = (
-                usize::try_from(self.width).unwrap_or(0),
-                usize::try_from(self.height).unwrap_or(0),
-            );
+            let width = usize_count(self.width, "frame width")?;
+            let height = usize_count(self.height, "frame height")?;
             format.data_layout(width, height).ok_or_else(|| {
                 RsmediaError::unsupported(format!(
                     "pixel format {} cannot be stored as sample planes at {}x{}",
@@ -838,8 +845,8 @@ where
                 .format
                 .into_sample()
                 .ok_or_else(|| RsmediaError::invalid_config("Audio frame needs a sample format"))?;
-            let channels = usize::try_from(self.nb_channels).unwrap_or(0);
-            let samples = usize::try_from(self.nb_samples).unwrap_or(0);
+            let channels = usize_count(self.nb_channels, "nb_channels")?;
+            let samples = usize_count(self.nb_samples, "nb_samples")?;
             Ok(format.data_layout(channels, samples))
         }
     }
@@ -875,12 +882,10 @@ where
     ///
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
     pub fn new_video_frame(width: i32, height: i32, format: PixelFormat) -> Result<Self> {
-        // 同 `data_layout`：负尺寸折成 0，让 `data_layout` 返回 `None` 走错误分支，
-        // 而不是把 `-1` 当成 2^64 去分配。
-        let (w, h) = (
-            usize::try_from(width).unwrap_or(0),
-            usize::try_from(height).unwrap_or(0),
-        );
+        // 同上：负尺寸在这里就点名拒绝，而不是折成 0 让 `data_layout` 把错误推给
+        // 像素格式。
+        let w = usize_count(width, "width")?;
+        let h = usize_count(height, "height")?;
         let layout = format.data_layout(w, h).ok_or_else(|| {
             RsmediaError::unsupported(format!(
                 "pixel format {} cannot be stored as sample planes at {width}x{height}",
@@ -933,12 +938,10 @@ where
         nb_samples: i32,
         sample_rate: i32,
     ) -> Result<Self> {
-        // `nb_channels` / `nb_samples` are signed (FFmpeg's width), but a sample
-        // layout needs real counts. Fold a nonsensical one to 0 here so that
-        // `new_audio`'s shared validation rejects it with its own message,
-        // instead of `as usize` turning `-1` into a request for 2^64 planes.
-        let channels = usize::try_from(nb_channels).unwrap_or(0);
-        let samples = usize::try_from(nb_samples).unwrap_or(0);
+        // 同上：声道数/采样数是 FFmpeg 的有符号字段，负值在这里点名拒绝，而不是
+        // 折成 0 让校验报出"0 声道"——那会把真正的问题（负数）藏起来。
+        let channels = usize_count(nb_channels, "nb_channels")?;
+        let samples = usize_count(nb_samples, "nb_samples")?;
         let layout = format.data_layout(channels, samples);
         Self::new_audio(
             format,

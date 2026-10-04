@@ -8,6 +8,7 @@
 //! converts with a single `.into()`.
 
 use std::fmt::{LowerHex, UpperHex};
+use std::str::FromStr;
 
 /// An RGBA color.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
@@ -281,12 +282,12 @@ impl From<Color> for colorous::Color {
     }
 }
 
-impl TryFrom<&str> for Color {
-    type Error = &'static str;
+impl FromStr for Color {
+    type Err = &'static str;
 
     /// Parses `#RRGGBBAA` (the leading `#` is optional; a 6-digit value is
     /// treated as fully opaque).
-    fn try_from(x: &str) -> std::result::Result<Self, Self::Error> {
+    fn from_str(x: &str) -> std::result::Result<Self, Self::Err> {
         let hex = x.trim_start_matches('#');
         let hex = match hex.len() {
             6 => format!("{hex}ff"),
@@ -297,6 +298,16 @@ impl TryFrom<&str> for Color {
         u32::from_str_radix(&hex, 16)
             .map(Self::from)
             .map_err(|_| "Failed to convert `Color` from str: invalid hex")
+    }
+}
+
+impl TryFrom<&str> for Color {
+    type Error = &'static str;
+
+    /// Same grammar as the [`FromStr`] impl, which this delegates to so that
+    /// `str::parse` and `TryFrom` cannot drift apart.
+    fn try_from(x: &str) -> std::result::Result<Self, Self::Error> {
+        x.parse()
     }
 }
 
@@ -450,6 +461,22 @@ mod tests {
             Color::try_from("#0000FF").unwrap(),
             Color::from_rgb(0, 0, 255)
         );
+    }
+
+    /// `FromStr` is the canonical parser; `TryFrom<&str>` delegates to it, so the
+    /// two must agree (including on the error cases).
+    #[test]
+    fn test_from_str_matches_try_from() {
+        for text in ["#FF0000", "00FF00", "#0000FF80", "010203"] {
+            let parsed: Color = text.parse().unwrap();
+            assert_eq!(parsed, Color::try_from(text).unwrap());
+        }
+
+        // Both reject the same inputs, and neither accepts them silently.
+        for text in ["", "#FF00", "#FF00000000", "nothex!!"] {
+            assert!(text.parse::<Color>().is_err(), "{text} should not parse");
+            assert!(Color::try_from(text).is_err(), "{text} should not convert");
+        }
     }
 
     #[test]

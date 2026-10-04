@@ -428,6 +428,20 @@ impl DecoderBuilder {
         }
     }
 
+    /// 校验编解码器报告的原生采样格式落在 rsmedia 的建模范围内。
+    ///
+    /// `AVCodecContext::sample_fmt` 是 FFmpeg 给的值，`SampleFormat::from` 对未
+    /// 列出的取值会 panic。未建模时必须快速失败并点名原始取值，而不是让
+    /// [`Decoder::sample_fmt`] 静默返回一个 `NONE` 默认值——那样调用方按它选出的
+    /// `T` 会在更下游才对不上，排查成本极高。
+    fn modelled_sample_fmt(sample_fmt: i32) -> Result<SampleFormat> {
+        SampleFormat::from_ffi_checked(sample_fmt).ok_or_else(|| {
+            RsmediaError::unsupported(format!(
+                "codec reports sample format {sample_fmt} which rsmedia does not model"
+            ))
+        })
+    }
+
     /// 初始化硬件解码上下文。
     ///
     /// # Errors
@@ -518,12 +532,7 @@ impl DecoderBuilder {
                 // `from_ffi_checked`，未建模时报错而不是中止进程。
                 let format = match output_sample_fmt {
                     Some(fmt) => fmt,
-                    None => SampleFormat::from_ffi_checked(ctx.sample_fmt).ok_or_else(|| {
-                        RsmediaError::unsupported(format!(
-                            "codec reports sample format {} which rsmedia does not model",
-                            ctx.sample_fmt
-                        ))
-                    })?,
+                    None => Self::modelled_sample_fmt(ctx.sample_fmt)?,
                 };
                 Ok(FilterParams::Audio(AudioParams {
                     nb_channels: ctx.ch_layout.nb_channels,
@@ -610,6 +619,13 @@ impl DecoderBuilder {
 
         let output_pix_fmt = self.resolve_output_pix_fmt()?;
         let output_sample_fmt = self.resolve_output_sample_fmt()?;
+
+        // 音频未指定目标格式时，交给调用方的就是编解码器原生格式
+        // （[`Decoder::sample_fmt`] 直接读 `context.sample_fmt`）。不建模的取值
+        // 在这里快速失败，而不是让 getter 静默返回 `NONE` 默认值。
+        if media_type == MediaType::AUDIO && output_sample_fmt.is_none() {
+            Self::modelled_sample_fmt(decode_ctx.sample_fmt)?;
+        }
 
         // 滤镜链声明的图输入格式（见 [`Filter::with_input_format`]）：帧在进图
         // 之前会被转成它，图内 buffer 源按同一格式声明，两者必须一致（声明与
@@ -847,9 +863,19 @@ impl Decoder {
     /// actually arrive.
     #[inline]
     pub fn sample_fmt(&self) -> SampleFormat {
-        self.output_sample_fmt
-            .or_else(|| SampleFormat::from_ffi_checked(self.context.sample_fmt))
-            .unwrap_or(SampleFormat::NONE)
+        if let Some(fmt) = self.output_sample_fmt {
+            return fmt;
+        }
+        // 原生格式已在构建时校验过（音频见 `modelled_sample_fmt`；非音频的
+        // `AV_SAMPLE_FMT_NONE` 本身是建模值），故走到这里仍未建模只可能是编解码器
+        // 在解码途中把它改写了。点名记录原始取值，不留静默默认值。
+        SampleFormat::from_ffi_checked(self.context.sample_fmt).unwrap_or_else(|| {
+            tracing::warn!(
+                "Decoder reports sample format {} which rsmedia does not model; reporting it as NONE",
+                self.context.sample_fmt
+            );
+            SampleFormat::NONE
+        })
     }
 
     #[inline]
