@@ -830,11 +830,7 @@ where
                 .format
                 .into_sample()
                 .ok_or_else(|| RsmediaError::invalid_config("Audio frame needs a sample format"))?;
-            // `nb_channels` is signed; a nonsensical count must not turn into an
-            // enormous `usize` here. Construction already rejects it (`validated`),
-            // the fold keeps a hand-edited field from allocating.
-            let channels = usize::try_from(self.nb_channels).unwrap_or(0);
-            Ok(format.data_layout(channels, self.nb_samples as usize))
+            Ok(format.data_layout(self.nb_channels as usize, self.nb_samples as usize))
         }
     }
 
@@ -923,12 +919,7 @@ where
         nb_samples: i32,
         sample_rate: i32,
     ) -> Result<Self> {
-        // `nb_channels` is signed (FFmpeg's width), but a sample layout needs a
-        // real channel count. Fold a nonsensical one to 0 here so that
-        // `new_audio`'s shared validation rejects it with its own message,
-        // instead of `as usize` turning `-1` into a request for 2^64 planes.
-        let channels = usize::try_from(nb_channels).unwrap_or(0);
-        let layout = format.data_layout(channels, nb_samples as usize);
+        let layout = format.data_layout(nb_channels as usize, nb_samples as usize);
         Self::new_audio(
             format,
             nb_channels,
@@ -946,10 +937,11 @@ where
     /// [`to_avframe`](Self::to_avframe)。
     fn validated(self) -> Result<Self> {
         // 音频的声道数/采样数必须为正。否则平面布局是空列表、`matches` 会接受，
-        // 一个"没有声道"的帧就能一路走到 FFmpeg。声道数是 `i32`（FFmpeg 的宽度），
-        // 所以判据是 `<= 0` 而不是 `== 0`。视频侧的等价约束由
+        // 一个"没有声道"的帧就能一路走到 FFmpeg。两者都是 `i32`（FFmpeg 的宽度），
+        // 所以判据是 `<= 0` 而不是 `== 0`——`nb_samples` 为负时同样要在这里被拒，
+        // 否则它会一路走到 `data_layout` 的 `as usize`。视频侧的等价约束由
         // `PixelFormat::data_layout` 对 0 尺寸返回 `None` 覆盖，无需在此重复。
-        if self.media_type == MediaType::AUDIO && (self.nb_channels <= 0 || self.nb_samples == 0) {
+        if self.media_type == MediaType::AUDIO && (self.nb_channels <= 0 || self.nb_samples <= 0) {
             return Err(RsmediaError::msg(format!(
                 "Audio frame needs a positive sample and channel count, got {} samples x {} channels",
                 self.nb_samples, self.nb_channels

@@ -692,19 +692,29 @@ impl EncoderBuilder {
         }
     }
 
-    /// Build an [`Encoder`].
+    /// 校验与媒体类型相关的设置项，非法值一律 fail fast（不静默退回默认值）。
     ///
-    /// Create an encoder from a [`StreamWriter`](crate::io::StreamWriter).
+    /// 判据**按媒体类型分开**，因为帧率与画面尺寸只有视频才用得到：
+    /// [`Self::effective_time_base`] 里音频走 `1/sample_rate`、字幕走 `1/1000`，
+    /// `frame_rate` 对两者都不成立（它的默认值 30 也只是视频的默认值）。因此在
+    /// 音频编码器上报"帧率非法"没有意义——那个值根本不会被读取，报错只会掩盖
+    /// 真正该看的项目（采样率、声道数）；字幕同理（真正必填的是 ASS header）。
     ///
-    /// # Arguments
+    /// 帧率有两个入口，判据因此分两条：
+    /// * [`Self::with_fps`]（浮点）— 只可能非正或非有限；
+    /// * [`Self::with_frame_rate`]（精确）— 只可能分子非正（分母非零由
+    ///   [`Rational`] 的类型保证）。
     ///
-    /// * `writer` - [`StreamWriter`](crate::io::StreamWriter) to create encoder from.
-    /// * `interleaved` - Whether to use interleaved write.
-    /// * `settings` - Encoder settings to use.
-    pub fn build(self) -> Result<Encoder> {
-        let media_type = self.media_type;
-        // 帧率的合法性分两条判据，对应两个入口：浮点入口只可能"非正/非有限"，
-        // 精确入口只可能"分子非正"（分母非零由 [`Rational`] 的类型保证）。
+    /// # Errors
+    ///
+    /// 视频流的 fps 非正/非有限、`frame_rate` 分子非正、或宽高非正时返回
+    /// [`RsmediaError::InvalidConfig`]。
+    fn validate(&self) -> Result<()> {
+        // 非视频流没有帧率与画面尺寸的概念，直接放行。
+        if self.media_type != MediaType::VIDEO {
+            return Ok(());
+        }
+
         if let Some(fps) = self.fps
             && !(fps > 0.0 && fps.is_finite())
         {
@@ -719,31 +729,300 @@ impl EncoderBuilder {
             )));
         }
 
-        if media_type == MediaType::VIDEO {
-            // `width`/`height` 是 `i32`，会原样写进 `AVCodecContext`（`AVFrame` 的宽高
-            // 也是 `int`）；0 或负数都不是合法画面尺寸（`buffer` 源要求正数）
-            for (name, value) in [("width", self.width), ("height", self.height)] {
-                if value <= 0 {
-                    return Err(RsmediaError::invalid_config(format!(
-                        "{name} must be positive, got {value}"
-                    )));
-                }
+        // `width`/`height` 是 `i32`，会原样写进 `AVCodecContext`（`AVFrame` 的宽高
+        // 也是 `int`）；0 或负数都不是合法画面尺寸（`buffer` 源要求正数）
+        for (name, value) in [("width", self.width), ("height", self.height)] {
+            if value <= 0 {
+                return Err(RsmediaError::invalid_config(format!(
+                    "{name} must be positive, got {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 解析编码器名：显式指定优先，否则按媒体类型取默认值。
+    ///
+    /// # Errors
+    ///
+    /// 媒体类型既没有默认编码器、又未显式指定时返回 `Unsupported`。
+    fn resolve_codec_name(&self) -> Result<String> {
+        match &self.codec_name {
+            Some(codec_name) => Ok(codec_name.clone()),
+            None => match self.media_type {
+                MediaType::VIDEO => Ok(Self::VIDEO_CODEC_NAME.to_string()),
+                MediaType::AUDIO => Ok(Self::AUDIO_CODEC_NAME.to_string()),
+                MediaType::SUBTITLE => Ok(Self::SUBTITLE_CODEC_NAME.to_string()),
+                _ => Err(RsmediaError::unsupported(format!(
+                    "media type {:?}",
+                    self.media_type
+                ))),
+            },
+        }
+    }
+
+    /// CRF 速率控制是否生效。
+    ///
+    /// 三个条件同时成立才生效：视频流 + [`Quality::Crf`] + 编码器在
+    /// `CRF_CAPABLE_CODECS` 里（即有 `crf` 私有选项）。其余情况回退到 `bit_rate`
+    /// 控制并给一次警告——与 ffmpeg CLI 行为一致，只是多一个警告。
+    fn crf_enabled(&self, codec_name: &str) -> bool {
+        if self.media_type != MediaType::VIDEO {
+            return false;
+        }
+        let Some(Quality::Crf(_)) = &self.quality else {
+            return false;
+        };
+        let capable = CRF_CAPABLE_CODECS.contains(&codec_name);
+        if !capable {
+            tracing::warn!(
+                "codec '{codec_name}' has no CRF support, falling back to bit rate control"
+            );
+        }
+        capable
+    }
+
+    /// 解析编码目标格式（像素 + 采样）。
+    ///
+    /// 显式指定的格式立即校验（fail fast），未指定的从编码器支持列表中挑选，
+    /// 避免把帧转进一个编码器不支持的格式后才在写入阶段报错。字幕编码器没有
+    /// 像素/采样格式的概念，跳过协商（返回占位值，不会被写入上下文）。
+    fn resolve_formats(
+        &self,
+        config: &CodecConfig,
+        codec_name: &str,
+    ) -> Result<(PixelFormat, SampleFormat)> {
+        if self.media_type == MediaType::SUBTITLE {
+            return Ok((PixelFormat::YUV420P, SampleFormat::FLTP));
+        }
+        Ok((
+            self.resolve_pixel_format(config, codec_name)?,
+            self.resolve_sample_format(config, codec_name)?,
+        ))
+    }
+
+    /// 构造滤镜图。
+    ///
+    /// 返回图本身，以及滤镜链声明的**输入格式**（未声明时为 `None`，调用方按
+    /// 编码器协商格式处理）。没有滤镜时返回 `(None, None)`。
+    ///
+    /// # Errors
+    ///
+    /// 滤镜链用在不支持滤镜的媒体类型（字幕等）上时返回 `InvalidConfig`；
+    /// 滤镜本身的媒体类型与可用性校验在 `FilterGraph::build` 内完成。
+    fn build_filter_graph(
+        &self,
+        input_time_base: Rational,
+        pixel_format: PixelFormat,
+        sample_format: SampleFormat,
+        pixel_aspect: Rational,
+    ) -> Result<(Option<FilterGraph>, Option<FrameFormat>)> {
+        let Some(filters) = self.filters.as_ref() else {
+            return Ok((None, None));
+        };
+
+        // 滤镜链可声明要求的输入格式（如 GIF 调色板链要求 RGB 输入、输出
+        // pal8；音频链可声明输入采样格式）；未声明时输入格式=编码器协商格式
+        // （src/sink 同格式，零行为变化）。
+        let input_format = filters.iter().find_map(|f| f.input_format());
+
+        let params = match self.media_type {
+            MediaType::VIDEO => FilterParams::Video(VideoParams {
+                width: self.width,
+                height: self.height,
+                src_format: input_format
+                    .and_then(FrameFormat::into_pixel)
+                    .unwrap_or(pixel_format),
+                format: pixel_format,
+                time_base: input_time_base,
+                frame_rate: self.frame_rate,
+                pixel_aspect,
+            }),
+            MediaType::AUDIO => FilterParams::Audio(AudioParams {
+                nb_channels: self.nb_channels,
+                sample_rate: self.sample_rate,
+                format: sample_format,
+                src_format: input_format
+                    .and_then(FrameFormat::into_sample)
+                    .unwrap_or(sample_format),
+                time_base: input_time_base, // time_base = 1 / sample_rate
+            }),
+            _ => {
+                return Err(RsmediaError::invalid_config(format!(
+                    "a {:?} filter cannot be used on this stream",
+                    self.media_type
+                )));
+            }
+        };
+
+        Ok((
+            Some(FilterGraph::build(&params, filters.as_slice())?),
+            input_format,
+        ))
+    }
+
+    /// 把滤镜图的输出帧率/尺寸采纳为编码器参数。
+    ///
+    /// 滤镜可能改变输出帧率/时间基（如 `framerate`、`fps`、`setpts`）以及输出
+    /// 尺寸（如 `scale`、`crop`、`pad`、`rotate`、`transpose`）。此时编码器必须
+    /// 采用滤镜的输出值，否则按输入参数推导的 `time_base` 会与滤镜输出 pts 不匹
+    /// 配（B 帧重排 dts 乱序、mux 报错），或 codec context 尺寸与滤镜输出帧尺寸
+    /// 不符导致 `send_frame` 报错。
+    ///
+    /// 只有视频受此影响：音频/字幕的滤镜图不产出帧率与尺寸，查询也没有意义。
+    fn apply_filter_output(
+        &self,
+        graph: Option<&mut FilterGraph>,
+        ctx: &mut AVCodecContext,
+    ) -> Result<()> {
+        let Some(graph) = graph else {
+            return Ok(());
+        };
+        if self.media_type != MediaType::VIDEO {
+            return Ok(());
+        }
+
+        let out_fr = graph.output_frame_rate()?;
+        if out_fr.num() > 0 && out_fr != self.frame_rate {
+            // 分子为正 ⇒ 倒数必然存在（`Rational` 的分母恒不为零）。
+            let time_base = out_fr.inverse()?;
+            tracing::info!(
+                "Filter changes frame rate: {} -> {}",
+                self.frame_rate,
+                out_fr
+            );
+            ctx.set_framerate(out_fr.into());
+            ctx.set_time_base(time_base.into());
+        }
+
+        let (fw, fh) = graph.output_size()?;
+        if fw > 0 && fh > 0 && (fw != ctx.width || fh != ctx.height) {
+            tracing::info!(
+                "Filter changes size: {}x{} -> {}x{}",
+                ctx.width,
+                ctx.height,
+                fw,
+                fh
+            );
+            ctx.set_width(fw);
+            ctx.set_height(fh);
+        }
+        Ok(())
+    }
+
+    /// 初始化硬件加速上下文（仅视频调用）。
+    ///
+    /// # Errors
+    ///
+    /// 设备创建失败，或 `setup_encoder_frames` 失败时返回错误。
+    fn init_hw_context(
+        &self,
+        cfg: HWDeviceConfig,
+        ctx: &mut AVCodecContext,
+    ) -> Result<Arc<HWContext>> {
+        tracing::info!(
+            "Video Encoder with HW acceleration codec: {:?}, config: {:#?}",
+            self.codec_name,
+            cfg
+        );
+
+        // *注意*: setup_encoder_frames 会根据 HW 能力修改 ctx.pix_fmt
+        let (width, height) = (ctx.width, ctx.height);
+        HWContext::new(cfg)
+            .and_then(|hw| {
+                hw.setup_encoder_frames(
+                    ctx,
+                    width,
+                    height,
+                    self.hw_pool_size
+                        .unwrap_or(crate::hwaccel::DEFAULT_HW_POOL_SIZE),
+                )?;
+                Ok(hw)
+            })
+            .context("Hardware acceleration context initialization failed")
+    }
+
+    /// 组装 `avcodec_open2` 的私有选项字典。
+    ///
+    /// `quality`/`profile`/`level` 写成 AVOption；调用方透传的 `user_opts` 只用于
+    /// 补充 builder 未建模的键——同一个键两边都给时以透传为准（typed setter 写的
+    /// 是 `AVCodecContext` 字段，`avcodec_open2` 在字段写入之后才应用这个字典，
+    /// 见 `with_options` 的文档）。
+    fn build_codec_options(&self, use_crf: bool, user_opts: Option<Options>) -> Options {
+        let mut opts = Options::new();
+        if use_crf && let Some(Quality::Crf(crf)) = &self.quality {
+            opts.set("crf", crf.to_string());
+        }
+        if self.media_type == MediaType::VIDEO {
+            if let Some(profile) = &self.profile {
+                opts.set("profile", profile.as_option_str());
+            }
+            if let Some(level) = &self.level {
+                opts.set("level", level);
             }
         }
 
-        let codec_name: String = match &self.codec_name {
-            Some(codec_name) => codec_name.clone(),
-            None => match media_type {
-                MediaType::VIDEO => Self::VIDEO_CODEC_NAME.to_string(),
-                MediaType::AUDIO => Self::AUDIO_CODEC_NAME.to_string(),
-                MediaType::SUBTITLE => Self::SUBTITLE_CODEC_NAME.to_string(),
-                _ => {
-                    return Err(RsmediaError::unsupported(format!(
-                        "media type {media_type:?}",
-                    )));
-                }
-            },
+        let Some(user_opts) = user_opts else {
+            return opts;
         };
+        // 这里能直接看出重叠的只有刚写进 `opts` 的 `crf`/`profile`/`level`；其余
+        // typed setter 直接写上下文字段，是否被字典覆盖只有 `avcodec_open2` 内部
+        // 知道，无法在此检测，故在 `with_options` 文档里声明规则。
+        for (key, _) in user_opts.iter() {
+            if opts.contains_key(key) {
+                tracing::warn!(
+                    "codec option '{key}' from with_options overrides the builder setting \
+                     for the same AVOption"
+                );
+            }
+        }
+        opts.merge(user_opts);
+        opts
+    }
+
+    /// 字幕编码器写入 ASS 脚本 header。
+    ///
+    /// 字幕编码器（mov_text/subrip 等）init 时会执行
+    /// `ff_ass_split(avctx->subtitle_header)`，未设置时返回 NULL →
+    /// `AVERROR_INVALIDDATA`。header 必须由调用方提供：转码时从解码器侧传递
+    /// （解码器 open 时填充），authoring 场景用 [`Self::with_subtitle_header`]
+    /// 显式给出。
+    ///
+    /// # Errors
+    ///
+    /// 字幕流未提供 header 时返回 `InvalidConfig`。
+    fn apply_subtitle_header(&self, ctx: &mut AVCodecContext) -> Result<()> {
+        if self.media_type != MediaType::SUBTITLE {
+            return Ok(());
+        }
+        let Some(header) = &self.subtitle_header else {
+            return Err(RsmediaError::invalid_config(
+                "subtitle encoder requires an ASS script header: provide it via \
+                 EncoderBuilder::with_subtitle_header, or forward it from the decoded \
+                 subtitle stream in a transcode pipeline",
+            ));
+        };
+        let header_c =
+            std::ffi::CString::new(header.as_str()).context("Invalid subtitle header")?;
+        ctx.set_subtitle_header(header_c.as_c_str())
+            .context("Failed to set subtitle header")?;
+        Ok(())
+    }
+
+    /// Build an [`Encoder`].
+    ///
+    /// Create an encoder from a [`StreamWriter`](crate::io::StreamWriter).
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - [`StreamWriter`](crate::io::StreamWriter) to create encoder from.
+    /// * `interleaved` - Whether to use interleaved write.
+    /// * `settings` - Encoder settings to use.
+    pub fn build(mut self) -> Result<Encoder> {
+        let media_type = self.media_type;
+        self.validate()?;
+
+        let codec_name = self.resolve_codec_name()?;
 
         let codec = AVCodec::find_encoder_by_name(&strutils::str_to_cstring(&codec_name)?)
             .ok_or_else(|| {
@@ -752,35 +1031,11 @@ impl EncoderBuilder {
                 ))
             })?;
 
-        // CRF 速率控制：仅对支持 crf 私有选项的视频编码器生效，其余编码器
-        // 回退到 bit_rate 控制（与 ffmpeg CLI 行为一致，只是多一个警告）。
-        let use_crf = media_type == MediaType::VIDEO
-            && match self.quality {
-                Some(Quality::Crf(_)) => {
-                    let capable = CRF_CAPABLE_CODECS.contains(&codec_name.as_str());
-                    if !capable {
-                        tracing::warn!(
-                            "codec '{codec_name}' has no CRF support, falling back to bit rate control"
-                        );
-                    }
-                    capable
-                }
-                _ => false,
-            };
+        let use_crf = self.crf_enabled(&codec_name);
 
         let mut encode_ctx = AVCodecContext::new(&codec);
         let config = CodecConfig::from_codec(codec);
-        // P0-2 自动格式协商：显式指定的格式立即校验（fail fast），未指定的
-        // 从编码器支持列表中挑选，避免把帧转进一个编码器不支持的格式后才
-        // 在写入阶段报错。字幕编码器无像素/采样格式概念，跳过协商。
-        let (pixel_format, sample_format) = if media_type == MediaType::SUBTITLE {
-            (PixelFormat::YUV420P, SampleFormat::FLTP)
-        } else {
-            (
-                self.resolve_pixel_format(&config, &codec_name)?,
-                self.resolve_sample_format(&config, &codec_name)?,
-            )
-        };
+        let (pixel_format, sample_format) = self.resolve_formats(&config, &codec_name)?;
 
         self.setup_codec_context(
             &mut encode_ctx,
@@ -790,185 +1045,32 @@ impl EncoderBuilder {
             &config,
         )?;
 
-        // 编码器输入时间基：与滤镜图 buffer 源（下方 FilterParams）和"滤镜未改写
+        // 编码器输入时间基：与滤镜图 buffer 源（见 `build_filter_graph`）和"滤镜未改写
         // 帧率时的编码器 time_base"同源。必须在 self 被部分 move 之前求值。
         let input_time_base = self.effective_time_base()?;
 
-        // 在 hw_device_config / codec_opts 被 move 之前构造 filter graph：
-        // 此位置 self 尚未被部分 move，可直接借用 self 计算 time_base。
-        // 滤镜链可声明要求的输入格式（如 GIF 调色板链要求 RGB 输入、输出
-        // pal8；音频链可声明输入采样格式）；未声明时输入格式=编码器协商格式
-        // （src/sink 同格式，零行为变化）。
-        let filter_input_format = self
-            .filters
-            .as_ref()
-            .and_then(|filters| filters.iter().find_map(|f| f.input_format()));
-        let mut filter_graph = if let Some(filters) = self.filters.as_ref() {
-            let filter_params = match media_type {
-                MediaType::VIDEO => {
-                    FilterParams::Video(VideoParams {
-                        width: self.width,
-                        height: self.height,
-                        src_format: filter_input_format
-                            .and_then(FrameFormat::into_pixel)
-                            .unwrap_or(pixel_format),
-                        format: pixel_format,
-                        time_base: input_time_base,
-                        frame_rate: self.frame_rate,
-                        // sample aspect ratio (0/1 if unknown)
-                        pixel_aspect: encode_ctx.sample_aspect_ratio.into(),
-                    })
-                }
-                MediaType::AUDIO => {
-                    FilterParams::Audio(AudioParams {
-                        nb_channels: self.nb_channels,
-                        sample_rate: self.sample_rate,
-                        format: sample_format,
-                        src_format: filter_input_format
-                            .and_then(FrameFormat::into_sample)
-                            .unwrap_or(sample_format),
-                        time_base: input_time_base, // time_base = 1 / sample_rate
-                    })
-                }
-                _ => {
-                    return Err(RsmediaError::invalid_config(format!(
-                        "a {media_type:?} filter cannot be used on this stream"
-                    )));
-                }
-            };
-            // 滤镜链的媒体类型与可用性校验都在 `init` 内（缺失滤镜 →
-            // `InvalidConfig`），这里不再重复一遍。
-            let graph = FilterGraph::build(&filter_params, filters.as_slice())?;
-            Some(graph)
+        // 构造滤镜图（在 `hw_device_config` / `codec_opts` 被 move 之前）。
+        let (mut filter_graph, filter_input_format) = self.build_filter_graph(
+            input_time_base,
+            pixel_format,
+            sample_format,
+            encode_ctx.sample_aspect_ratio.into(),
+        )?;
+        self.apply_filter_output(filter_graph.as_mut(), &mut encode_ctx)?;
+
+        let hw_context = if media_type == MediaType::VIDEO {
+            match self.hw_device_config.take() {
+                Some(cfg) => Some(self.init_hw_context(cfg, &mut encode_ctx)?),
+                None => None,
+            }
         } else {
             None
         };
 
-        // 滤镜可能改变输出帧率/时间基（如 `framerate`、`fps`、`setpts`）以及输出尺寸
-        // （如 `scale`、`crop`、`pad`、`rotate`、`transpose`）。此时编码器必须采用滤镜
-        // 输出帧率/时间基/尺寸，否则按输入参数推导的 time_base 会与滤镜输出 pts 不匹配
-        // （B 帧重排 dts 乱序、mux 报错），或 codec context 尺寸与滤镜输出帧尺寸不符
-        // 导致 send_frame 报错。
-        // 注：滤镜输出时间基无需在此缓存——`send_frame_post_filter` 会在发送前按需
-        // 从滤镜图实时查询，用于把 pts 换算到编码器时间基。
-        let (filter_frame_rate, filter_size) = match filter_graph.as_mut() {
-            Some(graph) => (Some(graph.output_frame_rate()?), Some(graph.output_size()?)),
-            None => (None, None),
-        };
-        if media_type == MediaType::VIDEO {
-            if let Some(out_fr) = filter_frame_rate {
-                let changed = out_fr != self.frame_rate;
-                if out_fr.num() > 0 && changed {
-                    // 分子为正 ⇒ 倒数必然存在（`Rational` 的分母恒不为零）。
-                    let time_base = out_fr.inverse()?;
-                    tracing::info!(
-                        "Filter changes frame rate: {} -> {}",
-                        self.frame_rate,
-                        out_fr
-                    );
-                    encode_ctx.set_framerate(out_fr.into());
-                    encode_ctx.set_time_base(time_base.into());
-                }
-            }
-            if let Some((fw, fh)) = filter_size
-                && fw > 0
-                && fh > 0
-                && (fw != encode_ctx.width || fh != encode_ctx.height)
-            {
-                tracing::info!(
-                    "Filter changes size: {}x{} -> {}x{}",
-                    encode_ctx.width,
-                    encode_ctx.height,
-                    fw,
-                    fh
-                );
-                encode_ctx.set_width(fw);
-                encode_ctx.set_height(fh);
-            }
-        }
+        let user_opts = self.codec_opts.take();
+        let opts = self.build_codec_options(use_crf, user_opts);
 
-        let hw_context = self
-            .hw_device_config
-            .filter(|_cfg| {
-                // hardware acceleration enabled for video
-                media_type == MediaType::VIDEO
-            })
-            .map(|cfg| {
-                // codec support or not for hardware acceleration
-                tracing::info!(
-                    "Video Encoder with HW acceleration codec: {:?}, config: {:#?}",
-                    self.codec_name,
-                    cfg
-                );
-
-                // create hardware context
-                let (width, height) = (encode_ctx.width, encode_ctx.height);
-                HWContext::new(cfg)
-                    .and_then(|ctx| {
-                        // *注意*: setup_encoder_frames 会根据 HW 能力修改 encode_ctx.pix_fmt
-                        ctx.setup_encoder_frames(
-                            &mut encode_ctx,
-                            width,
-                            height,
-                            self.hw_pool_size
-                                .unwrap_or(crate::hwaccel::DEFAULT_HW_POOL_SIZE),
-                        )?;
-                        Ok(ctx)
-                    })
-                    .context("Hardware acceleration context initialization failed")
-            })
-            .transpose()?;
-
-        // 打开编码器前的私有选项：quality/profile/level 写成 AVOption；用户
-        // codec_opts 只用于补充 builder 未建模的键 —— 同一个键两边都给时以用户透传为准
-        // （typed setter 写的是 `AVCodecContext` 字段，`avcodec_open2` 在字段写入之后
-        // 才应用这个字典，见 `EncoderBuilder::with_options` 文档）。
-        let mut opts = Options::new();
-        if use_crf && let Some(Quality::Crf(crf)) = self.quality {
-            opts.set("crf", crf.to_string());
-        }
-        if media_type == MediaType::VIDEO {
-            if let Some(profile) = self.profile {
-                opts.set("profile", profile.as_option_str());
-            }
-            if let Some(level) = &self.level {
-                opts.set("level", level);
-            }
-        }
-        if let Some(user_opts) = self.codec_opts {
-            // 这里能直接看出重叠的只有刚写进 `opts` 的 `crf`/`profile`/`level`；其余
-            // typed setter 直接写上下文字段，是否被字典覆盖只有 `avcodec_open2` 内部
-            // 知道，无法在此检测，故在 `with_options` 文档里声明规则。
-            for (key, _) in user_opts.iter() {
-                if opts.contains_key(key) {
-                    tracing::warn!(
-                        "codec option '{key}' from with_options overrides the builder setting \
-                         for the same AVOption"
-                    );
-                }
-            }
-            opts.merge(user_opts);
-        }
-
-        // 字幕编码器（mov_text/subrip 等）init 时会执行
-        // `ff_ass_split(avctx->subtitle_header)`，未设置时返回 NULL →
-        // AVERROR_INVALIDDATA。header 必须由调用方提供：转码时从解码器侧
-        // 传递（解码器 open 时填充），authoring 场景用
-        // [`EncoderBuilder::with_subtitle_header`] 显式给出。
-        if media_type == MediaType::SUBTITLE {
-            let Some(header) = &self.subtitle_header else {
-                return Err(RsmediaError::invalid_config(
-                    "subtitle encoder requires an ASS script header: provide it via \
-                     EncoderBuilder::with_subtitle_header, or forward it from the decoded \
-                     subtitle stream in a transcode pipeline",
-                ));
-            };
-            let header_c =
-                std::ffi::CString::new(header.as_str()).context("Invalid subtitle header")?;
-            encode_ctx
-                .set_subtitle_header(header_c.as_c_str())
-                .context("Failed to set subtitle header")?;
-        }
+        self.apply_subtitle_header(&mut encode_ctx)?;
 
         encode_ctx
             .open(opts.into_dict())

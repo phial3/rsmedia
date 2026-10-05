@@ -302,14 +302,23 @@ impl DecoderBuilder {
         Ok(())
     }
 
-    /// 某个仅对视频解码器生效的配置项被用于其它媒体类型时构造的错误。
+    /// 某个仅对某一类解码器生效的配置项被用于其它媒体类型时构造的错误。
     ///
     /// 属于调用方错误（用了只对某类解码器生效的 setter），因此报 `InvalidConfig`，
     /// 而不是落到笼统的 `Other`。
-    fn option_only_for(opt: &'static str, value: String, media_type: MediaType) -> RsmediaError {
+    ///
+    /// `required` 是该选项**本来只对哪一类解码器生效**，`media_type` 是调用方实际
+    /// 把它用在了哪一类上。两者必须分开传：只传后者会说出"with_pix_fmt 只对音频
+    /// 解码器有效，而你用的就是音频"这种自相矛盾、也指不出该改成什么的文案。
+    fn option_only_for(
+        opt: &'static str,
+        value: String,
+        required: MediaType,
+        media_type: MediaType,
+    ) -> RsmediaError {
         RsmediaError::invalid_config(format!(
             "{opt}({value}) is only valid for {} decoders, got media type: {media_type:?}",
-            media_type.get_media_name()
+            required.get_media_name()
         ))
     }
 
@@ -375,11 +384,158 @@ impl DecoderBuilder {
         self.build_from_reader(&reader)
     }
 
+    /// 输出像素格式：仅视频有效。
+    ///
+    /// 任何能表示为数据平面的格式都接受（布局由描述符推导，见
+    /// `PixelFormat::data_layout`）；位流 / 调色板 / 硬件格式在构建期快速失败，
+    /// 而不是拖到运行时。解码输出经 swscale 统一转换到目标格式。非视频类型配置
+    /// 了 `pix_fmt` 视为调用方错误，快速失败而非静默忽略。
+    fn resolve_output_pix_fmt(&self) -> Result<PixelFormat> {
+        match (self.media_type, self.pix_fmt) {
+            (MediaType::VIDEO, Some(fmt)) => {
+                Self::ensure_pix_fmt_storable(fmt)?;
+                Ok(fmt)
+            }
+            (_, None) => Ok(PixelFormat::YUV420P),
+            (media_type, Some(fmt)) => Err(Self::option_only_for(
+                "with_pix_fmt",
+                format!("{fmt:?}"),
+                MediaType::VIDEO,
+                media_type,
+            )),
+        }
+    }
+
+    /// 输出采样格式：仅音频有效。
+    ///
+    /// `None` = 保留编解码器原生格式（默认），代价为零；指定后解码帧在进滤镜图
+    /// 之前统一转换到目标格式。非音频类型配置了 `sample_fmt` 视为调用方错误，
+    /// 快速失败而非静默忽略。
+    fn resolve_output_sample_fmt(&self) -> Result<Option<SampleFormat>> {
+        match (self.media_type, self.sample_fmt) {
+            (MediaType::AUDIO, None) => Ok(None),
+            (MediaType::AUDIO, Some(fmt)) if fmt != SampleFormat::NONE => Ok(Some(fmt)),
+            (MediaType::AUDIO, Some(fmt)) => Err(RsmediaError::invalid_config(format!(
+                "with_sample_fmt({fmt:?}): not a usable output sample format"
+            ))),
+            (media_type, Some(fmt)) => Err(Self::option_only_for(
+                "with_sample_fmt",
+                format!("{fmt:?}"),
+                MediaType::AUDIO,
+                media_type,
+            )),
+            (_, None) => Ok(None),
+        }
+    }
+
+    /// 初始化硬件解码上下文。
+    ///
+    /// # Errors
+    ///
+    /// 设备创建失败、`setup_decoder_frames` 失败，或编解码器选中的硬件像素格式
+    /// rsmedia 不建模时返回错误。
+    fn init_hw_context(
+        &self,
+        mut cfg: HWDeviceConfig,
+        codec: &AVCodec,
+        ctx: &mut AVCodecContext,
+        width: i32,
+        height: i32,
+    ) -> Result<Arc<HWContext>> {
+        // 以 `avcodec_get_hw_config` 的声明为准回写配置：hw frames 按这个字段
+        // 分配，配置里的值若与编解码器声明不符，会得到错误的输出格式。
+        // 未知格式（绑定/FFmpeg 版本不匹配）报错而不是 panic。
+        let hw_pixel = cfg
+            .device_type
+            .find_hw_pixel_format_with_codec(codec)
+            .ok_or_else(|| {
+                // 名字来自 FFmpeg，可能是非 UTF-8；它只用于文案，
+                // 拿不到合法字符串并不改变"不支持"这一结论。
+                let codec_name =
+                    strutils::cstr_to_string(codec.name()).unwrap_or_else(|_| "unknown".to_owned());
+                RsmediaError::unsupported(format!(
+                    "hardware decoding is not available for codec: {codec_name}"
+                ))
+            })?;
+        cfg.hw_pixel_format = PixelFormat::from_ffi_checked(hw_pixel).ok_or_else(|| {
+            RsmediaError::unsupported(format!(
+                "codec {} selected hardware pixel format {hw_pixel}, which rsmedia does not model",
+                strutils::cstr_to_string_lossy(codec.name())
+            ))
+        })?;
+
+        tracing::info!(
+            "Video decoder with HW acceleration codec: {:?}, hw_pixel: {:?}, config: {:#?}",
+            codec.name(),
+            cfg.hw_pixel_format,
+            cfg
+        );
+
+        // 注意：setup_decoder_frames 可能会改变 ctx.pix_fmt
+        HWContext::new(cfg)
+            .and_then(|hw| {
+                hw.setup_decoder_frames(
+                    ctx,
+                    width,
+                    height,
+                    self.hw_pool_size
+                        .unwrap_or(crate::hwaccel::DEFAULT_HW_POOL_SIZE),
+                )?;
+                Ok(hw)
+            })
+            .context("Hardware acceleration context initialization failed")
+    }
+
+    /// 由解码器状态推导滤镜图的输入/输出参数。
+    ///
+    /// sink 端格式 = 解码输出格式：图内负责把链的输出转回来，`MediaFrame` 因此
+    /// 拿到的仍是 `with_pix_fmt` / `with_sample_fmt` 承诺的格式。
+    fn build_filter_params(
+        &self,
+        ctx: &AVCodecContext,
+        width: i32,
+        height: i32,
+        output_pix_fmt: PixelFormat,
+        output_sample_fmt: Option<SampleFormat>,
+        filter_input_format: Option<FrameFormat>,
+    ) -> Result<FilterParams> {
+        match self.media_type {
+            MediaType::VIDEO => Ok(FilterParams::Video(VideoParams {
+                width,
+                height,
+                src_format: filter_input_format
+                    .and_then(FrameFormat::into_pixel)
+                    .unwrap_or(output_pix_fmt),
+                format: output_pix_fmt,
+                time_base: ctx.time_base.into(),
+                frame_rate: ctx.framerate.into(),
+                pixel_aspect: ctx.sample_aspect_ratio.into(),
+            })),
+            MediaType::AUDIO => {
+                // sink 格式 = 解码输出采样格式（未指定则保留原生）。
+                let format = output_sample_fmt.unwrap_or(SampleFormat::from(ctx.sample_fmt));
+                Ok(FilterParams::Audio(AudioParams {
+                    nb_channels: ctx.ch_layout.nb_channels,
+                    sample_rate: ctx.sample_rate,
+                    format,
+                    src_format: filter_input_format
+                        .and_then(FrameFormat::into_sample)
+                        .unwrap_or(format),
+                    time_base: ctx.time_base.into(),
+                }))
+            }
+            _ => Err(RsmediaError::invalid_config(format!(
+                "a {:?} filter cannot be used on this stream",
+                self.media_type
+            ))),
+        }
+    }
+
     /// 用给定的 reader 构建**裸** [`Decoder`]（不持有 reader）。
     ///
     /// 高级/内部场景使用（如 mux 多流共享同一 reader）。解码时需每帧传入
     /// reader，且不支持 seek。
-    pub fn build_from_reader<R: Reader>(self, reader: &R) -> Result<Decoder> {
+    pub fn build_from_reader<R: Reader>(mut self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
         let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
         let input_stream =
@@ -416,62 +572,24 @@ impl DecoderBuilder {
         let init_width = decode_ctx.width;
         let init_height = decode_ctx.height;
 
-        let hw_context = self
-            .hw_device_config
-            .filter(|_cfg| {
-                // hardware acceleration enabled for video
-                media_type == MediaType::VIDEO
-            })
-            .map(|mut cfg| {
-                // codec support or not for hardware acceleration
-                let hw_pixel = cfg
-                    .device_type
-                    .find_hw_pixel_format_with_codec(&codec)
-                    .ok_or_else(|| {
-                        // 名字来自 FFmpeg，可能是非 UTF-8；它只用于文案，
-                        // 拿不到合法字符串并不改变"不支持"这一结论。
-                        let codec_name = strutils::cstr_to_string(codec.name())
-                            .unwrap_or_else(|_| "unknown".to_owned());
-                        RsmediaError::unsupported(format!(
-                            "hardware decoding is not available for codec: {codec_name}"
-                        ))
-                    })?;
+        let hw_context = if media_type == MediaType::VIDEO {
+            match self.hw_device_config.take() {
+                Some(cfg) => Some(self.init_hw_context(
+                    cfg,
+                    &codec,
+                    &mut decode_ctx,
+                    init_width,
+                    init_height,
+                )?),
+                None => None,
+            }
+        } else {
+            None
+        };
 
-                // 以 `avcodec_get_hw_config` 的声明为准回写配置：hw frames 按这个字段
-                // 分配，配置里的值若与编解码器声明不符，会得到错误的输出格式。
-                // 未知格式（绑定/FFmpeg 版本不匹配）报错而不是 panic。
-                cfg.hw_pixel_format = PixelFormat::from_ffi_checked(hw_pixel).ok_or_else(|| {
-                    RsmediaError::unsupported(format!(
-                        "codec {} selected hardware pixel format {hw_pixel}, which rsmedia does not model",
-                        strutils::cstr_to_string_lossy(codec.name())
-                    ))
-                })?;
-
-                tracing::info!(
-                    "Video decoder with HW acceleration codec: {:?}, hw_pixel: {:?}, config: {:#?}",
-                    codec.name(),
-                    cfg.hw_pixel_format,
-                    cfg
-                );
-
-                // create hardware context
-                HWContext::new(cfg)
-                    .and_then(|ctx| {
-                        // 注意：setup_decoder_frames 可能会改变 decode_ctx.pix_fmt
-                        ctx.setup_decoder_frames(
-                            &mut decode_ctx,
-                            init_width,
-                            init_height,
-                            self.hw_pool_size
-                                .unwrap_or(crate::hwaccel::DEFAULT_HW_POOL_SIZE),
-                        )?;
-                        Ok(ctx)
-                    })
-                    .context("Hardware acceleration context initialization failed")
-            })
-            .transpose()?;
-
-        let dict = self.codec_opts.and_then(|opts| opts.into_dict());
+        // `take()` 而非直接 `and_then`：后者会部分移出 `self.codec_opts`，之后就
+        // 不能再整体借用 `self`（后面的 `resolve_output_*` 需要 `&self`）。
+        let dict = self.codec_opts.take().and_then(|opts| opts.into_dict());
         decode_ctx
             .open(dict)
             .context("Failed to open decoder for stream")?;
@@ -479,45 +597,8 @@ impl DecoderBuilder {
         let stream_info = StreamInfo::from_stream(input_stream)?;
         tracing::info!("{stream_info}");
 
-        // 输出像素格式：仅视频有效。任何能表示为数据平面的格式都接受
-        // （布局由描述符推导，见 `PixelFormat::data_layout`）；位流 / 调色板 /
-        // 硬件格式在构建期快速失败，而不是拖到运行时。解码输出经 swscale 统一转换到目标格式。
-        // 非视频类型配置了 pix_fmt 视为调用方错误，快速失败而非静默忽略。
-        let output_pix_fmt = match (media_type, self.pix_fmt) {
-            (MediaType::VIDEO, Some(fmt)) => {
-                Self::ensure_pix_fmt_storable(fmt)?;
-                fmt
-            }
-            (_, None) => PixelFormat::YUV420P,
-            (media_type, Some(fmt)) => {
-                return Err(Self::option_only_for(
-                    "with_pix_fmt",
-                    format!("{fmt:?}"),
-                    media_type,
-                ));
-            }
-        };
-
-        // 输出采样格式：仅音频有效。`None` = 保留编解码器原生格式（默认），
-        // 代价为零；指定后解码帧在进滤镜图之前统一转换到目标格式。
-        // 非音频类型配置了 sample_fmt 视为调用方错误，快速失败而非静默忽略。
-        let output_sample_fmt = match (media_type, self.sample_fmt) {
-            (MediaType::AUDIO, None) => None,
-            (MediaType::AUDIO, Some(fmt)) if fmt != SampleFormat::NONE => Some(fmt),
-            (MediaType::AUDIO, Some(fmt)) => {
-                return Err(RsmediaError::invalid_config(format!(
-                    "with_sample_fmt({fmt:?}): not a usable output sample format"
-                )));
-            }
-            (media_type, Some(fmt)) => {
-                return Err(Self::option_only_for(
-                    "with_sample_fmt",
-                    format!("{fmt:?}"),
-                    media_type,
-                ));
-            }
-            (_, None) => None,
-        };
+        let output_pix_fmt = self.resolve_output_pix_fmt()?;
+        let output_sample_fmt = self.resolve_output_sample_fmt()?;
 
         // 滤镜链声明的图输入格式（见 [`Filter::with_input_format`]）：帧在进图
         // 之前会被转成它，图内 buffer 源按同一格式声明，两者必须一致（声明与
@@ -528,51 +609,26 @@ impl DecoderBuilder {
             .as_ref()
             .and_then(|filters| filters.iter().find_map(|f| f.input_format()));
 
-        let filter_graph = if let Some(filters) = self.filters {
-            let filter_params = match media_type {
-                MediaType::VIDEO => FilterParams::Video(VideoParams {
-                    width: init_width,
-                    height: init_height,
-                    src_format: filter_input_format
-                        .and_then(FrameFormat::into_pixel)
-                        .unwrap_or(output_pix_fmt),
-                    // sink 格式 = 解码输出格式：图内负责把链的输出转回来，
-                    // `MediaFrame` 因此拿到的仍是 `with_pix_fmt` 承诺的格式。
-                    format: output_pix_fmt,
-                    time_base: decode_ctx.time_base.into(),
-                    frame_rate: decode_ctx.framerate.into(),
-                    pixel_aspect: decode_ctx.sample_aspect_ratio.into(),
-                }),
-                MediaType::AUDIO => FilterParams::Audio(AudioParams {
-                    nb_channels: decode_ctx.ch_layout.nb_channels,
-                    sample_rate: decode_ctx.sample_rate,
-                    // sink 格式 = 解码输出采样格式（未指定则保留原生）。
-                    format: output_sample_fmt.unwrap_or(SampleFormat::from(decode_ctx.sample_fmt)),
-                    src_format: filter_input_format
-                        .and_then(FrameFormat::into_sample)
-                        .unwrap_or(
-                            output_sample_fmt.unwrap_or(SampleFormat::from(decode_ctx.sample_fmt)),
-                        ),
-                    time_base: decode_ctx.time_base.into(),
-                }),
-                _ => {
-                    return Err(RsmediaError::invalid_config(format!(
-                        "a {media_type:?} filter cannot be used on this stream"
-                    )));
-                }
-            };
-
-            // 滤镜链的媒体类型与可用性校验都在 `init` 内（缺失滤镜 → `InvalidConfig`）
-            let graph = FilterGraph::build(&filter_params, filters.as_slice())?;
-
-            // 参数随图一起留下：重启流水线时必须重建一张新图。
-            Some(DecodeFilterChain {
-                graph,
-                params: filter_params,
-                filters,
-            })
-        } else {
-            None
+        let filter_graph = match self.filters.take() {
+            Some(filters) => {
+                let params = self.build_filter_params(
+                    &decode_ctx,
+                    init_width,
+                    init_height,
+                    output_pix_fmt,
+                    output_sample_fmt,
+                    filter_input_format,
+                )?;
+                // 滤镜链的媒体类型与可用性校验都在 `init` 内（缺失滤镜 → `InvalidConfig`）
+                let graph = FilterGraph::build(&params, filters.as_slice())?;
+                // 参数随图一起留下：重启流水线时必须重建一张新图。
+                Some(DecodeFilterChain {
+                    graph,
+                    params,
+                    filters,
+                })
+            }
+            None => None,
         };
 
         Ok(Decoder {

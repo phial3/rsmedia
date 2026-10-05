@@ -271,18 +271,22 @@ impl StreamInfo {
             )
         };
 
+        // 同样来自外部数据：未列出的媒体类型退化为 `UNKNOWN` 而不是 panic，但退化时
+        // 必须点名原始取值——否则它就成了一个排查时无从下手的静默默认值。整条流只做
+        // 这一次转换，下面的 `rotation` 复用同一结果，避免两处判定出现分歧。
+        let media_type = MediaType::from_ffi_checked(codecpar.codec_type).unwrap_or_else(|| {
+            tracing::warn!(
+                "Stream {} has an unsupported media type {}; reporting it as unknown",
+                stream.index,
+                codecpar.codec_type
+            );
+            MediaType::UNKNOWN
+        });
+
         Ok(Self {
             id: stream.id,
             index: stream.index as usize,
-            // 同样来自外部数据：未列出的媒体类型退化为 `UNKNOWN` 而不是 panic。
-            media_type: MediaType::from_ffi_checked(codecpar.codec_type).unwrap_or_else(|| {
-                tracing::warn!(
-                    "Stream {} has an unsupported media type {}; reporting it as unknown",
-                    stream.index,
-                    codecpar.codec_type
-                );
-                MediaType::UNKNOWN
-            }),
+            media_type,
             #[allow(clippy::unnecessary_cast)]
             codec_id: codecpar.codec_id as u32,
             codec_tag: codecpar.codec_tag,
@@ -319,7 +323,16 @@ impl StreamInfo {
             color_primaries: codecpar.color_primaries,
             chroma_location: codecpar.chroma_location,
             field_order: codecpar.field_order,
-            rotation: Self::get_stream_display_rotation(stream, &metadata),
+            // 旋转是**视频专属**概念（来自 display matrix 侧数据，退化时读 `rotate`
+            // 元数据标签）。音频/字幕流没有它，但 `get_stream_display_rotation` 对
+            // 任意流都会退化到读 `rotate` 标签——一条带了杂散 `rotate` 标签的音轨
+            // 就会报出一个并不存在的角度。故非视频一律取 0（这是该流本来就正确的
+            // 取值，不是替错误打的默认值）。
+            rotation: if media_type == MediaType::VIDEO {
+                Self::get_stream_display_rotation(stream, &metadata)
+            } else {
+                0.0
+            },
             // Audio
             sample_rate: codecpar.sample_rate,
             channel_layout: codecpar.ch_layout().clone(),
