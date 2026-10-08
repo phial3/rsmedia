@@ -19,7 +19,7 @@ use rsmpeg::swresample::SwrContext;
 /// `pub(crate)`：对外的 [`Resampler::new`] 与 [`convert_frame`] 保留 FFI 镜像签名
 /// （裸 `ffi::AVChannelLayout` / `ffi::AVSampleFormat` / `i32`），在模块边界上转换 ——
 /// 与 crate 里其它 FFI 镜像层（`VideoParams`、`imgutils::fill_linesizes`…）一致。
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct AudioSpec {
     ch_layout: ffi::AVChannelLayout,
     sample_fmt: ffi::AVSampleFormat,
@@ -68,6 +68,16 @@ impl AudioSpec {
     /// `frame` 是否已经是这个格式。
     fn matches(self, frame: &AVFrame) -> bool {
         self == Self::from_frame(frame)
+    }
+}
+
+impl std::fmt::Debug for AudioSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioSpec")
+            .field("channels", &self.nb_channels())
+            .field("sample_fmt", &sample_fmt_name(self.sample_fmt))
+            .field("sample_rate", &self.sample_rate)
+            .finish()
     }
 }
 

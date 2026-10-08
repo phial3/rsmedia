@@ -1986,8 +1986,9 @@ fn write_side_data(frame: &mut AVFrame, entries: &[FrameSideData]) {
 mod tests {
     use super::*;
     use crate::colors::Color;
+
     use rsmpeg::UnsafeDerefMut;
-    use std::error::Error as _;
+    use std::error::Error as StdError;
     use std::time::Duration;
 
     /// 单行的平面同样要做"能整除"这道校验。
