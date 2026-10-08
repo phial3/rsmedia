@@ -15,18 +15,11 @@ use std::fmt;
 /// rsmpeg 的 `settable!` 字段表不含 `thread_count`，只能直接写字段；把这个
 /// unsafe 收敛在这里，`Encoder`/`Decoder` 都不再自己碰裸指针。
 ///
-/// 与 FFmpeg 的字段同为 `int`：只写正值。`0` 是 FFmpeg 的"自行推导"语义，负数没有
-/// 合法含义（调用方写错），两者都不写字段、让 FFmpeg 自己决定；负数另打一条 `warn!`。
+/// **不做任何取值判断**：值原样写入，包括 `0`（FFmpeg 的"自行推导"语义）与负数。
+///
+/// 调用方一侧的约定才是"用谁的"：只有用户**显式**调过 `with_thread_count` 才
+/// 写这个字段；没设置就完全不碰它，让 FFmpeg 用自己的默认值。
 pub(crate) fn set_thread_count(context: &mut AVCodecContext, thread_count: i32) {
-    if thread_count < 0 {
-        tracing::warn!(
-            "thread count {thread_count} is negative and was ignored; \
-             leaving FFmpeg's default in place"
-        );
-    }
-    if thread_count <= 0 {
-        return;
-    }
     // SAFETY: `context` 由 `AVCodecContext::new` 分配、在借用期内一直有效
     unsafe {
         context.deref_mut().thread_count = thread_count;

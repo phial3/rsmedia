@@ -2,20 +2,21 @@ use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::flags::FlagSet;
-use crate::fmt::FrameFormat;
+use crate::fmt::{FrameFormat, SampleFormat};
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
-use crate::io::Reader;
+use crate::io::{Reader, StreamReader};
+use crate::location::Location;
 use crate::options::Options;
+use crate::pixel::PixelFormat;
 use crate::resample;
 use crate::resize::Resize;
 use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler, VideoSpec};
 use crate::state::ProcessState;
-use crate::stream::StreamInfo;
+use crate::stream::{MediaType, StreamInfo};
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
 use crate::time::{Rational, Time};
-use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader};
 
 use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket, AVSubtitle};
@@ -101,7 +102,7 @@ pub struct DecoderBuilder {
     flags2: Option<FlagSet<AVCodecFlag2>>,
     /// `AVCodecContext.thread_type`（`FF_THREAD_*`）。`None` = FFmpeg 默认。
     thread_type: Option<FlagSet<ThreadType>>,
-    /// `None` = 未显式设置，构建时取 [`num_cpus::get`]。
+    /// `None` = 未显式设置
     thread_count: Option<i32>,
     media_type: MediaType,
     codec_name: Option<String>,
@@ -291,37 +292,6 @@ impl DecoderBuilder {
         self
     }
 
-    /// 校验像素格式能否以数据平面承载（非位流/调色板/硬件格式）。
-    fn ensure_pix_fmt_storable(fmt: PixelFormat) -> Result<()> {
-        if !fmt.is_plane_storable() {
-            return Err(RsmediaError::invalid_config(format!(
-                "with_pix_fmt({fmt:?}): the format cannot be stored as sample planes \
-                 (bitstream, paletted and hardware formats are not supported)"
-            )));
-        }
-        Ok(())
-    }
-
-    /// 某个仅对某一类解码器生效的配置项被用于其它媒体类型时构造的错误。
-    ///
-    /// 属于调用方错误（用了只对某类解码器生效的 setter），因此报 `InvalidConfig`，
-    /// 而不是落到笼统的 `Other`。
-    ///
-    /// `required` 是该选项**本来只对哪一类解码器生效**，`media_type` 是调用方实际
-    /// 把它用在了哪一类上。两者必须分开传：只传后者会说出"with_pix_fmt 只对音频
-    /// 解码器有效，而你用的就是音频"这种自相矛盾、也指不出该改成什么的文案。
-    fn option_only_for(
-        opt: &'static str,
-        value: String,
-        required: MediaType,
-        media_type: MediaType,
-    ) -> RsmediaError {
-        RsmediaError::invalid_config(format!(
-            "{opt}({value}) is only valid for {} decoders, got media type: {media_type:?}",
-            required.get_media_name()
-        ))
-    }
-
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
@@ -344,17 +314,14 @@ impl DecoderBuilder {
         if let Some(thread_type) = self.thread_type {
             crate::codec::set_thread_type(decoder, thread_type.bits() as i32);
         }
+        if let Some(cnt) = self.thread_count {
+            crate::codec::set_thread_count(decoder, cnt);
+        }
         decoder.set_time_base(input.time_base);
         decoder.set_pkt_timebase(input.time_base);
         if let Some(framerate) = input.guess_framerate() {
             decoder.set_framerate(framerate);
         }
-
-        // 未显式设置时取本机 CPU 数；`0`（自行推导）与负数跳过
-        crate::codec::set_thread_count(
-            decoder,
-            self.thread_count.unwrap_or_else(|| num_cpus::get() as i32),
-        );
 
         // 稳定性策略：rsmpeg 未生成 skip_frame / err_recognition 访问器，直接写字段
         // （encode.rs 写 rc_max_rate 同例）。两项都必须在 `avcodec_open2` 之前生效，
@@ -393,16 +360,20 @@ impl DecoderBuilder {
     fn resolve_output_pix_fmt(&self) -> Result<PixelFormat> {
         match (self.media_type, self.pix_fmt) {
             (MediaType::VIDEO, Some(fmt)) => {
-                Self::ensure_pix_fmt_storable(fmt)?;
+                if !fmt.is_plane_storable() {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "with_pix_fmt({fmt:?}): the format cannot be stored as sample planes \
+                         (bitstream, paletted and hardware formats are not supported)"
+                    )));
+                }
                 Ok(fmt)
             }
             (_, None) => Ok(PixelFormat::YUV420P),
-            (media_type, Some(fmt)) => Err(Self::option_only_for(
-                "with_pix_fmt",
-                format!("{fmt:?}"),
-                MediaType::VIDEO,
-                media_type,
-            )),
+            // 属于调用方错误（把只对视频生效的 setter 用在了别的类型上），报 `InvalidConfig` 而不是笼统的 `Other`
+            (media_type, Some(fmt)) => Err(RsmediaError::invalid_config(format!(
+                "with_pix_fmt({fmt:?}) is only valid for {} decoders, got media type: {media_type:?}",
+                MediaType::VIDEO.get_media_name()
+            ))),
         }
     }
 
@@ -418,12 +389,10 @@ impl DecoderBuilder {
             (MediaType::AUDIO, Some(fmt)) => Err(RsmediaError::invalid_config(format!(
                 "with_sample_fmt({fmt:?}): not a usable output sample format"
             ))),
-            (media_type, Some(fmt)) => Err(Self::option_only_for(
-                "with_sample_fmt",
-                format!("{fmt:?}"),
-                MediaType::AUDIO,
-                media_type,
-            )),
+            (media_type, Some(fmt)) => Err(RsmediaError::invalid_config(format!(
+                "with_sample_fmt({fmt:?}) is only valid for {} decoders, got media type: {media_type:?}",
+                MediaType::AUDIO.get_media_name()
+            ))),
             (_, None) => Ok(None),
         }
     }
@@ -799,9 +768,11 @@ impl Decoder {
 
     /// `AVCodecContext.thread_count`（0 = 自动）。
     ///
-    /// 读的是 `avcodec_open2` **之后**的实际值：帧级线程的编解码器会在
-    /// `thread_count == 0` 时把它改写成自动推导出的线程数（见 FFmpeg
-    /// `ff_frame_thread_init`），非 0 的调用方设置则原样保留。
+    /// 读的是 `avcodec_open2` **之后**的实际值。未调
+    /// [`DecoderBuilder::with_thread_count`] 时 rsmedia 不写该字段，值由 FFmpeg
+    /// 决定；显式设置过则原样交给 FFmpeg —— `0` 会被 `avcodec_open2` 改写成自动
+    /// 推导出的线程数，非 0 值（含负数）原样保留。取值是否合法由 FFmpeg 判断，
+    /// rsmedia 不做取舍。
     #[inline]
     pub fn thread_count(&self) -> i32 {
         self.context.thread_count
@@ -1718,14 +1689,22 @@ mod tests {
         assert_eq!(decoder.flags2(), AVCodecFlag2::FAST.into());
         assert!(decoder.flags2().contains(AVCodecFlag2::FAST));
         assert_eq!(decoder.thread_type(), ThreadType::FRAME | ThreadType::SLICE);
-        assert_eq!(decoder.thread_count(), num_cpus::get() as i32);
+        // 没有 with_thread_count ⇒ rsmedia 不写该字段，值由 FFmpeg 决定（实测 1）。
+        assert!(
+            decoder.thread_count() >= 1,
+            "未显式设置时应由 FFmpeg 自己定线程数，实际 {}",
+            decoder.thread_count()
+        );
         Ok(())
     }
 
-    /// 未设置 `with_flags` 时落到 rsmedia 的解码默认值 `LOW_DELAY`；显式正数
-    /// `thread_count` 原样落入上下文；`0`（自行推导）与负数没有合法语义，
-    /// [`crate::codec::set_thread_count`] 不写该字段 ⇒ 上下文保持 `0`，
-    /// `avcodec_open2` 会把它定成解码器的默认 `1`。
+    /// 未设置 `with_flags` 时落到 rsmedia 的解码默认值 `LOW_DELAY`；
+    /// `thread_count` 则是**用户显式设置才用用户的，没设置就交给 FFmpeg**。
+    ///
+    /// ⚠️ "未设置"与"显式 0"在解码侧**不等价**，别再合并成一个断言：不写字段时
+    /// 上下文保持 `avcodec_alloc_context3` 给的 `1`；而显式写 `0` 是 FFmpeg 的
+    /// "自动推导"，`avcodec_open2` 会把它改成实际线程数（本机 8 核 ⇒ 9）。
+    /// 所以默认值随 FFmpeg 版本/机器变，**不能**锁成具体数字
     #[test]
     fn test_builder_codec_flags_default_and_thread_count() -> Result<()> {
         use crate::codec::AVCodecFlag;
@@ -1740,19 +1719,29 @@ mod tests {
         let explicit = DecoderBuilder::new(MediaType::VIDEO)
             .with_thread_count(2)
             .build_from_reader(&reader)?;
-        assert_eq!(explicit.thread_count(), 2);
+        assert_eq!(explicit.thread_count(), 2, "显式设置的线程数必须原样生效");
 
-        for ignored in [0, -1] {
-            let non_positive = DecoderBuilder::new(MediaType::VIDEO)
-                .with_thread_count(ignored)
-                .build_from_reader(&reader)?;
-            assert_eq!(
-                non_positive.thread_count(),
-                1,
-                "a non-positive thread_count ({ignored}) must be ignored, \
-                 leaving FFmpeg's default"
+        // 多核机器上"未设置"一定不等于 CPU 数 —— 那正是旧实现的行为；
+        // 单核时两者恰好都是 1，这条断言没有判别力，直接跳过。
+        let cpus = num_cpus::get() as i32;
+        if cpus > 1 {
+            assert_ne!(
+                default.thread_count(),
+                cpus,
+                "未设置 thread_count 时不应由 rsmedia 填入 CPU 数（旧行为）"
             );
         }
+
+        // 显式 0：原样交给 FFmpeg 做自动推导，值由 FFmpeg 定，只断言它推导出了
+        // 一个合法的正线程数（不锁具体数字，跨机器/跨版本会变）。
+        let auto = DecoderBuilder::new(MediaType::VIDEO)
+            .with_thread_count(0)
+            .build_from_reader(&reader)?;
+        assert!(
+            auto.thread_count() >= 1,
+            "explicit 0 must be left to FFmpeg's auto-detection, got {}",
+            auto.thread_count()
+        );
         Ok(())
     }
 

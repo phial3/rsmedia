@@ -49,11 +49,13 @@
 
 use crate::error::{Context, Result, RsmediaError};
 use crate::time::Rational;
+
 use rsmpeg::avcodec::{
     AVBSFContext, AVBSFContextUninit, AVBitStreamFilter, AVCodecParameters, AVPacket,
 };
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
+
 use std::ffi::CString;
 
 /// 已初始化、可直接收发包的 bitstream filter 上下文。

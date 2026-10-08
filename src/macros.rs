@@ -667,9 +667,14 @@ macro_rules! impl_codec_builder_setters {
         /// Set the thread count.
         ///
         /// 与 FFmpeg 的 `AVCodecContext.thread_count` 同为 `i32`，直接写该字段。
-        /// 未设置时取 `num_cpus::get()`；同名 AVOption 若经 `with_options` 透传，
-        /// 以透传值为准（见 [`Self::with_options`]）。`0` 表示交给 codec 自行推导，
-        /// 负数没有合法含义：两者都不写字段、由 FFmpeg 自己决定（负数另打 `warn!`）。
+        ///
+        /// 传进来的值**原样**交给 FFmpeg，不做任何取值判断：`0` 是 FFmpeg 的
+        /// "自行推导"语义（解码器会在 `avcodec_open2` 里把它改成实际线程数），
+        /// 其它值（含负数）也照写，是否合法由 FFmpeg 决定。
+        ///
+        /// **不调用本方法**时 rsmedia 完全不碰该字段，线程数由 FFmpeg 自己定
+        /// （解码器上下文默认是 `1`；想要自动推导请显式传 `0`）。同名 AVOption
+        /// 若经 `with_options` 透传，以透传值为准（见 [`Self::with_options`]）。
         pub fn with_thread_count(mut self, thread_count: i32) -> Self {
             self.thread_count = Some(thread_count);
             self

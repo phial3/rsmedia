@@ -1,10 +1,10 @@
 use crate::error::{Result, RsmediaError};
-use crate::fmt::FrameFormat;
+use crate::fmt::{FrameFormat, SampleFormat};
 use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
 use crate::strutils;
 use crate::time::Rational;
-use crate::{Metadata, PixelFormat, SampleFormat};
+use crate::{Metadata, PixelFormat};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecParameters};
 use rsmpeg::avformat::AVStream;
