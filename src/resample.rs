@@ -570,12 +570,13 @@ impl Resampler {
 mod tests {
     use super::*;
     use crate::error::{Context, Result};
-    use crate::{SampleFormat, time::Rational};
+    use crate::fmt::SampleFormat;
+    use crate::time::Rational;
+
     use rsmpeg::avutil::AVChannelLayout;
     use rsmpeg::ffi;
 
     /// 音频格式特征描述
-    #[warn(dead_code)]
     struct AudioFormatDesc {
         format: ffi::AVSampleFormat,
         name: &'static str,

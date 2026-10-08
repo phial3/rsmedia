@@ -180,9 +180,13 @@ impl<T> FrameData<T> {
                     return Err(no_such_plane(plane, 1));
                 }
                 let (rows, cols, components) = array.dim();
-                let flat = array
-                    .as_slice()
-                    .ok_or_else(|| not_contiguous(plane, "interleaved"))?;
+                let flat = array.as_slice().ok_or_else(|| {
+                    RsmediaError::msg(format!(
+                        "Plane {plane} of a interleaved frame is not contiguous, so it has \
+                             no flat view; use `plane_samples` (which copies) or make the array \
+                             standard layout"
+                    ))
+                })?;
                 ArrayView2::from_shape((rows, cols * components), flat)
                     .context(format!("Plane {plane}"))
             }
@@ -201,9 +205,13 @@ impl<T> FrameData<T> {
                     return Err(no_such_plane(plane, 1));
                 }
                 let (rows, cols, components) = array.dim();
-                let flat = array
-                    .as_slice_mut()
-                    .ok_or_else(|| not_contiguous(plane, "interleaved"))?;
+                let flat = array.as_slice_mut().ok_or_else(|| {
+                    RsmediaError::msg(format!(
+                        "Plane {plane} of a interleaved frame is not contiguous, so it has \
+                             no flat view; use `plane_samples` (which copies) or make the array \
+                             standard layout"
+                    ))
+                })?;
                 ArrayViewMut2::from_shape((rows, cols * components), flat)
                     .context(format!("Plane {plane}"))
             }
@@ -349,38 +357,6 @@ impl<T: ElementType> FrameData<T> {
 /// The error for a plane index a layout does not have.
 fn no_such_plane(plane: usize, count: usize) -> RsmediaError {
     RsmediaError::invalid_config(format!("Frame has no plane {plane}: it has {count}"))
-}
-
-/// The error for borrowing a plane whose array is not stored contiguously.
-fn not_contiguous(plane: usize, layout: &str) -> RsmediaError {
-    RsmediaError::msg(format!(
-        "Plane {plane} of a {layout} frame is not contiguous, so it has no flat view; \
-         use `plane_samples` (which copies) or make the array standard layout"
-    ))
-}
-
-/// 转换结果的颜色范围与色度位置。
-///
-/// 换了像素格式，源帧的色域元数据不能整套照搬——最典型的现象是 full range 的
-/// RGB 样本沿用源帧的 limited range 标签，下游再压缩一次就发灰。
-///
-/// * RGB/BGR/GBR 家族的样本按定义铺满 `0..2^n-1`，因此结果恒标
-///   `AVCOL_RANGE_JPEG`（判据见 [`PixelFormat::is_full_range`]）；
-/// * YUV/NV **与 GRAY** 族的实际范围由 `color_range` 声明，转换以源帧声明的范围
-///   为输入，故随源帧保留（`UNSPECIFIED` 按 FFmpeg 约定等同 limited）。灰度与 YUV
-///   同档（FFmpeg 的 `range_override_needed` 只对非 YUV 且非 gray 的格式强制
-///   full range），把它也标成 JPEG 会给 16..235 的 luma 打上错误的标签；
-/// * `chroma_location` 描述色度采样点相对亮度栅格的位置，只对带色度平面的目标有意义。
-fn converted_color(
-    dst: PixelFormat,
-    color_range: ffi::AVColorRange,
-    chroma_location: ffi::AVChromaLocation,
-) -> (ffi::AVColorRange, ffi::AVChromaLocation) {
-    if dst.is_full_range() {
-        (ffi::AVCOL_RANGE_JPEG, ffi::AVCHROMA_LOC_UNSPECIFIED)
-    } else {
-        (color_range, chroma_location)
-    }
 }
 
 /// Converts a packed `RGB24` frame into a planar `YUV420P` frame.
@@ -1283,9 +1259,23 @@ where
             metadata,
             side_data,
         } = self;
-        // 色域元数据不能整套照搬：目标像素格式决定了样本范围的含义。
-        let (color_range, chroma_location) =
-            converted_color(format, *color_range, *chroma_location);
+        // 色域元数据不能整套照搬：目标像素格式决定了样本范围的含义——最典型的现象
+        // 是 full range 的 RGB 样本沿用源帧的 limited range 标签，下游再压缩一次
+        // 就发灰。
+        //
+        // * RGB/BGR/GBR 家族的样本按定义铺满 `0..2^n-1`，因此结果恒标
+        //   `AVCOL_RANGE_JPEG`（判据见 [`PixelFormat::is_full_range`]），且
+        //   `chroma_location` 只对带色度平面的目标有意义 ⇒ 置为 UNSPECIFIED；
+        // * YUV/NV **与 GRAY** 族的实际范围由 `color_range` 声明，转换以源帧声明的
+        //   范围为输入，故随源帧保留（`UNSPECIFIED` 按 FFmpeg 约定等同 limited）。
+        //   灰度与 YUV 同档（FFmpeg 的 `range_override_needed` 只对非 YUV 且非 gray
+        //   的格式强制 full range），把它也标成 JPEG 会给 16..235 的 luma 打上错误
+        //   的标签。
+        let (color_range, chroma_location) = if format.is_full_range() {
+            (ffi::AVCOL_RANGE_JPEG, ffi::AVCHROMA_LOC_UNSPECIFIED)
+        } else {
+            (*color_range, *chroma_location)
+        };
         Self {
             pts: *pts,
             pkt_dts: *pkt_dts,

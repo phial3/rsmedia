@@ -2,7 +2,7 @@ use crate::codec::{AVCodecFlag, AVCodecFlag2, CodecConfig, ThreadType};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::flags::FlagSet;
-use crate::fmt::FrameFormat;
+use crate::fmt::{FrameFormat, SampleFormat};
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
@@ -11,10 +11,10 @@ use crate::pixel::PixelFormat;
 use crate::resample;
 use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler, VideoSpec};
 use crate::state::ProcessState;
+use crate::stream::MediaType;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
 use crate::time::{self, Rational, Rescale};
-use crate::{MediaType, SampleFormat};
 
 use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecParameters, AVPacket, AVSubtitle};
@@ -729,15 +729,13 @@ impl EncoderBuilder {
             )));
         }
 
-        // `width`/`height` 是 `i32`，会原样写进 `AVCodecContext`（`AVFrame` 的宽高
-        // 也是 `int`）；0 或负数都不是合法画面尺寸（`buffer` 源要求正数）
-        for (name, value) in [("width", self.width), ("height", self.height)] {
-            if value <= 0 {
-                return Err(RsmediaError::invalid_config(format!(
-                    "{name} must be positive, got {value}"
-                )));
-            }
+        if self.width <= 0 || self.height <= 0 {
+            return Err(RsmediaError::invalid_config(format!(
+                "[width * height] must be positive, got [{}*{}]",
+                self.width, self.height
+            )));
         }
+
         Ok(())
     }
 

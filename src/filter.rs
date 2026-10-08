@@ -3,11 +3,11 @@
 //! The filters are implemented using the ffmpeg library.
 //!
 //! See: <https://ffmpeg.org/ffmpeg-filters.html>
-use crate::MediaType;
 use crate::error::{Context, Result, RsmediaError};
 use crate::fmt::{FrameFormat, SampleFormat};
 use crate::pixel::PixelFormat;
 use crate::state::ProcessState;
+use crate::stream::MediaType;
 use crate::strutils;
 use crate::time::Rational;
 
@@ -2046,16 +2046,6 @@ pub mod audio {
     }
 }
 
-/// 按媒体类型选择同名滤镜：音频滤镜在视频滤镜名前加 `a` 前缀
-/// （如 `asetpts`/`setpts`、`atrim`/`trim`）。
-fn audio_or_video_filter_name(
-    audio: &'static str,
-    video: &'static str,
-    mt: MediaType,
-) -> &'static str {
-    if mt == MediaType::AUDIO { audio } else { video }
-}
-
 /// 修改时间戳表达式（加速、减速、对齐等）。
 /// 典型值：`"0.5*PTS"`（2倍速）、`"1.5*PTS"`（慢放）、`"PTS-STARTPTS"`。
 /// `expr`: FFmpeg expression (e.g., "0.5*PTS", "PTS-STARTPTS").
@@ -2065,7 +2055,12 @@ fn audio_or_video_filter_name(
 /// description is a C string and cannot carry one. Anything `av_escape` fails with is
 /// propagated too.
 pub fn setpts(media_type: MediaType, expr: &str) -> Result<Filter> {
-    let name = audio_or_video_filter_name("asetpts", "setpts", media_type);
+    // 音频滤镜在视频滤镜名前加 `a` 前缀（如 `asetpts`/`setpts`）。
+    let name = if media_type == MediaType::AUDIO {
+        "asetpts"
+    } else {
+        "setpts"
+    };
     let escaped_expr = escape_filter_value(expr)?;
     Ok(Filter::new(
         name,
@@ -2083,7 +2078,12 @@ pub fn setpts(media_type: MediaType, expr: &str) -> Result<Filter> {
 /// `start`/`end` 之间还夹着 `starti`/`endi`，位置写法是否稳定取决于 FFmpeg
 /// 版本，而名字写法在任何版本上都只有一个意思。
 pub fn trim(media_type: MediaType, start: Duration, end: Duration) -> Filter {
-    let name = audio_or_video_filter_name("atrim", "trim", media_type);
+    // 同上：`atrim`/`trim`。
+    let name = if media_type == MediaType::AUDIO {
+        "atrim"
+    } else {
+        "trim"
+    };
     Filter::new(
         name,
         media_type,
@@ -2360,14 +2360,6 @@ fn is_valid_label(label: &str) -> bool {
         && label
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-}
-
-/// 标签非法时的统一错误（构建器在建图前报出）。
-fn invalid_label(label: &str) -> RsmediaError {
-    RsmediaError::invalid_config(format!(
-        "invalid filter graph label '{label}': a label must be non-empty and consist of ASCII \
-         letters, digits and underscores only"
-    ))
 }
 
 /// 滤镜实例的静态输入 pad 数，以及它是否允许比静态列表更多的输入
@@ -3488,7 +3480,10 @@ impl FilterGraphBuilder {
         let mut seen: HashSet<String> = HashSet::new();
         for (label, _) in &self.inputs {
             if !is_valid_label(label) {
-                return Err(invalid_label(label));
+                return Err(RsmediaError::invalid_config(format!(
+                    "invalid filter graph label '{label}': a label must be non-empty and consist \
+                     of ASCII letters, digits and underscores only"
+                )));
             }
             if !seen.insert(label.clone()) {
                 return Err(RsmediaError::invalid_config(format!(
@@ -3527,7 +3522,10 @@ impl FilterGraphBuilder {
             }
             for label in &labels {
                 if !is_valid_label(label) {
-                    return Err(invalid_label(label));
+                    return Err(RsmediaError::invalid_config(format!(
+                        "invalid filter graph label '{label}': a label must be non-empty and \
+                         consist of ASCII letters, digits and underscores only"
+                    )));
                 }
                 if !seen.insert(label.clone()) {
                     let auto = if node.outputs().is_empty() {

@@ -1,16 +1,16 @@
 use crate::bsf::Bsf;
+use crate::decode::{Decoder, DecoderBuilder};
+use crate::encode::{Encoder, EncoderBuilder};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
-use crate::io::{Reader, Writer};
+use crate::io::{Reader, StreamReader, StreamWriter, Writer};
+use crate::location::Location;
 use crate::options::{Metadata, Options};
 use crate::stream::{MediaType, StreamInfo};
 use crate::subtitle::SubtitleSegment;
 use crate::time::Rational;
 use crate::time::TIME_BASE;
-use crate::{
-    Decoder, DecoderBuilder, Encoder, EncoderBuilder, Location, StreamReader, StreamWriter,
-};
 
 use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::AVPacket;
@@ -1805,9 +1805,9 @@ unsafe impl<R: Reader + Send> Send for Demuxer<R> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{Context, Result};
     use crate::{EncoderBuilder, PixelFormat, SampleFormat, StreamReader, StreamWriter, strutils};
 
-    use crate::error::{Context, Result};
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
     use std::path::Path;
 

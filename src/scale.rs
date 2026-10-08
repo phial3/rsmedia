@@ -1,9 +1,8 @@
 use crate::error::{Context, Result, RsmediaError};
 use crate::flags::FlagSet;
 use crate::{PixelFormat, imgutils};
-use rsmpeg::avutil::{AVBufferPool, AVBufferRef};
 
-use rsmpeg::avutil::AVFrame;
+use rsmpeg::avutil::{AVBufferPool, AVBufferRef, AVFrame};
 use rsmpeg::ffi;
 use rsmpeg::{UnsafeDerefMut, swscale::SwsContext};
 
@@ -365,8 +364,7 @@ fn setup_scaler(src_spec: VideoSpec, dst_spec: VideoSpec, flags: u32) -> Result<
 ///
 /// 缩放前的 `imgutils::copy_frame_metadata` 会把源帧的色域元数据整套搬给目标帧，
 /// 而换了像素格式后这套标记不再成立：full range 的 RGB 样本若沿用源帧的 limited
-/// range 标签，下游再编码一次就会发灰（`frame.rs` 的 `converted_color` 记录了同一
-/// 约定）。因此这里按目标格式修正范围与色度位置：
+/// range 标签，因此这里按目标格式修正范围与色度位置：
 /// - RGB/BGR/GBR 目标：恒标 full range（`AVCOL_RANGE_JPEG`），色度位置无意义；
 /// - YUV/NV **与 GRAY** 目标：范围随源帧（`UNSPECIFIED` 按 FFmpeg 约定等同
 ///   limited），保持 `copy_frame_metadata` 搬来的取值 —— 灰度与 YUV 同档，

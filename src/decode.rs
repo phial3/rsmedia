@@ -2,20 +2,21 @@ use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
 use crate::flags::FlagSet;
-use crate::fmt::FrameFormat;
+use crate::fmt::{FrameFormat, SampleFormat};
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
-use crate::io::Reader;
+use crate::io::{Reader, StreamReader};
+use crate::location::Location;
 use crate::options::Options;
+use crate::pixel::PixelFormat;
 use crate::resample;
 use crate::resize::Resize;
 use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler, VideoSpec};
 use crate::state::ProcessState;
-use crate::stream::StreamInfo;
+use crate::stream::{MediaType, StreamInfo};
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
 use crate::time::{Rational, Time};
-use crate::{Location, MediaType, PixelFormat, SampleFormat, StreamReader};
 
 use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket, AVSubtitle};
@@ -291,37 +292,6 @@ impl DecoderBuilder {
         self
     }
 
-    /// 校验像素格式能否以数据平面承载（非位流/调色板/硬件格式）。
-    fn ensure_pix_fmt_storable(fmt: PixelFormat) -> Result<()> {
-        if !fmt.is_plane_storable() {
-            return Err(RsmediaError::invalid_config(format!(
-                "with_pix_fmt({fmt:?}): the format cannot be stored as sample planes \
-                 (bitstream, paletted and hardware formats are not supported)"
-            )));
-        }
-        Ok(())
-    }
-
-    /// 某个仅对某一类解码器生效的配置项被用于其它媒体类型时构造的错误。
-    ///
-    /// 属于调用方错误（用了只对某类解码器生效的 setter），因此报 `InvalidConfig`，
-    /// 而不是落到笼统的 `Other`。
-    ///
-    /// `required` 是该选项**本来只对哪一类解码器生效**，`media_type` 是调用方实际
-    /// 把它用在了哪一类上。两者必须分开传：只传后者会说出"with_pix_fmt 只对音频
-    /// 解码器有效，而你用的就是音频"这种自相矛盾、也指不出该改成什么的文案。
-    fn option_only_for(
-        opt: &'static str,
-        value: String,
-        required: MediaType,
-        media_type: MediaType,
-    ) -> RsmediaError {
-        RsmediaError::invalid_config(format!(
-            "{opt}({value}) is only valid for {} decoders, got media type: {media_type:?}",
-            required.get_media_name()
-        ))
-    }
-
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
@@ -393,16 +363,20 @@ impl DecoderBuilder {
     fn resolve_output_pix_fmt(&self) -> Result<PixelFormat> {
         match (self.media_type, self.pix_fmt) {
             (MediaType::VIDEO, Some(fmt)) => {
-                Self::ensure_pix_fmt_storable(fmt)?;
+                if !fmt.is_plane_storable() {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "with_pix_fmt({fmt:?}): the format cannot be stored as sample planes \
+                         (bitstream, paletted and hardware formats are not supported)"
+                    )));
+                }
                 Ok(fmt)
             }
             (_, None) => Ok(PixelFormat::YUV420P),
-            (media_type, Some(fmt)) => Err(Self::option_only_for(
-                "with_pix_fmt",
-                format!("{fmt:?}"),
-                MediaType::VIDEO,
-                media_type,
-            )),
+            // 属于调用方错误（把只对视频生效的 setter 用在了别的类型上），报 `InvalidConfig` 而不是笼统的 `Other`
+            (media_type, Some(fmt)) => Err(RsmediaError::invalid_config(format!(
+                "with_pix_fmt({fmt:?}) is only valid for {} decoders, got media type: {media_type:?}",
+                MediaType::VIDEO.get_media_name()
+            ))),
         }
     }
 
@@ -418,12 +392,10 @@ impl DecoderBuilder {
             (MediaType::AUDIO, Some(fmt)) => Err(RsmediaError::invalid_config(format!(
                 "with_sample_fmt({fmt:?}): not a usable output sample format"
             ))),
-            (media_type, Some(fmt)) => Err(Self::option_only_for(
-                "with_sample_fmt",
-                format!("{fmt:?}"),
-                MediaType::AUDIO,
-                media_type,
-            )),
+            (media_type, Some(fmt)) => Err(RsmediaError::invalid_config(format!(
+                "with_sample_fmt({fmt:?}) is only valid for {} decoders, got media type: {media_type:?}",
+                MediaType::AUDIO.get_media_name()
+            ))),
             (_, None) => Ok(None),
         }
     }
