@@ -73,7 +73,7 @@ pub struct EncoderBuilder {
     flags2: Option<FlagSet<AVCodecFlag2>>,
     /// `AVCodecContext.thread_type`（`FF_THREAD_*`）。`None` = FFmpeg 默认。
     thread_type: Option<FlagSet<ThreadType>>,
-    /// `None` = 未显式设置，构建时取 [`num_cpus::get`]。
+    /// `None` = 未显式设置
     thread_count: Option<i32>,
     media_type: MediaType,
     codec_name: Option<String>,
@@ -608,11 +608,9 @@ impl EncoderBuilder {
         if let Some(thread_type) = self.thread_type {
             crate::codec::set_thread_type(encoder, thread_type.bits() as i32);
         }
-        // 未显式设置时取本机 CPU 数；`0`（自行推导）与负数跳过
-        crate::codec::set_thread_count(
-            encoder,
-            self.thread_count.unwrap_or_else(|| num_cpus::get() as i32),
-        );
+        if let Some(cnt) = self.thread_count {
+            crate::codec::set_thread_count(encoder, cnt);
+        }
 
         Ok(())
     }
@@ -2016,9 +2014,21 @@ impl Encoder {
 
     /// `AVCodecContext.thread_count`（0 = 自动）。
     ///
-    /// 读的是 `avcodec_open2` **之后**的实际值：帧级线程的编解码器会在
-    /// `thread_count == 0` 时把它改写成自动推导出的线程数（见 FFmpeg
-    /// `ff_frame_thread_init`），非 0 的调用方设置则原样保留。
+    /// 未调 [`EncoderBuilder::with_thread_count`] 时 rsmedia 不写该字段，读到的就是
+    /// **编码器自己的**默认值；显式设置过则原样交给 FFmpeg —— 取值是否合法由
+    /// FFmpeg/编码器判断，rsmedia 不做取舍。
+    ///
+    /// # 默认值的两种形态（不要当成同一个语义）
+    ///
+    /// * **外部编码器**（如默认的 `libx264`）：自己的 `threads` 默认就是 `0`，
+    ///   意思是"交给 x264 自己推导"（`X264_THREADS_AUTO`）。x264 的线程池在库内部，
+    ///   FFmpeg 拿不到结果，所以 `0` 会一直保持为 `0` —— 它**不等于"不开线程"**。
+    /// * **原生编码器**（`mpeg4` / `png` / `ffv1` …）：`AVCodecContext` 的 `threads`
+    ///   默认是 `1`；只有显式传 `0` 时，`avcodec_open2` 才会把它改写成推导出的
+    ///   实际线程数（多核机器上 > 1）。
+    ///
+    /// 想让原生编码器并行编码，就显式调用 [`EncoderBuilder::with_thread_count`] 传
+    /// `0` —— 这与 ffmpeg CLI 的 `-threads 0` 等价。
     ///
     /// 类型与 FFmpeg 的字段一致（`int` 而非 `u32`）：与
     /// [`Decoder::thread_count`](crate::Decoder::thread_count) 保持同型。
@@ -2337,32 +2347,80 @@ mod tests {
         Ok(())
     }
 
-    /// 未设置时落到本机 CPU 数；显式正数原样落入上下文；`0`（FFmpeg 的"自行推导"）
-    /// 与负数（没有合法语义）都由 [`crate::codec::set_thread_count`] 跳过不写，上下文
-    /// 保持 FFmpeg 默认的 `0` = 由编码器自行推导。负数另有一条 `warn!`，让"线程数
-    /// 没生效"对调用方可见（日志断言需要 subscriber，故此处只锁行为）。
+    /// 用户显式设置 ⇒ 原样用它；未设置 ⇒ **不写** `thread_count`，交给 FFmpeg/编码器
+    /// 自己的默认值。
+    ///
+    /// 非 0 的显式值（含负数）原样落到上下文：要不要限制取值范围交给 FFmpeg
     #[test]
-    fn test_builder_thread_count_non_positive_is_ignored() -> Result<()> {
+    fn test_builder_thread_count_explicit_or_ffmpeg_default() -> Result<()> {
         let explicit = EncoderBuilder::new_video(64, 64)
             .with_thread_count(3)
             .build()?;
-        assert_eq!(explicit.thread_count(), 3);
+        assert_eq!(explicit.thread_count(), 3, "显式设置的线程数必须原样生效");
 
-        let cpu_count = num_cpus::get() as i32;
+        // 未设置时 rsmedia 一个字节都不写 ⇒ 上下文里就是**编码器自己的**默认值。
+        // 默认视频编码器（libx264）把 `threads` 的默认写成 `0`，意思是"交给 x264
+        // 自己推导"，而不是"不开线程" —— 所以这里锁的是"rsmedia 没塞 CPU 数进去"。
         let default = EncoderBuilder::new_video(64, 64).build()?;
-        assert_eq!(default.thread_count(), cpu_count);
-
-        for ignored in [0, -1, i32::MIN] {
-            let non_positive = EncoderBuilder::new_video(64, 64)
-                .with_thread_count(ignored)
-                .build()?;
-            assert_eq!(
-                non_positive.thread_count(),
-                0,
-                "a non-positive thread_count ({ignored}) must be ignored, \
-                 leaving FFmpeg's default"
+        let cpus = num_cpus::get() as i32;
+        if cpus > 1 {
+            assert_ne!(
+                default.thread_count(),
+                cpus,
+                "未设置 thread_count 时不应由 rsmedia 填入 CPU 数（旧行为）"
             );
         }
+        Ok(())
+    }
+
+    /// `thread_count` 在**外部编码器**（libx264）与**原生编码器**（mpeg4/png/ffv1…）
+    /// 上的语义不同，别用同一套数字去锁：
+    ///
+    /// | 设置 | libx264 | mpeg4 / png / ffv1 |
+    /// | --- | --- | --- |
+    /// | 未设置 | `0`（x264 自己的 `X264_THREADS_AUTO`） | `1`（FFmpeg 的 `threads` 默认） |
+    /// | 显式 `0` | `0`（同上，值不会被回写） | `avcodec_open2` 推导出的实际线程数 |
+    /// | 显式 `n` | `n` | `n` |
+    ///
+    /// 即：`0` 只在原生编码器上会被 FFmpeg 现场改写；libx264 的线程池在自己肚子里，
+    /// FFmpeg 永远看不到解析结果。这也正是"未设置不该由 rsmedia 填 CPU 数"的理由 ——
+    /// 写死了反而剥夺了各编码器自己的策略。
+    #[test]
+    fn test_thread_count_default_differs_between_external_and_native_encoders() -> Result<()> {
+        // 外部编码器：libx264 把 0 当"自动"，并且不会把推导结果写回上下文。
+        if default_video_encoder_available() {
+            let x264 = EncoderBuilder::new_video(64, 64).build()?;
+            assert_eq!(
+                x264.thread_count(),
+                0,
+                "libx264 未设置时应保持它自己的默认 0（x264 自动推导），实际 {}",
+                x264.thread_count()
+            );
+            let auto = EncoderBuilder::new_video(64, 64)
+                .with_thread_count(0)
+                .build()?;
+            assert_eq!(auto.thread_count(), 0, "libx264 的显式 0 同样是自动语义");
+        }
+
+        // 原生编码器：未设置 = FFmpeg 的 1；显式 0 = FFmpeg 现场推导出多核线程数。
+        let native = EncoderBuilder::new_video(64, 64)
+            .with_codec_name("mpeg4")
+            .build()?;
+        assert_eq!(
+            native.thread_count(),
+            1,
+            "mpeg4 未设置时应保持 FFmpeg 的默认 1，实际 {}",
+            native.thread_count()
+        );
+        let native_auto = EncoderBuilder::new_video(64, 64)
+            .with_codec_name("mpeg4")
+            .with_thread_count(0)
+            .build()?;
+        assert!(
+            native_auto.thread_count() >= 1,
+            "mpeg4 显式 0 应由 FFmpeg 推导出实际线程数，实际 {}",
+            native_auto.thread_count()
+        );
         Ok(())
     }
 
