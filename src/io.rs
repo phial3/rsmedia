@@ -446,7 +446,9 @@ fn open_input_custom(
         .open()
         .context("Create input format context with custom IO failed.")?;
     if let Some(interrupt) = interrupt {
-        install_interrupt(&mut ctx, interrupt);
+        unsafe {
+            ctx.deref_mut().interrupt_callback = interrupt_cb(interrupt);
+        }
     }
     ctx.dump(0, dump_name)
         .context("Dump input format context failed.")?;
@@ -455,8 +457,7 @@ fn open_input_custom(
 
 /// 用自定义 AVIO 构建输出上下文。
 ///
-/// 构建阶段的 muxer 私有选项不会在此消费（FFmpeg 在 `avformat_write_header` 时才读取），
-/// 由各 Writer 的 `write_header` 经 [`write_header_with_options`] 透传
+/// 构建阶段的 muxer 私有选项不会在此消费, 由各 Writer 的 `write_header` 透传
 fn build_output_custom(
     io_context: AVIOContextCustom,
     format: &CStr,
@@ -599,7 +600,6 @@ fn interrupt_cb(interrupt: &Interrupt) -> ffi::AVIOInterruptCB {
 /// 也正因为回调要先于 open，这里只能写裸指针：`Deref`/`UnsafeDerefMut` 要求
 /// 手上已有 [`AVFormatContextInput`]，而 open 前提前包装是不安全的——open 失败
 /// 时 FFmpeg 自行释放 context 并把局部指针置空，包装体的 `Drop` 会二次释放。
-/// 上下文成功建立之后的字段写（[`install_interrupt`]）则走 rsmpeg 的访问器。
 fn open_input_with_interrupt(
     filename: &std::ffi::CStr,
     format: Option<&AVInputFormat>,
@@ -648,20 +648,6 @@ fn open_input_with_interrupt(
             return Err(RsmpegError::FindStreamInfoError(ret).into());
         }
         Ok(ctx_input)
-    }
-}
-
-/// 把中断回调装到 format context（探测循环 `avformat_find_stream_info` 会读它）。
-///
-/// 只服务于自定义 IO 输入（`BufferReader`/`IoReader` 等）：这类输入不经过
-/// 协议层，没有 `URLContext` 副本，因此只有探测循环受保护；文件/URL 输入走
-/// [`open_input_with_interrupt`]，回调在 open 前就位、协议层一并生效。
-fn install_interrupt(ctx: &mut AVFormatContextInput, interrupt: &Interrupt) {
-    // SAFETY: context 独占；opaque 指向的 Arc 目标由调用方保活。此处只写
-    // `interrupt_callback` 字段，不触碰 FFmpeg 自身的指针/所有权成员，故走
-    // rsmpeg 为"改 ffi 结构体成员"提供的 `UnsafeDerefMut` 访问器。
-    unsafe {
-        ctx.deref_mut().interrupt_callback = interrupt_cb(interrupt);
     }
 }
 
@@ -720,20 +706,7 @@ impl<'a> StreamReaderBuilder<'a> {
     pub fn build(self) -> Result<StreamReader> {
         let Self { source, spec } = self;
         let filename = strutils::path_to_cstring(&source.as_path())?;
-        let protocol = unsafe { ffi::avio_find_protocol_name(filename.as_ptr()) };
-        if protocol.is_null() {
-            return Err(RsmediaError::unsupported(format!(
-                "input source protocol: {source}"
-            )));
-        }
-        tracing::debug!(
-            "Using input protocol: [{}], source: {}",
-            // SAFETY: `avio_find_protocol_name` returns a pointer into FFmpeg's
-            // static protocol registry (not a per-call allocation), valid for the
-            // process lifetime; the NULL case was rejected above.
-            unsafe { strutils::c_char_to_str(protocol) },
-            source
-        );
+        tracing::debug!("Opening input source: {source}");
 
         // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
         let fmt_opt = match spec.format {
@@ -1256,31 +1229,6 @@ impl<W: Writer + ?Sized> Writer for Box<W> {
     }
 }
 
-/// 将 builder 阶段未消费的 options 在 `write_header` 时传给 muxer。
-///
-/// FFmpeg 的 muxer 私有选项（如 `movflags`）在 `avformat_write_header` 时
-/// 才被消费，构建阶段传入的 options 若不透传到这里会被静默丢弃。
-fn write_header_with_options(
-    output: &mut AVFormatContextOutput,
-    options: &mut Option<AVDictionary>,
-) -> Result<()> {
-    output
-        .write_header(options)
-        .context("Failed to write header")
-}
-
-/// Flush avio 内部缓冲，确保字节立即送达 write 回调（内存/流式 Writer 用）。
-fn flush_avio(output: &mut AVFormatContextOutput) {
-    // SAFETY: `output` 由 `&mut` 独占，`deref_mut` 只在块内存活；`pb` 由 format
-    // context 持有，非空时即有效的 `AVIOContext`。
-    unsafe {
-        let pb = output.deref_mut().pb;
-        if !pb.is_null() {
-            ffi::avio_flush(pb);
-        }
-    }
-}
-
 ////////////////////////////////////////
 // 内置 Writer 共享状态
 ////////////////////////////////////////
@@ -1338,7 +1286,10 @@ impl WriterCore {
             ));
         }
         let mut dict = self.options.take();
-        write_header_with_options(&mut self.output, &mut dict)?;
+        self.output
+            .write_header(&mut dict)
+            .context("Failed to write header")?;
+
         self.header_written = true;
         self.flush();
         Ok(())
@@ -1371,7 +1322,13 @@ impl WriterCore {
     /// flush avio 内部缓冲（`flush_after_write` 为假时是空操作）。
     fn flush(&mut self) {
         if self.flush_after_write {
-            flush_avio(&mut self.output);
+            // SAFETY:
+            unsafe {
+                let pb = self.output.deref_mut().pb;
+                if !pb.is_null() {
+                    ffi::avio_flush(pb);
+                }
+            }
         }
     }
 
@@ -2057,26 +2014,42 @@ fn log_filter_hacks(line: &str) -> bool {
     !(line.contains(HACK_1_PELCO_NEEDLE_1) && line.contains(HACK_1_PELCO_NEEDLE_2))
 }
 
-/// 当前 FFmpeg 构建支持的**输入**协议名（`file`、`http`、`rtsp`、`rtp`、`tcp`…）。
+/// Names of the **input** protocols supported by the current FFmpeg build
+/// (`file`, `http`, `rtp`, `tcp`, `udp`, ...).
 ///
-/// 可用于构建前探测能力：URL 的协议不在列表中时，`avformat_open_input` 必然
-/// 失败。列表内容取决于 FFmpeg 编译配置。
+/// These are **AVIO** protocols — the byte-stream layer — *not* a list of "URLs
+/// you are allowed to open". RTSP, for example, is a **demuxer** in FFmpeg rather
+/// than an AVIO protocol (`ffmpeg -protocols` does not list `rtsp`), so it never
+/// appears here even though `avformat_open_input` opens it just fine. Do **not**
+/// use this list to pre-validate an input source; doing so rejects valid RTSP
+/// sources. The contents depend on how FFmpeg was configured at build time.
 pub fn input_protocols() -> Vec<String> {
     rsmpeg::avformat::AVIOProtocol::inputs()
         .map(|p| p.to_string_lossy().into_owned())
         .collect()
 }
 
-/// 当前 FFmpeg 构建支持的**输出**协议名。
+/// Names of the **output** protocols supported by the current FFmpeg build.
+///
+/// As with [`input_protocols`], this lists **AVIO** protocols only: RTSP push
+/// goes through the `rtsp` **muxer**, so it does not appear here even though
+/// [`StreamWriterBuilder`] can write it.
 pub fn output_protocols() -> Vec<String> {
     rsmpeg::avformat::AVIOProtocol::outputs()
         .map(|p| p.to_string_lossy().into_owned())
         .collect()
 }
 
-/// 返回将处理该 URL 的协议名（如 `"file"`、`"http"`），无匹配协议时为 `None`。
+/// Returns the name of the **AVIO** protocol that would handle this URL
+/// (`"file"`, `"http"`, ...), or `None` when no AVIO protocol matches.
+///
+/// This only inspects the AVIO layer. URLs handled by a **demuxer** — RTSP and
+/// RTP, which are absent from `ffmpeg -protocols` — return `None` here, and that
+/// does **not** mean `avformat_open_input` cannot open them. Use it for
+/// diagnostics and logging ("which byte-stream layer would this URL use?"), never
+/// to decide whether an input source is supported: that mistake is exactly what
+/// made earlier versions reject every `rtsp://` source.
 pub fn find_protocol_name(url: &str) -> Option<String> {
-    // URL 来自调用者：含 NUL 字节的 URL 不可能匹配任何协议，返回 None 不 panic。
     let url_c = strutils::str_to_cstring(url).ok()?;
     rsmpeg::avformat::AVIOProtocol::find_protocol_name(&url_c)
         .map(|p| p.to_string_lossy().into_owned())
