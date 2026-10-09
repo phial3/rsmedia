@@ -13,9 +13,9 @@ use rsmedia::{FrameFormat, MediaFrame, MediaType, SampleFormat, StreamReader};
 
 use anyhow::Result;
 
-const SAMPLE_RATE: i32 = 44_100;
-const CHANNELS: i32 = 2;
-const NB_SAMPLES: i32 = 1024;
+const SAMPLE_RATE: u32 = 44_100;
+const CHANNELS: u32 = 2;
+const NB_SAMPLES: u32 = 1024;
 /// 编码时长（秒），>10s 便于用播放器/ffprobe 验证。
 const DURATION_SEC: u32 = 12;
 
@@ -45,7 +45,7 @@ fn encode_audio(output: &'static str) -> Result<()> {
     let mut muxer = Muxer::new(output)?;
     let a_idx = muxer.add_encoder(encoder)?;
 
-    let total_frames = (SAMPLE_RATE * DURATION_SEC as i32) / NB_SAMPLES;
+    let total_frames = (SAMPLE_RATE * DURATION_SEC) / NB_SAMPLES;
     let mut total_pts: i64 = 0;
     for _ in 0..total_frames {
         let frame = sine_frame(total_pts as f32 / SAMPLE_RATE as f32)?;

@@ -78,7 +78,7 @@ fn assert_container_results(
 }
 
 /// 生成一帧纯色（RGB24）测试视频帧，颜色随相位 `p` 在彩虹色相上变化。
-fn rainbow_video_frame(w: i32, h: i32, p: f32) -> MediaFrame<u8> {
+fn rainbow_video_frame(w: u32, h: u32, p: f32) -> MediaFrame<u8> {
     use rsmedia::colors;
     let rgb = colors::hsv_to_rgb(p * 360.0, 100.0, 100.0);
     let mut frame = MediaFrame::<u8>::new_video_frame(w, h, PixelFormat::RGB24).unwrap();
@@ -139,9 +139,9 @@ impl SineSample for i32 {
 /// 生成一帧全幅正弦波（幅度 0.5）音频帧，帧数据类型与采样格式自动匹配。
 fn sine_audio_frame<T: SineSample>(
     freq: f32,
-    channels: i32,
-    nb_samples: i32,
-    sample_rate: i32,
+    channels: u32,
+    nb_samples: u32,
+    sample_rate: u32,
 ) -> MediaFrame<T> {
     use rsmedia::frame::MediaFrame;
     let mut frame =
@@ -396,8 +396,8 @@ mod video {
     fn test_encode_decode_roundtrip() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64i32;
-        let height = 64i32;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 10;
         let fps = 25.0;
 
@@ -444,8 +444,8 @@ mod video {
     fn test_quality_crf_roundtrip() -> Result<()> {
         use rsmedia::DecoderBuilder;
 
-        let width = 64i32;
-        let height = 64i32;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 10;
         let fps = 25.0;
 
@@ -488,8 +488,8 @@ mod video {
     fn test_negotiate_pixel_format_mjpeg() -> Result<()> {
         use rsmedia::DecoderBuilder;
 
-        let width = 64i32;
-        let height = 64i32;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 5;
 
         // 未显式指定 pix_fmt：协商为 mjpeg 支持列表中的格式
@@ -537,8 +537,8 @@ mod video {
     /// 容器元数据（avcC/SPS）应回报 profile=High(100)、level=4.1(41)。
     #[test]
     fn test_profile_level_applied() -> Result<()> {
-        let width = 64i32;
-        let height = 64i32;
+        let width = 64u32;
+        let height = 64u32;
         let fps = 25.0;
 
         let path = common::test_output_path("encode", "rsmedia_profile.mp4");
@@ -579,8 +579,8 @@ mod video {
     fn test_encode_delayed_filter_roundtrip() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64i32;
-        let height = 64i32;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 30;
         let fps = 30.0;
 
@@ -630,8 +630,8 @@ mod video {
     fn test_write_frame_auto_pts() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64i32;
-        let height = 64i32;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 8;
         let fps: f64 = 30.0;
 
@@ -695,8 +695,8 @@ mod video {
     fn test_video_pts_fully_automatic() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64i32;
-        let height = 64i32;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 8usize;
         let fps: f64 = 30.0;
 
@@ -811,7 +811,7 @@ mod video {
             ("libx264", true), // 支持延迟滤镜插值
             ("mpeg4", false),  // 简单编码器，检验无延迟路径
         ];
-        let srces: &[(i32, i32)] = &[(64, 64), (96, 48)];
+        let srces: &[(u32, u32)] = &[(64, 64), (96, 48)];
         let resizes: &[Option<Resize>] = &[
             None,                          // 不缩放，期望原尺寸
             Some(Resize::Exact(32, 32)),   // 精确尺寸
@@ -831,8 +831,8 @@ mod video {
                         // 期望尺寸：resize 实际输出的尺寸（按宽高比计算），None 则为原尺寸
                         let (ew, eh) = match resize {
                             Some(r) => {
-                                let (dw, dh) = r.compute_for((w as u32, h as u32)).unwrap();
-                                (dw as i32, dh as i32)
+                                let (dw, dh) = r.compute_for((w, h)).unwrap();
+                                (dw, dh)
                             }
                             None => (w, h),
                         };
@@ -933,8 +933,8 @@ mod video {
         use rsmedia::filter::video;
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let width = 64i32;
-        let height = 64i32;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 6;
         let fps = 25.0;
 
@@ -948,7 +948,7 @@ mod video {
             &'static str,
             rsmedia::filter::Filter,
             usize,
-            Option<(i32, i32)>,
+            Option<(u32, u32)>,
         );
         let cases: Vec<FilterCase> = vec![
             // 尺寸保持类
@@ -1133,7 +1133,7 @@ mod video {
     /// 噪声内容**不可压缩**：编码器无法靠"画面简单"省下码率，因此目标码率与
     /// `maxrate` 都会成为真实约束——这正是验证码率控制生效所需的内容，
     /// 用渐变/纯色画面会让码率上限完全看不出来。
-    fn noise_video_frame(w: i32, h: i32, seed: u32) -> MediaFrame<u8> {
+    fn noise_video_frame(w: u32, h: u32, seed: u32) -> MediaFrame<u8> {
         let mut frame = MediaFrame::<u8>::new_video_frame(w, h, PixelFormat::RGB24)
             .expect("RGB24 frame allocation");
         let samples = frame
@@ -1159,8 +1159,8 @@ mod video {
     fn encode_noise_sequence(
         builder: EncoderBuilder,
         path: &Path,
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
         n_frames: i64,
     ) -> Result<u64> {
         let encoder = builder.build()?;
@@ -1197,8 +1197,8 @@ mod video {
     /// 限流不能以损坏流为代价。
     #[test]
     fn test_vbv_rate_control_caps_bitrate() -> Result<()> {
-        let width = 320i32;
-        let height = 240i32;
+        let width = 320u32;
+        let height = 240u32;
         let fps = 25.0;
         let n_frames = 40i64;
         let bit_rate = 800_000;
@@ -1258,8 +1258,8 @@ mod video {
     /// YUV420P，因此这条用例同时覆盖「标记经 scaler 转换后仍保留」。
     #[test]
     fn test_force_key_frame() -> Result<()> {
-        let width = 64i32;
-        let height = 64i32;
+        let width = 64u32;
+        let height = 64u32;
         let n_frames = 20usize;
         let forced_index = 10usize;
         let path = common::test_output_path("encode", "rsmedia_force_key_frame.mp4");
@@ -1395,17 +1395,17 @@ mod audio {
         /// 目标码率，`0` = 无损/未压缩（编码器自动决定）
         bit_rate: u64,
         /// 期望采样率（编码器不支持时回退其支持列表首项，如 Opus 固定 48kHz 族）
-        sample_rate: i32,
+        sample_rate: u32,
         /// 声道数
-        channels: i32,
+        channels: u32,
     }
 
     const fn ac(
         container: &'static str,
         codec: Option<&'static str>,
         bit_rate: u64,
-        sample_rate: i32,
-        channels: i32,
+        sample_rate: u32,
+        channels: u32,
     ) -> AudioContainerSpec {
         AudioContainerSpec {
             container,
@@ -1470,10 +1470,10 @@ mod audio {
         let rates = config.supported_sample_rates().ok().flatten();
         let sample_rate = match rates {
             Some(rates) if !rates.is_empty() => {
-                if rates.contains(&spec.sample_rate) {
+                if rates.contains(&(spec.sample_rate as i32)) {
                     spec.sample_rate
                 } else {
-                    rates[0]
+                    rates[0] as u32
                 }
             }
             _ => spec.sample_rate, // 固定速率编码器（PCM 等）无列表，直接用表值
@@ -1497,7 +1497,7 @@ mod audio {
 
         // 1) 音频 time_base 应为 1/sample_rate
         let tb = encoder.time_base();
-        let expected_timeb = rat(1, sample_rate);
+        let expected_timeb = rat(1, sample_rate as i32);
         assert_eq!(
             tb, expected_timeb,
             "{}: audio time_base {tb} != 1/sample_rate",
@@ -1506,8 +1506,8 @@ mod audio {
 
         // 2) 编码 5 秒正弦波（1024 采样/帧，末尾不足一帧的余数忽略）；
         //    帧数据类型种类按协商出的采样率格式自动匹配（FLTP/FLT→f32 / S16→S16P / S32P→i32）
-        const AUDIO_DURATION_SECS: i32 = 1;
-        let samples_per_frame = 1024i32;
+        const AUDIO_DURATION_SECS: u32 = 1;
+        let samples_per_frame = 1024u32;
         let frames_to_write = AUDIO_DURATION_SECS * sample_rate / samples_per_frame;
         let input_samples = frames_to_write as u64 * samples_per_frame as u64;
         let mut total_pts: i64 = 0;
@@ -1615,9 +1615,9 @@ mod audio {
     fn test_negotiate_sample_format_pcm() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100i32;
-        let channels = 2i32;
-        let samples_per_frame = 1024i32;
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
+        let samples_per_frame = 1024u32;
         let frames_to_write = 10i32;
 
         let path = common::test_output_path("encode", "rsmedia_pcm_s16le.wav");
@@ -1682,8 +1682,8 @@ mod audio {
     fn test_audio_pts_fully_automatic() -> Result<()> {
         use rsmedia::{DecoderBuilder, MediaType, SampleFormat};
 
-        let sample_rate: i32 = 44_100;
-        let channels: i32 = 2;
+        let sample_rate: u32 = 44_100;
+        let channels: u32 = 2;
         let frame_size: i64 = 1024;
         // 可变输入帧长，故意都不足/超过 1024，触发 fifo 的切分与合并。
         let input_sizes = [700i32, 1300, 900, 1100, 1000];
@@ -1700,7 +1700,7 @@ mod audio {
         let a_idx = muxer.add_encoder(encoder)?;
         for &nb in &input_sizes {
             // 关键：不设置 pts，样本位置由 audio_fifo 的计数器自动维护。
-            let frame = sine_audio_frame::<f32>(440.0, channels, nb, sample_rate);
+            let frame = sine_audio_frame::<f32>(440.0, channels, nb as u32, sample_rate);
             muxer.mux(frame.to_avframe()?, a_idx)?;
         }
         muxer.finish()?;
@@ -1865,11 +1865,11 @@ mod audio {
         use rsmedia::frame::MediaFrame;
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100i32;
-        let channels = 2i32;
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
         let format = SampleFormat::FLTP;
         // AAC 默认 frame_size = 1024 采样/帧
-        let samples_per_frame = 1024i32;
+        let samples_per_frame = 1024u32;
         let frames_to_write = 10i32;
 
         let path = common::test_output_path("encode", "rsmedia_audio_roundtrip.m4a");
@@ -1879,7 +1879,7 @@ mod audio {
 
         // 1) 音频 time_base 应为 1/sample_rate
         let tb = encoder.time_base();
-        let expected_tb = rat(1, sample_rate);
+        let expected_tb = rat(1, sample_rate as i32);
         assert_eq!(tb, expected_tb, "audio time_base {tb} != 1/sample_rate");
 
         let mut total_pts: i64 = 0;
@@ -1939,8 +1939,8 @@ mod audio {
         use rsmedia::frame::MediaFrame;
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100i32;
-        let channels = 2i32;
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
         let format = SampleFormat::FLTP;
         let samples_per_frame = 1024;
         let frames_to_write = 5u32;
@@ -1998,8 +1998,8 @@ mod audio {
         use rsmedia::frame::MediaFrame;
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100i32;
-        let channels = 2i32;
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
         let format = SampleFormat::FLTP;
         // AAC frame_size = 1024；故意发非整倍数：3×1000 = 3000 样本
         let samples_per_frame = 1000;
@@ -2056,10 +2056,10 @@ mod audio {
         use rsmedia::frame::MediaFrame;
         use rsmedia::{DecoderBuilder, EncoderBuilder, MediaType, SampleFormat};
 
-        let sample_rate = 44_100i32;
-        let channels = 2i32;
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
         let format = SampleFormat::FLTP;
-        let samples_per_frame = 1024i32;
+        let samples_per_frame = 1024u32;
         let frames_to_write = 10i32;
 
         let src = common::test_output_path("encode", "rsmedia_audio_transcode_src.m4a");
@@ -2153,8 +2153,8 @@ mod audio {
         use rsmedia::filter::{self, audio};
         use rsmedia::{DecoderBuilder, MediaType};
 
-        let sample_rate = 44_100i32;
-        let channels = 2i32;
+        let sample_rate = 44_100u32;
+        let channels = 2u32;
         let format = SampleFormat::FLTP;
         let samples_per_frame = 1024;
         let frames_to_write = 12u32;
@@ -2190,10 +2190,14 @@ mod audio {
                 audio::three_band_equalizer(2.0, 0.0, 2.0),
                 true,
             ),
-            ("format", audio::format(channels, sample_rate, format), true),
+            (
+                "format",
+                audio::format(channels as i32, sample_rate as i32, format),
+                true,
+            ),
             (
                 "resample",
-                audio::resample(channels, sample_rate, format),
+                audio::resample(channels as i32, sample_rate as i32, format),
                 true,
             ),
             // 时长变化类

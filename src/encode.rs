@@ -34,18 +34,18 @@ pub struct EncoderBuilder {
     /// 所以必须把调用方原本写的浮点数留到 `build()`，才能 fail fast 而不是静默
     /// 沿用默认帧率。
     fps: Option<f32>,
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     /// `None` = 未显式指定，`build()` 时按编码器支持列表自动协商。
     pixel_format: Option<PixelFormat>,
     /// Audio
-    /// Channel count. `i32` — FFmpeg's own width (`AVChannelLayout.nb_channels`
-    /// is a `c_int`), so it reaches `AVChannelLayout::from_nb_channels` and the
-    /// supported-channel-count list without a cast.
-    nb_channels: i32,
-    /// Sample rate in Hz. `i32`, matching `AVCodecContext.sample_rate` (an FFmpeg
-    /// `int`) and the codec's own supported-sample-rate list.
-    sample_rate: i32,
+    /// Channel count. `u32` — a count is non-negative by nature, so a negative
+    /// is unrepresentable rather than silently wrapping. Cast to FFmpeg's `int`
+    /// (`AVChannelLayout.nb_channels`) only at the FFI boundary.
+    nb_channels: u32,
+    /// Sample rate in Hz. `u32` for the same reason as `nb_channels`; cast to
+    /// FFmpeg's `int` (`AVCodecContext.sample_rate`) at the boundary.
+    sample_rate: u32,
     /// `None` = 未显式指定，`build()` 时按编码器支持列表自动协商。
     sample_format: Option<SampleFormat>,
     /// Common
@@ -143,7 +143,7 @@ impl EncoderBuilder {
     ///
     /// * `width` - The width of the video stream.
     /// * `height` - The height of the video stream.
-    pub fn new_video(width: i32, height: i32) -> Self {
+    pub fn new_video(width: u32, height: u32) -> Self {
         Self::default().with_width(width).with_height(height)
     }
 
@@ -158,15 +158,15 @@ impl EncoderBuilder {
     /// * `sample_rate` - The sample rate of the audio stream.
     /// * `sample_format` - The sample format of the audio stream.
     ///
-    /// `nb_channels` and `sample_rate` are `i32`, FFmpeg's own width: the channel
-    /// count is an `AVChannelLayout.nb_channels` (`c_int`) and the sample rate is
-    /// an `AVCodecContext.sample_rate` (`int`), and the codec's supported-value
-    /// lists are signed too. Keeping that width means no cast can silently turn a
-    /// nonsensical negative into a huge positive on the way to FFmpeg.
+    /// `nb_channels` and `sample_rate` are `u32`: both are non-negative
+    /// quantities, so a nonsensical negative is unrepresentable rather than
+    /// silently wrapping. They are cast to FFmpeg's `int`
+    /// (`AVChannelLayout.nb_channels` / `AVCodecContext.sample_rate`) only at the
+    /// FFI boundary.
     pub fn new_audio(
         bit_rate: i64,
-        nb_channels: i32,
-        sample_rate: i32,
+        nb_channels: u32,
+        sample_rate: u32,
         sample_format: SampleFormat,
     ) -> Self {
         Self::default()
@@ -205,13 +205,13 @@ impl EncoderBuilder {
     }
 
     /// Set the width of the video stream.
-    pub fn with_width(mut self, width: i32) -> Self {
+    pub fn with_width(mut self, width: u32) -> Self {
         self.width = width;
         self
     }
 
     /// Set the height of the video stream.
-    pub fn with_height(mut self, height: i32) -> Self {
+    pub fn with_height(mut self, height: u32) -> Self {
         self.height = height;
         self
     }
@@ -395,7 +395,7 @@ impl EncoderBuilder {
     /// The count is expanded into a channel layout by
     /// `AVChannelLayout::from_nb_channels` at build time, so mono/stereo names
     /// are derived from the count rather than passed explicitly.
-    pub fn with_nb_channels(mut self, nb_channels: i32) -> Self {
+    pub fn with_nb_channels(mut self, nb_channels: u32) -> Self {
         self.nb_channels = nb_channels;
         self
     }
@@ -404,7 +404,7 @@ impl EncoderBuilder {
     ///
     /// Must appear in the encoder's supported-rate list, otherwise [`Self::build`]
     /// fails with [`RsmediaError::invalid_config`](crate::RsmediaError::invalid_config).
-    pub fn with_sample_rate(mut self, sample_rate: i32) -> Self {
+    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
         self.sample_rate = sample_rate;
         self
     }
@@ -447,7 +447,7 @@ impl EncoderBuilder {
     fn effective_time_base(&self) -> Result<Rational> {
         match self.media_type {
             MediaType::VIDEO => self.frame_rate.inverse(),
-            MediaType::AUDIO => Rational::new(1, self.sample_rate),
+            MediaType::AUDIO => Rational::new(1, self.sample_rate as i32),
             // 字幕：1/1000（毫秒精度），与 ffmpeg CLI 一致
             MediaType::SUBTITLE => Rational::new(1, Self::SUBTITLE_TIME_BASE_DEN),
             // 其它媒体类型（DATA 等）没有可推导的时间基，用 FFmpeg 的微秒基准。
@@ -495,8 +495,8 @@ impl EncoderBuilder {
         }
 
         if media_type == MediaType::VIDEO {
-            encoder.set_width(self.width);
-            encoder.set_height(self.height);
+            encoder.set_width(self.width as i32);
+            encoder.set_height(self.height as i32);
             // CRF 模式下不设置 bit_rate（CRF 以质量为目标，码率由编码器自行
             // 决定；写默认 1Mbps 会让 muxer 元数据与实际输出不符）。
             if !use_crf {
@@ -522,23 +522,25 @@ impl EncoderBuilder {
             encoder.set_pix_fmt(pixel_format.into());
             encoder.set_sample_aspect_ratio(Rational::ONE.into());
         } else if media_type == MediaType::AUDIO {
-            if !config.supports_channel_count(self.nb_channels) {
+            if !config.supports_channel_count(self.nb_channels as i32) {
                 return Err(RsmediaError::InvalidConfig(format!(
                     "encoder '{}' does not support nb_channels {}",
                     config.name().to_string_lossy(),
                     self.nb_channels
                 )));
             }
-            if !config.supports_sample_rate(self.sample_rate) {
+            if !config.supports_sample_rate(self.sample_rate as i32) {
                 return Err(RsmediaError::InvalidConfig(format!(
                     "encoder '{}' does not support sample rate {}",
                     config.name().to_string_lossy(),
                     self.sample_rate
                 )));
             }
-            encoder.set_ch_layout(AVChannelLayout::from_nb_channels(self.nb_channels).into_inner());
+            encoder.set_ch_layout(
+                AVChannelLayout::from_nb_channels(self.nb_channels as i32).into_inner(),
+            );
             encoder.set_bit_rate(self.effective_bit_rate());
-            encoder.set_sample_rate(self.sample_rate);
+            encoder.set_sample_rate(self.sample_rate as i32);
             encoder.set_sample_fmt(sample_format as _);
             encoder.set_time_base(self.effective_time_base()?.into());
             encoder.set_pkt_timebase(self.effective_time_base()?.into());
@@ -727,7 +729,7 @@ impl EncoderBuilder {
             )));
         }
 
-        if self.width <= 0 || self.height <= 0 {
+        if self.width == 0 || self.height == 0 {
             return Err(RsmediaError::invalid_config(format!(
                 "[width * height] must be positive, got [{}*{}]",
                 self.width, self.height
@@ -835,8 +837,8 @@ impl EncoderBuilder {
                 pixel_aspect,
             }),
             MediaType::AUDIO => FilterParams::Audio(AudioParams {
-                nb_channels: self.nb_channels,
-                sample_rate: self.sample_rate,
+                nb_channels: self.nb_channels as i32,
+                sample_rate: self.sample_rate as i32,
                 format: sample_format,
                 src_format: input_format
                     .and_then(FrameFormat::into_sample)
@@ -892,7 +894,7 @@ impl EncoderBuilder {
         }
 
         let (fw, fh) = graph.output_size()?;
-        if fw > 0 && fh > 0 && (fw != ctx.width || fh != ctx.height) {
+        if fw != 0 && fh != 0 && (fw != ctx.width as u32 || fh != ctx.height as u32) {
             tracing::info!(
                 "Filter changes size: {}x{} -> {}x{}",
                 ctx.width,
@@ -900,8 +902,8 @@ impl EncoderBuilder {
                 fw,
                 fh
             );
-            ctx.set_width(fw);
-            ctx.set_height(fh);
+            ctx.set_width(fw as i32);
+            ctx.set_height(fh as i32);
         }
         Ok(())
     }
@@ -923,7 +925,7 @@ impl EncoderBuilder {
         );
 
         // *注意*: setup_encoder_frames 会根据 HW 能力修改 ctx.pix_fmt
-        let (width, height) = (ctx.width, ctx.height);
+        let (width, height) = (ctx.width as u32, ctx.height as u32);
         HWContext::new(cfg)
             .and_then(|hw| {
                 hw.setup_encoder_frames(
@@ -1232,7 +1234,7 @@ impl Encoder {
     ///
     /// note: default video codec is `libx264`
     #[inline]
-    pub fn new_video(width: i32, height: i32) -> Result<Encoder> {
+    pub fn new_video(width: u32, height: u32) -> Result<Encoder> {
         EncoderBuilder::new_video(width, height).build()
     }
 
@@ -1246,8 +1248,8 @@ impl Encoder {
     /// note: default audio codec is `aac`
     #[inline]
     pub fn new_audio(
-        nb_channels: i32,
-        sample_rate: i32,
+        nb_channels: u32,
+        sample_rate: u32,
         sample_format: SampleFormat,
     ) -> Result<Encoder> {
         EncoderBuilder::new_audio(128_000, nb_channels, sample_rate, sample_format).build()
@@ -1505,7 +1507,7 @@ impl Encoder {
 
         // 采样率：未声明（0）时以编码器的目标率补齐。
         if is_audio && frame.sample_rate <= 0 {
-            frame.set_sample_rate(self.sample_rate());
+            frame.set_sample_rate(self.sample_rate() as i32);
         }
 
         // 时间基：帧自带有效且与编码器**不同**的时间基时（解码侧容器时间基，如 mp4 的
@@ -1543,7 +1545,7 @@ impl Encoder {
         resample::AudioSpec::new(
             self.ch_layout().clone().into_inner(),
             self.sample_fmt().into(),
-            self.sample_rate(),
+            self.sample_rate() as i32,
         )
     }
 
@@ -1636,6 +1638,9 @@ impl Encoder {
             }
             self.audio_fifo = Some(AVAudioFifo::new(sample_fmt, channels, frame_size));
         }
+        // SAFETY: `frame` is an allocated `AVFrame` whose `data[0]` holds at least `nb_samples`
+        // interleaved samples; `audio_fifo` is `Some` as just set in the branch above, and
+        // `write` copies exactly `nb_samples` samples from that buffer.
         unsafe {
             self.audio_fifo
                 .as_mut()
@@ -1671,7 +1676,7 @@ impl Encoder {
         frame.set_nb_samples(count);
         frame.set_ch_layout(self.ch_layout().clone().into_inner());
         frame.set_format(self.sample_fmt() as _);
-        frame.set_sample_rate(self.sample_rate());
+        frame.set_sample_rate(self.sample_rate() as i32);
         frame.set_time_base(self.time_base().into());
         // SAFETY: `frame` 已分配缓冲，`fifo.read` 最多写入 `count` 个样本/声道。
         unsafe {
@@ -1915,16 +1920,16 @@ impl Encoder {
     /// round-trip cast-free. The underlying `AVCodecContext.width` field is an
     /// FFmpeg `int`; the conversion here can never see a negative value.
     #[inline]
-    pub fn width(&self) -> i32 {
-        self.context.width
+    pub fn width(&self) -> u32 {
+        self.context.width as u32
     }
 
     /// Height of the encoder's negotiated video frame, in pixels.
     ///
     /// Returned as `u32` for the same reason as [`Self::width`].
     #[inline]
-    pub fn height(&self) -> i32 {
-        self.context.height
+    pub fn height(&self) -> u32 {
+        self.context.height as u32
     }
 
     #[inline]
@@ -1959,12 +1964,12 @@ impl Encoder {
 
     /// Audio samples per second.
     ///
-    /// Returned as `i32`, the width of the underlying `AVCodecContext.sample_rate`
-    /// field, matching [`EncoderBuilder::with_sample_rate`] and
-    /// [`MediaFrame`]'s audio metadata.
+    /// Returned as `u32`, matching [`EncoderBuilder::with_sample_rate`] and
+    /// [`MediaFrame`]'s audio metadata; the underlying
+    /// `AVCodecContext.sample_rate` is an FFmpeg `int`.
     #[inline]
-    pub fn sample_rate(&self) -> i32 {
-        self.context.sample_rate
+    pub fn sample_rate(&self) -> u32 {
+        self.context.sample_rate as u32
     }
 
     /// audio sample format
@@ -2055,7 +2060,7 @@ impl Encoder {
                 if fs <= 0 {
                     return 0;
                 }
-                Rational::new(fs, self.sample_rate()).unwrap_or(Rational::ZERO)
+                Rational::new(fs, self.sample_rate() as i32).unwrap_or(Rational::ZERO)
             }
             _ => return 0,
         };
@@ -2434,14 +2439,8 @@ mod tests {
             err
         }
 
-        // `width`/`height` 是 `i32`（FFmpeg 的 `AVFrame.width`/`height` 也是 `int`），
-        // 非正数不是合法画面尺寸。
-        for (width, height, want) in [
-            (0i32, 480, "width"),
-            (640, 0, "height"),
-            (-1, 480, "width"),
-            (640, -1, "height"),
-        ] {
+        // `width`/`height` 是 `u32`：负尺寸在类型层就不可表达，只剩零尺寸需要拒绝。
+        for (width, height, want) in [(0u32, 480, "width"), (640u32, 0, "height")] {
             let err = build_err(EncoderBuilder::new_video(width, height));
             assert!(err.is_invalid_config(), "{err}");
             assert!(err.to_string().contains(want), "{err}");
@@ -2804,7 +2803,7 @@ mod tests {
         const NB_SAMPLES: i32 = 1024;
 
         let mut encoder =
-            EncoderBuilder::new_audio(128_000, 2, OUT_RATE, SampleFormat::FLTP).build()?;
+            EncoderBuilder::new_audio(128_000, 2, OUT_RATE as u32, SampleFormat::FLTP).build()?;
         assert!(encoder.frame_size() > 0, "aac has a fixed frame size");
 
         for _ in 0..FRAMES {
@@ -2982,7 +2981,7 @@ mod tests {
             return Ok(());
         }
 
-        let (width, height) = (64i32, 64i32);
+        let (width, height) = (64u32, 64u32);
         let hw_ctx = HWContext::new(config.clone()).context("hardware device must open")?;
 
         // 源帧来自**另一个** frames context（同一台设备）——正是解码器输出帧的样子。
@@ -2998,8 +2997,8 @@ mod tests {
         let mut packets = 0usize;
         for index in 0..frame_count {
             let mut src = AVFrame::new();
-            src.set_width(width);
-            src.set_height(height);
+            src.set_width(width as i32);
+            src.set_height(height as i32);
             src.set_format(hw_ctx.get_format(true));
             src_frames.get_buffer(&mut src)?;
             src.set_pts(index);
@@ -3013,9 +3012,13 @@ mod tests {
                     .context
                     .hw_frames_ctx()
                     .expect("encoder owns a frames context");
+                // SAFETY: `frames` is a non-null `AVHWFramesContext` buffer ref the encoder
+                // owns; only its `data` field is read.
                 unsafe { (*frames.as_ptr()).data as usize }
             };
             assert!(
+                // SAFETY: `mapped` came from `map_hw_frame` just above, so its `hw_frames_ctx`
+                // is a non-null buffer ref; only its `data` field is read.
                 unsafe { (*mapped.hw_frames_ctx).data as usize } == expected_data,
                 "frame {index}: mapped frame must live in the encoder's frames context"
             );

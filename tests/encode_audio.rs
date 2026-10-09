@@ -494,7 +494,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
         .and_then(|rates| rates.first().copied())
         .unwrap_or(44_100);
 
-    let channels = 2;
+    let channels = 2u32;
 
     let output_path = test_output_path("encode_audio", &format!("sine.{container_type}"));
 
@@ -504,7 +504,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
         filter::audio::atempo(1.25), // 加速 25%
     ];
 
-    let encoder = EncoderBuilder::new_audio(bit_rate, channels, sample_rate, sample_format)
+    let encoder = EncoderBuilder::new_audio(bit_rate, channels, sample_rate as u32, sample_format)
         .with_codec_name(codec_name)
         .with_filters(audio_filters)
         .build()?;
@@ -520,7 +520,7 @@ fn encode_audio_container(container_type: &str, codec_name: &str, bit_rate: i64)
 
     let mut frame = AVFrame::new();
     frame.set_nb_samples(frame_size);
-    frame.set_ch_layout(AVChannelLayout::from_nb_channels(channels).into_inner());
+    frame.set_ch_layout(AVChannelLayout::from_nb_channels(channels as i32).into_inner());
     frame.set_sample_rate(sample_rate);
     frame.set_format(sample_format as _);
     frame

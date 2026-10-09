@@ -186,6 +186,7 @@ impl Options {
     /// `dest` must point at a live `AVDictionary` slot owned by an FFmpeg struct,
     /// or be null.
     pub(crate) unsafe fn write_into_raw_dict(&self, dest: &mut *mut ffi::AVDictionary) {
+        // SAFETY: the caller guarantees `dest` is a live dictionary slot or null (see `# Safety`).
         unsafe { ffi::av_dict_free(dest) };
         if let Some(dict) = self.to_dict() {
             *dest = dict.into_raw().as_ptr();

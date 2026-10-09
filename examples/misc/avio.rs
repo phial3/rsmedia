@@ -87,8 +87,8 @@ impl Decoder {
                     // 注意这里的 frame 编码格式为 YUV420P，需要转换为 RGB24
                     let rgb_frame = scale::scale_frame(
                         &yuv_frame,
-                        yuv_frame.width,
-                        yuv_frame.height,
+                        yuv_frame.width as u32,
+                        yuv_frame.height as u32,
                         PixelFormat::RGB24,
                     )?;
                     println!(
@@ -230,8 +230,8 @@ pub fn open_output_file(
 /// ticks_per_frame (i32): 每帧的时间戳增量。
 pub fn open_output_file_custom(
     filename: &CStr,
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     ratio: Rational,
     framerate: Rational,
     ticks_per_frame: i32,
@@ -281,8 +281,8 @@ pub fn open_output_file_custom(
     let mut encode_context = AVCodecContext::new(&encoder);
     let codec_config = CodecConfig::from_codec(encoder);
 
-    encode_context.set_width(width);
-    encode_context.set_height(height);
+    encode_context.set_width(width as i32);
+    encode_context.set_height(height as i32);
     encode_context.set_sample_aspect_ratio(ratio.into());
     encode_context.set_pix_fmt(
         if let Some(pix_fmts) = codec_config.supported_pixel_formats()? {
@@ -348,8 +348,8 @@ pub fn save_avframe_to_image(yuv_frame: &AVFrame, output_file_name: &str) -> Res
     // 转换为 RGB24 格式
     let rgb_frame = scale::scale_frame(
         yuv_frame,
-        yuv_frame.width,
-        yuv_frame.height,
+        yuv_frame.width as u32,
+        yuv_frame.height as u32,
         PixelFormat::RGB24,
     )?;
 
@@ -361,7 +361,12 @@ pub fn save_avframe_to_image(yuv_frame: &AVFrame, output_file_name: &str) -> Res
 
 pub fn save_avframe_rgb24(frame: &AVFrame, output_file_name: &str) -> Result<()> {
     let rgb_frame = if frame.format != ffi::AV_PIX_FMT_RGB24 {
-        scale::scale_frame(frame, frame.width, frame.height, PixelFormat::RGB24)?
+        scale::scale_frame(
+            frame,
+            frame.width as u32,
+            frame.height as u32,
+            PixelFormat::RGB24,
+        )?
     } else {
         frame.clone()
     };

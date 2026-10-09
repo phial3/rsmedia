@@ -2142,19 +2142,17 @@ impl FilterParams {
 
 /// Video filter parameters.
 ///
-/// The sizes mirror the shape of the corresponding `AVFrame` / `AVCodecContext`
-/// field, which is why they keep FFmpeg's `int` width (`i32`) instead of the
-/// `u32` used by the high-level API ([`EncoderBuilder`](crate::EncoderBuilder),
-/// [`MediaFrame`](crate::MediaFrame)). This mirror layer is the **only** place
-/// in the crate that deliberately keeps `i32` sizes. The rational parameters,
-/// by contrast, are plain [`Rational`] values — FFmpeg's `AVRational` never
-/// appears outside [`crate::time`].
+/// The sizes use the same `u32` as the high-level API
+/// ([`EncoderBuilder`](crate::EncoderBuilder), [`MediaFrame`](crate::MediaFrame));
+/// only the final write into FFmpeg's `int` fields narrows them. The rational
+/// parameters are plain [`Rational`] values — FFmpeg's `AVRational` never appears
+/// outside [`crate::time`].
 #[derive(Debug, Clone)]
 pub struct VideoParams {
-    /// Frame width in pixels, mirroring FFmpeg's `int`.
-    pub width: i32,
-    /// Frame height in pixels, mirroring FFmpeg's `int`.
-    pub height: i32,
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
     /// 滤镜图**输出**（sink）像素格式：编码器协商格式。
     pub format: PixelFormat,
     /// 滤镜图**输入**（buffer 源）像素格式：默认与 `format` 相同；当滤镜链
@@ -2223,10 +2221,8 @@ impl From<AudioEndpoint> for Endpoint {
 
 /// Format declaration for a video endpoint.
 ///
-/// Like [`VideoParams`], the sizes stay `i32` — FFmpeg's `int` — and so does the
-/// rest of this crate's size API: a value has to reach `AVFrame.width` and
-/// `AVCodecContext.width` unchanged, so `u32` would only add a narrowing step in
-/// which an out-of-range value wraps silently. The rational fields are plain
+/// Like [`VideoParams`], the sizes use the crate's `u32` size API; only the final
+/// write into FFmpeg's `int` fields narrows them. The rational fields are plain
 /// [`Rational`].
 ///
 /// The three rationals share a type and sit next to each other, so both a struct
@@ -2236,9 +2232,9 @@ impl From<AudioEndpoint> for Endpoint {
 #[derive(Debug, Clone, Copy)]
 pub struct VideoEndpoint {
     /// Width in pixels
-    pub width: i32,
+    pub width: u32,
     /// Height in pixels
-    pub height: i32,
+    pub height: u32,
     /// 像素格式。
     pub format: PixelFormat,
     /// 时间基。同一张图内各路输入应当一致，否则画面会错位。
@@ -2257,7 +2253,7 @@ impl VideoEndpoint {
     ///
     /// 默认值：时间基与帧率 [`Rational::ZERO`]（`buffer` 源会直接拒绝 `time_base=0/1`，
     /// 不会静默建出一个错的图）、像素宽高比 [`Rational::ONE`]（1:1，最常见的情形）。
-    pub fn new(width: i32, height: i32, format: PixelFormat) -> Self {
+    pub fn new(width: u32, height: u32, format: PixelFormat) -> Self {
         Self {
             width,
             height,
@@ -3204,7 +3200,7 @@ impl FilterGraph {
     ///
     /// Returns [`RsmediaError::InvalidConfig`] when the graph declares no
     /// output, or when the sink is missing from the graph.
-    pub fn output_size(&mut self) -> Result<(i32, i32)> {
+    pub fn output_size(&mut self) -> Result<(u32, u32)> {
         self.output_size_at(0)
     }
 
@@ -3214,9 +3210,9 @@ impl FilterGraph {
     ///
     /// Returns [`RsmediaError::InvalidConfig`] when `output` is out of range, or
     /// when the sink is missing from the graph.
-    pub fn output_size_at(&mut self, output: usize) -> Result<(i32, i32)> {
+    pub fn output_size_at(&mut self, output: usize) -> Result<(u32, u32)> {
         let sink = self.get_sink_context(output)?;
-        Ok((sink.get_w(), sink.get_h()))
+        Ok((sink.get_w() as u32, sink.get_h() as u32))
     }
 
     /// 运行时给图里的滤镜发一条命令（`avfilter_graph_send_command`）。
@@ -3254,6 +3250,9 @@ impl FilterGraph {
         // 元素类型跟随平台的 `c_char`（aarch64-linux 是 u8、macOS 与 x86_64 是 i8），
         // 写死任一种都会在另一种平台上编译不过——binding 的签名就是 `c_char`。
         let mut res = [0 as std::ffi::c_char; 256];
+        // SAFETY: `target_c`/`command_c`/`arg_c` are live NUL-terminated C strings, `res` is a
+        // live 256-byte buffer FFmpeg fills via `av_strlcpy`, the graph is an exclusive `&mut`,
+        // and the buffer length is passed so FFmpeg cannot overrun it.
         let ret = unsafe {
             ffi::avfilter_graph_send_command(
                 self.graph.as_mut_ptr(),
@@ -3280,7 +3279,7 @@ impl FilterGraph {
             )));
         }
 
-        // res 由 FFmpeg 用 av_strlcpy 写入，保证 NUL 结尾。
+        // SAFETY: on success FFmpeg wrote `res` with `av_strlcpy`, so it is NUL-terminated.
         Ok(strutils::cstr_to_string_lossy(unsafe {
             CStr::from_ptr(res.as_ptr())
         }))
@@ -3957,15 +3956,12 @@ impl FilterGraphBuilder {
     /// 最后 [`build`](Self::build)。
     fn finish_video_output(
         &mut self,
-        natural: (i32, i32),
+        natural: (u32, u32),
         output: VideoEndpoint,
     ) -> Result<FilterGraph> {
         if (output.width, output.height) != natural {
             let (width, height) = (output.width, output.height);
-            self.add_node(
-                FilterNode::new(video::scale(width as u32, height as u32, None)?)
-                    .with_label("scale"),
-            );
+            self.add_node(FilterNode::new(video::scale(width, height, None)?).with_label("scale"));
         }
         self.add_output_tail(output);
         self.build()
@@ -4005,12 +4001,12 @@ impl FilterGraphBuilder {
                 )));
             }
         }
-        let width: i32 = if horizontal {
+        let width: u32 = if horizontal {
             inputs.iter().map(|endpoint| endpoint.width).sum()
         } else {
             common
         };
-        let height: i32 = if horizontal {
+        let height: u32 = if horizontal {
             common
         } else {
             inputs.iter().map(|endpoint| endpoint.height).sum()
@@ -4743,12 +4739,12 @@ mod tests {
     }
 
     /// 构造一个 GRAY8 单平面、已分配缓冲的测试帧。
-    fn make_gray8_frame(width: i32, height: i32) -> AVFrame {
+    fn make_gray8_frame(width: u32, height: u32) -> AVFrame {
         use crate::error::Context;
         use crate::pixel::PixelFormat;
         let mut f = AVFrame::new();
-        f.set_width(width);
-        f.set_height(height);
+        f.set_width(width as i32);
+        f.set_height(height as i32);
         f.set_format(PixelFormat::GRAY8.into());
         f.alloc_buffer()
             .context("alloc buffer for gray8 frame")
@@ -4808,8 +4804,8 @@ mod tests {
         let out = graph
             .process_frame(Some(src))?
             .expect("one input frame should yield one output frame");
-        assert_eq!(out.width, w, "output width mismatch");
-        assert_eq!(out.height, h, "output height mismatch");
+        assert_eq!(out.width as u32, w, "output width mismatch");
+        assert_eq!(out.height as u32, h, "output height mismatch");
 
         // 校验每个像素是否被水平翻转（逐行逆序）。
         let linesize = out.linesize[0] as usize;
@@ -4878,12 +4874,12 @@ mod tests {
     }
 
     /// 构造一个 YUV420P 帧：亮度面整体填 `luma`，两个色度面填 128（中性）。
-    fn make_yuv420p_frame(width: i32, height: i32, luma: u8) -> AVFrame {
+    fn make_yuv420p_frame(width: u32, height: u32, luma: u8) -> AVFrame {
         use crate::pixel::PixelFormat;
 
         let mut frame = AVFrame::new();
-        frame.set_width(width);
-        frame.set_height(height);
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
         frame.set_format(PixelFormat::YUV420P.into());
         frame
             .alloc_buffer()
@@ -4914,12 +4910,12 @@ mod tests {
 
     /// 构造一个 YUV420P 帧：亮度面按列递增（第 x 列 = `x * 10`），用于区分「原样」
     /// 与「水平翻转」——翻转后逐列亮度必须与原来相反。
-    fn make_ramp_frame(width: i32, height: i32) -> AVFrame {
+    fn make_ramp_frame(width: u32, height: u32) -> AVFrame {
         use crate::pixel::PixelFormat;
 
         let mut frame = AVFrame::new();
-        frame.set_width(width);
-        frame.set_height(height);
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
         frame.set_format(PixelFormat::YUV420P.into());
         frame.alloc_buffer().context("alloc ramp frame").unwrap();
         let (w, h) = (width as usize, height as usize);
@@ -4978,7 +4974,7 @@ mod tests {
         unsafe { *frame.data[0].cast::<f32>().add(index) }
     }
 
-    fn video_endpoint(width: i32, height: i32) -> VideoEndpoint {
+    fn video_endpoint(width: u32, height: u32) -> VideoEndpoint {
         VideoEndpoint::new(width, height, PixelFormat::YUV420P)
             .with_time_base(rat(1, 25))
             .with_frame_rate(rat(25, 1))
@@ -5629,7 +5625,7 @@ mod tests {
         let out = graph
             .process_frame(Some(make_gray8_frame(w, h)))?
             .expect("a passthrough yields one frame per input frame");
-        assert_eq!((out.width, out.height), (w, h));
+        assert_eq!((out.width as u32, out.height as u32), (w, h));
         assert!(graph.process_frame(None)?.is_none());
 
         Ok(())

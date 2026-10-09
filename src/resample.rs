@@ -491,6 +491,10 @@ impl Resampler {
                 AVSamples::new(ch_layout.nb_channels, capacity, self.out_spec.sample_fmt, 0)
                     .context("Create samples buffer failed.")?;
 
+            // SAFETY: `out_samples` was freshly allocated for `capacity` samples in
+            // `out_spec.sample_fmt`, `src_frame` is a live normalized frame whose
+            // `extended_data`/`nb_samples` describe its real contents, and `self.swr` was built
+            // for exactly this (in, out) spec pair.
             let converted = unsafe {
                 self.swr
                     .convert(

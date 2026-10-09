@@ -121,13 +121,13 @@ pub struct PcmSpec {
     /// 输入采样率（Hz），如 cpal 的 `SampleRate(48_000)`。`i32`，与
     /// [`EncoderBuilder::with_sample_rate`](crate::EncoderBuilder::with_sample_rate)
     /// 和 FFmpeg 的 `int` 字段同宽。
-    pub sample_rate: i32,
+    pub sample_rate: u32,
     /// 声道数（交错布局），如立体声为 2。
     ///
     /// 与 crate 内其余声道数一致用 `i32`（FFmpeg 的 `AVChannelLayout.nb_channels`
     /// 就是 `c_int`）；cpal 的 `SupportedStreamConfig::channels()` 返回 `u16`，
     /// 调用方需 `as i32`。
-    pub channels: i32,
+    pub channels: u32,
     /// 声道布局掩码（`AV_CH_*` 的按位或，如 `AV_CH_LAYOUT_STEREO`），`0` 表示
     /// **不指定** —— 此时按 [`Self::channels`] 取 FFmpeg 的默认布局。
     ///
@@ -143,7 +143,7 @@ pub struct PcmSpec {
 
 impl PcmSpec {
     /// 按采样率与声道数建规格（采样格式由写入方法决定，布局取 FFmpeg 默认）。
-    pub fn new(sample_rate: i32, channels: i32) -> Self {
+    pub fn new(sample_rate: u32, channels: u32) -> Self {
         Self {
             sample_rate,
             channels,
@@ -257,7 +257,7 @@ impl<W: Writer> PcmSink<W> {
     /// * `stream_index` - [`Muxer::add_encoder`] 返回的音频流索引。
     /// * `spec` - 输入 PCM 的采样率与声道数（写入方法决定采样格式）。
     pub fn new(muxer: Muxer<W>, stream_index: usize, spec: PcmSpec) -> Result<Self> {
-        if spec.sample_rate <= 0 || spec.channels <= 0 {
+        if spec.sample_rate == 0 || spec.channels == 0 {
             return Err(RsmediaError::invalid_config(format!(
                 "invalid PCM spec: sample_rate={}, channels={}",
                 spec.sample_rate, spec.channels
@@ -284,8 +284,8 @@ impl<W: Writer> PcmSink<W> {
             (
                 encoder.sample_fmt() as _,
                 encoder.ch_layout().clone().into_inner(),
-                // 两侧同宽（FFmpeg 的 `int`），无需收窄。
-                encoder.sample_rate(),
+                // 编码器采样率转回 FFmpeg 的 `int` 宽度。
+                encoder.sample_rate() as i32,
             )
         };
         Ok(Self {
@@ -413,7 +413,7 @@ impl<W: Writer> PcmSink<W> {
     /// 输入声道布局：显式掩码优先，否则按声道数取 FFmpeg 默认布局。
     fn input_layout(&self) -> Result<ffi::AVChannelLayout> {
         if self.spec.channel_mask == 0 {
-            return Ok(AVChannelLayout::from_nb_channels(self.spec.channels).into_inner());
+            return Ok(AVChannelLayout::from_nb_channels(self.spec.channels as i32).into_inner());
         }
         let layout = AVChannelLayout::from_mask(self.spec.channel_mask).ok_or_else(|| {
             RsmediaError::invalid_config(format!(
@@ -422,7 +422,7 @@ impl<W: Writer> PcmSink<W> {
             ))
         })?;
         let raw = layout.into_inner();
-        if raw.nb_channels != self.spec.channels {
+        if raw.nb_channels != self.spec.channels as i32 {
             return Err(RsmediaError::invalid_config(format!(
                 "channel mask {:#x} describes {} channels, but the spec declares {}",
                 self.spec.channel_mask, raw.nb_channels, self.spec.channels
@@ -488,7 +488,7 @@ impl<W: Writer> PcmSink<W> {
             let mut src = AVFrame::new();
             src.set_format(sample_format);
             src.set_nb_samples(n as i32);
-            src.set_sample_rate(self.spec.sample_rate);
+            src.set_sample_rate(self.spec.sample_rate as i32);
             src.set_ch_layout(self.input_layout()?);
             src.alloc_buffer()
                 .context("Failed to allocate PCM input frame buffer")?;
@@ -522,7 +522,7 @@ impl<W: Writer> PcmSink<W> {
         let mut src = AVFrame::new();
         src.set_format(sample_format);
         src.set_nb_samples(nb_samples);
-        src.set_sample_rate(self.spec.sample_rate);
+        src.set_sample_rate(self.spec.sample_rate as i32);
         src.set_ch_layout(self.input_layout()?);
         src.alloc_buffer()
             .context("Failed to allocate PCM input frame buffer")?;
@@ -599,7 +599,7 @@ impl<W: Writer> PcmSink<W> {
             let resampler = Resampler::new(
                 in_layout,
                 sample_format,
-                self.spec.sample_rate,
+                self.spec.sample_rate as i32,
                 self.encoder_layout,
                 self.encoder_format,
                 self.encoder_sample_rate,
@@ -686,8 +686,8 @@ mod tests {
     fn sine_samples(
         start_sample: u64,
         len_per_channel: usize,
-        channels: i32,
-        rate: i32,
+        channels: u32,
+        rate: u32,
     ) -> Vec<f32> {
         let mut samples = Vec::with_capacity(len_per_channel * channels as usize);
         for i in 0..len_per_channel {
@@ -701,7 +701,7 @@ mod tests {
     }
 
     /// 解码输出文件，返回音频流的总样本数、采样率与声道数。
-    fn decode_audio_stream(path: &std::path::Path) -> Result<(usize, i32, i32)> {
+    fn decode_audio_stream(path: &std::path::Path) -> Result<(usize, u32, u32)> {
         let demuxer = Demuxer::new(path)?;
         let (audio_stream_index, sample_rate, channels) = {
             let s = demuxer
@@ -711,8 +711,8 @@ mod tests {
                 .expect("no audio stream in output");
             (
                 s.stream_index,
-                s.stream_info.sample_rate,
-                s.stream_info.channel_layout.nb_channels,
+                s.stream_info.sample_rate as u32,
+                s.stream_info.channel_layout.nb_channels as u32,
             )
         };
 
@@ -739,7 +739,7 @@ mod tests {
         let output_path = test_support::test_output_path("pcm", "test_pcm_f32.m4a");
         test_support::remove_test_output(&output_path);
 
-        let (in_rate, channels) = (44_100i32, 2i32);
+        let (in_rate, channels) = (44_100u32, 2u32);
         let total_in = 44_100usize; // 1 秒
 
         let encoder = Encoder::new_audio(channels, in_rate, SampleFormat::FLTP)?;
@@ -781,8 +781,8 @@ mod tests {
         let output_path = test_support::test_output_path("pcm", "test_pcm_resample.m4a");
         test_support::remove_test_output(&output_path);
 
-        let (in_rate, out_rate) = (48_000i32, 44_100i32);
-        let (in_channels, out_channels) = (1i32, 2i32);
+        let (in_rate, out_rate) = (48_000u32, 44_100u32);
+        let (in_channels, out_channels) = (1u32, 2u32);
         let in_total = 48_000usize; // 1 秒
 
         let encoder = Encoder::new_audio(out_channels, out_rate, SampleFormat::FLTP)?;
@@ -818,7 +818,7 @@ mod tests {
         let output_path = test_support::test_output_path("pcm", "test_pcm_i16.m4a");
         test_support::remove_test_output(&output_path);
 
-        let (in_rate, channels) = (44_100i32, 2i32);
+        let (in_rate, channels) = (44_100u32, 2u32);
         let total_in = 22_050usize; // 0.5 秒
 
         let encoder = Encoder::new_audio(channels, in_rate, SampleFormat::FLTP)?;
@@ -859,7 +859,7 @@ mod tests {
         let output_path = test_support::test_output_path("pcm", "test_pcm_u8.m4a");
         test_support::remove_test_output(&output_path);
 
-        let (in_rate, channels) = (44_100i32, 1i32);
+        let (in_rate, channels) = (44_100u32, 1u32);
         let total_in = 22_050usize; // 0.5 秒
 
         let encoder = Encoder::new_audio(channels, in_rate, SampleFormat::FLTP)?;
@@ -900,7 +900,7 @@ mod tests {
         let output_path = test_support::test_output_path("pcm", "test_pcm_filter_input.m4a");
         test_support::remove_test_output(&output_path);
 
-        let (in_rate, channels) = (44_100i32, 2i32);
+        let (in_rate, channels) = (44_100u32, 2u32);
         let total_in = 22_050usize; // 0.5 秒
 
         let filter = crate::filter::Filter::new(
@@ -949,7 +949,7 @@ mod tests {
         let output_path = test_support::test_output_path("pcm", "test_pcm_finish.mp4");
         test_support::remove_test_output(&output_path);
 
-        let (in_rate, channels) = (44_100i32, 2i32);
+        let (in_rate, channels) = (44_100u32, 2u32);
         let total_in = 22_050usize; // 0.5 秒
 
         let encoder = Encoder::new_audio(channels, in_rate, SampleFormat::FLTP)?;
@@ -983,7 +983,7 @@ mod tests {
         let output_path = test_support::test_output_path("pcm", "test_pcm_planar.m4a");
         test_support::remove_test_output(&output_path);
 
-        let (in_rate, channels) = (44_100i32, 2i32);
+        let (in_rate, channels) = (44_100u32, 2u32);
         let total_in = 22_050usize; // 0.5 秒
 
         let encoder = Encoder::new_audio(channels, in_rate, SampleFormat::FLTP)?;
@@ -1092,7 +1092,7 @@ mod tests {
         let output_path = test_support::test_output_path("pcm", "test_pcm_counters.m4a");
         test_support::remove_test_output(&output_path);
 
-        let (in_rate, out_rate) = (48_000i32, 44_100i32);
+        let (in_rate, out_rate) = (48_000u32, 44_100u32);
         let in_total = 48_000usize;
 
         let encoder = Encoder::new_audio(2, out_rate, SampleFormat::FLTP)?;

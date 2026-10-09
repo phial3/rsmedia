@@ -3,8 +3,8 @@ use crate::flags::FlagSet;
 use crate::{PixelFormat, imgutils};
 
 use rsmpeg::avutil::{AVBufferPool, AVBufferRef, AVFrame};
-use rsmpeg::ffi;
-use rsmpeg::{UnsafeDerefMut, swscale::SwsContext};
+use rsmpeg::swscale::SwsContext;
+use rsmpeg::{UnsafeDerefMut, ffi};
 
 // FFmpeg `SwsFlags` 定义参考: <https://ffmpeg.org/doxygen/trunk/group__libsws.html>
 //
@@ -273,14 +273,14 @@ ffi_enum_from!(
 /// （改尺寸 + 换格式）与编码（只换格式）两条路，两者的目的地不同。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoSpec {
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     pix_fmt: PixelFormat,
 }
 
 impl VideoSpec {
     /// 帧宽（像素）、帧高（像素）与像素格式。
-    pub const fn new(width: i32, height: i32, pix_fmt: PixelFormat) -> Self {
+    pub const fn new(width: u32, height: u32, pix_fmt: PixelFormat) -> Self {
         Self {
             width,
             height,
@@ -301,7 +301,7 @@ impl VideoSpec {
                 frame.format, frame.width, frame.height
             ))
         })?;
-        Ok(Self::new(frame.width, frame.height, pix_fmt))
+        Ok(Self::new(frame.width as u32, frame.height as u32, pix_fmt))
     }
 
     /// 只换像素格式，尺寸不变。
@@ -314,8 +314,8 @@ impl VideoSpec {
     /// 帧的格式超出收录范围时不算匹配 —— 那不可能等于目标格式，于是交给
     /// [`Scaler::scale_frame`] 报出可读的"不支持"错误，而不是在这里悄悄放行。
     fn matches(self, frame: &AVFrame) -> bool {
-        self.width == frame.width
-            && self.height == frame.height
+        self.width == frame.width as u32
+            && self.height == frame.height as u32
             && PixelFormat::from_ffi_checked(frame.format) == Some(self.pix_fmt)
     }
 }
@@ -440,14 +440,14 @@ fn set_scaler_colorspace_details(sws: &mut SwsContext, src_frame: &AVFrame, dst_
 /// across frames. See [`Scaler::scale_frame`] for the details.
 /// Scale a raw [`AVFrame`] into a newly allocated `AVFrame`.
 ///
-/// This is an FFI-level entry point: it takes a bare `AVFrame` and `i32` sizes,
-/// mirroring FFmpeg's own signatures. Callers working with the high-level
-/// [`MediaFrame`](crate::MediaFrame) should use
+/// This is an FFI-level entry point: it takes a bare `AVFrame` and the crate's
+/// `u32` sizes, narrowing them only at the FFmpeg call. Callers working with the
+/// high-level [`MediaFrame`](crate::MediaFrame) should use
 /// [`MediaFrame::convert_to`](crate::MediaFrame::convert_to) instead.
 pub fn scale_frame(
     src_frame: &AVFrame,
-    dst_width: i32,
-    dst_height: i32,
+    dst_width: u32,
+    dst_height: u32,
     dst_pix_fmt: PixelFormat,
 ) -> Result<AVFrame> {
     // Delegates to a one-off `Scaler` so there is exactly one implementation of
@@ -691,8 +691,8 @@ impl Scaler {
             Some(pool) => alloc_pooled_frame(pool, dst_spec)?,
             None => {
                 let mut dst_frame = AVFrame::new();
-                dst_frame.set_width(dst_spec.width);
-                dst_frame.set_height(dst_spec.height);
+                dst_frame.set_width(dst_spec.width as i32);
+                dst_frame.set_height(dst_spec.height as i32);
                 dst_frame.set_format(dst_spec.pix_fmt.into());
                 dst_frame
                     .alloc_buffer()
@@ -709,6 +709,9 @@ impl Scaler {
 
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         {
+            // SAFETY: `bound.sws` is a live `SwsContext` built for this exact (src, dst)
+            // geometry and format pair, and both frames are live; `sws_scale_frame` only reads
+            // `src` and writes `dst`.
             let ret = unsafe {
                 ffi::sws_scale_frame(
                     bound.sws.as_mut_ptr(),
@@ -814,11 +817,12 @@ fn pool_frame_padding() -> usize {
 /// 两者互为镜像）加上安全留白。
 fn pooled_frame_buffer_size(dst_spec: VideoSpec) -> Result<usize> {
     let align = pool_align();
+    // SAFETY: a pure size computation on a valid pixel format and dimensions; no pointers.
     let size = unsafe {
         ffi::av_image_get_buffer_size(
             dst_spec.pix_fmt.into(),
-            dst_spec.width,
-            dst_spec.height,
+            dst_spec.width as i32,
+            dst_spec.height as i32,
             align,
         )
     };
@@ -845,8 +849,8 @@ fn pooled_frame_buffer_size(dst_spec: VideoSpec) -> Result<usize> {
 /// padding 字节内容确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。
 fn alloc_pooled_frame(pool: &mut AVBufferPool, dst_spec: VideoSpec) -> Result<AVFrame> {
     let mut frame = AVFrame::new();
-    frame.set_width(dst_spec.width);
-    frame.set_height(dst_spec.height);
+    frame.set_width(dst_spec.width as i32);
+    frame.set_height(dst_spec.height as i32);
     frame.set_format(dst_spec.pix_fmt.into());
 
     let buffer = pool
@@ -877,8 +881,8 @@ fn alloc_pooled_frame(pool: &mut AVBufferPool, dst_spec: VideoSpec) -> Result<AV
             linesize.as_mut_ptr(),
             aligned,
             dst_spec.pix_fmt.into(),
-            dst_spec.width,
-            dst_spec.height,
+            dst_spec.width as i32,
+            dst_spec.height as i32,
             align,
         )
     };
@@ -937,7 +941,7 @@ unsafe fn zero_frame_padding(
     let mut visible = [0i32; 8];
     // Safety: 本地数组 + 调用方已校验的格式/尺寸。
     let ret = unsafe {
-        ffi::av_image_fill_linesizes(visible.as_mut_ptr(), spec.pix_fmt.into(), spec.width)
+        ffi::av_image_fill_linesizes(visible.as_mut_ptr(), spec.pix_fmt.into(), spec.width as i32)
     };
     if ret < 0 {
         return Err(RsmediaError::av_error(ret).with_context(format!(
@@ -951,7 +955,7 @@ unsafe fn zero_frame_padding(
         ffi::av_image_fill_plane_sizes(
             plane_bytes.as_mut_ptr(),
             spec.pix_fmt.into(),
-            spec.height,
+            spec.height as i32,
             visible_isize.as_ptr(),
         )
     };
@@ -1035,10 +1039,10 @@ mod tests {
     use crate::error::{Context, Result};
     use rsmpeg::avutil::AVFrame;
 
-    fn create_test_frame(width: i32, height: i32, pix_fmt: PixelFormat) -> Result<AVFrame> {
+    fn create_test_frame(width: u32, height: u32, pix_fmt: PixelFormat) -> Result<AVFrame> {
         let mut frame = AVFrame::new();
-        frame.set_width(width);
-        frame.set_height(height);
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
         frame.set_format(pix_fmt.into());
         frame
             .alloc_buffer()
@@ -1205,15 +1209,15 @@ mod tests {
 
             let a = pooled.scale_frame(&src, VideoSpec::new(dw, dh, dst_fmt))?;
             let b = plain.scale_frame(&src, VideoSpec::new(dw, dh, dst_fmt))?;
-            assert_eq!((a.width, a.height), (dw, dh));
+            assert_eq!((a.width, a.height), (dw as i32, dh as i32));
             assert_eq!(a.format, b.format);
             assert_eq!(a.linesize[0] % 32, 0, "池化帧 stride 应按 32 对齐");
-            assert_visible_pixels_equal(&a, &b, dw as u32, dh as u32, dst_fmt);
+            assert_visible_pixels_equal(&a, &b, dw, dh, dst_fmt);
 
             // 复用后的缓冲内容同样正确（先归还 a，再缩放一帧比对）。
             drop(a);
             let a2 = pooled.scale_frame(&src, VideoSpec::new(dw, dh, dst_fmt))?;
-            assert_visible_pixels_equal(&a2, &b, dw as u32, dh as u32, dst_fmt);
+            assert_visible_pixels_equal(&a2, &b, dw, dh, dst_fmt);
         }
         Ok(())
     }

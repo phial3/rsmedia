@@ -21,16 +21,16 @@ use std::thread;
 
 /// Video job: 2 s of 320x240 @ 30 fps (60 frames, pts left unset so the
 /// encoder's automatic numbering is exercised).
-pub const WIDTH: i32 = 320;
-pub const HEIGHT: i32 = 240;
+pub const WIDTH: u32 = 320;
+pub const HEIGHT: u32 = 240;
 pub const FPS: f32 = 30.0;
 pub const VIDEO_FRAMES: usize = 60;
 pub const VIDEO_MEDIA_SECS: f64 = 2.0;
 
 /// Audio job: ~3 s of 44.1 kHz stereo AAC with variable input frame sizes, so
 /// the encoder's sample FIFO has to split and merge.
-pub const SAMPLE_RATE: i32 = 44_100;
-pub const CHANNELS: i32 = 2;
+pub const SAMPLE_RATE: u32 = 44_100;
+pub const CHANNELS: u32 = 2;
 pub const AUDIO_FRAMES: usize = 100;
 pub const AUDIO_SAMPLES_MAX: i32 = 1200;
 pub const AUDIO_MEDIA_SECS: f64 = 3.0;
@@ -214,9 +214,13 @@ fn rainbow_frame(p: f32) -> MediaFrame<u8> {
 }
 
 fn sine_audio_frame(nb_samples: i32) -> MediaFrame<f32> {
-    let mut frame =
-        MediaFrame::<f32>::new_audio_frame(SampleFormat::FLT, CHANNELS, nb_samples, SAMPLE_RATE)
-            .unwrap();
+    let mut frame = MediaFrame::<f32>::new_audio_frame(
+        SampleFormat::FLT,
+        CHANNELS,
+        nb_samples as u32,
+        SAMPLE_RATE,
+    )
+    .unwrap();
     let samples = frame
         .data
         .as_packed_mut()

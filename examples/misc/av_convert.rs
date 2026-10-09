@@ -32,8 +32,8 @@ pub fn image_rgb_to_avframe_yuv420p(image: &RgbImage, frame_pts: i64) -> Result<
     let rgb_frame = image_rgb_to_avframe_rgb24(image, frame_pts)?;
     Ok(scale::scale_frame(
         &rgb_frame,
-        rgb_frame.width,
-        rgb_frame.height,
+        rgb_frame.width as u32,
+        rgb_frame.height as u32,
         PixelFormat::YUV420P,
     )?)
 }
@@ -82,7 +82,12 @@ pub fn avframe_rgb24_to_image_rgb(rgb_frame: &AVFrame) -> Result<RgbImage> {
 
 /// 将 AVFrame YUV420P 转换为 RgbImage
 pub fn avframe_yuv420p_to_image_rgb(frame: &AVFrame) -> Result<RgbImage> {
-    let rgb_frame = scale::scale_frame(frame, frame.width, frame.height, PixelFormat::RGB24)?;
+    let rgb_frame = scale::scale_frame(
+        frame,
+        frame.width as u32,
+        frame.height as u32,
+        PixelFormat::RGB24,
+    )?;
     avframe_rgb24_to_image_rgb(&rgb_frame)
 }
 

@@ -32,8 +32,8 @@ use rsmedia::{
 };
 
 /// 合成模式源图尺寸：故意用非 295:413 比例的底图，验证裁剪。
-const SRC_W: i32 = 600;
-const SRC_H: i32 = 800;
+const SRC_W: u32 = 600;
+const SRC_H: u32 = 800;
 /// 合成图的蓝底颜色
 const SYNTH_BG_RGB: (u8, u8, u8) = (215, 139, 67);
 
@@ -156,8 +156,8 @@ fn swap_background(
     similarity: f32,
     new_bg: (u8, u8, u8),
 ) -> Result<MediaFrame<u8>> {
-    let (w, h) = (photo.width, photo.height);
-    let endpoint = rgb_endpoint(w, h);
+    let (w, h) = (photo.width as i32, photo.height as i32);
+    let endpoint = rgb_endpoint(w as u32, h as u32);
 
     let mut builder = FilterGraphBuilder::new();
     builder.add_input_with("photo", endpoint);
@@ -211,7 +211,7 @@ fn crop_scale(
     beautify: bool,
 ) -> Result<MediaFrame<u8>> {
     let target_ratio = tw as f64 / th as f64;
-    let (w, h) = (photo.width, photo.height);
+    let (w, h) = (photo.width as i32, photo.height as i32);
     // 居中裁剪框：源更宽则裁宽，更高则裁高。
     let (cw, ch) = if (w as f64 / h as f64) > target_ratio {
         ((h as f64 * target_ratio) as i32, h)
@@ -223,8 +223,8 @@ fn crop_scale(
     let cx = (w - cw) / 2;
     let cy = (h - ch) / 2;
 
-    let endpoint = rgb_endpoint(w, h);
-    let out_endpoint = rgb_endpoint(tw as i32, th as i32);
+    let endpoint = rgb_endpoint(w as u32, h as u32);
+    let out_endpoint = rgb_endpoint(tw as u32, th as u32);
     let mut chain: Vec<Filter> = vec![
         video::crop(cx, cy, cw as u32, ch as u32),
         video::scale(tw as u32, th as u32, Some("lanczos"))?,
@@ -333,7 +333,7 @@ fn encode_jpeg(frame: &MediaFrame<u8>, qscale: u32) -> Result<Vec<u8>> {
 }
 
 /// 证件照统一用的 RGB24 视频端点（25fps，时间基 1/25）。
-fn rgb_endpoint(width: i32, height: i32) -> VideoEndpoint {
+fn rgb_endpoint(width: u32, height: u32) -> VideoEndpoint {
     VideoEndpoint::new(width, height, PixelFormat::RGB24)
         .with_time_base(Rational::new(1, 25).unwrap())
         .with_frame_rate(Rational::new(25, 1).unwrap())
@@ -342,7 +342,7 @@ fn rgb_endpoint(width: i32, height: i32) -> VideoEndpoint {
 /// 校验合成模式的结果：尺寸正确；开了换底则再校验新底色生效且人像未被盖住。
 fn verify(frame: &MediaFrame<u8>, tw: usize, th: usize, swapped: bool) -> Result<()> {
     anyhow::ensure!(
-        (frame.width, frame.height) == (tw as i32, th as i32),
+        (frame.width, frame.height) == (tw as u32, th as u32),
         "unexpected size {}x{}",
         frame.width,
         frame.height

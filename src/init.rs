@@ -88,10 +88,10 @@ pub fn init_with_level(level: AVLogLevel) -> Result<()> {
 pub fn init_with(level: AVLogLevel, flag: impl Into<FlagSet<AVLogFlag>>) -> Result<()> {
     INIT.get_or_try_init(|| {
         // 1. Register all libavdevice devices.
-        //    The call itself is idempotent and thread-safe on the FFmpeg side
-        //    (`avpriv_register_devices` stores the static lists with atomic
-        //    stores), but keeping it inside the once-guard keeps ALL init work
-        //    under the documented "first call wins" semantics.
+        // SAFETY: `avdevice_register_all` has no preconditions and is idempotent/thread-safe
+        // on the FFmpeg side (`avpriv_register_devices` stores the static lists with atomic
+        // stores); keeping it inside the once-guard keeps all init work under the documented
+        // "first call wins" semantics.
         unsafe { ffi::avdevice_register_all() };
 
         // 2. Redirect logging to the Rust logging facade.

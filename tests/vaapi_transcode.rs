@@ -38,16 +38,16 @@ fn set_hwframe_ctx(
     is_decoder: bool,
     codec_ctx: &mut AVCodecContext,
     hw_device_ctx: &AVHWDeviceContext,
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     hw_format: AVPixelFormat,
     sw_format: AVPixelFormat,
 ) -> Result<()> {
     let mut hw_frames_ref = hw_device_ctx.hwframe_ctx_alloc();
     hw_frames_ref.data().format = hw_format;
     hw_frames_ref.data().sw_format = sw_format;
-    hw_frames_ref.data().width = width;
-    hw_frames_ref.data().height = height;
+    hw_frames_ref.data().width = width as i32;
+    hw_frames_ref.data().height = height as i32;
     hw_frames_ref.data().initial_pool_size = 20;
 
     hw_frames_ref
@@ -102,8 +102,8 @@ fn open_input_file(
         true,
         &mut decode_ctx,
         hw_device_ctx,
-        width,
-        height,
+        width as u32,
+        height as u32,
         hw_format,
         sw_format,
     )?;
@@ -151,8 +151,8 @@ fn open_output_file(
         false,
         &mut encode_ctx,
         hw_device_ctx,
-        width,
-        height,
+        width as u32,
+        height as u32,
         hw_format,
         sw_format,
     )?;

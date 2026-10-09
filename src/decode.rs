@@ -408,8 +408,8 @@ impl DecoderBuilder {
         mut cfg: HWDeviceConfig,
         codec: &AVCodec,
         ctx: &mut AVCodecContext,
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
     ) -> Result<Arc<HWContext>> {
         // 以 `avcodec_get_hw_config` 的声明为准回写配置：hw frames 按这个字段
         // 分配，配置里的值若与编解码器声明不符，会得到错误的输出格式。
@@ -462,8 +462,8 @@ impl DecoderBuilder {
     fn build_filter_params(
         &self,
         ctx: &AVCodecContext,
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
         output_pix_fmt: PixelFormat,
         output_sample_fmt: Option<SampleFormat>,
         filter_input_format: Option<FrameFormat>,
@@ -538,8 +538,8 @@ impl DecoderBuilder {
         self.setup_codec_context(&mut decode_ctx, input_stream)?;
 
         // video
-        let init_width = decode_ctx.width;
-        let init_height = decode_ctx.height;
+        let init_width = decode_ctx.width as u32;
+        let init_height = decode_ctx.height as u32;
 
         let hw_context = if media_type == MediaType::VIDEO {
             match self.hw_device_config.take() {
@@ -1252,6 +1252,8 @@ impl Decoder {
     /// reason: those frames were already decoded, so dropping the codec's buffers
     /// without dropping them would deliver pre-seek pictures after the seek.
     pub fn flush_buffers(&mut self) -> Result<()> {
+        // SAFETY: `self.context` is a live decoder context we exclusively own (`&mut self`);
+        // `avcodec_flush_buffers` only resets its internal buffers.
         unsafe {
             ffi::avcodec_flush_buffers(self.context.as_mut_ptr());
         }
@@ -1364,10 +1366,8 @@ impl Decoder {
                         })?,
                     None => (sw_frame.width as u32, sw_frame.height as u32),
                 };
-                self.scaler.scale_if_needed(
-                    sw_frame,
-                    VideoSpec::new(out_w as i32, out_h as i32, target_sw_pix_fmt),
-                )?
+                self.scaler
+                    .scale_if_needed(sw_frame, VideoSpec::new(out_w, out_h, target_sw_pix_fmt))?
             }
             MediaType::AUDIO => match self
                 .filter_input_format

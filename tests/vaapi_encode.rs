@@ -23,16 +23,16 @@ use std::{
 fn set_hwframe_ctx(
     avctx: &mut AVCodecContext,
     hw_device_ctx: &AVHWDeviceContext,
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     hw_format: AVPixelFormat,
     sw_format: AVPixelFormat,
 ) -> Result<()> {
     let mut hw_frames_ref = hw_device_ctx.hwframe_ctx_alloc();
     hw_frames_ref.data().format = hw_format;
     hw_frames_ref.data().sw_format = sw_format;
-    hw_frames_ref.data().width = width;
-    hw_frames_ref.data().height = height;
+    hw_frames_ref.data().width = width as i32;
+    hw_frames_ref.data().height = height as i32;
     hw_frames_ref.data().initial_pool_size = 20;
 
     hw_frames_ref
@@ -102,8 +102,8 @@ fn encode_write(
 struct HwEncodeConfig<'a> {
     input: &'a Path,
     output: &'a std::path::Path,
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     encode_codec: &'a CStr,
     device_type: AVHWDeviceType,
     hw_format: AVPixelFormat,
@@ -124,8 +124,8 @@ fn hw_encode(config: &HwEncodeConfig<'_>) -> Result<()> {
 
     let mut avctx = AVCodecContext::new(&codec);
 
-    avctx.set_width(config.width);
-    avctx.set_height(config.height);
+    avctx.set_width(config.width as i32);
+    avctx.set_height(config.height as i32);
     avctx.set_time_base(ra(1, 25));
     avctx.set_framerate(ra(25, 1));
     avctx.set_sample_aspect_ratio(ra(1, 1));
@@ -149,8 +149,8 @@ fn hw_encode(config: &HwEncodeConfig<'_>) -> Result<()> {
         let mut sw_frame = AVFrame::new();
 
         // read data into software frame, and transfer them into hw frame
-        sw_frame.set_width(config.width);
-        sw_frame.set_height(config.height);
+        sw_frame.set_width(config.width as i32);
+        sw_frame.set_height(config.height as i32);
         sw_frame.set_format(config.sw_format);
         sw_frame.get_buffer(0).context("Get buffer failed.")?;
 
@@ -194,8 +194,8 @@ fn vaapi_encode_test_vaapi() {
     hw_encode(&HwEncodeConfig {
         input: &input,
         output: &output_path,
-        width: width as i32,
-        height: height as i32,
+        width: width as u32,
+        height: height as u32,
         encode_codec: c"h264_vaapi",
         device_type: AV_HWDEVICE_TYPE_VAAPI,
         hw_format: AV_PIX_FMT_VAAPI,
@@ -223,8 +223,8 @@ fn nvenc_encode_test_nvenc() {
     hw_encode(&HwEncodeConfig {
         input: &input,
         output: &output_path,
-        width: width as i32,
-        height: height as i32,
+        width: width as u32,
+        height: height as u32,
         encode_codec: c"h264_nvenc",
         device_type: AV_HWDEVICE_TYPE_CUDA,
         hw_format: AV_PIX_FMT_CUDA,
@@ -244,8 +244,8 @@ fn toolbox_encode_test_videotoolbox() {
     hw_encode(&HwEncodeConfig {
         input: &input,
         output: &output_path,
-        width: width as i32,
-        height: height as i32,
+        width: width as u32,
+        height: height as u32,
         encode_codec: c"h264_videotoolbox",
         device_type: AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
         hw_format: AV_PIX_FMT_VIDEOTOOLBOX,

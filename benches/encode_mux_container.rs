@@ -81,7 +81,7 @@ fn encode_container(path: &Path, enc_threads: i32) -> Result<()> {
     // Audio frames (variable sizes; the encoder's sample FIFO re-frames them).
     let a_frame_ticks = rsmpeg::avutil::av_rescale_q(
         a_enc.frame_size() as i64,
-        Rational::new(1, SAMPLE_RATE).unwrap().into(),
+        Rational::new(1, SAMPLE_RATE as i32).unwrap().into(),
         a_tb.into(),
     );
     for i in 0..AUDIO_FRAMES {
@@ -168,9 +168,13 @@ fn rainbow_frame(p: f32) -> MediaFrame<u8> {
 }
 
 fn sine_audio_frame(nb_samples: i32) -> MediaFrame<f32> {
-    let mut frame =
-        MediaFrame::<f32>::new_audio_frame(SampleFormat::FLT, CHANNELS, nb_samples, SAMPLE_RATE)
-            .unwrap();
+    let mut frame = MediaFrame::<f32>::new_audio_frame(
+        SampleFormat::FLT,
+        CHANNELS,
+        nb_samples as u32,
+        SAMPLE_RATE,
+    )
+    .unwrap();
     let samples = frame
         .data
         .as_packed_mut()

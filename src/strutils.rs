@@ -167,6 +167,8 @@ pub unsafe fn c_char_to_str(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
+    // SAFETY: the caller guarantees `ptr` is NULL or a valid NUL-terminated C string; the NULL
+    // case returned early above.
     let cstr = unsafe { CStr::from_ptr(ptr) };
     match cstr.to_str() {
         Ok(s) => s.to_owned(),
@@ -190,6 +192,8 @@ pub unsafe fn c_char_to_str_list(ptr: *const c_char) -> Vec<String> {
     if ptr.is_null() {
         return Vec::new();
     }
+    // SAFETY: the caller guarantees `ptr` is NULL or a valid NUL-terminated C string; the NULL
+    // case returned early above.
     let cstr = unsafe { CStr::from_ptr(ptr) };
     cstr.to_string_lossy()
         .split(',')

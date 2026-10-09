@@ -21,8 +21,8 @@ use rsmedia::{
 /// 每帧的 pts（`Muxer::mux` 不会像旧的 EncoderWrapper 那样自动设置）。
 fn make_test_video(
     path: &std::path::Path,
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     n_frames: usize,
     fps: f32,
 ) -> Result<()> {
@@ -37,7 +37,7 @@ fn make_test_video(
     for i in 0..n_frames {
         let rgb = colors::hsv_to_rgb(i as f32 / n_frames as f32 * 360.0, 100.0, 100.0);
         let mut frame =
-            MediaFrame::<u8>::new_video_frame(width as i32, height as i32, PixelFormat::RGB24)?;
+            MediaFrame::<u8>::new_video_frame(width as u32, height as u32, PixelFormat::RGB24)?;
         let samples = frame
             .data
             .as_packed_mut()
@@ -65,8 +65,8 @@ fn make_test_video(
 /// filter-EOF 类 BUG）。
 #[test]
 fn test_decode_delayed_filter_eof() -> Result<()> {
-    let width = 64i32;
-    let height = 64i32;
+    let width = 64u32;
+    let height = 64u32;
     // (滤镜名, 参数, 输入帧数, fps, 期望最小输出帧数)
     let cases: &[(&str, &str, usize, f32, usize)] = &[
         ("framerate", "framerate=fps=30", 30, 30.0, 30),
@@ -106,8 +106,8 @@ fn test_decode_delayed_filter_eof() -> Result<()> {
 /// 停止谓词也必须是 `is_finished()`（含滤镜图排空）而非 `is_flushed()`。
 #[test]
 fn test_demuxer_drain_does_not_stop_on_eagain() -> Result<()> {
-    let width = 64i32;
-    let height = 64i32;
+    let width = 64u32;
+    let height = 64u32;
     // (滤镜名, 参数, 输入帧数, fps, 期望最小输出帧数)
     let cases: &[(&str, &str, usize, f32, usize)] = &[
         ("framerate", "framerate=fps=30", 30, 30.0, 30),

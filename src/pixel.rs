@@ -496,7 +496,9 @@ impl PixelFormat {
     /// `width`/`height` or an [`Self::is_plane_storable`] check in hand first.
     /// [`Self::is_plane_storable`] predicts the first two classes; the third
     /// cannot be predicted, so only a panic catches it.
-    pub fn data_layout(self, width: usize, height: usize) -> DataLayout {
+    pub fn data_layout(self, width: u32, height: u32) -> DataLayout {
+        let width = width as usize;
+        let height = height as usize;
         if width == 0 || height == 0 {
             panic!(
                 "pixel format {self:?} has a zero dimension ({width}x{height}); \
@@ -637,6 +639,8 @@ pub fn find_best_pix_fmt(
 
     // 返回的是**选中的像素格式**（`AV_PIX_FMT_NONE` 表示无法选择）。`loss_ptr`
     // 才承载"会损失什么"的位掩码，这里不需要，故传 NULL。
+    // SAFETY: a pure query — every argument is an enum value and the optional loss pointer is
+    // NULL; no pointer is retained.
     let best = unsafe {
         ffi::av_find_best_pix_fmt_of_2(
             dst_pix_fmt1.into(),
@@ -672,6 +676,8 @@ pub fn find_codec_best_pix_fmt(
     let mut pix_fmts: Vec<i32> = pix_fmt_list.iter().map(|&fmt| fmt.into()).collect();
     pix_fmts.push(ffi::AV_PIX_FMT_NONE);
     let alpha = if has_alpha { 1 } else { 0 };
+    // SAFETY: `pix_fmts` is a live, `AV_PIX_FMT_NONE`-terminated list (sentinel pushed just
+    // above) that outlives the call; the loss pointer is NULL and nothing is retained.
     let ret = unsafe {
         ffi::avcodec_find_best_pix_fmt_of_list(
             pix_fmts.as_ptr(),
@@ -709,6 +715,7 @@ pub fn get_pix_fmt_loss(
     src_pix_fmt: PixelFormat,
     has_alpha: bool,
 ) -> Result<i32> {
+    // SAFETY: a pure computation on two enum values; no pointers are involved.
     let loss = unsafe {
         ffi::av_get_pix_fmt_loss(dst_pix_fmt.into(), src_pix_fmt.into(), has_alpha as i32)
     };
@@ -759,7 +766,7 @@ mod tests {
                 assert_eq!(rows, 7, "{fmt:?} at width {width}");
                 assert_eq!(
                     row_elements * element_bytes,
-                    fill_linesizes(fmt, width as i32)?[0] as usize,
+                    fill_linesizes(fmt, width)?[0] as usize,
                     "{fmt:?} at width {width}: layout row bytes vs FFmpeg linesize"
                 );
             }

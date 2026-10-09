@@ -19,12 +19,12 @@ use rsmedia::{DecoderBuilder, EncoderBuilder, MediaType, Options, Quality};
 use std::ffi::CString;
 use std::time::Instant;
 
-const WIDTH: i32 = 96;
-const HEIGHT: i32 = 64;
+const WIDTH: u32 = 96;
+const HEIGHT: u32 = 64;
 const FRAMES: usize = 10;
 const FPS: f32 = 25.0;
-const SAMPLE_RATE: i32 = 44_100;
-const CHANNELS: i32 = 2;
+const SAMPLE_RATE: u32 = 44_100;
+const CHANNELS: u32 = 2;
 const AUDIO_FRAMES: usize = 10;
 
 /// Returns true when `name` is a usable **encoder** in this FFmpeg build.
@@ -125,8 +125,8 @@ fn audio_roundtrip(
     label: &str,
     codec_name: &str,
     container: &str,
-    sample_rate: i32,
-    nb_samples: i32,
+    sample_rate: u32,
+    nb_samples: u32,
     quality: Option<Quality>,
 ) -> anyhow::Result<()> {
     if !encoder_available(codec_name) {
@@ -186,7 +186,7 @@ fn audio_roundtrip(
         .map_err(|e| anyhow::anyhow!("{label}: decode failed: {e}"))?
     {
         assert_eq!(
-            frame.sample_rate, sample_rate,
+            frame.sample_rate as u32, sample_rate,
             "{label}: decoded sample rate mismatch"
         );
         assert!(frame.nb_samples > 0, "{label}: decoded empty audio frame");
