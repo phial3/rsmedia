@@ -52,8 +52,8 @@ fn main() -> anyhow::Result<()> {
         } else if info.media_type == MediaType::AUDIO {
             EncoderBuilder::new_audio(
                 info.bit_rate,
-                info.channel_layout.nb_channels,
-                info.sample_rate,
+                info.channel_layout.nb_channels as u32,
+                info.sample_rate as u32,
                 info.format.into_sample().unwrap_or(SampleFormat::NONE),
             )
             .build()?

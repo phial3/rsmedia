@@ -447,8 +447,8 @@ impl HWContext {
     pub(crate) fn setup_decoder_frames(
         &self,
         codec_ctx: &mut AVCodecContext,
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
         pool_size: i32,
     ) -> Result<()> {
         let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
@@ -490,8 +490,8 @@ impl HWContext {
     pub(crate) fn setup_encoder_frames(
         &self,
         codec_ctx: &mut AVCodecContext,
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
         pool_size: i32,
     ) -> Result<()> {
         let hw_frames_ctx = self.create_hw_frames_ctx(width, height, pool_size)?;
@@ -510,15 +510,15 @@ impl HWContext {
     /// therefore no way for a value to be silently reinterpreted on the way in.
     pub(crate) fn create_hw_frames_ctx(
         &self,
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
         pool_size: i32,
     ) -> Result<rsmpeg::avutil::AVHWFramesContext> {
         let mut hw_frames_ctx = self.device_ctx.hwframe_ctx_alloc();
         hw_frames_ctx.data().format = self.get_format(true);
         hw_frames_ctx.data().sw_format = self.get_format(false);
-        hw_frames_ctx.data().width = width;
-        hw_frames_ctx.data().height = height;
+        hw_frames_ctx.data().width = width as i32;
+        hw_frames_ctx.data().height = height as i32;
         hw_frames_ctx.data().initial_pool_size = pool_size;
 
         hw_frames_ctx
@@ -547,6 +547,8 @@ impl HWContext {
         codec_ctx: &mut AVCodecContext,
         src: AVFrame,
     ) -> Result<AVFrame> {
+        // SAFETY: `codec_ctx` is a live `&mut` context (FFmpeg set its `hw_frames_ctx` before
+        // this runs); only the field is read, and the result is null-checked next.
         let dst_ref = unsafe { (*codec_ctx.as_ptr()).hw_frames_ctx };
         if dst_ref.is_null() {
             return Err(RsmediaError::invalid_config(
@@ -556,11 +558,16 @@ impl HWContext {
         // 比较的是 AVHWFramesContext 对象本身（`AVBufferRef::data`），不是 buffer_ref
         // 结构体地址：`av_buffer_ref`/`av_hwframe_get_buffer` 每次都会新建一个
         // AVBufferRef 指向同一对象，结构体地址几乎总是不等。
+        // SAFETY: both pointers are checked non-null — `dst_ref` above, `src.hw_frames_ctx` in
+        // this condition; each `AVBufferRef` is live and only its `data` field is read.
         if !src.hw_frames_ctx.is_null() && unsafe { (*src.hw_frames_ctx).data == (*dst_ref).data } {
             return Ok(src);
         }
 
         let mut dst = AVFrame::new();
+        // SAFETY: `dst` is a freshly created, unshared frame (`deref_mut` gives an exclusive
+        // `&mut`) and `src` is only read; `dst_ref` is the non-null buffer ref checked above, and
+        // `av_buffer_ref` hands back a new reference the caller owns.
         let map_ret = unsafe {
             // `av_hwframe_map` 要裸指针，但**填字段不需要**：`deref_mut` 给出
             // `&mut ffi::AVFrame`，只在调用处隐式转成 `*mut`（`&mut T -> *mut T`）。
@@ -987,6 +994,8 @@ impl HWDeviceType {
     /// Uses `av_hwdevice_iterate_types` internally.
     pub fn list_available() -> Vec<HWDeviceType> {
         let mut hw_device_types = Vec::new();
+        // SAFETY: `av_hwdevice_iterate_types` is a pure static-table walk with no preconditions;
+        // the loop advances on the returned value and stops at `AV_HWDEVICE_TYPE_NONE`.
         unsafe {
             let mut hwdevice_type = ffi::av_hwdevice_iterate_types(ffi::AV_HWDEVICE_TYPE_NONE);
             while hwdevice_type != ffi::AV_HWDEVICE_TYPE_NONE {
@@ -1044,6 +1053,8 @@ impl HWDeviceType {
     pub fn find_hw_pixel_format_with_codec(&self, codec: &AVCodec) -> Option<ffi::AVPixelFormat> {
         let mut i = 0;
         loop {
+            // SAFETY: `codec` is a live `AVCodec` for the duration of the call; the returned
+            // config pointer is null-checked and its fields are only read.
             unsafe {
                 let hw_config = ffi::avcodec_get_hw_config(codec.as_ptr(), i);
                 if !hw_config.is_null() {
@@ -1082,6 +1093,8 @@ unsafe extern "C" fn hwaccel_get_format(
     _ctx: *mut ffi::AVCodecContext,
     pix_fmts: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
+    // SAFETY: installed as the codec's `get_format` callback, so FFmpeg passes a valid,
+    // `AV_PIX_FMT_NONE`-terminated candidate array per that contract.
     unsafe {
         let mut p = pix_fmts;
         while *p != ffi::AV_PIX_FMT_NONE {

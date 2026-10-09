@@ -37,8 +37,8 @@ use rsmpeg::avcodec::AVCodec;
 use rsmpeg::avutil::AVMediaType;
 use rsmpeg::ffi;
 
-const WIDTH: i32 = 320;
-const HEIGHT: i32 = 240;
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 240;
 const FPS: f32 = 25.0;
 /// 0.4 s of video — long enough to decode a real sequence, short enough to keep
 /// the whole matrix fast.
@@ -47,7 +47,7 @@ const VIDEO_FRAMES: i64 = 10;
 /// lot (AAC 1024 samples, FLAC 4608), so counting frames would give a 0.23 s
 /// file for one container and a 1.05 s file for the next.
 const AUDIO_SECONDS: f64 = 0.4;
-const CHANNELS: i32 = 2;
+const CHANNELS: u32 = 2;
 /// Both cues live inside the video's duration.
 const CUES: [(i64, i64, &str); 2] = [
     (0, 150, "first cue"),
@@ -275,8 +275,8 @@ struct Written {
     /// codecs re-chunk; lossy ones add padding, hence the tolerance below).
     frame_samples: i32,
     audio_samples: u64,
-    sample_rate: i32,
-    channels: i32,
+    sample_rate: u32,
+    channels: u32,
 }
 
 /// Decodes the audio stream into its **native** element type, returning
@@ -387,9 +387,10 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
     let (audio_index, frame_samples, sample_rate) = match spec.audio {
         Some(codec) => {
             let (sample_format, sample_rate) = negotiate_audio(codec, spec.sample_rate)?;
-            let encoder = EncoderBuilder::new_audio(128_000, CHANNELS, sample_rate, sample_format)
-                .with_codec_name(codec)
-                .build()?;
+            let encoder =
+                EncoderBuilder::new_audio(128_000, CHANNELS, sample_rate as u32, sample_format)
+                    .with_codec_name(codec)
+                    .build()?;
             // Fixed-frame-size codecs (AAC 1024, Opus 960, MP3 1152) want exactly
             // this many samples per frame; the rest take whole frames as they come.
             let frame_size = encoder.frame_size();
@@ -435,7 +436,12 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
         if let Some(index) = audio_index {
             let target = ((frame_index + 1) as f64 / FPS as f64 * sample_rate as f64) as u64;
             while audio_written + frame_samples as u64 <= target {
-                let audio = common::sine_audio_frame(440.0, CHANNELS, frame_samples, sample_rate);
+                let audio = common::sine_audio_frame(
+                    440.0,
+                    CHANNELS,
+                    frame_samples as u32,
+                    sample_rate as u32,
+                );
                 muxer.mux(audio.to_avframe()?, index)?;
                 audio_written += frame_samples as u64;
             }
@@ -444,7 +450,8 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
     // Top the audio up to the full frame count when video did not already.
     if let Some(index) = audio_index {
         while audio_written < audio_frames * frame_samples as u64 {
-            let audio = common::sine_audio_frame(440.0, CHANNELS, frame_samples, sample_rate);
+            let audio =
+                common::sine_audio_frame(440.0, CHANNELS, frame_samples as u32, sample_rate as u32);
             muxer.mux(audio.to_avframe()?, index)?;
             audio_written += frame_samples as u64;
         }
@@ -461,7 +468,7 @@ fn write_container(path: &Path, spec: &ContainerSpec) -> Result<Written> {
     Ok(Written {
         frame_samples,
         audio_samples: audio_written,
-        sample_rate,
+        sample_rate: sample_rate as u32,
         channels: CHANNELS,
     })
 }

@@ -14,13 +14,13 @@ use rsmedia::frame::MediaFrame;
 use rsmedia::mux::Muxer;
 use rsmedia::{EncoderBuilder, PixelFormat, SampleFormat};
 
-const WIDTH: i32 = 320;
-const HEIGHT: i32 = 240;
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 240;
 const FPS: f32 = 30.0;
 const VIDEO_FRAMES: usize = 90; // 3 s
 
-const SAMPLE_RATE: i32 = 44_100;
-const CHANNELS: i32 = 2;
+const SAMPLE_RATE: u32 = 44_100;
+const CHANNELS: u32 = 2;
 const AUDIO_FRAMES: usize = 129; // variable sizes, sums to ~3 s
 const FREQ: f32 = 440.0;
 
@@ -93,9 +93,13 @@ fn rainbow_frame(p: f32) -> MediaFrame<u8> {
 }
 
 fn sine_audio_frame(nb_samples: i32) -> MediaFrame<f32> {
-    let mut frame =
-        MediaFrame::<f32>::new_audio_frame(SampleFormat::FLT, CHANNELS, nb_samples, SAMPLE_RATE)
-            .unwrap();
+    let mut frame = MediaFrame::<f32>::new_audio_frame(
+        SampleFormat::FLT,
+        CHANNELS,
+        nb_samples as u32,
+        SAMPLE_RATE,
+    )
+    .unwrap();
     let samples = frame
         .data
         .as_packed_mut()

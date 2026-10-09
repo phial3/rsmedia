@@ -369,7 +369,7 @@ impl DecoderBuilder {
                 Ok(fmt)
             }
             (_, None) => Ok(PixelFormat::YUV420P),
-            // 属于调用方错误（把只对视频生效的 setter 用在了别的类型上），报 `InvalidConfig` 而不是笼统的 `Other`
+            // 属于调用方错误（把只对视频生效的 setter 用在了别的类型上）
             (media_type, Some(fmt)) => Err(RsmediaError::invalid_config(format!(
                 "with_pix_fmt({fmt:?}) is only valid for {} decoders, got media type: {media_type:?}",
                 MediaType::VIDEO.get_media_name()
@@ -408,8 +408,8 @@ impl DecoderBuilder {
         mut cfg: HWDeviceConfig,
         codec: &AVCodec,
         ctx: &mut AVCodecContext,
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
     ) -> Result<Arc<HWContext>> {
         // 以 `avcodec_get_hw_config` 的声明为准回写配置：hw frames 按这个字段
         // 分配，配置里的值若与编解码器声明不符，会得到错误的输出格式。
@@ -462,8 +462,8 @@ impl DecoderBuilder {
     fn build_filter_params(
         &self,
         ctx: &AVCodecContext,
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
         output_pix_fmt: PixelFormat,
         output_sample_fmt: Option<SampleFormat>,
         filter_input_format: Option<FrameFormat>,
@@ -538,8 +538,8 @@ impl DecoderBuilder {
         self.setup_codec_context(&mut decode_ctx, input_stream)?;
 
         // video
-        let init_width = decode_ctx.width;
-        let init_height = decode_ctx.height;
+        let init_width = decode_ctx.width as u32;
+        let init_height = decode_ctx.height as u32;
 
         let hw_context = if media_type == MediaType::VIDEO {
             match self.hw_device_config.take() {
@@ -825,7 +825,7 @@ impl Decoder {
     /// Get decoder time base.
     #[inline(always)]
     pub fn time_base(&self) -> Rational {
-        self.duration.time_base
+        self.duration.time_base()
     }
 
     /// Number of frames in the input stream (`AVStream.nb_frames`).
@@ -1252,6 +1252,8 @@ impl Decoder {
     /// reason: those frames were already decoded, so dropping the codec's buffers
     /// without dropping them would deliver pre-seek pictures after the seek.
     pub fn flush_buffers(&mut self) -> Result<()> {
+        // SAFETY: `self.context` is a live decoder context we exclusively own (`&mut self`);
+        // `avcodec_flush_buffers` only resets its internal buffers.
         unsafe {
             ffi::avcodec_flush_buffers(self.context.as_mut_ptr());
         }

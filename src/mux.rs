@@ -486,12 +486,16 @@ impl<W: Writer> Muxer<W> {
         // 兼容，清空后由目标 muxer 在 write_header 时自行指派正确 tag。
         // 与 ffmpeg remux 的 `codec_tag = 0` 语义一致。
         let stream = self.stream_ptr(stream_idx)?;
+        // SAFETY: `stream` is a non-null, live output stream pointer (checked by `stream_ptr`)
+        // that `&mut self` owns exclusively; only its `codecpar` field is read.
         let raw_codecpar = unsafe { (*stream).codecpar };
         if raw_codecpar.is_null() {
             return Err(RsmediaError::msg(format!(
                 "output stream {stream_idx} has no codec parameters"
             )));
         }
+        // SAFETY: `raw_codecpar` was checked non-null just above and belongs to the output
+        // context we exclusively own; writing its `codec_tag` is the only access path.
         unsafe {
             (*raw_codecpar).codec_tag = 0;
         }
@@ -708,7 +712,7 @@ impl<W: Writer> Muxer<W> {
     pub fn add_cover_art(&mut self, cover_frame: AVFrame) -> Result<usize> {
         let width = cover_frame.width;
         let height = cover_frame.height;
-        let encoder = EncoderBuilder::new_video(width, height)
+        let encoder = EncoderBuilder::new_video(width as u32, height as u32)
             .with_codec_name("mjpeg")
             .build()?;
         self.add_cover_art_with(encoder, cover_frame)
@@ -754,6 +758,8 @@ impl<W: Writer> Muxer<W> {
         // here instead; sound because the writer exclusively owns the context
         // and the disposition must be set before `write_header`.
         let stream = self.stream_ptr(stream_idx)?;
+        // SAFETY: `stream` is a non-null, live output stream pointer (checked by `stream_ptr`)
+        // that the writer exclusively owns; OR-ing its `disposition` is the only access path.
         unsafe {
             (*stream).disposition |= ffi::AV_DISPOSITION_ATTACHED_PIC as i32;
         }
@@ -841,6 +847,9 @@ impl<W: Writer> Muxer<W> {
         }
 
         // 3) 复制节点指针并转移所有权给 format context。
+        // SAFETY: `chapters_ptr` was allocated by `av_calloc` for exactly `count` pointers
+        // (checked just above) and `chapter_nodes` holds `count` live entries, so the two
+        // regions are valid, non-overlapping and large enough.
         unsafe {
             std::ptr::copy_nonoverlapping(chapter_nodes.as_ptr(), chapters_ptr, count);
         }
@@ -855,6 +864,9 @@ impl<W: Writer> Muxer<W> {
     /// 释放一组尚未转移所有权的 chapter 节点（`av_free` 对空指针安全）。
     fn free_chapter_nodes(nodes: &mut Vec<*mut ffi::AVChapter>) {
         for node in nodes.drain(..) {
+            // SAFETY: each `node` came from `av_mallocz` and has not been handed to FFmpeg
+            // (this runs on the failure path only), so freeing it here is correct and happens
+            // exactly once; `av_free` also accepts a null pointer.
             unsafe {
                 ffi::av_free(node as *mut std::os::raw::c_void);
             }
@@ -1800,6 +1812,9 @@ impl<R: Reader> Iterator for Demuxer<R> {
 /// `R: Send` 是必需的：`Demuxer` 直接持有 `reader: R`，而 `Reader` 并没有
 /// `Send` 约束（见 [`Reader`]），少了它就可以把一个内含
 /// `Rc` 之类非 `Send` 类型的 reader 连同 `Demuxer` 一起送进别的线程。
+/// SAFETY: only promises the value can be moved to another thread for exclusive use (`Send`);
+/// the `R: Send` bound keeps the directly-held reader `Send` too. `Sync` is deliberately not
+/// implemented (`AVFormatContext` is not shareable).
 unsafe impl<R: Reader + Send> Send for Demuxer<R> {}
 
 #[cfg(test)]
@@ -1812,10 +1827,10 @@ mod tests {
     use std::path::Path;
 
     /// 生成YUV420P格式的视频帧,彩色渐变测试图
-    fn generate_video_frame(width: i32, height: i32, frame_index: i64) -> AVFrame {
+    fn generate_video_frame(width: u32, height: u32, frame_index: i64) -> AVFrame {
         let mut frame = AVFrame::new();
-        frame.set_width(width);
-        frame.set_height(height);
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
         frame.set_format(PixelFormat::YUV420P.into());
         frame
             .alloc_buffer()
@@ -1875,12 +1890,12 @@ mod tests {
         freq: f32,
         channels: usize,
         nb_samples: usize,
-        sample_rate: i32,
+        sample_rate: u32,
     ) -> Result<AVFrame> {
         let mut frame = AVFrame::new();
         frame.set_format(SampleFormat::FLTP as _);
         frame.set_ch_layout(AVChannelLayout::from_nb_channels(channels as i32).into_inner());
-        frame.set_sample_rate(sample_rate);
+        frame.set_sample_rate(sample_rate as i32);
         frame.set_nb_samples(nb_samples as i32);
         frame
             .alloc_buffer()
@@ -2249,14 +2264,14 @@ mod tests {
     #[test]
     fn test_multiple_streams() -> Result<()> {
         // 视频参数
-        pub const VIDEO_WIDTH: i32 = 640;
-        pub const VIDEO_HEIGHT: i32 = 360;
+        pub const VIDEO_WIDTH: u32 = 640;
+        pub const VIDEO_HEIGHT: u32 = 360;
         pub const VIDEO_FPS: f32 = 30f32;
         pub const VIDEO_DURATION_SEC: u32 = 3;
 
         // 音频参数
-        pub const AUDIO_SAMPLE_RATE: i32 = 48_000;
-        pub const AUDIO_CHANNELS: i32 = 2;
+        pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
+        pub const AUDIO_CHANNELS: u32 = 2;
         pub const SAMPLES_PER_FRAME: u32 = 1024;
 
         let output_path = crate::test_support::test_output_path("mux", "test_multiple_streams.mp4");
@@ -2711,8 +2726,8 @@ mod tests {
             frames.len()
         );
         let (_, frame) = &frames[0];
-        assert_eq!(frame.width, width);
-        assert_eq!(frame.height, height);
+        assert_eq!(frame.width as u32, width);
+        assert_eq!(frame.height as u32, height);
 
         let frame_count = frames.len() as f64;
 
@@ -2756,8 +2771,8 @@ mod tests {
 
         // 生成一张 RGB24 渐变封面帧（编码器自动协商并转换为 mjpeg 支持的格式）
         let mut cover = AVFrame::new();
-        cover.set_width(width);
-        cover.set_height(height);
+        cover.set_width(width as i32);
+        cover.set_height(height as i32);
         cover.set_format(PixelFormat::RGB24.into());
         cover.alloc_buffer().context("alloc cover frame")?;
         let rgb = cover.data_mut()[0];

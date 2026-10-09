@@ -44,7 +44,7 @@ pub fn remove_test_output(path: &std::path::Path) {
 /// gradients plus a phase-shifted blue channel, so round-trips exercise every
 /// plane.
 #[allow(dead_code)]
-pub fn gradient_video_frame(width: i32, height: i32, phase: f32) -> rsmedia::MediaFrame<u8> {
+pub fn gradient_video_frame(width: u32, height: u32, phase: f32) -> rsmedia::MediaFrame<u8> {
     let mut frame =
         rsmedia::MediaFrame::<u8>::new_video_frame(width, height, rsmedia::PixelFormat::RGB24)
             .expect("video frame allocation");
@@ -70,9 +70,9 @@ pub fn gradient_video_frame(width: i32, height: i32, phase: f32) -> rsmedia::Med
 #[allow(dead_code)]
 pub fn sine_audio_frame(
     freq: f32,
-    channels: i32,
-    nb_samples: i32,
-    sample_rate: i32,
+    channels: u32,
+    nb_samples: u32,
+    sample_rate: u32,
 ) -> rsmedia::MediaFrame<f32> {
     let mut frame = rsmedia::MediaFrame::<f32>::new_audio_frame(
         rsmedia::SampleFormat::FLTP,

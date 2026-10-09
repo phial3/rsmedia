@@ -13,10 +13,10 @@ use rsmpeg::avcodec::AVCodec;
 use rsmpeg::avutil::AVFrame;
 
 /// 生成一张带非零图案的 YUV420P 源帧（不依赖 ndarray）。
-fn make_source_frame(width: i32, height: i32, seed: u8) -> Result<AVFrame> {
+fn make_source_frame(width: u32, height: u32, seed: u8) -> Result<AVFrame> {
     let mut frame = AVFrame::new();
-    frame.set_width(width);
-    frame.set_height(height);
+    frame.set_width(width as i32);
+    frame.set_height(height as i32);
     frame.set_format(PixelFormat::YUV420P.into());
     frame
         .alloc_buffer()
@@ -164,10 +164,10 @@ fn test_pooled_and_plain_frames_interleave() -> Result<()> {
 }
 
 /// 构造一张填充了图案的 RGB24 帧（真实转换路径的源帧）。
-fn make_rgb_frame(width: i32, height: i32, seed: u8) -> Result<AVFrame> {
+fn make_rgb_frame(width: u32, height: u32, seed: u8) -> Result<AVFrame> {
     let mut frame = AVFrame::new();
-    frame.set_width(width);
-    frame.set_height(height);
+    frame.set_width(width as i32);
+    frame.set_height(height as i32);
     frame.set_format(PixelFormat::RGB24.into());
     frame
         .alloc_buffer()

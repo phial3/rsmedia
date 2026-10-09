@@ -86,14 +86,10 @@ fn main() -> Result<()> {
     // ---- rsmedia 侧：Encoder（默认 AAC）+ Muxer + PcmSink ----
     // 编码器规格可以与设备不同（例：设备 48kHz 单声道 -> 编码器 44.1kHz 立体声），
     // PcmSink 内部的持久重采样器会自动完成格式/采样率/声道数转换。
-    let encoder = Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
+    let encoder = Encoder::new_audio(channels as u32, rate, rsmedia::SampleFormat::FLTP)?;
     let mut muxer = Muxer::new(&output)?;
     let audio_index = muxer.add_encoder(encoder)?;
-    let mut sink = PcmSink::new(
-        muxer,
-        audio_index,
-        PcmSpec::new(rate as i32, channels as i32),
-    )?;
+    let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels as u32))?;
 
     // ---- cpal 侧：音频回调线程 --mpsc--> 主线程（PcmSink 非线程安全，留在主线程）----
     let (chunk_tx, chunk_rx) = mpsc::channel::<Chunk>();
@@ -241,16 +237,11 @@ mod tests {
         std::fs::create_dir_all(output.parent().unwrap())?;
         let _ = std::fs::remove_file(&output);
 
-        let (rate, channels) = (44_100u32, 2u16);
-        let encoder =
-            Encoder::new_audio(channels as i32, rate as i32, rsmedia::SampleFormat::FLTP)?;
+        let (rate, channels) = (44_100, 2);
+        let encoder = Encoder::new_audio(channels, rate, rsmedia::SampleFormat::FLTP)?;
         let mut muxer = Muxer::new(&output)?;
         let audio_index = muxer.add_encoder(encoder)?;
-        let mut sink = PcmSink::new(
-            muxer,
-            audio_index,
-            PcmSpec::new(rate as i32, channels as i32),
-        )?;
+        let mut sink = PcmSink::new(muxer, audio_index, PcmSpec::new(rate, channels as u32))?;
 
         // 1 秒 440Hz 正弦，模拟 cpal 回调块粒度
         let total = rate as usize;

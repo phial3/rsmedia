@@ -97,14 +97,14 @@ impl SampleFormat {
     /// set of `(1, samples, channels)` interleaved samples. Audio planes are
     /// always exactly one row tall, which is what lets the same plane-copying
     /// code serve audio and video alike.
-    pub fn data_layout(self, channels: usize, samples: usize) -> DataLayout {
+    pub fn data_layout(self, channels: u32, samples: u32) -> DataLayout {
         if self.is_planar() {
-            DataLayout::Planar(vec![(1, samples); channels])
+            DataLayout::Planar(vec![(1, samples as usize); channels as usize])
         } else {
             DataLayout::Interleaved {
                 rows: 1,
-                cols: samples,
-                components: channels,
+                cols: samples as usize,
+                components: channels as usize,
             }
         }
     }

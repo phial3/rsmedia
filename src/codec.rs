@@ -278,6 +278,8 @@ impl CodecConfig {
                 // ffmpeg6 无 `AV_CODEC_CONFIG_CHANNEL_LAYOUT` 能力接口，改用旧式
                 // `AVCodec.ch_layouts` 字段（`*const AVChannelLayout`，以 zeroed layout 结尾）。
                 // `build_array` 依赖字节相等性判断终止，zeroed layout 即终止哨兵。
+                // SAFETY: `self.codec.ch_layouts` is FFmpeg's own zero-terminated static array;
+                // `build_array` reads until the zeroed sentinel and copies the entries out.
                 unsafe {
                     rsmpeg::build_array::<ffi::AVChannelLayout>(
                         self.codec.ch_layouts,
@@ -370,6 +372,9 @@ impl CodecConfig {
     /// [`CodecConfig::profile_name`] to resolve a known profile id instead.
     pub fn profiles(&self) -> Vec<Profile> {
         let mut out = Vec::new();
+        // SAFETY: `self.codec.profiles` is FFmpeg's static, `AV_PROFILE_UNKNOWN`-terminated
+        // array (or NULL, checked below); the loop stops at the sentinel and only reads each
+        // entry, copying the name out via `c_char_to_str`.
         unsafe {
             let mut p = self.codec.profiles;
             if p.is_null() {
@@ -392,6 +397,8 @@ impl CodecConfig {
     /// Works on all supported FFmpeg versions, even when [`CodecConfig::profiles`]
     /// returns an empty list.
     pub fn profile_name(&self, profile_id: i32) -> Option<String> {
+        // SAFETY: `avcodec_profile_name` returns FFmpeg's static string (or NULL);
+        // `c_char_to_str` handles NULL and copies the contents out immediately.
         let pname = unsafe { ffi::avcodec_profile_name(self.codec.id, profile_id) };
         unsafe { Some(strutils::c_char_to_str(pname)) }
     }
@@ -473,6 +480,8 @@ impl FormatInfo {
         long_name: *const std::os::raw::c_char,
         extensions: *const std::os::raw::c_char,
     ) -> Self {
+        // SAFETY: the three pointers come from FFmpeg's static codec tables (NULL or
+        // NUL-terminated); `c_char_to_str`/`c_char_to_str_list` accept NULL and copy out at once.
         Self {
             name: unsafe { strutils::c_char_to_str(name) },
             long_name: unsafe { strutils::c_char_to_str(long_name) },

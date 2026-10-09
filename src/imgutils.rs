@@ -13,14 +13,9 @@ const MAX_FFMPEG_PLANES: usize = 4;
 
 /// Fill plane linesizes for an image with pixel format pix_fmt and width.
 ///
-/// This mirrors `av_image_fill_linesizes` one-to-one, including its `int`
-/// parameters and result — hence `width: i32` and `[i32; 4]`, the same width the
-/// rest of this crate uses for sizes (FFmpeg's `int`, so that a value reaches
-/// `AVFrame.width` unchanged instead of being narrowed into a wrap).
-///
-/// A negative `width` is **rejected**, not mirrored: FFmpeg's `image_get_linesize`
-/// answers `AVERROR(EINVAL)` for `width < 0`, so no stride is ever negative
-/// (verified 5.1…9.0). The signedness is kept purely to match FFmpeg's `int`.
+/// `width` follows the crate's `u32` size API and is narrowed to FFmpeg's `int`
+/// only at the boundary (where the value is required to be non-negative); the
+/// result stays `[i32; 4]` to mirror `av_image_fill_linesizes`.
 ///
 /// # Arguments
 ///
@@ -28,10 +23,13 @@ const MAX_FFMPEG_PLANES: usize = 4;
 /// * `width` - The width of the image in pixels.
 ///
 /// Returns an array of four integers representing the linesizes for each plane of the image.
-pub fn fill_linesizes(pix_fmt: PixelFormat, width: i32) -> Result<[i32; 4]> {
+pub fn fill_linesizes(pix_fmt: PixelFormat, width: u32) -> Result<[i32; 4]> {
     let mut linesizes = [0; 4];
-    let ret =
-        unsafe { ffi::av_image_fill_linesizes(linesizes.as_mut_ptr(), pix_fmt.into(), width) };
+    // SAFETY: `linesizes` is a live 4-element array (FFmpeg writes at most 4 entries) and
+    // `pix_fmt` is a valid enum value; nothing is retained.
+    let ret = unsafe {
+        ffi::av_image_fill_linesizes(linesizes.as_mut_ptr(), pix_fmt.into(), width as i32)
+    };
 
     // >= 0 in case of success, a negative error code otherwise
     if ret < 0 {
@@ -51,7 +49,7 @@ pub fn fill_linesizes(pix_fmt: PixelFormat, width: i32) -> Result<[i32; 4]> {
 /// * `plane` - The index of the plane to compute the size for.
 ///
 /// Returns The size of the image line in bytes for the specified plane.
-pub fn get_linesize(pix_fmt: PixelFormat, width: i32, plane: usize) -> Result<usize> {
+pub fn get_linesize(pix_fmt: PixelFormat, width: u32, plane: usize) -> Result<usize> {
     // 这一层必须自己卡边界：`av_image_get_linesize` 内部是
     // `image_get_linesize(width, plane, max_step[plane], max_step_comp[plane], desc)`，
     // 而 `max_step`/`max_step_comp` 是**长度 4 的栈数组**（由
@@ -65,8 +63,9 @@ pub fn get_linesize(pix_fmt: PixelFormat, width: i32, plane: usize) -> Result<us
         )));
     }
 
-    // Safe because format is a valid format and this function is pure computation.
-    let ret = unsafe { ffi::av_image_get_linesize(pix_fmt.into(), width, plane as _) };
+    // SAFETY: `pix_fmt` is valid and `plane` was bounds-checked against `MAX_FFMPEG_PLANES`
+    // just above; `av_image_get_linesize` is a pure computation.
+    let ret = unsafe { ffi::av_image_get_linesize(pix_fmt.into(), width as i32, plane as _) };
 
     // returns the computed size in bytes
     if ret < 0 {
@@ -99,7 +98,7 @@ pub fn get_linesize(pix_fmt: PixelFormat, width: i32, plane: usize) -> Result<us
 pub fn fill_plane_sizes<I: IntoIterator<Item = i32>>(
     format: PixelFormat,
     linesizes: I,
-    height: i32,
+    height: u32,
 ) -> Result<Vec<usize>> {
     // 平面数由像素格式决定，而不是由传入的行步长个数决定：底层只读
     // `linesizes[0..planes]`，个数不符时多传的部分会被静默忽略、少传则读到未初始化值。
@@ -128,13 +127,13 @@ pub fn fill_plane_sizes<I: IntoIterator<Item = i32>>(
     }
     let mut plane_sizes_buf = [0; MAX_FFMPEG_PLANES];
 
-    // Safe because plane_sizes_buf and linesizes_buf have the size specified by the API, format is
-    // valid, and this function doesn't have any side effects other than writing to plane_sizes_buf.
+    // SAFETY: `plane_sizes_buf`/`linesizes_buf` are sized to `MAX_FFMPEG_PLANES` (the API's
+    // maximum), `format` is valid, and the call only writes into `plane_sizes_buf`.
     let ret = unsafe {
         ffi::av_image_fill_plane_sizes(
             plane_sizes_buf.as_mut_ptr(),
             format.into(),
-            height,
+            height as i32,
             linesizes_buf.as_ptr(),
         )
     };
@@ -193,6 +192,8 @@ pub fn copy_frame_to_buffer(frame: &AVFrame) -> Result<Vec<u8>> {
 /// * `dst` - 目标 AVFrame（`copy_data` 时须已分配）
 /// * `copy_data` - 是否连同样本数据一起复制
 pub fn copy_frame_metadata(src: &AVFrame, dst: &mut AVFrame, copy_data: bool) -> Result<()> {
+    // SAFETY: `src`/`dst` are live frames (`dst` is an exclusive `&mut`); the calls below only
+    // read `src` and write `dst`, which are distinct objects.
     unsafe {
         if copy_data {
             // 目标 AVFrame 需已分配内存：这是调用方的错误，按 `Err` 上报而不是 panic。
@@ -515,6 +516,8 @@ pub fn fill_plane_from_buffer(
     }
 
     // 复制平面数据
+    // SAFETY: the destination plane was size-checked against `required_size` just above, `src`
+    // is a live slice of that length, and the two regions belong to distinct buffers.
     unsafe {
         ffi::av_image_copy_plane(
             frame.data[plane_idx], // 目标数据指针
@@ -756,6 +759,7 @@ pub fn check_image_size(
     // `av_image_check_size2` 会把 `max_pixels` 当作硬上限，0 表示“0 个像素”。
     // 这里把 <=0 归一化为“不限制”，避免误伤。
     let max_pixels = if max_pixels > 0 { max_pixels } else { i64::MAX };
+    // SAFETY: a pure validation query — all arguments are values and the log pointer is NULL.
     let ret = unsafe {
         ffi::av_image_check_size2(
             width,
@@ -787,6 +791,8 @@ pub fn apply_cropping(frame: &mut AVFrame, flags: i32) -> Result<()> {
             "Frame buffer is not allocated (frame.data is null)".to_string(),
         ));
     }
+    // SAFETY: `frame` is a live, allocated `&mut` frame (its `data[0]` was checked non-null
+    // just above); the call only adjusts fields in place.
     let ret = unsafe { ffi::av_frame_apply_cropping(frame.as_mut_ptr(), flags) };
     if ret < 0 {
         return Err(RsmediaError::av_error(ret).with_context(format!(
@@ -833,8 +839,12 @@ pub fn to_dynamic_image(frame: &AVFrame) -> Result<image::DynamicImage> {
         }
         _ => {
             // 其他格式（YUV/BGR 族等）：swscale 统一转 RGB24
-            let rgb =
-                crate::scale::scale_frame(frame, frame.width, frame.height, PixelFormat::RGB24)?;
+            let rgb = crate::scale::scale_frame(
+                frame,
+                frame.width as u32,
+                frame.height as u32,
+                PixelFormat::RGB24,
+            )?;
             let buf = copy_frame_to_buffer(&rgb)?;
             image::RgbImage::from_raw(width, height, buf)
                 .map(image::DynamicImage::ImageRgb8)
@@ -1184,10 +1194,10 @@ mod tests {
     }
 
     /// 创建测试用的AVFrame
-    fn create_test_frame(width: i32, height: i32, format: i32) -> Result<AVFrame> {
+    fn create_test_frame(width: u32, height: u32, format: i32) -> Result<AVFrame> {
         let mut frame = AVFrame::new();
-        frame.set_width(width);
-        frame.set_height(height);
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
         frame.set_format(format);
 
         // 分配帧缓冲区
@@ -1338,7 +1348,7 @@ mod tests {
         // 垂直翻转的帧：行步长为负，`data[0]` 指向图像的第一行、后续行向低地址延伸。
         // 负行步长不得被当成巨大 usize（那会算出行外的偏移并越界读）。
         let (width, height) = (32usize, 8usize);
-        let mut frame = create_test_frame(width as i32, height as i32, ffi::AV_PIX_FMT_GRAY8)?;
+        let mut frame = create_test_frame(width as u32, height as u32, ffi::AV_PIX_FMT_GRAY8)?;
 
         unsafe {
             let base = frame.data[0].cast::<u8>();
@@ -1398,8 +1408,8 @@ mod tests {
         ];
 
         for format in formats {
-            let frame = create_test_frame(width, height, format.into())?;
-            let linesizes = fill_linesizes(format, width)?;
+            let frame = create_test_frame(width as u32, height as u32, format.into())?;
+            let linesizes = fill_linesizes(format, width as u32)?;
             for (plane, &linesize) in linesizes
                 .iter()
                 .enumerate()
@@ -1429,10 +1439,10 @@ mod tests {
     #[test]
     fn test_get_plane_buffer_packed_subsampled_keeps_the_last_unit() -> Result<()> {
         let (width, height) = (65usize, 8usize);
-        let frame = create_test_frame(width as i32, height as i32, PixelFormat::YUYV422.into())?;
+        let frame = create_test_frame(width as u32, height as u32, PixelFormat::YUYV422.into())?;
         const ROW_BYTES: usize = 132; // ceil(65 / 2) 个色度单元 × 4 字节
         assert_eq!(
-            fill_linesizes(PixelFormat::YUYV422, width as i32)?[0] as usize,
+            fill_linesizes(PixelFormat::YUYV422, width as u32)?[0] as usize,
             ROW_BYTES,
             "FFmpeg's own linesize for a 65-wide yuyv422 row"
         );
@@ -1473,7 +1483,7 @@ mod tests {
     #[test]
     fn test_get_plane_buffer_alpha_plane_is_full_resolution() -> Result<()> {
         let (width, height) = (64usize, 48usize);
-        let frame = create_test_frame(width as i32, height as i32, ffi::AV_PIX_FMT_YUVA420P)?;
+        let frame = create_test_frame(width as u32, height as u32, ffi::AV_PIX_FMT_YUVA420P)?;
 
         // alpha 平面逐行写入行号，行内为定值。
         unsafe {

@@ -427,7 +427,7 @@ impl PixelFormat {
     /// [`Self::data_layout`] 的与尺寸无关版本，供还没拿到帧尺寸时判断格式用。
     /// 它是 `data_layout` 能给出布局的**必要条件而非充分条件**：位流、调色板、
     /// 硬件格式恒为 `false`；其余格式为 `true`，但其中一部分 `data_layout` 仍会
-    /// 返回 `None` —— 水平二次采样的打包格式可能每个像素占**分数个**样本
+    /// **panic** —— 水平二次采样的打包格式可能每个像素占**分数个**样本
     /// （`uyyvyy411`：4 像素 6 字节），整像素数组表达不了。
     pub fn is_plane_storable(self) -> bool {
         AVPixFmtDescriptorRef::get(self.into()).is_some_and(|desc| !has_no_sample_planes(&desc))
@@ -486,24 +486,43 @@ impl PixelFormat {
     /// * a **planar** format is one array per plane, each chroma plane carrying
     ///   its own subsampled size, taken from `log2_chroma_w` / `log2_chroma_h`.
     ///
-    /// `None` 有三种情形：位流/调色板/硬件格式（分量不是整样本）、任一维度为 0、
-    /// 以及该格式无法用整像素元素表达（水平二次采样的打包格式会出现分数个元素
-    /// 每像素，如 `uyyvyy411` 的 4 像素 6 字节）。前两种可由
-    /// [`Self::is_plane_storable`] 预判，第三种不行。
-    pub fn data_layout(self, width: usize, height: usize) -> Option<DataLayout> {
+    /// The same layout type [`crate::fmt::SampleFormat::data_layout`] returns for audio, so
+    /// the two are symmetric: no `Option` to thread through a caller. A format
+    /// that has no whole-sample plane representation —
+    /// a bitstream / palette / hardware format, a zero dimension, or a
+    /// horizontally subsampled packed format whose pixels are not whole elements
+    /// (e.g. `uyyvyy411`: 6 bytes per 4 pixels) — **panics** instead of returning
+    /// a value, because it cannot be expressed and the caller almost always has a
+    /// `width`/`height` or an [`Self::is_plane_storable`] check in hand first.
+    /// [`Self::is_plane_storable`] predicts the first two classes; the third
+    /// cannot be predicted, so only a panic catches it.
+    pub fn data_layout(self, width: u32, height: u32) -> DataLayout {
+        let width = width as usize;
+        let height = height as usize;
         if width == 0 || height == 0 {
-            return None;
+            panic!(
+                "pixel format {self:?} has a zero dimension ({width}x{height}); \
+                 reject zero-sized frames before calling data_layout"
+            );
         }
-        let desc = AVPixFmtDescriptorRef::get(self.into())?;
+        let desc = AVPixFmtDescriptorRef::get(self.into()).unwrap_or_else(|| {
+            panic!(
+                "pixel format {self:?} has no FFmpeg descriptor (e.g. NONE or a hardware pixel format)"
+            )
+        });
         if has_no_sample_planes(&desc) {
-            return None;
+            panic!(
+                "pixel format {self:?} has no whole-sample planes (bitstream / palette / hardware \
+                 format); check is_plane_storable first"
+            );
         }
 
         let components = desc.nb_components as usize;
         if components == 0 {
-            return None;
+            panic!("pixel format {self:?} describes no components");
         }
-        let element_bytes = element_bytes(&desc)?;
+        let element_bytes = element_bytes(&desc)
+            .unwrap_or_else(|| panic!("pixel format {self:?} has no whole-byte component width"));
 
         // FFmpeg models planes 1 and 2 as the chroma planes (`av_image_fill_plane_sizes`
         // does the same) and reports the chroma shifts as 0 for RGB formats, so this
@@ -524,29 +543,37 @@ impl PixelFormat {
             // elements per 2-pixel unit, `rgb24`: 3 elements per 1-pixel unit).
             let max_step = (0..components)
                 .map(|c| desc.comp[c].step.max(0) as usize)
-                .max()?;
+                .max()
+                .expect("a format with non-zero components always yields a step");
             let unit_pixels = 1usize << desc.log2_chroma_w;
             // Elements per pixel. A horizontally subsampled packed format can store a
             // fractional number of elements per pixel (`uyyvyy411`: 6 elements per 4
             // pixels), which no whole-pixel array can express.
             if !max_step.is_multiple_of(element_bytes * unit_pixels) {
-                return None;
+                panic!(
+                    "pixel format {self:?} stores a fractional number of elements per pixel \
+                     ({max_step} bytes over {} pixels); it cannot be expressed as a whole-element array",
+                    element_bytes * unit_pixels
+                );
             }
             let elements_per_pixel = max_step / (element_bytes * unit_pixels);
             if elements_per_pixel == 0 {
-                return None;
+                panic!("pixel format {self:?} has zero elements per pixel");
             }
             // FFmpeg rounds the row up to whole units (`av_image_fill_linesizes`),
             // so an odd width covers the pixels of one more unit: 65 pixels of
             // `yuyv422` occupy 33 units = 66 columns. Using `width` verbatim would
             // drop that last unit, leaving each row's tail out of the round trip.
-            Some(DataLayout::Interleaved {
+            DataLayout::Interleaved {
                 rows: height,
                 cols: ceil_shift(width, desc.log2_chroma_w as u32) * unit_pixels,
                 components: elements_per_pixel,
-            })
+            }
         } else {
-            let plane_count = self.count_planes().ok()? as usize;
+            let plane_count = self
+                .count_planes()
+                .unwrap_or_else(|_| panic!("pixel format {self:?} reports no plane count"))
+                as usize;
             let mut planes = Vec::with_capacity(plane_count);
             for plane in 0..plane_count {
                 // Elements this plane stores per luma column, e.g. 1 for a planar
@@ -556,14 +583,17 @@ impl PixelFormat {
                     .map(|c| component_bytes(&desc, c))
                     .sum();
                 if plane_bytes == 0 || !plane_bytes.is_multiple_of(element_bytes) {
-                    return None;
+                    panic!(
+                        "pixel format {self:?} plane {plane} stores {plane_bytes} bytes, not a \
+                         whole number of {element_bytes}-byte elements"
+                    );
                 }
                 planes.push((
                     ceil_shift(height, h_shift(plane)),
                     ceil_shift(width, w_shift(plane)) * (plane_bytes / element_bytes),
                 ));
             }
-            Some(DataLayout::Planar(planes))
+            DataLayout::Planar(planes)
         }
     }
 
@@ -609,6 +639,8 @@ pub fn find_best_pix_fmt(
 
     // 返回的是**选中的像素格式**（`AV_PIX_FMT_NONE` 表示无法选择）。`loss_ptr`
     // 才承载"会损失什么"的位掩码，这里不需要，故传 NULL。
+    // SAFETY: a pure query — every argument is an enum value and the optional loss pointer is
+    // NULL; no pointer is retained.
     let best = unsafe {
         ffi::av_find_best_pix_fmt_of_2(
             dst_pix_fmt1.into(),
@@ -644,6 +676,8 @@ pub fn find_codec_best_pix_fmt(
     let mut pix_fmts: Vec<i32> = pix_fmt_list.iter().map(|&fmt| fmt.into()).collect();
     pix_fmts.push(ffi::AV_PIX_FMT_NONE);
     let alpha = if has_alpha { 1 } else { 0 };
+    // SAFETY: `pix_fmts` is a live, `AV_PIX_FMT_NONE`-terminated list (sentinel pushed just
+    // above) that outlives the call; the loss pointer is NULL and nothing is retained.
     let ret = unsafe {
         ffi::avcodec_find_best_pix_fmt_of_list(
             pix_fmts.as_ptr(),
@@ -681,6 +715,7 @@ pub fn get_pix_fmt_loss(
     src_pix_fmt: PixelFormat,
     has_alpha: bool,
 ) -> Result<i32> {
+    // SAFETY: a pure computation on two enum values; no pointers are involved.
     let loss = unsafe {
         ffi::av_get_pix_fmt_loss(dst_pix_fmt.into(), src_pix_fmt.into(), has_alpha as i32)
     };
@@ -726,21 +761,16 @@ mod tests {
         ] {
             let element_bytes = fmt.bytes_per_component().expect("whole-byte components");
             for width in 1..=9 {
-                let layout = fmt
-                    .data_layout(width, 7)
-                    .expect("packed format has a layout");
+                let layout = fmt.data_layout(width, 7);
                 let (rows, row_elements) = layout.plane_row_extent(0).expect("one plane");
                 assert_eq!(rows, 7, "{fmt:?} at width {width}");
                 assert_eq!(
                     row_elements * element_bytes,
-                    fill_linesizes(fmt, width as i32)?[0] as usize,
+                    fill_linesizes(fmt, width)?[0] as usize,
                     "{fmt:?} at width {width}: layout row bytes vs FFmpeg linesize"
                 );
             }
         }
-
-        // 每像素不足一个元素、无法用整像素数组表达的格式不被臆造出来
-        assert_eq!(PixelFormat::UYYVYY411.data_layout(8, 7), None);
 
         Ok(())
     }

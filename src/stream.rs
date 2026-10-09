@@ -101,9 +101,9 @@ pub struct StreamInfo {
 
     // Video parameters
     /// Video width
-    pub width: i32,
+    pub width: u32,
     /// Video height
-    pub height: i32,
+    pub height: u32,
     /// Video frame rate FPS
     pub frame_rate: Rational,
     pub avg_frame_rate: Rational,
@@ -252,6 +252,9 @@ impl StreamInfo {
             FrameFormat::Sample(_) => None,
         };
 
+        // SAFETY: all four are pure queries on a codec id / a borrowed pixel-format descriptor
+        // (`pix_fmt_desc` came from `descriptor()` and stays borrowed for the call); no pointer
+        // is retained.
         let (bits_per_sample, exact_bits_per_sample, bits_per_pixel, padded_bits_per_pixel) = unsafe {
             let bits_sample = ffi::av_get_bits_per_sample(codecpar.codec_id);
             let exact_bits_sample = ffi::av_get_exact_bits_per_sample(codecpar.codec_id);
@@ -303,8 +306,8 @@ impl StreamInfo {
             profile: codecpar.profile,
             level: codecpar.level,
             // Video
-            width: codecpar.width,
-            height: codecpar.height,
+            width: codecpar.width as u32,
+            height: codecpar.height as u32,
             bit_rate: codecpar.bit_rate,
             frame_rate: codecpar.framerate.into(),
             avg_frame_rate: stream.avg_frame_rate.into(),
@@ -314,8 +317,8 @@ impl StreamInfo {
             sample_aspect_ratio: codecpar.sample_aspect_ratio.into(),
             display_aspect_ratio: Self::compute_display_aspect_ratio(
                 codecpar.sample_aspect_ratio.into(),
-                codecpar.width,
-                codecpar.height,
+                codecpar.width as u32,
+                codecpar.height as u32,
             ),
             color_space: codecpar.color_space,
             color_range: codecpar.color_range,
@@ -359,10 +362,10 @@ impl StreamInfo {
     /// 用 `av_reduce` 规约分数（与 FFmpeg 内部一致），避免溢出且得到最简比。
     fn compute_display_aspect_ratio(
         sample_aspect_ratio: Rational,
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
     ) -> Rational {
-        if width <= 0 || height <= 0 {
+        if width == 0 || height == 0 {
             return Rational::ZERO;
         }
         // SAR 未知/非法时按方形像素（1/1）处理。`Rational` 的分母恒为正，所以
@@ -661,11 +664,11 @@ impl Display for StreamInfo {
     }
 }
 
-// `StreamInfo` 完全持有自身数据（`codec_parameters` 为深拷贝的 owned 快照），
-// 不引用任何外部 reader/writer 的生命周期，可安全跨线程传递与共享。
-// 由于 rsmpeg 的 `AVCodecParameters` 仅实现了 `Send` 而未实现 `Sync`，
-// `StreamInfo` 无法自动推导 `Sync`，此处手动补上（比较 `&self` 只读访问
-// 快照字段，无数据竞争）。
+// `StreamInfo` 完全持有自身数据（`codec_parameters` 为深拷贝的 owned 快照）
+// SAFETY: `StreamInfo` fully owns its data (`codec_parameters` is an owned deep copy) and
+// references no external reader/writer, so it can be moved and shared across threads; `&self`
+// only reads snapshot fields, but rsmpeg's `AVCodecParameters` is `Send`-only, so `Send`/`Sync`
+// are supplied by hand here.
 unsafe impl Send for StreamInfo {}
 unsafe impl Sync for StreamInfo {}
 

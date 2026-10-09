@@ -3,8 +3,8 @@ use crate::flags::FlagSet;
 use crate::{PixelFormat, imgutils};
 
 use rsmpeg::avutil::{AVBufferPool, AVBufferRef, AVFrame};
-use rsmpeg::ffi;
-use rsmpeg::{UnsafeDerefMut, swscale::SwsContext};
+use rsmpeg::swscale::SwsContext;
+use rsmpeg::{UnsafeDerefMut, ffi};
 
 // FFmpeg `SwsFlags` 定义参考: <https://ffmpeg.org/doxygen/trunk/group__libsws.html>
 //
@@ -267,6 +267,11 @@ ffi_enum_from!(
 /// （尺寸与格式不会再各传各的，也不会写反）；[`Scaler`] 里"上下文是按什么建出来的"
 /// 那份记录从 6 个字段变成 2 个；`setup_scaler` 的 7 个位置参数变成 3 个。
 ///
+/// `width`/`height` 保持 FFmpeg `int` 的宽度（`i32`），与音频侧的
+/// `resample::AudioSpec` 属于同一层规格：两者都是 FFmpeg 参数的镜像，只在上层
+/// （[`MediaFrame`](crate::MediaFrame) 的 `u32` 尺寸、自由函数 `scale_frame`）构造时
+/// 收窄一次，之后直达 `sws_*` 与缓冲区计算，不再转回。
+///
 /// 音频侧的对应物是 `resample::AudioSpec`，差别在于它只在 crate 内部出现：那边的逐帧入口
 /// [`Resampler::convert_frame_owned`](crate::Resampler::convert_frame_owned) 用的是上下文
 /// 自己记着的那份输出格式；这里的目标必须逐次给出 —— 一个 [`Scaler`] 同时服务解码
@@ -440,14 +445,14 @@ fn set_scaler_colorspace_details(sws: &mut SwsContext, src_frame: &AVFrame, dst_
 /// across frames. See [`Scaler::scale_frame`] for the details.
 /// Scale a raw [`AVFrame`] into a newly allocated `AVFrame`.
 ///
-/// This is an FFI-level entry point: it takes a bare `AVFrame` and `i32` sizes,
-/// mirroring FFmpeg's own signatures. Callers working with the high-level
-/// [`MediaFrame`](crate::MediaFrame) should use
+/// This is an FFI-level entry point: it takes a bare `AVFrame` and the crate's
+/// `u32` sizes, narrowing them once when building the [`VideoSpec`]. Callers
+/// working with the high-level [`MediaFrame`](crate::MediaFrame) should use
 /// [`MediaFrame::convert_to`](crate::MediaFrame::convert_to) instead.
 pub fn scale_frame(
     src_frame: &AVFrame,
-    dst_width: i32,
-    dst_height: i32,
+    dst_width: u32,
+    dst_height: u32,
     dst_pix_fmt: PixelFormat,
 ) -> Result<AVFrame> {
     // Delegates to a one-off `Scaler` so there is exactly one implementation of
@@ -455,7 +460,7 @@ pub fn scale_frame(
     // itself (`Scaler::new_with_options`).
     Scaler::new().scale_frame(
         src_frame,
-        VideoSpec::new(dst_width, dst_height, dst_pix_fmt),
+        VideoSpec::new(dst_width as i32, dst_height as i32, dst_pix_fmt),
     )
 }
 
@@ -709,6 +714,9 @@ impl Scaler {
 
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         {
+            // SAFETY: `bound.sws` is a live `SwsContext` built for this exact (src, dst)
+            // geometry and format pair, and both frames are live; `sws_scale_frame` only reads
+            // `src` and writes `dst`.
             let ret = unsafe {
                 ffi::sws_scale_frame(
                     bound.sws.as_mut_ptr(),
@@ -814,6 +822,7 @@ fn pool_frame_padding() -> usize {
 /// 两者互为镜像）加上安全留白。
 fn pooled_frame_buffer_size(dst_spec: VideoSpec) -> Result<usize> {
     let align = pool_align();
+    // SAFETY: a pure size computation on a valid pixel format and dimensions; no pointers.
     let size = unsafe {
         ffi::av_image_get_buffer_size(
             dst_spec.pix_fmt.into(),
@@ -1035,10 +1044,10 @@ mod tests {
     use crate::error::{Context, Result};
     use rsmpeg::avutil::AVFrame;
 
-    fn create_test_frame(width: i32, height: i32, pix_fmt: PixelFormat) -> Result<AVFrame> {
+    fn create_test_frame(width: u32, height: u32, pix_fmt: PixelFormat) -> Result<AVFrame> {
         let mut frame = AVFrame::new();
-        frame.set_width(width);
-        frame.set_height(height);
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
         frame.set_format(pix_fmt.into());
         frame
             .alloc_buffer()

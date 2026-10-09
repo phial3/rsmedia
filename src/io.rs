@@ -164,6 +164,8 @@ pub trait Seekable: Reader {
     /// Treat the return value of each `seek_*` call as the authority.
     fn is_byte_seekable(&self) -> bool {
         let pb = self.input().pb;
+        // SAFETY: `pb` is null-checked first; when non-null it is the live `AVIOContext` owned
+        // by this reader, and only its `seekable` flag is read (no write aliasing).
         unsafe { !pb.is_null() && ((*pb).seekable & ffi::AVIO_SEEKABLE_NORMAL as i32) != 0 }
     }
 
@@ -276,6 +278,9 @@ pub trait Seekable: Reader {
                 "Cannot seek stream {stream_index}: the input has {nb_streams} stream(s)"
             )));
         }
+        // SAFETY: `stream_index` was bounds-checked against `nb_streams` just above (FFmpeg
+        // dereferences the stream without checking, so out-of-range is UB), and `input_mut`
+        // borrows the context exclusively for the duration of the call.
         unsafe {
             let res = ffi::av_seek_frame(
                 self.input_mut().as_mut_ptr(),
@@ -313,6 +318,8 @@ fn seek_file(
     ts: i64,
     max: i64,
 ) -> Result<()> {
+    // SAFETY: `input` is a live `&mut` context; the timestamps are FFmpeg's own `int64_t` and
+    // `flags = 0`. No pointer is retained after the call.
     let res = unsafe { ffi::avformat_seek_file(input.as_mut_ptr(), stream_index, min, ts, max, 0) };
     if res < 0 {
         // >=0 on success, error code otherwise
@@ -446,6 +453,8 @@ fn open_input_custom(
         .open()
         .context("Create input format context with custom IO failed.")?;
     if let Some(interrupt) = interrupt {
+        // SAFETY: `ctx` is a freshly opened context we exclusively own (`&mut` via `deref_mut`);
+        // writing its `interrupt_callback` slot is the only access path to it here.
         unsafe {
             ctx.deref_mut().interrupt_callback = interrupt_cb(interrupt);
         }
@@ -606,6 +615,8 @@ fn open_input_with_interrupt(
     options: &mut Option<AVDictionary>,
     interrupt: &Interrupt,
 ) -> Result<AVFormatContextInput> {
+    // SAFETY: `avformat_alloc_context` has no preconditions; the returned pointer is
+    // null-checked on the next line.
     let mut ctx = unsafe { ffi::avformat_alloc_context() };
     if ctx.is_null() {
         return Err(RsmediaError::msg("avformat_alloc_context failed"));
@@ -813,8 +824,9 @@ impl Reader for StreamReader {
 
 impl Seekable for StreamReader {}
 
-/// 线程安全性说明：`AVFormatContext` 本身非线程安全，这里仅承诺可以**移动**
-/// 到其他线程独占使用（`Send`），不承诺 `&Self` 跨线程共享（不实现 `Sync`）。
+/// SAFETY: `AVFormatContext` is not thread-safe; this only promises the value can be
+/// **moved** to another thread for exclusive use (`Send`), not shared (`&Self`), so
+/// `Sync` is deliberately not implemented.
 unsafe impl Send for StreamReader {}
 
 ////////////////////////////////////////
@@ -938,7 +950,8 @@ impl Reader for BufferReader {
 
 impl Seekable for BufferReader {}
 
-/// 仅承诺可移动到其他线程独占使用（内部回调均为 `Send`）。
+/// SAFETY: only promises the value can be moved to another thread for exclusive use
+/// (`Send`); every internal callback it holds is `Send`.
 unsafe impl Send for BufferReader {}
 
 ////////////////////////////////////////
@@ -1036,7 +1049,8 @@ impl Reader for IoReader {
     }
 }
 
-/// 仅承诺可移动到其他线程独占使用（内部 reader 与回调均为 `Send`）。
+/// SAFETY: only promises the value can be moved to another thread for exclusive use
+/// (`Send`); the wrapped reader and every callback are `Send`.
 unsafe impl Send for IoReader {}
 
 ////////////////////////////////////////
@@ -1322,7 +1336,14 @@ impl WriterCore {
     /// flush avio 内部缓冲（`flush_after_write` 为假时是空操作）。
     fn flush(&mut self) {
         if self.flush_after_write {
-            // SAFETY:
+            // SAFETY: `self.output.deref_mut()` yields an exclusive `&mut` borrow of the
+            // format context for the duration of this block, and `&mut self` guarantees no
+            // other reference to it exists. `.pb` is the `AVIOContext` owned by this output
+            // context; we null-check before use (a null `pb` means there is no AVIO layer,
+            // e.g. a custom writer, and there is nothing to flush). `avio_flush` only flushes
+            // the buffered bytes to the underlying transport — it does not free or transfer
+            // ownership of the `AVIOContext`, so the context still owns it afterwards and it
+            // stays valid for the rest of `self`'s lifetime. The pointer is not retained.
             unsafe {
                 let pb = self.output.deref_mut().pb;
                 if !pb.is_null() {
@@ -1493,7 +1514,7 @@ impl Writer for StreamWriter {
     }
 }
 
-/// 仅承诺可移动到其他线程独占使用。
+/// SAFETY: only promises the value can be moved to another thread for exclusive use.
 unsafe impl Send for StreamWriter {}
 
 ////////////////////////////////////////
@@ -1723,7 +1744,7 @@ impl Writer for BufferWriter {
     }
 }
 
-/// 仅承诺可移动到其他线程独占使用。
+/// SAFETY: only promises the value can be moved to another thread for exclusive use.
 unsafe impl Send for BufferWriter {}
 
 ////////////////////////////////////////
@@ -1867,7 +1888,8 @@ impl<W: std::io::Write + Send + 'static> Writer for IoWriter<W> {
     }
 }
 
-/// 仅承诺可移动到其他线程独占使用（内部 writer 与回调均为 `Send`）。
+/// SAFETY: only promises the value can be moved to another thread for exclusive use;
+/// the `W: Send` bound covers the wrapped writer, and every callback is `Send`.
 unsafe impl<W: std::io::Write + Send + 'static> Send for IoWriter<W> {}
 
 ////////////////////////////////////////
@@ -1885,6 +1907,8 @@ unsafe impl<W: std::io::Write + Send + 'static> Send for IoWriter<W> {}
 pub fn init_logging(level: AVLogLevel, flag: impl Into<FlagSet<AVLogFlag>>) {
     let flag = flag.into();
     LOG_LEVEL.store(level as i32, Ordering::Relaxed);
+    // SAFETY: all three are process-global setters with no preconditions; `log_callback` is an
+    // `extern "C"` fn whose signature is exactly the one FFmpeg calls it through.
     unsafe {
         ffi::av_log_set_callback(Some(log_callback));
         ffi::av_log_set_level(level as _);
@@ -1958,6 +1982,9 @@ unsafe fn log_callback_impl(
         let mut line = [0; 1024];
         let mut print_prefix: std::ffi::c_int = 1;
         // Use the ffmpeg default formatting.
+        // SAFETY: FFmpeg passes `avcl`/`fmt`/`vl` per its `av_log` callback contract; `line` is
+        // a live 1024-byte buffer and `print_prefix` a live local, both written by the call and
+        // neither retained.
         let ret = unsafe {
             ffi::av_log_format_line2(
                 avcl,
@@ -1970,6 +1997,8 @@ unsafe fn log_callback_impl(
             )
         };
         // Simply discard the log message if formatting fails.
+        // SAFETY: on success (`ret > 0`) FFmpeg NUL-terminated `line`, so reading it as a C
+        // string is in-bounds.
         if ret > 0
             && let Ok(line) = unsafe { std::ffi::CStr::from_ptr(line.as_mut_ptr()) }.to_str()
         {
