@@ -1539,7 +1539,10 @@ where
         // 复用一个即可，不必为每帧新建上下文；缩放后的样本仍要拷回 `FrameData`，
         // 这是 `Scaler` 只吃 `AVFrame` 的接口所决定的。
         let converted = CONVERT_SCALER.with_borrow_mut(|scaler| {
-            scaler.scale_frame(&src, VideoSpec::new(self.width, self.height, dst_fmt))
+            scaler.scale_frame(
+                &src,
+                VideoSpec::new(self.width as i32, self.height as i32, dst_fmt),
+            )
         })?;
         let data = read_samples::<T>(&converted, &dst_layout)?;
         Ok(self.with_data(data, dst_fmt))

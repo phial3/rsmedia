@@ -267,20 +267,25 @@ ffi_enum_from!(
 /// （尺寸与格式不会再各传各的，也不会写反）；[`Scaler`] 里"上下文是按什么建出来的"
 /// 那份记录从 6 个字段变成 2 个；`setup_scaler` 的 7 个位置参数变成 3 个。
 ///
+/// `width`/`height` 保持 FFmpeg `int` 的宽度（`i32`），与音频侧的
+/// `resample::AudioSpec` 属于同一层规格：两者都是 FFmpeg 参数的镜像，只在上层
+/// （[`MediaFrame`](crate::MediaFrame) 的 `u32` 尺寸、自由函数 `scale_frame`）构造时
+/// 收窄一次，之后直达 `sws_*` 与缓冲区计算，不再转回。
+///
 /// 音频侧的对应物是 `resample::AudioSpec`，差别在于它只在 crate 内部出现：那边的逐帧入口
 /// [`Resampler::convert_frame_owned`](crate::Resampler::convert_frame_owned) 用的是上下文
 /// 自己记着的那份输出格式；这里的目标必须逐次给出 —— 一个 [`Scaler`] 同时服务解码
 /// （改尺寸 + 换格式）与编码（只换格式）两条路，两者的目的地不同。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoSpec {
-    width: u32,
-    height: u32,
+    width: i32,
+    height: i32,
     pix_fmt: PixelFormat,
 }
 
 impl VideoSpec {
     /// 帧宽（像素）、帧高（像素）与像素格式。
-    pub const fn new(width: u32, height: u32, pix_fmt: PixelFormat) -> Self {
+    pub const fn new(width: i32, height: i32, pix_fmt: PixelFormat) -> Self {
         Self {
             width,
             height,
@@ -301,7 +306,7 @@ impl VideoSpec {
                 frame.format, frame.width, frame.height
             ))
         })?;
-        Ok(Self::new(frame.width as u32, frame.height as u32, pix_fmt))
+        Ok(Self::new(frame.width, frame.height, pix_fmt))
     }
 
     /// 只换像素格式，尺寸不变。
@@ -314,8 +319,8 @@ impl VideoSpec {
     /// 帧的格式超出收录范围时不算匹配 —— 那不可能等于目标格式，于是交给
     /// [`Scaler::scale_frame`] 报出可读的"不支持"错误，而不是在这里悄悄放行。
     fn matches(self, frame: &AVFrame) -> bool {
-        self.width == frame.width as u32
-            && self.height == frame.height as u32
+        self.width == frame.width
+            && self.height == frame.height
             && PixelFormat::from_ffi_checked(frame.format) == Some(self.pix_fmt)
     }
 }
@@ -441,8 +446,8 @@ fn set_scaler_colorspace_details(sws: &mut SwsContext, src_frame: &AVFrame, dst_
 /// Scale a raw [`AVFrame`] into a newly allocated `AVFrame`.
 ///
 /// This is an FFI-level entry point: it takes a bare `AVFrame` and the crate's
-/// `u32` sizes, narrowing them only at the FFmpeg call. Callers working with the
-/// high-level [`MediaFrame`](crate::MediaFrame) should use
+/// `u32` sizes, narrowing them once when building the [`VideoSpec`]. Callers
+/// working with the high-level [`MediaFrame`](crate::MediaFrame) should use
 /// [`MediaFrame::convert_to`](crate::MediaFrame::convert_to) instead.
 pub fn scale_frame(
     src_frame: &AVFrame,
@@ -455,7 +460,7 @@ pub fn scale_frame(
     // itself (`Scaler::new_with_options`).
     Scaler::new().scale_frame(
         src_frame,
-        VideoSpec::new(dst_width, dst_height, dst_pix_fmt),
+        VideoSpec::new(dst_width as i32, dst_height as i32, dst_pix_fmt),
     )
 }
 
@@ -691,8 +696,8 @@ impl Scaler {
             Some(pool) => alloc_pooled_frame(pool, dst_spec)?,
             None => {
                 let mut dst_frame = AVFrame::new();
-                dst_frame.set_width(dst_spec.width as i32);
-                dst_frame.set_height(dst_spec.height as i32);
+                dst_frame.set_width(dst_spec.width);
+                dst_frame.set_height(dst_spec.height);
                 dst_frame.set_format(dst_spec.pix_fmt.into());
                 dst_frame
                     .alloc_buffer()
@@ -821,8 +826,8 @@ fn pooled_frame_buffer_size(dst_spec: VideoSpec) -> Result<usize> {
     let size = unsafe {
         ffi::av_image_get_buffer_size(
             dst_spec.pix_fmt.into(),
-            dst_spec.width as i32,
-            dst_spec.height as i32,
+            dst_spec.width,
+            dst_spec.height,
             align,
         )
     };
@@ -849,8 +854,8 @@ fn pooled_frame_buffer_size(dst_spec: VideoSpec) -> Result<usize> {
 /// padding 字节内容确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。
 fn alloc_pooled_frame(pool: &mut AVBufferPool, dst_spec: VideoSpec) -> Result<AVFrame> {
     let mut frame = AVFrame::new();
-    frame.set_width(dst_spec.width as i32);
-    frame.set_height(dst_spec.height as i32);
+    frame.set_width(dst_spec.width);
+    frame.set_height(dst_spec.height);
     frame.set_format(dst_spec.pix_fmt.into());
 
     let buffer = pool
@@ -881,8 +886,8 @@ fn alloc_pooled_frame(pool: &mut AVBufferPool, dst_spec: VideoSpec) -> Result<AV
             linesize.as_mut_ptr(),
             aligned,
             dst_spec.pix_fmt.into(),
-            dst_spec.width as i32,
-            dst_spec.height as i32,
+            dst_spec.width,
+            dst_spec.height,
             align,
         )
     };
@@ -941,7 +946,7 @@ unsafe fn zero_frame_padding(
     let mut visible = [0i32; 8];
     // Safety: 本地数组 + 调用方已校验的格式/尺寸。
     let ret = unsafe {
-        ffi::av_image_fill_linesizes(visible.as_mut_ptr(), spec.pix_fmt.into(), spec.width as i32)
+        ffi::av_image_fill_linesizes(visible.as_mut_ptr(), spec.pix_fmt.into(), spec.width)
     };
     if ret < 0 {
         return Err(RsmediaError::av_error(ret).with_context(format!(
@@ -955,7 +960,7 @@ unsafe fn zero_frame_padding(
         ffi::av_image_fill_plane_sizes(
             plane_bytes.as_mut_ptr(),
             spec.pix_fmt.into(),
-            spec.height as i32,
+            spec.height,
             visible_isize.as_ptr(),
         )
     };
@@ -1209,15 +1214,15 @@ mod tests {
 
             let a = pooled.scale_frame(&src, VideoSpec::new(dw, dh, dst_fmt))?;
             let b = plain.scale_frame(&src, VideoSpec::new(dw, dh, dst_fmt))?;
-            assert_eq!((a.width, a.height), (dw as i32, dh as i32));
+            assert_eq!((a.width, a.height), (dw, dh));
             assert_eq!(a.format, b.format);
             assert_eq!(a.linesize[0] % 32, 0, "池化帧 stride 应按 32 对齐");
-            assert_visible_pixels_equal(&a, &b, dw, dh, dst_fmt);
+            assert_visible_pixels_equal(&a, &b, dw as u32, dh as u32, dst_fmt);
 
             // 复用后的缓冲内容同样正确（先归还 a，再缩放一帧比对）。
             drop(a);
             let a2 = pooled.scale_frame(&src, VideoSpec::new(dw, dh, dst_fmt))?;
-            assert_visible_pixels_equal(&a2, &b, dw, dh, dst_fmt);
+            assert_visible_pixels_equal(&a2, &b, dw as u32, dh as u32, dst_fmt);
         }
         Ok(())
     }

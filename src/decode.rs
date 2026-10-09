@@ -1366,8 +1366,10 @@ impl Decoder {
                         })?,
                     None => (sw_frame.width as u32, sw_frame.height as u32),
                 };
-                self.scaler
-                    .scale_if_needed(sw_frame, VideoSpec::new(out_w, out_h, target_sw_pix_fmt))?
+                self.scaler.scale_if_needed(
+                    sw_frame,
+                    VideoSpec::new(out_w as i32, out_h as i32, target_sw_pix_fmt),
+                )?
             }
             MediaType::AUDIO => match self
                 .filter_input_format
