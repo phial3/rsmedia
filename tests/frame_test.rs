@@ -125,9 +125,7 @@ fn read_avframe_plane(
 
 /// 创建一个按 `fmt` 布局填充好确定性数据的 `AVFrame`。
 fn create_test_frame(fmt: PixelFormat, width: i32, height: i32, element_bytes: usize) -> AVFrame {
-    let layout = fmt
-        .data_layout(width as usize, height as usize)
-        .expect("supported format");
+    let layout = fmt.data_layout(width as usize, height as usize);
     let mut frame = AVFrame::new();
     frame.set_format(fmt.into());
     frame.set_width(width);
@@ -140,7 +138,7 @@ fn create_test_frame(fmt: PixelFormat, width: i32, height: i32, element_bytes: u
 /// 创建测试用的 packed 8bit AVFrame（按 (x*ch+c+y) 生成确定性数据）
 fn create_test_packed_frame(fmt: PixelFormat, width: i32, height: i32) -> AVFrame {
     let ch = match fmt.data_layout(width as usize, height as usize) {
-        Some(DataLayout::Interleaved { components, .. }) => components,
+        DataLayout::Interleaved { components, .. } => components,
         other => panic!("{fmt:?} should be an interleaved format, got {other:?}"),
     };
     let mut frame = AVFrame::new();
@@ -345,9 +343,7 @@ fn test_video_yuv420p_frame_conversion() -> Result<()> {
     let height = 240;
 
     // 每个平面用确定性数据填充，跳过行尾 padding
-    let layout = PixelFormat::YUV420P
-        .data_layout(width as usize, height as usize)
-        .unwrap();
+    let layout = PixelFormat::YUV420P.data_layout(width as usize, height as usize);
     let frame = create_test_frame(PixelFormat::YUV420P, width, height, 1);
 
     // 转换为 MediaFrame
@@ -724,13 +720,11 @@ fn test_yuv420p_odd_dimensions() -> Result<()> {
     // 布局：色度平面为 ceil(w/2) x ceil(h/2)
     assert_eq!(
         PixelFormat::YUV420P.data_layout(width as usize, height as usize),
-        Some(DataLayout::Planar(vec![(49, 65), (25, 33), (25, 33)]))
+        DataLayout::Planar(vec![(49, 65), (25, 33), (25, 33)])
     );
 
     // 奇数尺寸的 YUV420P 帧可以无损往返
-    let layout = PixelFormat::YUV420P
-        .data_layout(width as usize, height as usize)
-        .unwrap();
+    let layout = PixelFormat::YUV420P.data_layout(width as usize, height as usize);
     let mut av = AVFrame::new();
     av.set_format(ffi::AV_PIX_FMT_YUV420P);
     av.set_width(width);
@@ -773,9 +767,7 @@ fn test_packed_formats_lossless_roundtrip() -> Result<()> {
         PixelFormat::YUYV422,
         PixelFormat::UYVY422,
     ] {
-        let layout = fmt
-            .data_layout(width as usize, height as usize)
-            .expect("supported format");
+        let layout = fmt.data_layout(width as usize, height as usize);
         let elements = match layout {
             DataLayout::Interleaved { components, .. } => components,
             DataLayout::Planar(_) => panic!("{fmt:?} should be interleaved"),
@@ -837,9 +829,7 @@ fn test_planar_formats_lossless_roundtrip() -> Result<()> {
         PixelFormat::NV21,
         PixelFormat::GBRP,
     ] {
-        let layout = fmt
-            .data_layout(width as usize, height as usize)
-            .expect("supported format");
+        let layout = fmt.data_layout(width as usize, height as usize);
         let av = create_test_frame(fmt, width, height, 1);
 
         let media = MediaFrame::<u8>::from_avframe(&av)?;
@@ -874,9 +864,7 @@ fn test_planar_formats_lossless_roundtrip() -> Result<()> {
 fn test_planar_16bit_roundtrip() -> Result<()> {
     let (width, height) = (64i32, 48i32);
     for fmt in [PixelFormat::YUV420P10LE, PixelFormat::GBRP16LE] {
-        let layout = fmt
-            .data_layout(width as usize, height as usize)
-            .expect("supported format");
+        let layout = fmt.data_layout(width as usize, height as usize);
         assert_eq!(fmt.bytes_per_component(), Some(2));
         let av = create_test_frame(fmt, width, height, 2);
 

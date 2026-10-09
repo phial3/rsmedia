@@ -311,13 +311,35 @@ impl std::fmt::Display for Rational {
 /// object, on which arithmetic operations can be performed.
 #[derive(Debug, Copy, Clone)]
 pub struct Time {
-    pub time: Option<i64>,
+    /// The time value, in `time_base` units. `Option` so that "no timestamp"
+    /// (FFmpeg's `AV_NOPTS_VALUE` sentinel, filtered out by [`Self::new`]) can be
+    /// represented. The field is private: build a [`Time`] through a constructor
+    /// so the sentinel is normalised up front, and read it through
+    /// [`Self::time`] / [`Self::has_value`] / [`Self::into_value`].
+    time: Option<i64>,
     /// The time base, as a [`Rational`] — see that type for why.
     ///
     /// [`Rational::ZERO`] is the "no time base" spelling: FFmpeg's own `0/0`
     /// placeholder is normalised to it on the way in, and every accessor below
     /// treats a zero time base as "nothing to convert".
-    pub time_base: Rational,
+    time_base: Rational,
+}
+
+impl Time {
+    /// The raw time value as stored, in `time_base` units.
+    ///
+    /// This is the field that [`Self::new`] holds verbatim; it may still contain
+    /// FFmpeg's `AV_NOPTS_VALUE` sentinel if the [`Time`] was built by hand
+    /// within this crate. For the normalised, sentinel-free view use
+    /// [`Self::has_value`] / [`Self::into_value`] instead.
+    pub fn time(self) -> Option<i64> {
+        self.time
+    }
+
+    /// The time base of this timestamp.
+    pub fn time_base(self) -> Rational {
+        self.time_base
+    }
 }
 
 impl Time {

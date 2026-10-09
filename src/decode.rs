@@ -369,7 +369,7 @@ impl DecoderBuilder {
                 Ok(fmt)
             }
             (_, None) => Ok(PixelFormat::YUV420P),
-            // 属于调用方错误（把只对视频生效的 setter 用在了别的类型上），报 `InvalidConfig` 而不是笼统的 `Other`
+            // 属于调用方错误（把只对视频生效的 setter 用在了别的类型上）
             (media_type, Some(fmt)) => Err(RsmediaError::invalid_config(format!(
                 "with_pix_fmt({fmt:?}) is only valid for {} decoders, got media type: {media_type:?}",
                 MediaType::VIDEO.get_media_name()
@@ -825,7 +825,7 @@ impl Decoder {
     /// Get decoder time base.
     #[inline(always)]
     pub fn time_base(&self) -> Rational {
-        self.duration.time_base
+        self.duration.time_base()
     }
 
     /// Number of frames in the input stream (`AVStream.nb_frames`).

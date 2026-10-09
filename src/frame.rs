@@ -791,16 +791,7 @@ where
                 .format
                 .into_pixel()
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
-            format
-                .data_layout(self.width as usize, self.height as usize)
-                .ok_or_else(|| {
-                    RsmediaError::unsupported(format!(
-                        "pixel format {} cannot be stored as sample planes at {}x{}",
-                        format.get_pix_fmt_name(),
-                        self.width,
-                        self.height
-                    ))
-                })
+            Ok(format.data_layout(self.width as usize, self.height as usize))
         } else {
             let format = self
                 .format
@@ -841,14 +832,7 @@ where
     ///
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
     pub fn new_video_frame(width: i32, height: i32, format: PixelFormat) -> Result<Self> {
-        let layout = format
-            .data_layout(width as usize, height as usize)
-            .ok_or_else(|| {
-                RsmediaError::unsupported(format!(
-                    "pixel format {} cannot be stored as sample planes at {width}x{height}",
-                    format.get_pix_fmt_name()
-                ))
-            })?;
+        let layout = format.data_layout(width as usize, height as usize);
         Self::new_video(width, height, format, FrameData::zeros(&layout))
     }
 
@@ -1537,16 +1521,7 @@ where
         if self.format == FrameFormat::Pixel(dst_fmt) {
             return Ok(self.clone());
         }
-        let dst_layout = dst_fmt
-            .data_layout(self.width as usize, self.height as usize)
-            .ok_or_else(|| {
-                RsmediaError::unsupported(format!(
-                    "pixel format {} cannot be stored as sample planes at {}x{}",
-                    dst_fmt.get_pix_fmt_name(),
-                    self.width,
-                    self.height
-                ))
-            })?;
+        let dst_layout = dst_fmt.data_layout(self.width as usize, self.height as usize);
         // `read_samples::<T>` reads `size_of::<T>()`-wide elements, so a target
         // with a different component width must be rejected here rather than
         // reinterpreted: asking for `YUV420P10LE` out of a `MediaFrame<u8>`
@@ -1853,14 +1828,7 @@ fn check_layout<T>(
     width: i32,
     height: i32,
 ) -> Result<()> {
-    let layout = format
-        .data_layout(width as usize, height as usize)
-        .ok_or_else(|| {
-            RsmediaError::unsupported(format!(
-                "pixel format {} has no data layout at {width}x{height}",
-                format.get_pix_fmt_name()
-            ))
-        })?;
+    let layout = format.data_layout(width as usize, height as usize);
     if data.matches(&layout) {
         Ok(())
     } else {
@@ -2091,11 +2059,11 @@ mod tests {
         ] {
             assert_eq!(
                 format.data_layout(width, height),
-                Some(DataLayout::Interleaved {
+                DataLayout::Interleaved {
                     rows: height,
                     cols: width,
                     components: elements,
-                }),
+                },
                 "{format:?}"
             );
         }
@@ -2103,30 +2071,30 @@ mod tests {
         // 平面格式：每分量一个平面，色度按 log2_chroma 右移
         assert_eq!(
             PixelFormat::YUV420P.data_layout(width, height),
-            Some(DataLayout::Planar(vec![(48, 64), (24, 32), (24, 32)]))
+            DataLayout::Planar(vec![(48, 64), (24, 32), (24, 32)])
         );
         assert_eq!(
             PixelFormat::YUV422P.data_layout(width, height),
-            Some(DataLayout::Planar(vec![(48, 64), (48, 32), (48, 32)]))
+            DataLayout::Planar(vec![(48, 64), (48, 32), (48, 32)])
         );
         assert_eq!(
             PixelFormat::YUV444P.data_layout(width, height),
-            Some(DataLayout::Planar(vec![(48, 64), (48, 64), (48, 64)]))
+            DataLayout::Planar(vec![(48, 64), (48, 64), (48, 64)])
         );
         // 平面 RGB：无色度抽样
         assert_eq!(
             PixelFormat::GBRP.data_layout(width, height),
-            Some(DataLayout::Planar(vec![(48, 64), (48, 64), (48, 64)]))
+            DataLayout::Planar(vec![(48, 64), (48, 64), (48, 64)])
         );
         // 半平面 NV12：色度平面 U/V 交错，故列数为 2 * ceil(w/2)
         assert_eq!(
             PixelFormat::NV12.data_layout(width, height),
-            Some(DataLayout::Planar(vec![(48, 64), (24, 64)]))
+            DataLayout::Planar(vec![(48, 64), (24, 64)])
         );
         // 10bit 平面：元素为 2 字节，形状仍是样本数
         assert_eq!(
             PixelFormat::YUV420P10LE.data_layout(width, height),
-            Some(DataLayout::Planar(vec![(48, 64), (24, 32), (24, 32)]))
+            DataLayout::Planar(vec![(48, 64), (24, 32), (24, 32)])
         );
         assert_eq!(PixelFormat::YUV420P10LE.bytes_per_component(), Some(2));
         assert_eq!(PixelFormat::YUV420P.bytes_per_component(), Some(1));
@@ -2134,15 +2102,64 @@ mod tests {
         // 奇数尺寸：色度按 ceil 右移，因此仍可表达
         assert_eq!(
             PixelFormat::YUV420P.data_layout(65, 49),
-            Some(DataLayout::Planar(vec![(49, 65), (25, 33), (25, 33)]))
+            DataLayout::Planar(vec![(49, 65), (25, 33), (25, 33)])
         );
+    }
 
-        // 位流 / 调色板 / 硬件格式无法用整块样本数组表达
-        assert_eq!(PixelFormat::MONOWHITE.data_layout(width, height), None);
-        assert_eq!(PixelFormat::PAL8.data_layout(width, height), None);
-        assert_eq!(PixelFormat::VAAPI.data_layout(width, height), None);
-        assert_eq!(PixelFormat::NONE.data_layout(width, height), None);
-        assert_eq!(PixelFormat::RGB24.data_layout(0, height), None);
+    /// `PixelFormat::data_layout` 在以下情形**快速失败（panic）**而非返回 `None`，
+    /// 这样调用方不必处理 `Option`，与 `SampleFormat::data_layout` 对称。
+    /// 下面是它所有可能的 panic 分支，按 `src/pixel.rs` 中 `PixelFormat::data_layout`
+    /// 的执行顺序列出——每一条都说清「是什么情况」与「是哪个检查 panic 的」：
+    ///
+    /// | # | 触发情形（situation）                            | 哪个检查 panic（operation）                          | panic 消息关键字                            |
+    /// |---|--------------------------------------------------|------------------------------------------------------|--------------------------------------------|
+    /// | 1 | 零尺寸：`width == 0 \|\| height == 0`             | 入口尺寸守卫                                         | `zero dimension`                           |
+    /// | 2 | 无描述符：`AV_PIX_FMT_NONE` / 未知原始值          | `AVPixFmtDescriptorRef::get` 返回 `None`             | `no FFmpeg descriptor`                     |
+    /// | 3 | 不能整样本平面化：位流 / 调色板 / 硬件格式        | `has_no_sample_planes`（BITSTREAM / PAL / HWACCEL）  | `no whole-sample planes`                   |
+    /// | 4 | 描述符无分量（`nb_components == 0`）              | `components == 0` 守卫                               | `describes no components`                  |
+    /// | 5 | 分量宽度非整字节（所有分量 depth == 0）           | `element_bytes` 为 `None`                            | `no whole-byte component width`            |
+    /// | 6 | 交错格式每像素元素为分数（如 `uyyvyy411`: 6B/4px）| `!max_step.is_multiple_of(element_bytes * unit)`     | `fractional number of elements per pixel`  |
+    /// | 7 | 交错格式每像素元素数为 0（`max_step == 0`）        | `elements_per_pixel == 0` 守卫                       | `zero elements per pixel`                  |
+    /// | 8 | 平面格式 `av_pix_fmt_count_planes` 返回 < 0        | `count_planes()` 出错                                | `reports no plane count`                   |
+    /// | 9 | 平面某平面字节数不是整元素数的整数倍              | `plane_bytes == 0` 或 `!is_multiple_of` 守卫         | `not a whole number of`                    |
+    ///
+    /// 其中 1、2、3、6 能被公开 `PixelFormat` 值直接触发，各自有独立测试并断言了
+    /// 精确 panic 消息；4、5、7、8、9 在本 FFmpeg 构建里没有任何公开 `PixelFormat`
+    /// 会触发——它们是防呆护栏（硬件格式已被 #3 先拦下，真实格式不会落到这些分支），
+    /// 因此只在上面这张表里登记
+    #[test]
+    #[should_panic(expected = "zero dimension")]
+    fn data_layout_panics_on_zero_dimension() {
+        // 情形 1：零尺寸。RGB24 本身是整样本可平面的，但 0 宽让它无法表达。
+        let _ = PixelFormat::RGB24.data_layout(0, 48);
+    }
+
+    #[test]
+    #[should_panic(expected = "no FFmpeg descriptor")]
+    fn data_layout_panics_on_none_has_no_descriptor() {
+        // 情形 2：`AV_PIX_FMT_NONE` 没有描述符。
+        let _ = PixelFormat::NONE.data_layout(64, 48);
+    }
+
+    #[test]
+    #[should_panic(expected = "no whole-sample planes")]
+    fn data_layout_panics_on_palette_no_sample_planes() {
+        // 情形 3（调色板）：PAL8 通过 palette 平面寻址，不能当整样本平面。
+        let _ = PixelFormat::PAL8.data_layout(64, 48);
+    }
+
+    #[test]
+    #[should_panic(expected = "no whole-sample planes")]
+    fn data_layout_panics_on_bitstream_no_sample_planes() {
+        // 情形 3（位流）：MONOWHITE 每像素 1 bit，分量打包进子字节字段。
+        let _ = PixelFormat::MONOWHITE.data_layout(64, 48);
+    }
+
+    #[test]
+    #[should_panic(expected = "fractional number of elements per pixel")]
+    fn data_layout_panics_on_fractional_elements_per_pixel() {
+        // 情形 6：uyyvyy411 每 4 像素占 6 字节，无法用整元素数组表达。
+        let _ = PixelFormat::UYYVYY411.data_layout(8, 7);
     }
 
     /// 元素宽度不符的帧在**构造点**就被拒绝，而不是等到 `to_avframe`。
