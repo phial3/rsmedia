@@ -5,7 +5,7 @@ use crate::flags::FlagSet;
 use crate::fmt::{FrameFormat, SampleFormat};
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
-use crate::io::{Reader, StreamReader};
+use crate::io::{Reader, StreamReader, StreamReaderBuilder};
 use crate::location::Location;
 use crate::options::Options;
 use crate::pixel::PixelFormat;
@@ -130,6 +130,18 @@ pub struct DecoderBuilder {
     /// 错误识别位集（`AVCodecContext.err_recognition`）。`None` = FFmpeg 默认，
     /// 即 `0`（**所有位都不置**，连 [`CRCCHECK`](ErrRecognition::CRCCHECK) 也没开）。
     err_recognition: Option<FlagSet<ErrRecognition>>,
+    /// 输入 demuxer 名（`avformat_open_input` 的 `iformat`）。`None` = 由
+    /// libavformat 自行探测。
+    ///
+    /// 只被 [`build`](Self::build) 使用；[`build_from_reader`](Self::build_from_reader)
+    /// 的输入由调用方自己打开，格式已在那一侧定下。
+    input_format: Option<String>,
+    /// 传给 `avformat_open_input` 的输入参数（`framerate` / `video_size` /
+    /// `pixel_format` 等 demuxer 私有键）。
+    ///
+    /// 与 `codec_opts` 严格分开：后者写进 `avcodec_open2`，管的是**编解码器**
+    /// 参数（`preset`/`tune`…）。采集设备的端点参数只被 demuxer 认，两处互不通用。
+    input_opts: Option<Options>,
 }
 
 impl DecoderBuilder {
@@ -158,6 +170,8 @@ impl DecoderBuilder {
             sample_fmt: None,
             skip_frame: None,
             err_recognition: None,
+            input_format: None,
+            input_opts: None,
         }
     }
 
@@ -292,6 +306,108 @@ impl DecoderBuilder {
         self
     }
 
+    /// 指定输入的 demuxer 名（`avformat_open_input` 的 `iformat`）。
+    ///
+    /// 默认（不调用本方法）由 libavformat 按 `source` 的内容自行探测容器格式。
+    /// 采集设备（webcam / 麦克风 / 屏幕）没有可探测的头，必须显式声明它。
+    /// 常用取值（`-f` 后的名字，跨平台）：
+    ///
+    /// | 平台 | 视频 | 音频 |
+    /// |---|---|---|
+    /// | macOS | `avfoundation` | `avfoundation` |
+    /// | Windows | `dshow` | `dshow` |
+    /// | Linux | `v4l2` | `alsa` / `pulse` |
+    ///
+    /// 屏幕录制另有 `x11grab`（X11）/ `gdigrab`（Windows）/ `fbdev`（framebuffer），
+    /// 采集卡有 `decklink` / `vfwcap`。实际可用项取决于该 FFmpeg 构建编译进了哪些
+    /// 设备，用 `ffmpeg -devices` 可列出当前构建支持的（名字不在其中时
+    /// `avformat_open_input` 直接失败）。
+    ///
+    /// 此时 `source` 是**设备的索引对**而非文件名，例如 macOS 上
+    /// `avfoundation` 的 `"0:none"` = 0 号视频设备 + 不采集音频，
+    /// `"0:1"` = 同时采集 0 号视频与 1 号音频（一个设备 URL 出音视频双流，
+    /// 天然同步，省掉跨设备对齐）。
+    ///
+    /// 采集端点通常还要用 [`with_input_options`](Self::with_input_options) 补
+    /// `framerate` / `video_size` / `pixel_format` 等**设备私有**参数（这些键由
+    /// demuxer 解释，`avfoundation` / `dshow` / `v4l2` 都认）—— 注意它与
+    /// [`with_options`](Self::with_options) 不是一回事，后者写的是**编解码器**参数
+    /// （`avcodec_open2`），设备端点参数只被 demuxer 认。
+    ///
+    /// 仅作用于 [`build`](Self::build)；[`build_from_reader`](Self::build_from_reader)
+    /// 的输入由你自己打开，格式已在那一侧确定，本设置会被忽略。
+    ///
+    /// 名称含 NUL 字节时在构建期报错，而不是 panic。
+    ///
+    /// # 前置条件：必须先 [`init()`](crate::init())
+    ///
+    /// 采集设备的 demuxer 是由 `avdevice_register_all()` 注册进来的，而这一步在
+    /// [`init()`](crate::init()) / [`init_with()`](crate::init_with()) 里、且只在 once-guard
+    /// 内执行一次。**没调用过 `init()` 就构建，会以 `Cannot open input file. (-2)`
+    /// 失败** —— 错误信息完全看不出是缺初始化，很容易误判成 URL 或格式名写错。
+    ///
+    /// ```no_run
+    /// use rsmedia::{DecoderBuilder, MediaType};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// rsmedia::init()?;                 // 注册 avfoundation / dshow / v4l2 等设备
+    /// let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+    ///     .with_input_format("avfoundation")
+    ///     .build("0:none")?;
+    /// # let _ = decoder.decode_frame();
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// 普通文件输入不需要这一前置条件（容器 demuxer 是编译期静态注册的）。
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use rsmedia::{DecoderBuilder, MediaType, Options};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut opts = Options::new();
+    /// opts.set("framerate", "30");
+    /// opts.set("video_size", "1280x720");
+    ///
+    /// let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+    ///     .with_input_format("avfoundation")
+    ///     .with_input_options(opts)
+    ///     .build("0:none")?;
+    /// # let _ = decoder.decode_frame();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_input_format(mut self, format: impl Into<String>) -> Self {
+        self.input_format = Some(format.into());
+        self
+    }
+
+    /// 设置传给 `avformat_open_input` 的输入参数（demuxer 私有键）。
+    ///
+    /// 采集设备类输入几乎总需要它：光有 demuxer 名只能打开端点，帧率、分辨率、
+    /// 像素格式仍要由设备侧协商，指定哪个组合才可用是平台与设备相关的。例如
+    /// `avfoundation` 的 `framerate` / `video_size`、`v4l2` 的
+    /// `input_format` / `framerate`、`dshow` 的 `video_size`。
+    ///
+    /// **与 [`with_options`](Self::with_options) 的区别**（容易混淆）：
+    ///
+    /// | 方法 | 写入哪一步 | 管什么 |
+    /// |---|---|---|
+    /// | `with_input_options` | `avformat_open_input` | demuxer / 协议 / 设备端点参数 |
+    /// | `with_options` | `avcodec_open2` | 编解码器私有参数（`preset`/`tune`…） |
+    ///
+    /// 两者互不通用：把 `framerate` 交给 `with_options` 会被 codec 层忽略，
+    /// 反之把 `preset` 交给本方法也一样无效。
+    ///
+    /// 仅作用于 [`build`](Self::build)；[`build_from_reader`](Self::build_from_reader)
+    /// 的输入由你自己打开，参数已在那一侧传过，本设置会被忽略。
+    pub fn with_input_options(mut self, options: impl Into<Option<Options>>) -> Self {
+        self.input_opts = options.into();
+        self
+    }
+
     fn setup_codec_context(&self, decoder: &mut AVCodecContext, input: &AVStream) -> Result<()> {
         let media_type = self.media_type;
         if media_type as ffi::AVMediaType != decoder.codec_type {
@@ -346,9 +462,32 @@ impl DecoderBuilder {
     /// 适合需要精细控制 reader 生命周期的高级场景：这里只为**探测流信息**临时
     /// 打开一次 reader，构建结束即释放；解码时需每帧传入你自己的 reader
     /// （`decoder.decode(&mut reader)`），seek 也由你显式操作该 reader。
+    ///
+    /// [`with_input_format`](Self::with_input_format) /
+    /// [`with_input_options`](Self::with_input_options) 只作用于这里那个临时
+    /// reader。用 [`build_from_reader`](Self::build_from_reader) 时它们被忽略 ——
+    /// 那条路径的输入由你打开，格式与参数已在那一侧定下。
     pub fn build(self, source: impl Into<Location>) -> Result<Decoder> {
-        let reader = StreamReader::new(source)?;
+        let reader = self.open_reader(source)?;
         self.build_from_reader(&reader)
+    }
+
+    /// 按 `with_input_format` / `with_input_options` 打开构建期用的 reader。
+    ///
+    /// 两者都未设置时走 [`StreamReader::new`]（内容探测），与本方法引入前一致。
+    fn open_reader(&self, source: impl Into<Location>) -> Result<StreamReader> {
+        if self.input_format.is_none() && self.input_opts.is_none() {
+            return StreamReader::new(source);
+        }
+        // 只有调用方显式要求时才付这个代价：builder 的其余部分与 reader 无关
+        let mut builder = StreamReaderBuilder::new(source);
+        if let Some(format) = self.input_format.as_deref() {
+            builder = builder.with_format(format);
+        }
+        if let Some(options) = self.input_opts.clone() {
+            builder = builder.with_options(options);
+        }
+        builder.build()
     }
 
     /// 输出像素格式：仅视频有效。
@@ -1639,6 +1778,84 @@ mod tests {
     use super::*;
     use crate::filter;
     use std::collections::HashSet;
+
+    /// `with_input_format` 让 `build()` 能打开**没有可探测头部**的输入
+    /// （采集设备 / 虚拟源），而这正是它引入前失败（`Cannot open input file. (-2)`）
+    /// 的场景。
+    ///
+    /// 用 `lavfi` 虚拟源代替真实摄像头：CI 与沙箱里没有设备，也不该有权限依赖。
+    /// `lavfi` 与真实设备 demuxer 走的是同一条 `avformat_open_input(url, iformat)`
+    /// 路径，因此这里验证的正是设备输入要用的那条。
+    #[test]
+    fn test_input_format_enables_device_style_input() -> Result<()> {
+        // 采集 demuxer 由 avdevice_register_all 注册 —— 见 with_input_format 的
+        // 「前置条件」小节。缺这一步会得到毫无线索的 -2。
+        crate::init()?;
+
+        let decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_input_format("lavfi")
+            .build("testsrc=size=320x240:rate=30")?;
+        assert_eq!(decoder.width(), 320);
+        assert_eq!(decoder.height(), 240);
+
+        // 反证：不指定格式时同一个源打不开（容器 demuxer 无法探测 lavfi 图）。
+        assert!(
+            DecoderBuilder::new(MediaType::VIDEO)
+                .build("testsrc=size=320x240:rate=30")
+                .is_err(),
+            "lavfi input must not open without an explicit format"
+        );
+        Ok(())
+    }
+
+    /// `with_input_options` 的字典走的是 `avformat_open_input`，与
+    /// `with_options`（`avcodec_open2`）严格分开；两者互不通用。
+    ///
+    /// 这里断言的是**副作用**而非"参数被 FFmpeg 校验"：FFmpeg 对不认识的
+    /// 输入键是**容忍**的（`StreamReaderBuilder::with_options` 同样如此，实测
+    /// 如此），所以"传错键会报错"不是有效断言。能观测的差别是 lavfi 图的
+    /// `size`/`rate` 写在 URL 里、参数键影响不到它 —— 因此这里只保证
+    /// 设置了参数后构建仍成功（不因参数本身失败），把"字典确实传下去了"
+    /// 交给设备类输入在真实设备上的集成测试。
+    #[test]
+    fn test_input_options_do_not_break_build() -> Result<()> {
+        crate::init()?;
+
+        // 真实设备会用的键。lavfi 忽略它们，但参数本身不应导致构建失败。
+        let mut opts = Options::new();
+        opts.set("framerate", "30");
+        opts.set("video_size", "1280x720");
+        DecoderBuilder::new(MediaType::VIDEO)
+            .with_input_format("lavfi")
+            .with_input_options(opts)
+            .build("testsrc=size=320x240:rate=30")?;
+
+        // 未知的输入键同样被 FFmpeg 容忍（与 StreamReaderBuilder 一致）。
+        let mut bogus = Options::new();
+        bogus.set("definitely_not_a_real_option", "1");
+        DecoderBuilder::new(MediaType::VIDEO)
+            .with_input_format("lavfi")
+            .with_input_options(bogus)
+            .build("testsrc=size=320x240:rate=30")?;
+        Ok(())
+    }
+
+    /// 未知格式名以错误返回，不 panic —— 格式名来自调用方，属于输入错误。
+    #[test]
+    fn test_unknown_input_format_errors_cleanly() {
+        let result = DecoderBuilder::new(MediaType::VIDEO)
+            .with_input_format("no_such_demuxer")
+            .build("testsrc");
+        assert!(result.is_err());
+    }
+
+    /// 未设置任何输入格式/参数时，`build()` 与引入前完全一致（走内容探测）。
+    #[test]
+    fn test_default_input_path_unchanged() -> Result<()> {
+        let decoder = DecoderBuilder::new(MediaType::VIDEO).build("assets/mp4.mp4")?;
+        assert!(decoder.width() > 0 && decoder.height() > 0);
+        Ok(())
+    }
 
     #[test]
     fn test_decode_video() -> Result<()> {
