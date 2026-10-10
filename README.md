@@ -55,7 +55,7 @@ Legend:
 | **Frames & images** | ndarray-backed frames with full pixel-format conversion (any pair swscale can reach), thumbnails, and color science (HSV/HSL/LAB/XYZ, CIEDE2000). | `MediaFrame::convert_to`, `thumbnail`, `imgutils`, `colors` |
 | **Subtitles** | Decode subtitle streams into timed segments, and encode them into any container that carries a subtitle track (ASS/MOV text/...). | `SubtitleSegment`, `Decoder::decode_subtitle_segment`, `Muxer::mux_subtitle_segment`, `EncoderBuilder::new_subtitle` |
 | **Hardware acceleration** | Decode/encode on GPU through FFmpeg's hwaccel (VideoToolbox, CUDA/NVENC, VAAPI, QSV, Vulkan, AMF), with device auto-detection and frame download/upload. | `HWDeviceConfig` (`cuda` / `vaapi` / `auto_platform` …), `HWDeviceType`, `.with_hardware_device(...)` |
-| **Everything else** | PCM capture into an audio encoder, codec/container introspection, option presets. | `PcmSink`, `CodecConfig`, `Options` presets |
+| **Everything else** | PCM capture into an audio encoder (optionally alongside video in one file), codec/container introspection, option presets. | `PcmSink` (+ `muxer_mut`), `CodecConfig`, `Options` presets |
 
 The full module map is in the API docs (`cargo doc --open`)
 

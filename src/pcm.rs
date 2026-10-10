@@ -121,12 +121,19 @@
 //! and cut it afterwards, or use
 //! [`Muxer::new_segmented`](crate::mux::Muxer::new_segmented).
 //!
-//! # Not `Send`
+//! # Threading
 //!
-//! `PcmSink` is **not** `Send`, so it cannot be moved to another thread. Feed it
-//! from a capture callback over a channel instead of calling `write_*` inside the
-//! callback — that is what `examples/pcm_recorder.rs` does, and it is a
-//! requirement rather than a style choice.
+//! `PcmSink` is `Send`, so it may be built on one thread and fed from another —
+//! the usual shape is to own it on the audio thread and drive it from a capture
+//! callback there. It is **not** `Sync`: the underlying [`Muxer`] holds an
+//! `AVFormatContext` that must not be touched from two threads at once, so give
+//! each sink its own thread rather than sharing one.
+//!
+//! Note that a capture callback should still hand blocks over a channel instead
+//! of encoding inline: the callback runs on a real-time thread, and encoding
+//! there invites priority inversion and dropouts under load. `Send` makes that
+//! pattern possible; it does not make it advisable. That is what
+//! `examples/pcm_recorder.rs` demonstrates.
 
 use crate::error::{Context, Result, RsmediaError};
 use crate::io::Writer;
@@ -299,6 +306,51 @@ impl<W: Writer> PcmSink<W> {
         Ok(self.muxer.into_writer())
     }
 
+    /// The underlying [`Muxer`], mutably borrowed.
+    ///
+    /// This is how a recording gets a second stream: construct the sink on an
+    /// audio encoder's stream, then add a video encoder to the same muxer and
+    /// mux frames straight into it. [`Muxer::add_encoder`] refuses to add a
+    /// stream once the header has been written, so **register every stream
+    /// before the first [`write_*`](Self::write_f32) call** — the first write is
+    /// what commits the header.
+    ///
+    /// ```no_run
+    /// use rsmedia::mux::Muxer;
+    /// use rsmedia::pcm::{PcmSink, PcmSpec};
+    /// use rsmedia::{Encoder, EncoderBuilder, PixelFormat, SampleFormat};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut muxer = Muxer::new("out.mp4")?;
+    /// let audio = muxer.add_encoder(Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?)?;
+    ///
+    /// // Bind the audio side, then register video *before* the first write.
+    /// let mut sink = PcmSink::new(muxer, audio, PcmSpec::new(48_000, 2))?;
+    /// let video = sink.muxer_mut().add_encoder(
+    ///     EncoderBuilder::new_video(1280, 720).with_pix_fmt(PixelFormat::YUV420P).build()?,
+    /// )?;
+    ///
+    /// // Audio through the sink (any block size), video straight into the muxer.
+    /// sink.write_f32(&[0.0f32; 1024])?;
+    /// let frame = rsmedia::MediaFrame::<u8>::new_video_frame(1280, 720, PixelFormat::YUV420P)?
+    ///     .to_avframe()?;
+    /// sink.muxer_mut().mux(frame, video)?;
+    /// sink.finish()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Ordering tip: with a single device URL such as `avfoundation://0:1`
+    /// both streams come from one source and therefore stay in sync by
+    /// construction — far better than combining a camera with a separate
+    /// microphone, whose clocks drift.
+    ///
+    /// Prefer this over adding packets directly whenever the audio side is
+    /// driven by this sink, so the interleaving stays the muxer's job.
+    pub fn muxer_mut(&mut self) -> &mut Muxer<W> {
+        &mut self.muxer
+    }
+
     /// The underlying [`Muxer`]'s writer, mutably borrowed.
     ///
     /// Used to pull incremental bytes for a stream-as-you-go sink; writing must
@@ -353,7 +405,6 @@ impl<W: Writer> PcmSink<W> {
         let mut frame = AVFrame::new();
         frame.set_format(sample_format);
         frame.set_nb_samples(nb_samples);
-        // FFmpeg's sample rate is an `int`; the rate is validated non-zero.
         frame.set_sample_rate(self.spec.sample_rate as i32);
         frame.set_ch_layout(self.input_layout()?);
         frame
@@ -999,6 +1050,76 @@ mod tests {
         assert!(
             (samples as i64 - total_in as i64).abs() <= 1024,
             "decoded {samples} samples, expected ~{total_in}"
+        );
+        Ok(())
+    }
+
+    /// `muxer_mut` 的存在意义：音频走 sink、同时录视频到**同一个文件**。
+    /// 这在此前做不到 —— sink 按值吃掉 muxer 且没有出口。
+    #[test]
+    fn test_audio_and_video_into_one_file() -> Result<()> {
+        let output_path = test_support::test_output_path("pcm", "test_pcm_av.mp4");
+        test_support::remove_test_output(&output_path);
+
+        let mut muxer = Muxer::new(&output_path)?;
+        let audio = muxer.add_encoder(
+            EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP).build()?,
+        )?;
+        let mut sink = PcmSink::new(muxer, audio, PcmSpec::new(48_000, 2))?;
+
+        // 视频流必须在**第一次 write 之前**注册：第一次写就提交容器头。
+        let video = sink
+            .muxer_mut()
+            .add_encoder(EncoderBuilder::new_video(320, 240).with_fps(30.0).build()?)?;
+
+        for step in 1..=20i64 {
+            sink.write_f32(&vec![0.0f32; 1024])?;
+            let mut frame =
+                crate::MediaFrame::<u8>::new_video_frame(320, 240, crate::PixelFormat::YUV420P)?
+                    .to_avframe()?;
+            frame.set_pts(step);
+            sink.muxer_mut().mux(frame, video)?;
+        }
+        sink.finish()?;
+
+        // 产物必须真的带两条流。
+        let reader = crate::StreamReader::new(&output_path)?;
+        let kinds: Vec<_> = reader
+            .input()
+            .streams()
+            .iter()
+            .map(|s| s.codecpar().codec_type)
+            .collect();
+        assert_eq!(kinds.len(), 2, "output must carry video AND audio");
+        assert!(
+            kinds.contains(&ffi::AVMEDIA_TYPE_VIDEO) && kinds.contains(&ffi::AVMEDIA_TYPE_AUDIO),
+            "expected one video and one audio stream, got {kinds:?}"
+        );
+        Ok(())
+    }
+
+    /// 顺序约束必须由代码强制，而不只是文档里写一句：容器头一旦写出，
+    /// 再加流会破坏 FFmpeg 内部的流数组（实测 SIGSEGV），`Muxer` 因此拦截。
+    /// 这里确认该拦截在 sink 存在时同样生效。
+    #[test]
+    fn test_adding_a_stream_after_the_first_write_is_rejected() -> Result<()> {
+        let output_path = test_support::test_output_path("pcm", "test_pcm_late_stream.mp4");
+        test_support::remove_test_output(&output_path);
+
+        let mut muxer = Muxer::new(&output_path)?;
+        let audio = muxer.add_encoder(
+            EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP).build()?,
+        )?;
+        let mut sink = PcmSink::new(muxer, audio, PcmSpec::new(48_000, 2))?;
+
+        sink.write_f32(&[0.0f32; 1024])?; // commits the header
+
+        let late = sink
+            .muxer_mut()
+            .add_encoder(EncoderBuilder::new_video(320, 240).build()?);
+        assert!(
+            late.is_err(),
+            "adding a stream after the header must be refused, not silently accepted"
         );
         Ok(())
     }
