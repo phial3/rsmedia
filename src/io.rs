@@ -1304,6 +1304,27 @@ impl WriterCore {
             .write_header(&mut dict)
             .context("Failed to write header")?;
 
+        // 传进来的选项分两段被消费：avio/protocol 层在构建时吃掉一部分，剩下的
+        // 交给 muxer（`movflags` 等私有键）。FFmpeg 对**不认识的键**既不报错也
+        // 不警告，于是拼错的键（如 `mov_flag`）会静默失效——用户看到的是"设置没
+        // 生效"却查不到原因。这里把 muxer 没取走的键报出来：只告警不报错，
+        // 既有代码行为不变。
+        //
+        // 注意这不是"键无效"的判定：avio 层已消费掉的键不会出现在这里，而某些
+        // muxer 会接受它并不在 `options` 里声明的键（走各自的私有解析）。因此
+        // 残留只说明"这个键没被任何一层认领"，是最值得看一眼的线索，而不是结论。
+        if let Some(leftover) = dict.as_ref().filter(|d| !d.is_empty()) {
+            let unclaimed = leftover
+                .iter()
+                .map(|e| e.key().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                "these options were not consumed by the protocol, muxer or codec layers and \
+                 had no effect: {unclaimed:?}; check for typos — FFmpeg silently ignores \
+                 unknown option keys"
+            );
+        }
+
         self.header_written = true;
         self.flush();
         Ok(())
@@ -2093,6 +2114,73 @@ mod tests {
     use crate::pixel::PixelFormat;
     use crate::{DecoderBuilder, MediaType};
     use rsmpeg::avutil::AVFrame;
+
+    fn options_of(pairs: &[(&str, &str)]) -> Options {
+        let mut o = Options::new();
+        for (k, v) in pairs {
+            o.set(*k, *v);
+        }
+        o
+    }
+
+    /// mux 到一个单视频流的小文件（header 会被真正写出，选项 dict 因此被消费）。
+    fn write_one_frame_mp4(path: &std::path::Path, options: Options) -> Result<()> {
+        let _ = std::fs::remove_file(path);
+        let mut muxer = Muxer::new_with_options(path, options)?;
+        let encoder = EncoderBuilder::new_video(64, 64).build()?;
+        let index = muxer.add_encoder(encoder)?;
+        let frame =
+            crate::MediaFrame::<u8>::new_video_frame(64, 64, PixelFormat::YUV420P)?.to_avframe()?;
+        muxer.mux(frame, index)?;
+        muxer.finish()
+    }
+
+    /// 契约：没被任何一层认领的键（含拼错的）**只告警、不报错**——mux 必须照常
+    /// 成功写出可读容器。
+    ///
+    /// 告警文本本身不在这里断言：`tracing` 的输出需要装 subscriber 才能观察，
+    /// 为此在测试里搭一套日志捕获机制并不划算（而且它断言的是"日志长什么样"
+    /// 而非"行为对不对"）。可观察的部分是行为——写出的文件能正常打开。
+    #[test]
+    fn test_unclaimed_option_keys_do_not_break_muxing() -> Result<()> {
+        let dir = crate::test_support::test_output_path("io", "");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("unclaimed_keys.mp4");
+
+        write_one_frame_mp4(
+            &path,
+            options_of(&[("mov_flag", "+faststart")]), // 真实键是 movflags
+        )?;
+
+        let written = std::fs::metadata(&path)?.len();
+        assert!(written > 0, "a misspelled key must not abort the mux");
+        Ok(())
+    }
+
+    /// 反向保证：正常键走同一条路也必须成功（`movflags` 被 muxer 消费），确保上
+    /// 一条不是因为"无论什么键都写不出文件"而空转。
+    #[test]
+    fn test_consumed_option_keys_still_mux() -> Result<()> {
+        let dir = crate::test_support::test_output_path("io", "");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("consumed_keys.mp4");
+
+        write_one_frame_mp4(&path, options_of(&[("movflags", "+faststart")]))?;
+        assert!(std::fs::metadata(&path)?.len() > 0);
+        Ok(())
+    }
+
+    /// 没有选项时同样正常——基线行为不变。
+    #[test]
+    fn test_no_options_muxes() -> Result<()> {
+        let dir = crate::test_support::test_output_path("io", "");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("no_options.mp4");
+
+        write_one_frame_mp4(&path, Options::new())?;
+        assert!(std::fs::metadata(&path)?.len() > 0);
+        Ok(())
+    }
 
     /// `deadline` 这个 mutex 被 poison 之后，`triggered()` 仍必须承认**已到期**的超时。
     ///

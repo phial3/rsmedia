@@ -1372,8 +1372,55 @@ pub struct Demuxer<R: Reader> {
 }
 
 impl Demuxer<StreamReader> {
+    /// Opens `source` and probes its stream information.
+    ///
+    /// The format is detected from the content. To pass protocol or demuxer
+    /// options — `rtsp_transport`, `reconnect`, `user_agent`, … — use
+    /// [`new_with_options`](Self::new_with_options), which is the read-side
+    /// counterpart of [`Muxer::new_with_options`].
     pub fn new(source: impl Into<Location>) -> Result<Self> {
         let reader = StreamReader::new(source)?;
+        Self::new_from_reader(reader, None, None)
+    }
+
+    /// Opens `source` with the given protocol / demuxer options.
+    ///
+    /// This is the read-side counterpart of [`Muxer::new_with_options`]: those
+    /// options are handed to `avformat_open_input`, so they configure the
+    /// **protocol layer** (how the bytes are fetched) and the demuxer — not the
+    /// decoder. Decoder-private AVOptions belong to
+    /// [`DecoderBuilder::with_options`](crate::DecoderBuilder::with_options).
+    ///
+    /// `options` are also visible to the FFmpeg protocol layer first, which is
+    /// what makes transport-level keys such as `rtsp_transport=tcp` work.
+    ///
+    /// ```no_run
+    /// use rsmedia::options::Options;
+    /// use rsmedia::{Demuxer, Reader};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut options = Options::new();
+    /// options.set("rtsp_transport", "tcp");
+    /// options.set("stimeout", "5000000");
+    ///
+    /// let demuxer = Demuxer::new_with_options("rtsp://cam.local/stream", options)?;
+    /// println!("{} stream(s)", demuxer.streams().len());
+    /// # let _ = demuxer.reader.read_packet();
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Options that no layer claims are silently ignored by FFmpeg; the writer
+    /// reports the leftovers when the container header is written (see
+    /// [`StreamReaderBuilder::with_options`](crate::io::StreamReaderBuilder::with_options)).
+    pub fn new_with_options(
+        source: impl Into<Location>,
+        options: impl Into<Option<Options>>,
+    ) -> Result<Self> {
+        let reader = crate::io::StreamReaderBuilder::new(source)
+            .with_options(options)
+            .build()
+            .context("Failed to open input")?;
         Self::new_from_reader(reader, None, None)
     }
 }
@@ -1825,6 +1872,33 @@ mod tests {
 
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
     use std::path::Path;
+
+    /// `new_with_options` 必须与 `new` 看到同样的流——它是"带协议选项的 new"，
+    /// 不是另一种打开方式。（读写对称：写出侧早有 `Muxer::new_with_options`。）
+    #[test]
+    fn test_demuxer_new_with_options_matches_new() -> Result<()> {
+        let plain = Demuxer::new("assets/mp4.mp4")?;
+        let plain_streams = plain.streams().len();
+        assert!(plain_streams > 0, "fixture must expose at least one stream");
+
+        let mut options = Options::new();
+        options.set("fflags", "discardcorrupt"); // a real libavformat option
+        let with_options = Demuxer::new_with_options("assets/mp4.mp4", options)?;
+        assert_eq!(
+            plain_streams,
+            with_options.streams().len(),
+            "options must not change which streams are found"
+        );
+
+        // 空选项等价于 `new`，且仍能正常解包。
+        let mut empty = Demuxer::new_with_options("assets/mp4.mp4", Options::new())?;
+        assert_eq!(empty.streams().len(), plain_streams);
+        assert!(
+            empty.reader.read_packet()?.is_some(),
+            "a demuxer built with options must still read packets"
+        );
+        Ok(())
+    }
 
     /// 生成YUV420P格式的视频帧,彩色渐变测试图
     fn generate_video_frame(width: u32, height: u32, frame_index: i64) -> AVFrame {

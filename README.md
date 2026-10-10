@@ -46,16 +46,16 @@ Legend:
 
 | Feature | What it does | Main entry points |
 |---|---|---|
-| **Decoding** | Turns video / audio / subtitle streams into Rust data: ndarray-backed frames (`MediaFrame`), raw `AVFrame`s, or subtitle segments. Output pixel/sample format can be unified per builder. | `DecoderBuilder` → `Decoder::decode::<T>`, `decode_raw`, `decode_subtitle_segment` |
+| **Decoding** | Turns video / audio / subtitle streams into Rust data: ndarray-backed frames (`MediaFrame`), raw `AVFrame`s, or subtitle segments. Output pixel/sample format can be unified per builder. Capture devices (webcam / mic / screen) are reachable by naming the demuxer. | `DecoderBuilder` → `Decoder::decode::<T>`, `decode_raw`, `decode_subtitle_segment`; `.with_input_format("avfoundation")` |
 | **Encoding** | FFmpeg encoders with FFmpeg-aligned defaults (unset options defer to the codec) and automatic pts numbering. | `EncoderBuilder::new_video` / `new_audio` / `new_subtitle` → `Encoder` |
-| **Mux / demux** | Remux or transcode containers; each output stream is either an encoder stream or a bit-exact copy stream. Interleaved writing, metadata, chapters, cover art. | `Demuxer`, `Muxer::add_encoder` / `add_copy_stream` / `mux` / `finish` |
-| **IO & seek** | One abstraction for local paths, in-memory buffers and any `std::io` stream, with interruptible reads and keyframe / timestamp seeking. | `StreamReader(Builder)`, `StreamWriter(Builder)`, `BufferReader/Writer`, `IoReader/Writer`, `Seekable`, `Interrupt` |
+| **Mux / demux** | Remux or transcode containers; each output stream is either an encoder stream or a bit-exact copy stream. Interleaved writing, metadata, chapters, cover art. Protocol options on both sides (`rtsp_transport` & co). | `Demuxer::new_with_options`, `Muxer::new_with_options` / `add_encoder` / `add_copy_stream` / `mux` / `finish` |
+| **IO & seek** | One abstraction for local paths, in-memory buffers and any `std::io` stream, with interruptible reads and keyframe / timestamp seeking. Options no layer claims are reported instead of failing silently. | `StreamReader(Builder)`, `StreamWriter(Builder)`, `BufferReader/Writer`, `IoReader/Writer`, `Seekable`, `Interrupt` |
 | **Filters** | FFmpeg filter graphs attached to either builder; typed builders for the common video/audio filters plus an escape hatch for raw specs. | `filter::video::*`, `filter::audio::*`, `Filter`, `.with_filters(...)` |
 | **Scaling & resampling** | A reusable scaler (swscale) and resampler (swresample) that hold their kernel/quality policy across frames. | `Scaler`, `ScaleAlgorithm`, `ScaleQuality`, `Resampler`, `resample::convert_frame` |
 | **Frames & images** | ndarray-backed frames with full pixel-format conversion (any pair swscale can reach), thumbnails, and color science (HSV/HSL/LAB/XYZ, CIEDE2000). | `MediaFrame::convert_to`, `thumbnail`, `imgutils`, `colors` |
 | **Subtitles** | Decode subtitle streams into timed segments, and encode them into any container that carries a subtitle track (ASS/MOV text/...). | `SubtitleSegment`, `Decoder::decode_subtitle_segment`, `Muxer::mux_subtitle_segment`, `EncoderBuilder::new_subtitle` |
 | **Hardware acceleration** | Decode/encode on GPU through FFmpeg's hwaccel (VideoToolbox, CUDA/NVENC, VAAPI, QSV, Vulkan, AMF), with device auto-detection and frame download/upload. | `HWDeviceConfig` (`cuda` / `vaapi` / `auto_platform` …), `HWDeviceType`, `.with_hardware_device(...)` |
-| **Everything else** | PCM capture/playback, codec/container introspection, option presets. | `PcmSink`, `CodecConfig`, `Options` presets |
+| **Everything else** | PCM capture into an audio encoder, codec/container introspection, option presets. | `PcmSink`, `CodecConfig`, `Options` presets |
 
 The full module map is in the API docs (`cargo doc --open`)
 
