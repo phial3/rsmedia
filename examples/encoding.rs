@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut encoder = EncoderBuilder::new_video(width, height)
         // encoder with CUDA acceleration
-        .with_hardware_device(Some(HWDeviceConfig::auto_platform()?))
+        .with_hardware_device(HWDeviceConfig::auto_platform()?)
         // libx264, libx265, h264_nvenc, h264_vaapi
         // .with_codec_name("h264_nvenc")
         // .with_options(Options::preset_h264_nvenc())

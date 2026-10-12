@@ -33,7 +33,7 @@ fn check(codec: &'static str, ext: &str) -> anyhow::Result<()> {
     let enc = EncoderBuilder::new_video(w, h)
         .with_fps(30.0)
         .with_codec_name(codec)
-        .with_hardware_device(Some(dev))
+        .with_hardware_device(dev)
         .build()?;
     let enc_tb = enc.time_base();
     let mut muxer = rsmedia::mux::Muxer::new(&path)?;

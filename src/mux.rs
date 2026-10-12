@@ -181,7 +181,10 @@ impl MuxerStream {
 
 impl Muxer<StreamWriter> {
     pub fn new(destination: impl Into<Location>) -> Result<Self> {
-        Self::new_with_options(destination, None)
+        let writer = crate::io::StreamWriterBuilder::new(destination)
+            .build()
+            .context("Failed to open output")?;
+        Ok(Self::new_from_writer(writer))
     }
 
     /// 打开输出并透传 **muxer 选项**（`movflags`、`frag_keyframe`、
@@ -206,7 +209,7 @@ impl Muxer<StreamWriter> {
     /// ```
     pub fn new_with_options(
         destination: impl Into<Location>,
-        options: impl Into<Option<Options>>,
+        options: Options,
     ) -> Result<Self> {
         let writer = crate::io::StreamWriterBuilder::new(destination)
             .with_options(options)
@@ -261,10 +264,7 @@ impl Muxer<StreamWriter> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_segmented(
-        pattern: impl Into<Location>,
-        options: impl Into<Option<Options>>,
-    ) -> Result<Self> {
+    pub fn new_segmented(pattern: impl Into<Location>, options: Options) -> Result<Self> {
         let writer = crate::io::StreamWriterBuilder::new(pattern)
             .with_format("segment")
             .with_options(options)
@@ -1413,10 +1413,7 @@ impl Demuxer<StreamReader> {
     /// Options that no layer claims are silently ignored by FFmpeg; the writer
     /// reports the leftovers when the container header is written (see
     /// [`StreamReaderBuilder::with_options`](crate::io::StreamReaderBuilder::with_options)).
-    pub fn new_with_options(
-        source: impl Into<Location>,
-        options: impl Into<Option<Options>>,
-    ) -> Result<Self> {
+    pub fn new_with_options(source: impl Into<Location>, options: Options) -> Result<Self> {
         let reader = crate::io::StreamReaderBuilder::new(source)
             .with_options(options)
             .build()
@@ -1457,12 +1454,14 @@ impl<R: Reader> Demuxer<R> {
                 stream_info.codec_id, stream_info.index
             )));
         };
-        match DecoderBuilder::new(media_type)
-            .with_codec_name(codec_name.clone())
-            .with_hardware_device(device_config.clone())
-            .with_filters(filters.get(&media_type).cloned())
-            .build_from_reader(reader)
-        {
+        let mut builder = DecoderBuilder::new(media_type).with_codec_name(codec_name.clone());
+        if let Some(cfg) = &device_config {
+            builder = builder.with_hardware_device(cfg.clone());
+        }
+        if let Some(chain) = filters.get(&media_type) {
+            builder = builder.with_filters(chain.clone());
+        }
+        match builder.build_from_reader(reader) {
             Ok(decoder) => Ok(decoder),
             Err(e) if device_type.is_some() => {
                 // 硬件解码器构建失败（如 hw 初始化失败）：回退软件解码器重试，
@@ -1474,9 +1473,11 @@ impl<R: Reader> Demuxer<R> {
                 let software_name = stream_info
                     .find_decoder_name(None)
                     .unwrap_or_else(|| codec_name.clone());
-                DecoderBuilder::new(media_type)
-                    .with_codec_name(software_name)
-                    .with_filters(filters.get(&media_type).cloned())
+                let mut fallback = DecoderBuilder::new(media_type).with_codec_name(software_name);
+                if let Some(chain) = filters.get(&media_type) {
+                    fallback = fallback.with_filters(chain.clone());
+                }
+                fallback
                     .build_from_reader(reader)
                     .context("Failed to build decoder (hw and software both failed)")
             }

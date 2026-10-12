@@ -363,8 +363,8 @@ fn seek_offset(pos: i64, len: usize, offset: i64, whence: i32) -> Option<i64> {
 /// 为 reader builder 生成 `with_format` / `with_options` / `with_interrupt`，
 /// 三者都只写 [`ReaderSpec`]。
 ///
-/// 三个 reader builder 的这三项语义完全相同（含 `impl Into<Option<_>>` 的取值
-/// 方式），因此只在这里写一遍：builder 只需持有 `spec: ReaderSpec<'a>`。
+/// 三个 reader builder 的这三项语义完全相同，因此只在这里写一遍：builder
+/// 只需持有 `spec: ReaderSpec<'a>`。
 macro_rules! impl_reader_builder_setters {
     () => {
         /// Specify a custom format for the reader.
@@ -382,8 +382,8 @@ macro_rules! impl_reader_builder_setters {
         /// # Arguments
         ///
         /// * `options` - Options to pass on to input.
-        pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-            self.spec.options = options.into();
+        pub fn with_options(mut self, options: Options) -> Self {
+            self.spec.options = Some(options);
             self
         }
 
@@ -392,8 +392,8 @@ macro_rules! impl_reader_builder_setters {
         /// 覆盖范围见 [`Interrupt`]：URL 输入（`StreamReader`）的打开与协议层
         /// 阻塞读都能被取消；自定义 IO 输入（`BufferReader` / `IoReader`）只有
         /// 探测循环生效，回调自身的阻塞读不受保护。
-        pub fn with_interrupt(mut self, interrupt: impl Into<Option<Interrupt>>) -> Self {
-            self.spec.interrupt = interrupt.into();
+        pub fn with_interrupt(mut self, interrupt: Interrupt) -> Self {
+            self.spec.interrupt = Some(interrupt);
             self
         }
     };
@@ -410,8 +410,8 @@ macro_rules! impl_writer_builder_setters {
         /// # Arguments
         ///
         /// * `options` - Options to pass on to output.
-        pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-            self.spec.options = options.into();
+        pub fn with_options(mut self, options: Options) -> Self {
+            self.spec.options = Some(options);
             self
         }
     };
@@ -689,7 +689,7 @@ struct ReaderSpec<'a> {
 /// options.set("rtsp_transport", "tcp");
 ///
 /// let mut reader = StreamReaderBuilder::new("my_file.mp4")
-///    .with_options(Some(options))
+///    .with_options(options)
 ///    .build()
 ///    .unwrap();
 /// ```
@@ -1313,7 +1313,7 @@ impl WriterCore {
         // 注意这不是"键无效"的判定：avio 层已消费掉的键不会出现在这里，而某些
         // muxer 会接受它并不在 `options` 里声明的键（走各自的私有解析）。因此
         // 残留只说明"这个键没被任何一层认领"，是最值得看一眼的线索，而不是结论。
-        if let Some(leftover) = dict.as_ref().filter(|d| !d.is_empty()) {
+        if let Some(leftover) = dict.as_ref().filter(|d| d.iter().next().is_some()) {
             let unclaimed = leftover
                 .iter()
                 .map(|e| e.key().to_string_lossy().into_owned())
@@ -1479,7 +1479,7 @@ impl<'a> StreamWriterBuilder<'a> {
 /// options.set("movflags", "frag_keyframe+empty_moov");
 ///
 /// let mut writer = StreamWriterBuilder::new("my_file.mp4")
-///     .with_options(Some(options))
+///     .with_options(options)
 ///     .build()
 ///     .unwrap();
 /// ```

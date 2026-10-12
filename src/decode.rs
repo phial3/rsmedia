@@ -403,8 +403,8 @@ impl DecoderBuilder {
     ///
     /// 仅作用于 [`build`](Self::build)；[`build_from_reader`](Self::build_from_reader)
     /// 的输入由你自己打开，参数已在那一侧传过，本设置会被忽略。
-    pub fn with_input_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.input_opts = options.into();
+    pub fn with_input_options(mut self, options: Options) -> Self {
+        self.input_opts = Some(options);
         self
     }
 

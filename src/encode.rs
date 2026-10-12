@@ -2989,7 +2989,7 @@ mod tests {
 
         let mut encoder = EncoderBuilder::new_video(width, height)
             .with_codec_name(codec_name)
-            .with_hardware_device(Some(config))
+            .with_hardware_device(config)
             .with_hw_pool_size(2)
             .build()?;
 
