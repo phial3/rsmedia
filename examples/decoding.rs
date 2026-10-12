@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
     let mut reader = StreamReader::new(source)?;
     let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
         // decoder with CUDA acceleration
-        .with_hardware_device(Some(HWDeviceConfig::auto_platform()?))
+        .with_hardware_device(HWDeviceConfig::auto_platform()?)
         // h264_cuvid decoder name
         // .with_codec_name("h264_cuvid")
         .with_filters(filters)

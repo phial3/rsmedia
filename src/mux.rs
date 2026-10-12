@@ -207,10 +207,7 @@ impl Muxer<StreamWriter> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_with_options(
-        destination: impl Into<Location>,
-        options: Options,
-    ) -> Result<Self> {
+    pub fn new_with_options(destination: impl Into<Location>, options: Options) -> Result<Self> {
         let writer = crate::io::StreamWriterBuilder::new(destination)
             .with_options(options)
             .build()
