@@ -3,6 +3,12 @@ pub use url::Url;
 
 /// Represents a video file or stream location. Can be either a file resource (a path) or a network
 /// resource (a URL).
+///
+/// The common input of every reader/writer builder (`impl Into<Location>`), so
+/// `&str` / `String` / `Path` / `PathBuf` / [`Url`] all plug in directly. For
+/// string inputs the scheme decides the variant: a network scheme (`http`,
+/// `rtsp`, `srt`, ...) becomes [`Location::Network`], everything else (including
+/// Windows drive paths like `C:\video\a.mov`) becomes [`Location::File`].
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Location {
     /// File source.
@@ -14,8 +20,10 @@ pub enum Location {
 impl Location {
     /// Coerce underlying location to a path.
     ///
-    /// This will create a path with a URL in it (which is kind of weird but we use it to pass on
-    /// URLs to ffmpeg).
+    /// A [`Location::Network`] yields a path *containing* the URL string. That is
+    /// the intended hand-off, not a bug: FFmpeg's `avformat_open_input` takes a
+    /// single filename and dispatches on the scheme itself, so the URL text is
+    /// exactly what the protocol layer expects.
     pub fn as_path(&self) -> &std::path::Path {
         match self {
             Location::File(path) => path.as_path(),

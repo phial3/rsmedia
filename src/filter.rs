@@ -1,6 +1,33 @@
-//! Filter module
-//! This module provides a set of filters that can be used to process media data.
-//! The filters are implemented using the ffmpeg library.
+//! Media filtering on top of FFmpeg's `libavfilter` graph.
+//!
+//! Four layers, each owning exactly one question:
+//!
+//! | Layer | Question | Type |
+//! |---|---|---|
+//! | leaf | *what* filter — name, media type, escaped spec | [`Filter`] |
+//! | node | *how it is wired* — which upstream label feeds each input pad, what its output pads are called | [`FilterNode`] |
+//! | endpoint | *what format* one link carries in or out | [`Endpoint`] |
+//! | graph | the negotiated, running graph | [`FilterGraph`] |
+//!
+//! There are two ways to get a running graph:
+//!
+//! * **Linear chain** — hand a `Vec<Filter>` to `DecoderBuilder::with_filters` /
+//!   `EncoderBuilder::with_filters`. The filters are joined with `,`, so only
+//!   single-input / single-output filters fit, and the crate owns the graph lifecycle.
+//! * **Arbitrary graph** — assemble with [`FilterGraphBuilder`] when you need
+//!   `overlay` / `amix` / `hstack`, fan-out, or several outputs, then drive
+//!   [`FilterGraph`] yourself: [`push_frame_to`](FilterGraph::push_frame_to) →
+//!   [`receive_frame_from`](FilterGraph::receive_frame_from) →
+//!   [`drain_output`](FilterGraph::drain_output).
+//!
+//! Two caveats that are invisible from the signatures alone:
+//!
+//! * **A frame you push must match the endpoint you declared for that input.** The
+//!   mismatch surfaces only as a bare `EINVAL` at pull time, so the graph error message
+//!   enumerates the declared input formats to help locate the offending one.
+//! * **Negotiation happens once**, when the graph is built or [`init`](FilterGraph::init)ed.
+//!   Changing an endpoint or a filter option afterwards means rebuilding the graph; for
+//!   live parameter tweaks use [`FilterGraph::send_command`] instead.
 //!
 //! See: <https://ffmpeg.org/ffmpeg-filters.html>
 use crate::error::{Context, Result, RsmediaError};
@@ -21,6 +48,15 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// 叶子节点：**是什么**滤镜（名字 + 媒体类型 + 转义好的描述串）。
+///
+/// 描述串的转义在构造时已完成——`video::*` / `audio::*` 里的便捷函数都走
+/// `escape_filter_value`，所以这里拿到的是可直接拼进线性链的片段。直接用
+/// [`Filter::new`] 写裸描述时，调用方要自己转义（手写描述里的 `,` `;` `:` 会被 FFmpeg
+/// 当成分隔符）。
+///
+/// [`Escape hatch`](FilterNode)：单个滤镜直接进图用 [`FilterGraph::init`]；需要接线或
+/// fan-out 时包成 [`FilterNode`]。
 #[derive(Debug, Clone)]
 pub struct Filter {
     name: &'static str,
@@ -77,8 +113,8 @@ impl Filter {
 /// [`Filter`] 只描述「滤镜是什么」，接线（这一路输入来自哪个上游、输出叫什么名字）
 /// 属于图的结构，放在这里。两者分开的好处是：单输入滤镜可以线性链式拼接（`Vec<Filter>`），
 /// 而多输入滤镜（`overlay` / `amix` / `hstack` / `vstack` / `concat`）只能作为节点
-/// 显式接线，**无法**被误塞进线性链——那正是过去 `filter::video::overlay()` 公开却
-/// 建不出图的根源。
+/// 显式接线——把它们放进线性链建不出图（`Filter::new` 建的 `Filter` 没有 `inputs=`/
+/// `n=` 选项可用，路数只能由这里的标签个数决定）。
 ///
 /// 输出侧同理：单输出滤镜用 [`with_label`](Self::with_label)，多输出 pad 的滤镜
 /// （`split` / `asplit`，见 [`video::split`] / [`audio::asplit`]）用
@@ -253,15 +289,13 @@ const GRAPH_SPECIALS: &str = "\\'[],;";
 
 /// 走 FFmpeg 自己的 `av_escape`（BACKSLASH 模式，不带 `AV_ESCAPE_FLAG_STRICT`）。
 ///
-/// `av_escape` 只有两种失败，两种都如实报出，**没有任何降级**：
+/// `av_escape` 只有两种失败，两种都如实报出，**没有任何降级**：入参含内部 NUL 时它
+/// 无法成为 C 字符串，也不可能是滤镜描述的一部分（[`NulError`](std::ffi::NulError)
+/// 经 `From` 变成 [`RsmediaError::InvalidConfig`]）；分配失败（`av_escape` 返回负值）
+/// 时带上 `AVERROR` 变体与上下文报出。
 ///
-/// * 入参含内部 NUL —— 它无法成为 C 字符串，也不可能是滤镜描述的一部分；
-///   [`NulError`](std::ffi::NulError) 经 `From` 变成 [`RsmediaError::InvalidConfig`]，
-///   错误消息会指出是 NUL 的问题。
-/// * 分配失败（`av_escape` 返回负值）—— 带上 `AVERROR` 变体与上下文报出。
-///
-/// 以前这里失败时会 `input.replace('\0', "")` 然后原样放行：滤镜描述会悄悄少几个字符
-/// 却照常建图成功，调用方完全看不出自己给的值没被用上。这就是"掩盖问题"。
+/// **不可降级**：悄悄丢掉 NUL 再放行会让滤镜描述少几个字符却照常建图成功，调用方完全
+/// 看不出自己给的值没被用上——这正是本函数要报出来而非掩盖的情形。
 fn escape_backslash(input: &str, specials: &str, all_whitespace: bool) -> Result<String> {
     let c_input = CString::new(input)?;
     // `specials` 是 crate 里的常量，NUL 是编译期就能排除的；这里不是降级，是不变量。
@@ -409,10 +443,9 @@ impl Expr<'_> {
     /// when the expression contains a NUL byte — a filter description is a C string and
     /// cannot carry one.
     ///
-    /// This replaces the `Display` impl this type used to have: rendering an option value
-    /// is fallible now, and `Display` has no way to report that (its only failure exit is
-    /// `fmt::Error`, which makes `format!` panic). Constructors call this method and
-    /// propagate the error instead.
+    /// This is a fallible method rather than a `Display` impl on purpose: rendering an
+    /// option value can fail, and `Display`'s only failure exit is `fmt::Error`, which
+    /// makes `format!` panic. Constructors call this method and propagate the error.
     pub fn to_filter_value(self) -> Result<String> {
         match self {
             Self::Const(value) => Ok(format!("{value}")),
@@ -453,31 +486,18 @@ fn duration_literal(duration: Duration) -> String {
 
 /// Render a filter's numeric option value.
 ///
-/// Filter options are plain decimals by the time they reach FFmpeg, so the
-/// question is only which Rust type to accept. These parameters are typed
-/// `impl Into<f64>` for two reasons, in this order:
+/// These parameters are typed `impl Into<f64>` so every spelling a caller already
+/// keeps working — `highpass(80)`, `nlmeans(1.0)`, an `f32` from a pipeline, an `f64`
+/// computation. FFmpeg declares most of these `<double>` (the rest `<float>`/`<int>`)
+/// and does accept fractional dB, gain and frequency (31.5 Hz is a standard 1/3-octave
+/// centre), so a narrower parameter type would reject values FFmpeg takes.
 ///
-/// * **No boilerplate.** Every spelling a caller already has keeps working
-///   unchanged — an integer literal (`highpass(80)`), a float literal
-///   (`nlmeans(1.0)`), an `f32` value from elsewhere in a pipeline, and an
-///   `f64` computation. A plain `f64` parameter would force `.0` onto every
-///   integer call site, which is exactly the "make the caller write
-///   boilerplate" cost this crate avoids elsewhere.
-/// * **No narrowing.** FFmpeg declares most of these `<double>` (and the rest
-///   `<float>`/`<int>`); an `f32` or `i32` parameter would reject values FFmpeg
-///   accepts — fractional dB, fractional gain, fractional frequency (31.5 Hz is
-///   a standard 1/3-octave centre). `f64` is the narrowest type that contains all
-///   three declarations.
-///
-/// Options FFmpeg declares `<float>` are still `f32` inside FFmpeg; a wider
-/// value is rounded there, exactly as it would be from the `ffmpeg` CLI.
+/// Options FFmpeg declares `<float>` are still `f32` inside FFmpeg; a wider value is
+/// rounded there, exactly as it would be from the `ffmpeg` CLI.
 fn number(value: impl Into<f64>) -> String {
     format!("{}", value.into())
 }
 
-/// 转义文本，但保留 FFmpeg 的 `%{...}` 展开块（如 `%{localtime}`、`%{pts:hms}`）。
-///
-/// 用于 `drawtext` 等需要显示动态时间/帧号的场景，避免 `{` `}` 被转义后无法展开。
 /// 转义文本，但保留 FFmpeg 的 `%{...}` 展开块（如 `%{localtime}`、`%{pts:hms}`）。
 ///
 /// 用于 `drawtext` 等需要显示动态时间/帧号的场景，避免 `{` `}` 被转义后无法展开。
@@ -581,12 +601,12 @@ pub mod video {
     /// See: <https://ffmpeg.org/ffmpeg-scaler.html#Scaler-Options>
     /// # Errors
     ///
-    /// [`RsmediaError::InvalidConfig`] when `flags` contains a NUL byte, or whatever
-    /// Anything `av_escape` fails with is propagated as well.
+    /// [`RsmediaError::InvalidConfig`] when `flags` contains a NUL byte. Anything
+    /// `av_escape` fails with is propagated as well.
     pub fn scale<'a>(width: u32, height: u32, flags: impl Into<Option<&'a str>>) -> Result<Filter> {
         let flags: Option<&str> = flags.into();
         // 默认与 FFmpeg `scale` 滤镜一致，也与本 crate 的 `Scaler::default()`
-        // 一致（BICUBIC）；早先这里是 `fast_bilinear`，与上方文档矛盾。
+        // 一致（BICUBIC）。
         let flags_str = escape_filter_value(flags.unwrap_or("bicubic"))?;
 
         Ok(Filter::new(
@@ -1141,9 +1161,6 @@ pub mod video {
     /// * `luma` - 亮度空间降噪强度（`luma_spatial`，FFmpeg: 0~DBL_MAX，默认 0；
     ///   常用 4）。
     /// * `chroma` - 色度空间降噪强度（`chroma_spatial`，同上，常用 3）。
-    ///
-    /// `hqdn3d.luma_spatial` / `chroma_spatial` 在 FFmpeg 里是 `<double>`，因此这里
-    /// 收 `f64`：包一层 `f32` 会比 FFmpeg 实际接受的域更窄。
     pub fn hqdn3d(luma: impl Into<f64>, chroma: impl Into<f64>) -> Filter {
         Filter::new(
             "hqdn3d",
@@ -1661,9 +1678,6 @@ pub mod audio {
     /// * `frequency` - Center frequency in Hz.
     /// * `gain` - Gain in dB.
     /// * `width` - Bandwidth in Hz (`width_type=h`).
-    ///
-    /// 三个参数在 FFmpeg 里都是 `<double>`，所以统一收 `f64`：中心频率与带宽
-    /// 都不是"整数才合理"的量。
     pub fn equalizer(
         frequency: impl Into<f64>,
         gain: impl Into<f64>,
@@ -1814,13 +1828,10 @@ pub mod audio {
     ///   传别的值（例如 `'p'`）会原样写进 spec，最终在建图时报错。
     ///   `'c'` 还要配合 `band_noise` 才有意义，本函数不暴露该选项。
     /// * `track_residual`: `afftdn.tr`，FFmpeg 声明为 **`<boolean>`**：跟踪残余噪声
-    ///   （`track_residual`），不是"时间平滑系数"。
+    ///   （`track_residual`），**不是**"时间平滑系数"。名字与类型若指向一个浮点系数，
+    ///   FFmpeg 会拒绝整条滤镜链（`Unable to parse "tr" option value "0.5" as
+    ///   boolean`），因此这里只接受 `bool`。
     ///
-    /// 早先这个参数叫 `time_smoothing`、类型是 `Option<f32>`，会被格式化成
-    /// `tr=0.5` 这样的值——而 `tr` 是布尔选项，FFmpeg 直接拒绝整条滤镜链：
-    /// `Unable to parse "tr" option value "0.5" as boolean`。也就是说**只要传入
-    /// 任何非整数，`advanced_fft_denoise` 都会让 `FilterGraph` 建不起来**；
-    /// 名字与类型都指向"一个浮点系数"，掩盖了真实的选项语义。
     /// # Errors
     ///
     /// Returns [`RsmediaError::InvalidConfig`] when a value contains a NUL byte: a filter
@@ -2140,13 +2151,13 @@ impl FilterParams {
     }
 }
 
-/// Video filter parameters.
+/// Video filter parameters — the single-input / single-output linear chain
+/// ([`FilterGraph::init`]), as opposed to [`Endpoint`] which the multi-input
+/// [`FilterGraphBuilder`] uses.
 ///
-/// The sizes use the same `u32` as the high-level API
-/// ([`EncoderBuilder`](crate::EncoderBuilder), [`MediaFrame`](crate::MediaFrame));
-/// only the final write into FFmpeg's `int` fields narrows them. The rational
-/// parameters are plain [`Rational`] values — FFmpeg's `AVRational` never appears
-/// outside [`crate::time`].
+/// [`format`](VideoParams::format) is what the sink constrains (the encoder's
+/// negotiated format); [`src_format`](VideoParams::src_format) is what the
+/// `buffer` source is configured with (the format frames actually arrive in).
 #[derive(Debug, Clone)]
 pub struct VideoParams {
     /// Frame width in pixels.
@@ -2168,7 +2179,12 @@ pub struct VideoParams {
     pub pixel_aspect: Rational,
 }
 
-/// 音频过滤器参数
+/// Audio filter parameters — the single-input / single-output linear chain
+/// ([`FilterGraph::init`]).
+///
+/// [`format`](AudioParams::format) is what the `abuffersink` constrains (the encoder's
+/// negotiated format); [`src_format`](AudioParams::src_format) is what the `abuffer`
+/// source is configured with (the format samples actually arrive in).
 #[derive(Debug, Clone)]
 pub struct AudioParams {
     pub nb_channels: i32,
@@ -2220,10 +2236,6 @@ impl From<AudioEndpoint> for Endpoint {
 }
 
 /// Format declaration for a video endpoint.
-///
-/// Like [`VideoParams`], the sizes use the crate's `u32` size API; only the final
-/// write into FFmpeg's `int` fields narrows them. The rational fields are plain
-/// [`Rational`].
 ///
 /// The three rationals share a type and sit next to each other, so both a struct
 /// literal and a positional constructor can swap them without the compiler
@@ -2445,6 +2457,30 @@ const DEFAULT_ORDERING: Ordering = Ordering::SeqCst;
 /// 与多输入合成图（[`FilterGraphBuilder`]）走同一套实现：前者就是「1 进 1 出」的
 /// 退化情形。下标 0 是**主输入 / 主输出**，[`Self::process_frame`]、
 /// [`Self::is_flushed`] 这些便捷方法都以它为准。
+///
+/// # Lifecycle
+///
+/// A graph is built once, then driven, then drained — in that order, and it does not go
+/// back:
+///
+/// 1. **build** — [`FilterGraphBuilder::build`] or [`Self::init`]. Both negotiate formats
+///    (`av_buffersrc_add_frame` is unusable before this).
+/// 2. **push → pull** — [`Self::push_frame_to`] (or [`Self::process_frame`]) then
+///    [`Self::receive_frame_from`]. A pull returning `Ok(None)` means *not yet*; keep
+///    feeding and pull again.
+/// 3. **drain** — [`Self::flush`] / [`Self::drain_output`] pushes EOF to every input and
+///    collects the frames still buffered inside the graph. Frames are **not** handed back
+///    by the last `push`, so skipping this step silently drops them.
+///
+/// There is no rewind: frames already fed cannot be recalled, and a sink that has seen
+/// EOF stays at EOF forever. After a seek or to reuse a drained graph, build a new one.
+///
+/// # Timestamps
+///
+/// A frame's `pts` travels in the **endpoint's** `time_base`, but comes out of the graph
+/// in the **sink's** time base, which filters such as `fps` may have rewritten. Always
+/// rescale against [`Self::output_time_base`] / [`Self::output_frame_rate`] rather than
+/// against what you pushed.
 pub struct FilterGraph {
     graph: AVFilterGraph,
     /// 每路输出的状态；下标 0 为主输出。
@@ -2918,8 +2954,18 @@ impl FilterGraph {
 
     /// 把一帧（`Some`）或 EOF（`None`）推入第 `input` 路输入。
     ///
+    /// FFmpeg 的源是**有缓冲**的：推一帧进去不等于立刻能取到一帧输出，滤镜的内部缓冲
+    /// （帧同步、`fps` 重采样等）决定了要推多少帧才吐得出帧。
+    ///
     /// EOF 只会推一次：重复 `av_buffersrc_add_frame(src, NULL)` 会返回
     /// `AVERROR_EOF`，所以第二次起直接返回 `Ok(())`。
+    ///
+    /// # Errors
+    ///
+    /// [`RsmediaError::InvalidConfig`] when the graph is not initialized yet or `input` is
+    /// out of range — both are programming errors, not stream conditions. An error from
+    /// FFmpeg itself (typically a frame whose format or size differs from the endpoint
+    /// declared for that input) is propagated as-is.
     pub fn push_frame_to(&mut self, input: usize, frame: Option<AVFrame>) -> Result<()> {
         if !self.is_initialized() {
             return Err(RsmediaError::invalid_config("Filter graph not initialized"));
@@ -2967,6 +3013,21 @@ impl FilterGraph {
     /// 从第 `output` 路输出取一帧：`Ok(Some)` 是产出帧，`Ok(None)` 表示这一刻没有帧
     /// ——要么图还需要更多输入（`EAGAIN`，状态保持在 `Normal`），要么正在排空
     /// （EOF 已送出，状态置为 `Drained`）或已到流末尾（状态置为 `Flushed`）。
+    ///
+    /// `Ok(None)` 是**正常**结果而非错误：与 [`Self::push_frame_to`] 配对成
+    /// 「推一帧、取一帧」的循环，取到 `None` 就继续推、继续取，直到
+    /// [`Self::is_flushed`] 为真。多输入图里一路没数据会让整张图暂时取不出帧——
+    /// 每个 pad 一对一接线，某一路没喂就没人替它凑。
+    ///
+    /// 取到的帧归调用方所有（`AVFrame` 独立引用计数），不再需要时交回给 rsmpeg
+    /// 释放即可。
+    ///
+    /// # Errors
+    ///
+    /// [`RsmediaError::InvalidConfig`] when `output` is out of range — a programming
+    /// error, deliberately not folded into `Ok(None)`. Other errors come from FFmpeg
+    /// and carry the declared format of every graph input, because the most common real
+    /// cause is a pushed frame that does not match its declared endpoint.
     pub fn receive_frame_from(&mut self, output: usize) -> Result<Option<AVFrame>> {
         if output >= self.states.len() {
             return Err(RsmediaError::invalid_config(format!(

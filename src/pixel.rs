@@ -29,10 +29,8 @@ ffi_enum_from!(
     /// corrupts the picture, while a fast failure points at the actual mismatch. The listed
     /// `AV_PIX_FMT_NONE` itself still converts to `NONE` as usual.
     ///
-    /// Since `ffi::AVPixelFormat` **is** `c_int`, the generated conversions *are* the `i32` ones:
-    /// `i32::from(PixelFormat::RGB24)` and `PixelFormat::from(raw_i32)` both exist (the latter
-    /// panics on an unlisted value, so prefer [`from_ffi_checked`](PixelFormat::from_ffi_checked)
-    /// for values coming from FFmpeg).
+    /// Prefer [`from_ffi_checked`](PixelFormat::from_ffi_checked) over the panicking `From` for
+    /// values coming from FFmpeg.
     #[allow(non_camel_case_types)]
     PixelFormat => ffi::AVPixelFormat,
     repr = i32,
@@ -359,7 +357,7 @@ ffi_enum_from!(
 /// device. Both [`PixelFormat::data_layout`] and
 /// [`PixelFormat::is_plane_storable`] turn on this one predicate, so the two
 /// never disagree about *this* part of the answer — but `data_layout` has
-/// further reasons to return `None`, so `is_plane_storable` is a necessary,
+/// further reasons to **panic**, so `is_plane_storable` is a necessary,
 /// not a sufficient, condition (see that method).
 fn has_no_sample_planes(desc: &AVPixFmtDescriptorRef) -> bool {
     const UNSUPPORTED: u32 =
@@ -393,8 +391,8 @@ impl PixelFormat {
     /// 的格式照样打出真名（`yuv422p12le` 之类，比枚举的 `Debug` 名更有用），
     /// 只有 FFmpeg 也不认的值才退化成 `pix_fmt <n>`。
     ///
-    /// （本构建实测 `AV_PIX_FMT_NB` = 267，`PixelFormat` 恰好收录了其中每一个值；
-    /// 6.1 / 7.1 上存在版本门控差异，那时这条"未收录也能取名"的能力才真正用得上。）
+    /// （版本门控差异会让 6.1 / 7.1 上出现本 crate 未收录的值，那时这条
+    /// "未收录也能取名"的能力才真正用得上。）
     pub(crate) fn name_of(raw: ffi::AVPixelFormat) -> String {
         Self::raw_name(raw).unwrap_or_else(|| format!("pix_fmt {raw}"))
     }
@@ -412,7 +410,10 @@ impl PixelFormat {
         }
     }
 
-    /// get number of planes in pix_fmt
+    /// Number of planes in this pixel format.
+    ///
+    /// `Err` for formats FFmpeg cannot count (e.g. `NONE`): a negative return is
+    /// an error code, not "0 planes".
     pub fn count_planes(&self) -> Result<i32> {
         let cnt = unsafe { ffi::av_pix_fmt_count_planes((*self).into()) };
         if cnt < 0 {
@@ -687,9 +688,8 @@ pub fn find_codec_best_pix_fmt(
         )
     };
     // 返回值是**选中的格式**，`AV_PIX_FMT_NONE`(-1) 只表示"候选里没有能用的"。
-    // 它既不是错误码也不是可用格式，所以直接按能力缺口上报——之前的
-    // `ret < 0` 分支会把 NONE 当成 `AVERROR(-1)`（渲染成语义完全无关的
-    // "Operation not permitted"），而真正的"无可用候选"判定在下面。
+    // 它既不是错误码也不是可用格式：按返回码上报会把它渲染成语义完全无关的
+    // "Operation not permitted"，因此按能力缺口上报。
     PixelFormat::from_ffi_checked(ret)
         .filter(|fmt| *fmt != PixelFormat::NONE)
         .ok_or_else(|| {

@@ -13,10 +13,6 @@ const MAX_FFMPEG_PLANES: usize = 4;
 
 /// Fill plane linesizes for an image with pixel format pix_fmt and width.
 ///
-/// `width` follows the crate's `u32` size API and is narrowed to FFmpeg's `int`
-/// only at the boundary (where the value is required to be non-negative); the
-/// result stays `[i32; 4]` to mirror `av_image_fill_linesizes`.
-///
 /// # Arguments
 ///
 /// * `pix_fmt` - The pixel format of the image.

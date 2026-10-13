@@ -552,7 +552,6 @@ mod tests {
     }
 
     /// Decode a file, returning the audio stream's (samples, rate, channels).
-    /// Rate and channel count come back as `u32` to match the public API.
     fn decode_audio_stream(path: &std::path::Path) -> Result<(usize, u32, u32)> {
         let demuxer = Demuxer::new(path)?;
         let (audio_stream_index, sample_rate, channels) = {

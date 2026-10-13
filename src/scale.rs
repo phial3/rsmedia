@@ -6,35 +6,18 @@ use rsmpeg::avutil::{AVBufferPool, AVBufferRef, AVFrame};
 use rsmpeg::swscale::SwsContext;
 use rsmpeg::{UnsafeDerefMut, ffi};
 
-// FFmpeg `SwsFlags` 定义参考: <https://ffmpeg.org/doxygen/trunk/group__libsws.html>
+// FFmpeg `SwsFlags` 参考: <https://ffmpeg.org/doxygen/trunk/group__libsws.html>
 //
-// 版本注记（依据 data/ffmpeg-*/binding.rs）：
-// - 6/7：`SWS_*` 是裸 `u32` 常量；`SwsContext` 不透明，无字段可设。
-// - 8：常量类型化为 `ffi::SwsFlags`；`SwsContext` 暴露 flags/threads/dither/
-//   alpha_blend/intent，并新增 `SWS_STRICT`(1<<11)、`SWS_UNSTABLE`(1<<20)、
-//   `SWS_DITHER_*`、`SWS_ALPHA_BLEND_*`、`SWS_INTENT_*`。
+// 版本差异（依据 data/ffmpeg-*/binding.rs）决定下面哪些成员存在：
+// - 6/7：`SWS_*` 是裸 `u32` 常量，`SwsContext` 不透明（无字段可设）。
+// - 8：常量类型化为 `ffi::SwsFlags`，`SwsContext` 暴露 flags/threads/dither/
+//   alpha_blend/intent，并新增 `SWS_STRICT`、`SWS_UNSTABLE`、`SWS_DITHER_*`、
+//   `SWS_ALPHA_BLEND_*`、`SWS_INTENT_*`。
 // - 9：再新增 `SwsContext.scaler`/`scaler_sub`/`backends` 与 `SWS_SCALE_*`、
 //   `SWS_BACKEND_*`（`SWS_SCALE_*` 在 8 中完全不存在）。
-//   SWS_STRICT         1 << 11   Return an error on underspecified conversions.
-//   SWS_PRINT_INFO     1 << 12   Emit verbose log of scaling parameters.
-//   SWS_FULL_CHR_H_INT 1 << 13   Perform full chroma upsampling when upscaling to RGB.
-//   SWS_FULL_CHR_H_INP 1 << 14   Perform full chroma interpolation when downscaling RGB.
-//   SWS_ACCURATE_RND   1 << 18   Force bit-exact output rounding.
-//   SWS_BITEXACT       1 << 19   Disable platform-specific optimizations for bit-exactness.
-//   SWS_UNSTABLE       1 << 20   Prefer experimental code paths.
-//   SWS_DIRECT_BGR     1 << 15   Deprecated: no effect.
-//   SWS_ERROR_DIFFUSION 1 << 23   Deprecated: set `SwsDither` instead.
-//   SWS_FAST_BILINEAR  1 <<  0   fast bilinear filtering
-//   SWS_BILINEAR       1 <<  1   bilinear filtering
-//   SWS_BICUBIC        1 <<  2   2-tap cubic B-spline
-//   SWS_X              1 <<  3   experimental
-//   SWS_POINT          1 <<  4   nearest neighbor
-//   SWS_AREA           1 <<  5   area averaging
-//   SWS_BICUBLIN       1 <<  6   bicubic luma, bilinear chroma
-//   SWS_GAUSS          1 <<  7   gaussian approximation
-//   SWS_SINC           1 <<  8   unwindowed sinc
-//   SWS_LANCZOS        1 <<  9   3-tap sinc/sinc
-//   SWS_SPLINE         1 << 10   unwindowed natural cubic spline
+//
+// 算法位（1<<0..1<<10）与质量位（1<<11..1<<20）互不重叠，这正是本文件把 `flags`
+// 拆成两个枚举的依据；每个位的确切值见对应变体的定义。
 ffi_enum!(
     /// Video scaler algorithm selector (SWS_* algorithm bits, 1 << 0 .. 1 << 10).
     ///
@@ -260,21 +243,16 @@ ffi_enum_from!(
     }
 );
 
-/// 一帧视频的几何与像素格式：宽 + 高 + 像素格式。
+/// 一帧视频的目标几何与像素格式（宽 + 高 + 像素格式），`sws_*` 参数的镜像层。
 ///
-/// 这三样在缩放里总是一起出现（源一份、目标一份），打包传递后：
-/// [`Scaler::scale_frame`] 与 [`Scaler::scale_if_needed`] 的目标只占**一个**参数
-/// （尺寸与格式不会再各传各的，也不会写反）；[`Scaler`] 里"上下文是按什么建出来的"
-/// 那份记录从 6 个字段变成 2 个；`setup_scaler` 的 7 个位置参数变成 3 个。
-///
-/// `width`/`height` 保持 FFmpeg `int` 的宽度（`i32`），与音频侧的
-/// `resample::AudioSpec` 属于同一层规格：两者都是 FFmpeg 参数的镜像，只在上层
+/// 目标侧的这三样总是一起出现，打包传递后 [`Scaler::scale_frame`] 与
+/// [`Scaler::scale_if_needed`] 只占**一个**参数，不会各传各的或写反。
+/// `width`/`height` 保持 FFmpeg `int` 的宽度（`i32`），只在上层
 /// （[`MediaFrame`](crate::MediaFrame) 的 `u32` 尺寸、自由函数 `scale_frame`）构造时
 /// 收窄一次，之后直达 `sws_*` 与缓冲区计算，不再转回。
 ///
-/// 音频侧的对应物是 `resample::AudioSpec`，差别在于它只在 crate 内部出现：那边的逐帧入口
-/// [`Resampler::convert_frame_owned`](crate::Resampler::convert_frame_owned) 用的是上下文
-/// 自己记着的那份输出格式；这里的目标必须逐次给出 —— 一个 [`Scaler`] 同时服务解码
+/// 与音频侧的 `resample::AudioSpec` 的差别：那边只出现在 crate 内部、且逐帧入口用的是
+/// 上下文自己记着的输出格式；这里的目标必须逐次给出 —— 一个 [`Scaler`] 同时服务解码
 /// （改尺寸 + 换格式）与编码（只换格式）两条路，两者的目的地不同。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoSpec {
@@ -284,7 +262,8 @@ pub struct VideoSpec {
 }
 
 impl VideoSpec {
-    /// 帧宽（像素）、帧高（像素）与像素格式。
+    /// 帧宽（像素）、帧高（像素）与像素格式。本构造只是 `sws_*` 参数的镜像，不校验尺寸；
+    /// 非法尺寸由 [`Scaler::scale_frame`] 报出。
     pub const fn new(width: i32, height: i32, pix_fmt: PixelFormat) -> Self {
         Self {
             width,
@@ -355,8 +334,8 @@ fn setup_scaler(src_spec: VideoSpec, dst_spec: VideoSpec, flags: u32) -> Result<
     .context("Failed to create swscale context.")
 }
 
-/// FFmpeg 8+ 的全动态路径：参数签名与 6/7 分支保持一致以便调用方无感切换，
-/// 除 flags 外的参数（尺寸/格式）由 [`SwsContext::scale_full_frame`] 从帧属性推导，
+/// FFmpeg 8+ 的全动态路径：签名与 6/7 分支保持一致以便调用方无感切换，但除 flags 外
+/// 的参数（尺寸/格式）在此被忽略 —— 由 [`SwsContext::scale_full_frame`] 从帧属性推导。
 #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
 #[allow(unused_variables)]
 fn setup_scaler(src_spec: VideoSpec, dst_spec: VideoSpec, flags: u32) -> Result<SwsContext> {
@@ -367,9 +346,9 @@ fn setup_scaler(src_spec: VideoSpec, dst_spec: VideoSpec, flags: u32) -> Result<
 
 /// 按**目标像素格式**修正缩放输出帧的色彩标记。
 ///
-/// 缩放前的 `imgutils::copy_frame_metadata` 会把源帧的色域元数据整套搬给目标帧，
-/// 而换了像素格式后这套标记不再成立：full range 的 RGB 样本若沿用源帧的 limited
-/// range 标签，因此这里按目标格式修正范围与色度位置：
+/// 缩放前的 `imgutils::copy_frame_metadata` 把源帧的色域元数据整套搬给了目标帧，换了
+/// 像素格式后其中一部分不再成立（full range 的 RGB 样本若沿用 limited range 标签），
+/// 故按目标格式修正范围与色度位置：
 /// - RGB/BGR/GBR 目标：恒标 full range（`AVCOL_RANGE_JPEG`），色度位置无意义；
 /// - YUV/NV **与 GRAY** 目标：范围随源帧（`UNSPECIFIED` 按 FFmpeg 约定等同
 ///   limited），保持 `copy_frame_metadata` 搬来的取值 —— 灰度与 YUV 同档，
@@ -438,26 +417,30 @@ fn set_scaler_colorspace_details(sws: &mut SwsContext, src_frame: &AVFrame, dst_
     }
 }
 
-/// Scales one frame into a new frame, with the default kernel and quality mask.
+/// Scale a raw [`AVFrame`] into a newly allocated `AVFrame`, with the default kernel
+/// ([`ScaleAlgorithm::default`]) and quality mask ([`ScaleQuality::default_mask`]).
 ///
-/// Free-function form for a single conversion; a stream should keep a [`Scaler`]
-/// instead, which reuses its `SwsContext` (and, optionally, the output buffers)
-/// across frames. See [`Scaler::scale_frame`] for the details.
-/// Scale a raw [`AVFrame`] into a newly allocated `AVFrame`.
-///
-/// This is an FFI-level entry point: it takes a bare `AVFrame` and the crate's
-/// `u32` sizes, narrowing them once when building the [`VideoSpec`]. Callers
-/// working with the high-level [`MediaFrame`](crate::MediaFrame) should use
+/// This is an FFI-level entry point: it takes a bare `AVFrame` and the crate's `u32`
+/// sizes, narrowing them once when building the [`VideoSpec`]. Callers working with the
+/// high-level [`MediaFrame`](crate::MediaFrame) should use
 /// [`MediaFrame::convert_to`](crate::MediaFrame::convert_to) instead.
+///
+/// A stream should keep a [`Scaler`] instead: the free function builds a throwaway
+/// `SwsContext` (and destination buffer) on every call, whereas `Scaler` reuses both
+/// across frames. See [`Scaler::scale_frame`] for the details.
+///
+/// # Errors
+///
+/// See [`Scaler::scale_frame`] — [`RsmediaError::Unsupported`] for a hardware source
+/// frame or an unmodelled pixel format, otherwise whatever `swscale` reports.
 pub fn scale_frame(
     src_frame: &AVFrame,
     dst_width: u32,
     dst_height: u32,
     dst_pix_fmt: PixelFormat,
 ) -> Result<AVFrame> {
-    // Delegates to a one-off `Scaler` so there is exactly one implementation of
-    // the actual scaling; a caller who needs another kernel builds a `Scaler`
-    // itself (`Scaler::new_with_options`).
+    // 一次性 `Scaler`：缩放实现只有这一份，需要别的 kernel 的调用方自己建 `Scaler`
+    // （`Scaler::new_with_options`）。
     Scaler::new().scale_frame(
         src_frame,
         VideoSpec::new(dst_width as i32, dst_height as i32, dst_pix_fmt),
@@ -466,34 +449,31 @@ pub fn scale_frame(
 
 /// Persistent streaming video scaler, held by the encoder and the decoder.
 ///
-/// Unlike the free function [`scale_frame`] (which creates a temporary `SwsContext`
-/// on every call — the flags live on [`Scaler::new_with_options`]), `Scaler` owns the
-/// scaling **policy** — one
-/// [`ScaleAlgorithm`] kernel plus a mask of [`ScaleQuality`] bits — and keeps a matching
-/// `SwsContext` alive across calls, so a continuous stream does not pay for a context
-/// allocation per frame.
+/// Unlike the free function [`scale_frame`] (which creates a temporary `SwsContext` on
+/// every call — the flags live on [`Scaler::new_with_options`]), `Scaler` owns the
+/// scaling **policy** — one [`ScaleAlgorithm`] kernel plus a mask of [`ScaleQuality`]
+/// bits — and keeps a matching `SwsContext` alive across calls, so a continuous stream
+/// does not pay for a context allocation per frame.
 ///
 /// The context is bound **lazily**: [`Scaler::new`] allocates nothing; the first
-/// [`Scaler::scale_frame`] call creates the context from that frame's source geometry and
-/// pixel format plus the destination geometry and pixel format requested for the call.
-/// Whenever a later frame needs a different source/destination geometry or format the
-/// context is rebuilt, so a stream whose resolution or format changes mid-way keeps
-/// scaling correctly.
+/// [`Scaler::scale_frame`] call creates it from that frame's source geometry and pixel
+/// format plus the destination requested for the call. A later frame with different
+/// source/destination geometry or format rebuilds it, so a stream whose resolution or
+/// format changes mid-way keeps scaling correctly.
 ///
 /// Because the destination is supplied per call, one `Scaler` serves both the encoder
-/// path (same size, conversion into the codec's pixel format) and the decoder path (resize
-/// plus format conversion). [`Encoder`](crate::Encoder) and [`Decoder`](crate::Decoder)
-/// each hold one, built inside the builder's `build` from the `with_scale_algorithm` /
-/// `with_scale_quality` options; the defaults are the policy below.
+/// path (same size, conversion into the codec's pixel format) and the decoder path
+/// (resize plus format conversion). [`Encoder`](crate::Encoder) and
+/// [`Decoder`](crate::Decoder) each hold one, built inside the builder's `build` from
+/// the `with_scale_algorithm` / `with_scale_quality` options.
 ///
-/// Destination frames are allocated with `alloc_buffer` (a fresh allocation per call)
-/// unless pooling is enabled via [`Scaler::with_buffer_pool`]; the pool then recycles the
-/// buffers of previously dropped frames, so a steady stream of same-geometry output stops
-/// allocating after a couple of frames — see [`BufferPool`](rsmpeg::avutil::AVBufferPool).
+/// Destination frames are freshly allocated per call unless pooling is enabled via
+/// [`Scaler::with_buffer_pool`]; the pool then recycles the buffers of previously
+/// dropped frames, so a steady stream of same-geometry output stops allocating after a
+/// couple of frames — see [`BufferPool`](rsmpeg::avutil::AVBufferPool).
 ///
-/// The policy mirrors FFmpeg's own flag rules: [`ScaleAlgorithm`] selects exactly one
-/// scaling kernel (*"Only one may be active at a time."*), while the quality bits are a
-/// mask of which any subset may be set — see [`ScaleQuality`].
+/// Not `Sync`: the bound context is driven through a raw `*mut SwsContext`, so `Scaler`
+/// stays on one thread (and, with it, the encoder/decoder that owns it).
 pub struct Scaler {
     /// The (mutually exclusive) scaling kernel selector.
     algorithm: ScaleAlgorithm,
@@ -577,20 +557,21 @@ impl Scaler {
     /// Enable (`true`) or disable (`false`) pooled allocation of destination frames.
     ///
     /// With pooling on, the destination frame's pixel buffer is taken from an internal
-    /// [`BufferPool`](rsmpeg::avutil::AVBufferPool) instead of being freshly allocated per call; when
-    /// a previously returned frame is dropped, its buffer goes back to the pool and the
-    /// next same-geometry call reuses it. A steady stream of same-geometry output thus
-    /// stops allocating after a couple of frames. The pool zeroes exactly the bytes
-    /// swscale never writes (alignment offset, stride slack, plane gaps, tail padding),
-    /// so those stay deterministic for the encoder; the visible pixels are always fully
-    /// overwritten by swscale. Note that `AVFrame::alloc_buffer` does **not** zero
-    /// anything — it goes through `av_frame_get_buffer` → `av_buffer_alloc` →
-    /// `av_malloc` — so if you allocate a frame yourself and feed it to an encoder,
-    /// fill it (e.g. with [`crate::imgutils::fill_black`]) instead of relying on
-    /// zeroed memory.
+    /// [`BufferPool`](rsmpeg::avutil::AVBufferPool) instead of being freshly allocated per
+    /// call; when a previously returned frame is dropped, its buffer goes back to the pool
+    /// and the next same-geometry call reuses it, so a steady stream of same-geometry output
+    /// stops allocating after a couple of frames. The pool zeroes exactly the bytes swscale
+    /// never writes (alignment offset, stride slack, plane gaps, tail padding); the visible
+    /// pixels are always fully overwritten by swscale.
     ///
-    /// The pool is created lazily together with the scaling context and sized for the
-    /// bound destination geometry; a geometry/format change rebuilds it. This is a
+    /// Note that `AVFrame::alloc_buffer` does **not** zero anything — it goes through
+    /// `av_frame_get_buffer` → `av_buffer_alloc` → `av_malloc` — so a frame you allocate
+    /// yourself and feed to an encoder must be filled (e.g. with
+    /// [`crate::imgutils::fill_black`]) rather than assumed zeroed. Pooled frames are the
+    /// stricter case here.
+    ///
+    /// The pool is created lazily together with the scaling context and sized for the bound
+    /// destination geometry; a geometry/format change rebuilds it. This is a
     /// construction-time setting — it consumes and returns the scaler — so the pool is
     /// always in place before the first [`Self::scale_frame`].
     ///
@@ -649,7 +630,8 @@ impl Scaler {
     /// created on the first call and rebuilt whenever either side's geometry or pixel
     /// format changes — `dst_spec` may differ from one call to the next, which is what lets
     /// one `Scaler` serve both the decode path (resize *and* format) and the encode path
-    /// (format only).
+    /// (format only). The returned frame is freshly allocated (or pooled), never an alias
+    /// of `src_frame`.
     ///
     /// # Errors
     ///
@@ -662,7 +644,7 @@ impl Scaler {
                 "Hardware frames are not supported in this software scaler",
             ));
         }
-        // 帧的格式来自解码器，可能超出本 crate 收录的范围：报错而不是 panic。
+        // 帧的格式来自解码器，可能超出本 crate 收录的范围：报 Err 而不是 panic。
         let src_spec = VideoSpec::from_frame(src_frame)?;
 
         let reusable = self
@@ -670,12 +652,11 @@ impl Scaler {
             .as_ref()
             .is_some_and(|bound| bound.src_spec == src_spec && bound.dst_spec == dst_spec);
         if !reusable {
-            // FFmpeg 6/7 的 legacy `SwsContext` 在此固定源/目标几何与格式；FFmpeg 8+
-            // 的动态上下文只取 flags，几何在缩放时由帧属性推导——两条路径都按这里的
-            // 源/目标规格调用，故两个版本的行为保持一致。
+            // 6/7 的 legacy `SwsContext` 在此固定源/目标几何与格式；8+ 的动态上下文只取
+            // flags，几何以帧属性为准——两条路径都按这里的规格调用，故版本间行为一致。
             let sws = setup_scaler(src_spec, dst_spec, self.flags())?;
-            // 池与上下文同生命周期：按本次绑定的目标规格建池，规格变化
-            // 重建时旧池一并析构（未归还的缓冲由引用计数安全释放）。
+            // 池与上下文同生命周期：规格变化重建时旧池一并析构，未归还的缓冲由引用
+            // 计数安全释放（不会回到新池里）。
             let pool = if self.pool_enabled {
                 Some(AVBufferPool::new(pooled_frame_buffer_size(dst_spec)?)?)
             } else {
@@ -802,7 +783,7 @@ const POOL_PADDING: usize = 64;
 /// 更低的位置。
 ///
 /// 返回值只做 `usize → i32` 这一次转换（`av_image_*` 那组 `int align` 参数要的
-/// 就是这个宽度）；不加范围判断：FFmpeg 的返回值上限是 64，而能被喂回 FFmpeg 的
+/// 就是这个宽度）；不加范围检查：FFmpeg 的返回值上限是 64，能被喂回 FFmpeg 的
 /// 值域本就是 `int`。
 fn pool_align() -> i32 {
     // SAFETY: `av_cpu_max_align` 是无副作用的 CPU 能力查询（纯读静态标志）
@@ -811,8 +792,8 @@ fn pool_align() -> i32 {
 
 /// 池化帧缓冲相对 `av_image_get_buffer_size` 的额外字节数。
 ///
-/// 至少要有 [`pool_align`]，否则那次 data 对齐偏移（最多 `align - 1`）会落在
-/// 缓冲之外 —— 这是对历史上"`POOL_PADDING` 恰好够用"这条隐含假设的解耦。
+/// 必须 **≥ [`pool_align`]`**：小于它时那次 data 对齐偏移（最多 `align - 1`）会落到
+/// 缓冲之外，把 `POOL_PADDING` 恰好够用从巧合变成依赖。
 fn pool_frame_padding() -> usize {
     POOL_PADDING.max(pool_align() as usize)
 }
@@ -847,11 +828,10 @@ fn pooled_frame_buffer_size(dst_spec: VideoSpec) -> Result<usize> {
 /// 缓冲自动归还池（池已析构则直接释放）。
 ///
 /// FFmpeg **两边都不清零**：`AVBufferPool` 复用时不重置内容，而
-/// `av_frame_get_buffer` 走 `av_buffer_alloc`（即 `av_malloc`，没有 memset），
-/// 所以 `alloc_buffer` 出来的帧 padding 同样是未初始化的。这里在组装帧前把
-/// swscale 不会写入的 padding 字节清零（见 [`zero_frame_padding`]）：代价是
-/// 一次只覆盖 padding 的写，换来比 `alloc_buffer` **更严格**的语义——帧的
-/// padding 字节内容确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。
+/// `av_frame_get_buffer` 走 `av_buffer_alloc`（即 `av_malloc`，没有 memset）。
+/// 因此这里显式把 swscale 不会写入的 padding 字节清零（见 [`zero_frame_padding`]）：
+/// 代价是一次只覆盖 padding 的写，换来比 `alloc_buffer` **更严格**的语义——
+/// padding 字节确定为零，编码器内部的 SIMD 读取路径不受脏数据影响。
 fn alloc_pooled_frame(pool: &mut AVBufferPool, dst_spec: VideoSpec) -> Result<AVFrame> {
     let mut frame = AVFrame::new();
     frame.set_width(dst_spec.width);
@@ -897,12 +877,7 @@ fn alloc_pooled_frame(pool: &mut AVBufferPool, dst_spec: VideoSpec) -> Result<AV
         )));
     }
 
-    // 池缓冲在**复用**时不会重新清零。顺带更正一个常见误解：`alloc_buffer`
-    // 也不清零 —— `av_frame_get_buffer` 走 `av_buffer_alloc`（`av_malloc`），
-    // 所以本函数清零 padding 是比它更严格、而不是"与它一致"。swscale 不会写入
-    // 的字节（对齐偏移、行内 stride 余量、平面间隙、尾部留白）因此确定为零，
-    // 编码器内部的 SIMD 读取路径不受脏数据影响。可见像素由 swscale 整体覆写，
-    // 无需预先清零。
+    // 复用时池缓冲带着上一帧的脏数据，清零的范围见函数注释与 `zero_frame_padding`。
     // Safety: buffer 为独占引用（引用计数 1），data/linesize 是上面
     // `av_image_fill_arrays` 在 buffer 内部排布的结果。
     unsafe {
@@ -1257,8 +1232,8 @@ mod tests {
         Ok(())
     }
 
-    /// 稳态流水线特性：连续 50 帧同几何缩放，真实分配次数必须停留在
-    /// 极小值（≤2）——这是池化生效、热路径不再逐帧 malloc 的直接证据。
+    /// 稳态流水线特性：连续 50 帧同几何缩放，去重后的缓冲指针数必须 ≤2
+    /// ——这是池化生效、热路径不再逐帧 malloc 的直接证据。
     #[test]
     fn test_scaler_pool_steady_state_stops_allocating() -> Result<()> {
         let mut scaler = Scaler::new().with_buffer_pool(true);
@@ -1281,7 +1256,7 @@ mod tests {
 
     /// 安全性：**复用的缓冲必须清零**。FFmpeg 的池归还时不重置内容（而
     /// `alloc_buffer` 本身也**不**清零 —— 它走 `av_malloc`），所以池化路径在使用前
-    /// 显式清零整个缓冲。本测试把整个缓冲写满垃圾、归还、再缩放，断言可见像素正确且
+    /// 显式清零 padding。本测试把整个缓冲写满垃圾、归还、再缩放，断言可见像素正确且
     /// 全部 padding（行间隙 + 平面间隙 + 尾部留白）为 0。
     #[test]
     fn test_scaler_pool_padding_zeroed_on_reuse() -> Result<()> {
@@ -1333,8 +1308,7 @@ mod tests {
     /// `av_image_fill_arrays` 的平面排布与编码器 SIMD 读取都依赖这一点。
     ///
     /// 断言跟着 [`pool_align`] 走而不是写死 32：本机的对齐随 CPU 能力变化
-    /// （AVX-512 上是 64），写死会让测试在别的机器上失去意义——或者在曾经
-    /// 的这个实现下，**恰好因为两边都写死 32 而测不出 AVX-512 上的欠对齐**。
+    /// （AVX-512 上是 64），写死会让测试在别的机器上失去意义，也测不出欠对齐。
     #[test]
     fn test_scaler_pool_frame_alignment() -> Result<()> {
         let align = pool_align() as usize;

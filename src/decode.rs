@@ -1,3 +1,59 @@
+//! Turn a container (file, URL, capture device) into decoded frames.
+//!
+//! A [`Decoder`] owns one open stream of the input: [`DecoderBuilder::build`]
+//! and [`DecoderBuilder::build_from_reader`] pick the *best* stream of the
+//! requested [`MediaType`] for you, so one decoder yields one video, audio or
+//! subtitle track. Want several tracks? Build one decoder per stream.
+//!
+//! # The decode family
+//!
+//! | Call | Yields |
+//! |---|---|
+//! | [`decode::<T>()`](Decoder::decode) | [`MediaFrame<T>`] — element type `T` must match the sample width |
+//! | [`decode_frame`](Decoder::decode_frame) | `MediaFrame<u8>` — the common 8-bit video path |
+//! | [`decode_raw`](Decoder::decode_raw) | raw FFmpeg [`AVFrame`], no conversion |
+//! | [`decode_subtitle_segment`](Decoder::decode_subtitle_segment) | timed text segments |
+//!
+//! Each call decodes **one** frame and reads from the [`Reader`] you pass in,
+//! which keeps seeking and stream ownership on the caller's side. When the
+//! reader is exhausted the decoder still holds buffered frames (reordering,
+//! decoder delay): drain them with [`Decoder::drain`] / [`Decoder::drain_raw`],
+//! which keep returning `Some(frame)` until the codec is empty, then `None`.
+//!
+//! # What happens to a frame on the way out
+//!
+//! Hardware frames are downloaded to system memory, frames are converted to the
+//! builder's unified output format ([`with_pix_fmt`](DecoderBuilder::with_pix_fmt)
+//! / [`with_sample_fmt`](DecoderBuilder::with_sample_fmt), defaulting to
+//! `YUV420P` for video), resized if [`with_resize`](DecoderBuilder::with_resize)
+//! asked for it, and pushed through the filter graph from
+//! [`with_filters`](DecoderBuilder::with_filters). The output is therefore
+//! always plain, storable sample data.
+//!
+//! # Caveats
+//!
+//! - **Capture devices** (webcam / mic / screen) additionally need
+//!   [`init()`](crate::init()) once, plus the demuxer name via
+//!   [`with_input_format`](DecoderBuilder::with_input_format) and its private
+//!   options via [`with_input_options`](DecoderBuilder::with_input_options).
+//! - A decoder is [`Send`] but **not** [`Sync`]: drive it from one thread.
+//! - After the stream is drained, further input fails fast; call
+//!   [`reset`](Decoder::reset) to reuse the decoder on a new segment.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use rsmedia::{DecoderBuilder, MediaType, StreamReader};
+//! # fn main() -> rsmedia::error::Result<()> {
+//! let mut reader = StreamReader::new("/tmp/test.mp4")?;
+//! let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+//! while let Some(frame) = decoder.decode_frame(&mut reader)? {
+//!     println!("{}x{} pts={:?}", frame.width, frame.height, frame.pts);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
 use crate::codec::{AVCodecFlag, AVCodecFlag2, ThreadType};
 use crate::error::{Context, Result, RsmediaError};
 use crate::filter::{AudioParams, Filter, FilterGraph, FilterParams, VideoParams};
@@ -34,6 +90,11 @@ ffi_enum_from!(
     /// （`skip_frame` 之上还有 `AV_CODEC_FLAG2_SKIP_MANUAL`、`avcodec_send_packet`
     /// 层面的跳过，本类型不涉及）。用于只要关键帧的场景：生成缩略图/预览、
     /// 快速粗剪、按关键帧建索引等。
+    ///
+    /// # Panics
+    ///
+    /// [`From<AVDiscard>`](ffi::AVDiscard) 对表外取值 panic（编程错误信号）；
+    /// 值来自 FFmpeg 内部时改用 [`from_ffi_checked`](Self::from_ffi_checked)。
     #[allow(non_camel_case_types)]
     SkipFrame => ffi::AVDiscard,
     repr = i32,
@@ -347,14 +408,17 @@ impl DecoderBuilder {
     /// 失败** —— 错误信息完全看不出是缺初始化，很容易误判成 URL 或格式名写错。
     ///
     /// ```no_run
-    /// use rsmedia::{DecoderBuilder, MediaType};
+    /// use rsmedia::{DecoderBuilder, MediaType, StreamReaderBuilder};
     ///
     /// # fn main() -> rsmedia::Result<()> {
     /// rsmedia::init()?;                 // 注册 avfoundation / dshow / v4l2 等设备
+    /// let mut reader = StreamReaderBuilder::new("0:none")
+    ///     .with_format("avfoundation")  // 解码用的 reader，格式与构建期一致
+    ///     .build()?;
     /// let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
     ///     .with_input_format("avfoundation")
-    ///     .build("0:none")?;
-    /// # let _ = decoder.decode_frame();
+    ///     .build_from_reader(&reader)?;
+    /// # let _ = decoder.decode_frame(&mut reader);
     /// # Ok(())
     /// # }
     /// ```
@@ -371,11 +435,10 @@ impl DecoderBuilder {
     /// opts.set("framerate", "30");
     /// opts.set("video_size", "1280x720");
     ///
-    /// let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+    /// let _decoder = DecoderBuilder::new(MediaType::VIDEO)
     ///     .with_input_format("avfoundation")
     ///     .with_input_options(opts)
     ///     .build("0:none")?;
-    /// # let _ = decoder.decode_frame();
     /// # Ok(())
     /// # }
     /// ```
@@ -474,7 +537,7 @@ impl DecoderBuilder {
 
     /// 按 `with_input_format` / `with_input_options` 打开构建期用的 reader。
     ///
-    /// 两者都未设置时走 [`StreamReader::new`]（内容探测），与本方法引入前一致。
+    /// 两者都未设置时走 [`StreamReader::new`]（内容探测）。
     fn open_reader(&self, source: impl Into<Location>) -> Result<StreamReader> {
         if self.input_format.is_none() && self.input_opts.is_none() {
             return StreamReader::new(source);
@@ -656,8 +719,7 @@ impl DecoderBuilder {
                 )))?;
 
         // 优先用调用方指定的解码器名，否则用流自带的名字（`find_best_stream`
-        // 的返回值）。这两个名字来自不同来源，不要写在同名绑定里——那样两个分支
-        // 看起来一模一样，实际解析到不同的变量。
+        // 的返回值）。
         let codec_name = self.codec_name.as_deref().unwrap_or(&codec_name);
         let codec = AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name)?)
             .ok_or_else(|| {
@@ -833,7 +895,7 @@ impl Decoder {
     ///
     /// # Arguments
     ///
-    /// * `reader` - A [`Reader`] to read the source from.
+    /// * `source` - The source to open (path, URL, or capture device).
     #[inline]
     pub fn new_video(source: impl Into<Location>) -> Result<Decoder> {
         DecoderBuilder::new(MediaType::VIDEO).build(source)
@@ -843,7 +905,7 @@ impl Decoder {
     ///
     /// # Arguments
     ///
-    /// * `reader` - A [`Reader`] to read the source from.
+    /// * `source` - The source to open (path, URL, or capture device).
     #[inline]
     pub fn new_audio(source: impl Into<Location>) -> Result<Decoder> {
         DecoderBuilder::new(MediaType::AUDIO).build(source)
@@ -856,26 +918,19 @@ impl Decoder {
     ///
     /// # Arguments
     ///
-    /// * `reader` - A [`Reader`] to read the source from.
+    /// * `source` - The source to open (path, URL, or capture device).
     #[inline]
     pub fn new_subtitle(source: impl Into<Location>) -> Result<Decoder> {
         DecoderBuilder::new(MediaType::SUBTITLE).build(source)
     }
 
     /// Width of the decoder's input video frame, in pixels.
-    ///
-    /// A width is non-negative by nature, so this is returned as `u32`, matching
-    /// [`Encoder::width`](crate::Encoder::width). The underlying
-    /// `AVCodecContext.width` field is an FFmpeg `int`; the conversion here can
-    /// never see a negative value.
     #[inline(always)]
     pub fn width(&self) -> i32 {
         self.context.width
     }
 
     /// Height of the decoder's input video frame, in pixels.
-    ///
-    /// Returned as `u32` for the same reason as [`Self::width`].
     #[inline(always)]
     pub fn height(&self) -> i32 {
         self.context.height
@@ -929,9 +984,6 @@ impl Decoder {
     }
 
     /// Audio samples per second.
-    ///
-    /// Returned as `i32`, the width of the underlying `AVCodecContext.sample_rate`
-    /// field, matching [`Encoder::sample_rate`](crate::Encoder::sample_rate).
     #[inline]
     pub fn sample_rate(&self) -> i32 {
         self.context.sample_rate
@@ -989,6 +1041,9 @@ impl Decoder {
         self.media_type
     }
 
+    /// Index of the input stream this decoder reads: the best stream of the
+    /// builder's [`MediaType`], chosen at build time. Callers feeding packets
+    /// themselves must filter the reader's packets by this index.
     #[inline]
     pub fn stream_index(&self) -> usize {
         self.stream_index
@@ -1053,15 +1108,26 @@ impl Decoder {
     ///
     /// # Return value
     ///
-    /// A tuple of the frame timestamp (relative to the stream) and the frame itself.
+    /// The decoded frame, or [`None`] at end of stream. The frame carries its
+    /// own timestamp (`pts` + time base); there is no separate tuple.
+    ///
+    /// # Errors
+    ///
+    /// An error once the whole pipeline is finished — decoder at EOF and filter
+    /// graph flushed; call [`reset`](Self::reset) before decoding again.
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// loop {
-    ///     let (ts, frame) = decoder.decode::<u8>().unwrap();
+    /// ```no_run
+    /// # use rsmedia::{DecoderBuilder, MediaType, StreamReader};
+    /// # fn main() -> rsmedia::error::Result<()> {
+    /// # let mut reader = StreamReader::new("/tmp/test.mp4")?;
+    /// # let mut decoder = DecoderBuilder::new(MediaType::AUDIO).build_from_reader(&reader)?;
+    /// while let Some(frame) = decoder.decode::<f32>(&mut reader)? {
     ///     // Do something with frame...
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn decode<T>(&mut self, reader: &mut impl Reader) -> Result<Option<MediaFrame<T>>>
     where
@@ -1087,11 +1153,21 @@ impl Decoder {
     /// # Return value
     ///
     /// The decoded frame, or [`None`] at end of stream.
+    ///
+    /// # Errors
+    ///
+    /// An error once the whole pipeline is finished (call [`reset`](Self::reset)
+    /// to reuse the decoder), or when `u8` does not match the frame format's
+    /// sample width (e.g. 9..16-bit video).
     pub fn decode_frame(&mut self, reader: &mut impl Reader) -> Result<Option<MediaFrame<u8>>> {
         self.decode::<u8>(reader)
     }
 
     /// Decode a single frame and return the raw ffmpeg `AvFrame`.
+    ///
+    /// The frame comes out after hardware-frame download and filtering, with no
+    /// element-type conversion — reach for it when the typed [`MediaFrame`]
+    /// conversion is unwanted (raw access, custom handling).
     ///
     /// # Arguments
     ///
@@ -1099,7 +1175,12 @@ impl Decoder {
     ///
     /// # Return value
     ///
-    /// The decoded raw frame that after decoding, HW download, and filtering as [`AVFrame`].
+    /// The decoded frame as [`AVFrame`], or [`None`] at end of stream.
+    ///
+    /// # Errors
+    ///
+    /// An error once the whole pipeline is finished — call [`reset`](Self::reset)
+    /// to decode again.
     pub fn decode_raw<R>(&mut self, reader: &mut R) -> Result<Option<AVFrame>>
     where
         R: Reader,
@@ -1212,15 +1293,16 @@ impl Decoder {
         )))
     }
 
-    /// Decode one [`AVPacket`].
+    /// Decode one [`AVPacket`] into a typed [`MediaFrame<T>`].
     ///
-    /// Feeds the packet to the decoder and returns a frame if there is one available. The caller
-    /// should keep feeding packets until the decoder returns a frame.
+    /// Thin wrapper over [`decode_raw_packet`](Self::decode_raw_packet): same
+    /// packet-in / frame-out contract, same multi-frame queuing and error
+    /// behavior — the only addition is the element-type conversion (`T` must
+    /// match the frame format's sample width, see [`decode`](Self::decode)).
     ///
     /// # Return value
     ///
-    /// A tuple of the [`AVFrame`] and timestamp (relative to the stream) and the frame itself if the
-    /// decoder has a frame available, [`None`] if not.
+    /// The decoded frame as [`MediaFrame<T>`] if the decoder has one available, [`None`] if not.
     pub fn decode_packet<T>(&mut self, packet: &AVPacket) -> Result<Option<MediaFrame<T>>>
     where
         T: ElementType,
@@ -1319,8 +1401,11 @@ impl Decoder {
     ///
     /// # Return value
     ///
-    /// A tuple of the [`AVFrame`] and timestamp (relative to the stream) and the frame itself if the
-    /// decoder has a frame available, [`None`] if not.
+    /// The decoded frame as [`MediaFrame<T>`] if the decoder has one available, [`None`] if not.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the decoder itself fails while flushing.
     pub fn drain<T>(&mut self) -> Result<Option<MediaFrame<T>>>
     where
         T: ElementType,
@@ -1566,8 +1651,11 @@ impl Decoder {
         resample::resample_if_needed(&mut self.resampler, frame, out_spec)
     }
 
-    /// Pull a decoded frame from the decoder. This function also implements retry mechanism in case
-    /// the decoder signals `EAGAIN` and `EOF`
+    /// Pull a decoded frame from the decoder.
+    ///
+    /// `EAGAIN` ("no frame right now, keep feeding packets") and EOF both surface
+    /// as `Ok(None)`; EOF additionally moves the phase to `Flushed`. Any other
+    /// decoder error propagates.
     fn decoder_receive_frame(&mut self) -> Result<Option<AVFrame>> {
         match self.context.receive_frame() {
             Ok(frame) => Ok(Some(frame)),
@@ -1780,8 +1868,8 @@ mod tests {
     use std::collections::HashSet;
 
     /// `with_input_format` 让 `build()` 能打开**没有可探测头部**的输入
-    /// （采集设备 / 虚拟源），而这正是它引入前失败（`Cannot open input file. (-2)`）
-    /// 的场景。
+    /// （采集设备 / 虚拟源）；不指定格式时，这类输入会以
+    /// `Cannot open input file. (-2)` 失败。
     ///
     /// 用 `lavfi` 虚拟源代替真实摄像头：CI 与沙箱里没有设备，也不该有权限依赖。
     /// `lavfi` 与真实设备 demuxer 走的是同一条 `avformat_open_input(url, iformat)`
@@ -1849,7 +1937,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// 未设置任何输入格式/参数时，`build()` 与引入前完全一致（走内容探测）。
+    /// 未设置任何输入格式/参数时，`build()` 走内容探测打开输入。
     #[test]
     fn test_default_input_path_unchanged() -> Result<()> {
         let decoder = DecoderBuilder::new(MediaType::VIDEO).build("assets/mp4.mp4")?;
@@ -1940,7 +2028,7 @@ mod tests {
             .build_from_reader(&reader)?;
         assert_eq!(explicit.thread_count(), 2, "显式设置的线程数必须原样生效");
 
-        // 多核机器上"未设置"一定不等于 CPU 数 —— 那正是旧实现的行为；
+        // 多核机器上"未设置"一定不等于 CPU 数；
         // 单核时两者恰好都是 1，这条断言没有判别力，直接跳过。
         let cpus = num_cpus::get() as i32;
         if cpus > 1 {
@@ -2122,8 +2210,7 @@ mod tests {
         }
     }
 
-    /// 平面 / 半平面格式现在同样可以作为解码输出（每平面一个数组），
-    /// 输出格式不再是「YUV420P + packed 8bit」白名单。
+    /// 平面 / 半平面格式同样可以作为解码输出（每平面一个数组），不限 packed 8bit。
     #[test]
     fn test_decode_video_with_planar_pix_fmt_accepted() {
         for fmt in [PixelFormat::NV12, PixelFormat::YUV422P, PixelFormat::GBRP] {
@@ -2457,7 +2544,7 @@ mod tests {
 
     /// 手动逐包解码与常规 `decode_frame` 通道必须给出**逐帧相同**的结果。
     ///
-    /// 这条锁的是 `receive_normalized_frame` 的交付顺序（B2 的重构动了它的入口）：
+    /// 这条锁的是 `receive_normalized_frame` 的交付顺序：
     /// 队列与解码器两处来源合起来仍要按解码顺序输出，既不丢帧也不乱序。
     #[test]
     fn test_decode_raw_packet_recovers_from_a_full_decoder() -> Result<()> {
@@ -2467,7 +2554,7 @@ mod tests {
         let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
         let mut source = StreamReader::new(video_path)?;
 
-        // 逐包手动解码，全程不得报错（旧行为会在第 3 个包上失败）。
+        // 逐包手动解码，全程不得报错（送包不重试就会在第 3 个包上失败）。
         let mut manual = Vec::new();
         while let Some((index, packet)) = source.read_packet()? {
             if index != decoder.stream_index() {

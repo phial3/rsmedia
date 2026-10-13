@@ -1,3 +1,43 @@
+//! Where media bytes come from and go to: readers and writers.
+//!
+//! Every source in the crate — a file, a URL, a memory buffer, a caller's own
+//! [`std::io`] stream — is reached through the same pair of traits:
+//!
+//! | Side | Trait | Implementations |
+//! |---|---|---|
+//! | input | [`Reader`] (+ [`Seekable`]) | [`StreamReader`] (path/URL), [`BufferReader`] (`Vec<u8>`), [`IoReader`] (any `Read`) |
+//! | output | [`Writer`] | [`StreamWriter`] (path/URL), [`BufferWriter`] (memory), [`IoWriter`] (any `Write`) |
+//!
+//! All of them are built through a matching `*Builder` that carries the
+//! protocol/format options ([`StreamReaderBuilder`], [`StreamWriterBuilder`],
+//! …), and all accept the same [`Location`], so
+//! `StreamReader::new("/tmp/a.mp4")` and `StreamReader::new("http://h/a.mp4")`
+//! are one call apart in code.
+//!
+//! # Reading back what was written
+//!
+//! A [`Writer`] owns the bytes; how to pull them out depends on the
+//! implementation:
+//!
+//! * [`BufferWriter::take_written`] hands out each segment as it is produced —
+//!   the right pull for streaming containers (mpegts, matroska);
+//! * containers that rewrite their header in the trailer (mp4, mov, wav) only
+//!   form a complete image after [`BufferWriter::into_bytes`] /
+//!   [`Muxer::finish`](crate::mux::Muxer::finish);
+//! * [`IoWriter::into_inner`] returns the caller's own writer.
+//!
+//! # Slow or hanging sources
+//!
+//! Network inputs can stall for a long time. [`Interrupt`] gives a reader a
+//! deadline or an external abort switch, checked from FFmpeg's own callback
+//! context — the standard fix for "the read never returns".
+//!
+//! # Options hygiene
+//!
+//! Builder options are consumed by the layer that understands them (avio
+//! protocol first, then the demuxer/muxer); anything left over is reported as a
+//! warning instead of being silently dropped.
+
 use crate::error::{Context, Result, RsmediaError};
 use crate::flags::FlagSet;
 use crate::init::{AVLogFlag, AVLogLevel};
@@ -47,10 +87,9 @@ ffi_enum!(
     /// assert!(set.contains(AVSeekFlag::ANY));
     /// ```
     ///
-    /// Mixing a flag with a raw mask needs an explicit `as i32`: the `AVSEEK_FLAG_*`
-    /// constants in rsmpeg are **`u32`**, whereas the operators are generated for the
-    /// enum's own `repr` (here `i32`, because `av_seek_frame` takes `int`) and for
-    /// `AVSeekFlag` only:
+    /// Mixing a flag with a raw mask needs an explicit `as i32`: rsmpeg's
+    /// `AVSEEK_FLAG_*` constants are `u32`, which the `|` operators do not accept —
+    /// combining the two without a cast does not compile:
     ///
     /// ```
     /// # use rsmedia::AVSeekFlag;
@@ -71,7 +110,12 @@ ffi_enum!(
         FRAME => ffi::AVSEEK_FLAG_FRAME;
     }
 );
-
+/// reads packets from it. Implemented by every input — [`StreamReader`],
+/// [`BufferReader`], [`IoReader`] — so generic code can be written against
+/// `impl Reader`.
+///
+/// Random access is a separate concern: only seekable sources implement the
+/// [`Seekable`] supertrait ([`IoReader`] deliberately does not).
 pub trait Reader {
     fn input(&self) -> &AVFormatContextInput;
     fn input_mut(&mut self) -> &mut AVFormatContextInput;
@@ -322,7 +366,6 @@ fn seek_file(
     // `flags = 0`. No pointer is retained after the call.
     let res = unsafe { ffi::avformat_seek_file(input.as_mut_ptr(), stream_index, min, ts, max, 0) };
     if res < 0 {
-        // >=0 on success, error code otherwise
         return Err(RsmediaError::av_error(res).with_context(format!(
             "Failed to seek stream {stream_index} into ts=[{min}, {max}] (target {ts})"
         )));
@@ -573,8 +616,8 @@ impl Default for Interrupt {
 /// 覆盖整个 format context（context 先于数据 drop），回调期间指针有效。
 unsafe extern "C" fn interrupt_callback(opaque: *mut std::ffi::c_void) -> std::ffi::c_int {
     let data = unsafe { &*(opaque as *const InterruptData) };
-    // 与 [`Interrupt::triggered`] 共用同一个谓词，避免两处实现各自漂移
-    // （曾经一份在 poison 时恢复、一份当成"没到期"）。
+    // 与 [`Interrupt::triggered`] 共用同一个谓词：两处实现一旦漂移（如 poison
+    // 处理方向不一致），中断就会被静默丢弃，阻塞读永远等下去。
     i32::from(data.is_set())
 }
 
@@ -626,7 +669,7 @@ fn open_input_with_interrupt(
     // destroyed and replaced with a dict containing options that were not found"
     // —— 传进去的字典由 FFmpeg 就地释放。因此先把所有权交给 C（`into_raw` 不运行
     // Rust 析构），调用结束再接管它回写的指针：既不漏掉未识别的选项，也不会让
-    // Rust 去二次释放一个 C 已释放的句柄（旧写法正是"换出旧值再 forget"）。
+    // Rust 去二次释放一个 C 已释放的句柄。
     let mut opts = options
         .take()
         .map(|dict| dict.into_raw().as_ptr())
@@ -678,6 +721,10 @@ struct ReaderSpec<'a> {
 }
 
 /// Builds a [`StreamReader`].
+///
+/// Reach for the builder instead of [`StreamReader::new`] when you need a forced
+/// container format, protocol options, or an [`Interrupt`] handle; a plain
+/// `new(source)` is enough otherwise.
 ///
 /// # Example
 ///
@@ -1021,8 +1068,11 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
 /// Video reader that reads from any [`std::io::Read`] implementor.
 ///
 /// For streaming inputs (sockets, pipes, decryptors, ...). Does **not** implement
-/// [`Seekable`]. Because `avformat_open_input` needs to probe, `reader` must be
-/// re-readable; no seeking is required since probing only moves forward.
+/// [`Seekable`]: probing and decoding only move the stream forward, so the source
+/// never needs to seek — it just has to keep answering `read` calls until EOF.
+///
+/// The reader is moved into the AVIO callbacks for the reader's lifetime and
+/// cannot be taken back afterwards (unlike [`IoWriter::into_inner`]).
 pub struct IoReader {
     core: ReaderCore,
 }
@@ -1074,9 +1124,9 @@ unsafe impl Send for IoReader {}
 /// | [`BufferWriter`] | [`take_written`](BufferWriter::take_written) 取增量，[`into_bytes`](BufferWriter::into_bytes) 取完整容器 |
 ///
 /// 拉模型的好处是**漏取不会丢数据**：增量接口只是把游标往前推，字节本身仍在
-/// writer 内，最后 [`BufferWriter::into_bytes`] 拿到的永远是完整容器。早先的推
-/// 模型（`write_*` 返回增量、由调用方自己累加）漏一次就是永久丢字节，而且这份
-/// 累加责任落在每个调用点上——包括那些根本不关心字节的调用点。
+/// writer 内，最后 [`BufferWriter::into_bytes`] 拿到的永远是完整容器。若改成推
+/// 模型（`write_*` 返回增量、由调用方累加），漏一次就是永久丢字节，累加责任
+/// 还会落到每个调用点上。
 ///
 /// trait 是 object-safe 的：`Box<dyn Writer>`（跨线程移动时用 [`DynWriter`]）
 /// 本身就是一个 [`Writer`]，因此运行时决定输出目标、或把不同类型的 writer 放进
@@ -1151,8 +1201,8 @@ pub trait Writer {
     /// movenc 会重设 timescale）。因此写包时应**实时获取**，不要缓存 write 前
     /// 的值，否则 packet 的 pts/duration 会按错误的 time_base 解析。
     ///
-    /// 流不存在时返回错误：早先这里回退为 [`TIME_BASE`](crate::time::TIME_BASE)
-    /// （1/1000000），会让 `rescale_ts` 静默算出完全错误的时间戳。
+    /// 流不存在时返回错误，而不是回退到 [`TIME_BASE`](crate::time::TIME_BASE)
+    /// 之类的默认值：错误的 time_base 会让 rescale 静默算出完全错误的时间戳。
     fn stream_time_base(&self, stream_index: usize) -> Result<Rational> {
         self.output()
             .streams()
@@ -1388,6 +1438,10 @@ impl WriterCore {
 ////////////////////////////////////////
 
 /// Build a [`StreamWriter`].
+///
+/// Reach for the builder instead of [`StreamWriter::new`] to force a container
+/// format or pass protocol/muxer options; `new(destination)` lets FFmpeg guess
+/// the format from the destination.
 pub struct StreamWriterBuilder<'a> {
     destination: Location,
     format: Option<&'a str>,
@@ -1544,9 +1598,6 @@ unsafe impl Send for StreamWriter {}
 
 /// 内存写状态：`data` 为累计输出，`pos` 为 avio 当前写位置（支持 seek 回退
 /// 重写），`delivered` 为已通过增量接口返回给调用方的字节数。
-///
-/// 存储用 [`BytesMut`] 而非 `Vec<u8>`：`into_bytes` 可零拷贝 freeze/转换，
-/// 追加路径走 [`BufMut::put_slice`] 免去 `resize` 的 memset + memcpy 双写。
 #[derive(Default)]
 struct MemWriterState {
     data: BytesMut,
@@ -1655,6 +1706,9 @@ impl BufferWriterBuilder {
 }
 
 /// Video writer that writes to a buffer.
+///
+/// 每次 `write_*` 后 avio 立即 flush，产出的字节马上可被
+/// [`take_written`](Self::take_written) 看到，适合边产边发的流式场景。
 ///
 /// 字节全部累积在 writer 内部，由调用方**主动取**：
 /// - [`take_written`](Self::take_written)：取上次取走之后新增的字节，适合流式
@@ -1981,7 +2035,6 @@ unsafe fn log_callback_impl(
         return;
     }
 
-    // Check whether or not the message would be printed at all.
     let event_would_log = match level_no as u32 {
         // These are all error states.
         ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
@@ -2262,8 +2315,7 @@ mod tests {
         assert!(combined.contains(AVSeekFlag::ANY));
         assert!(!combined.contains(AVSeekFlag::FRAME));
 
-        // 与 rsmpeg 的 u32 常量混合时需显式 `as i32`（宏只实现 BitOr<i32>，
-        // 以免 repr=u32 的旗标枚举生成重复 impl）。
+        // 与 rsmpeg 的 u32 常量混合时需显式 `as i32`（原因见 `AVSeekFlag` 文档）。
         let mixed = AVSeekFlag::FRAME | (ffi::AVSEEK_FLAG_BYTE as i32);
         assert_eq!(mixed.bits(), ffi::AVSEEK_FLAG_FRAME | ffi::AVSEEK_FLAG_BYTE);
 
@@ -2275,7 +2327,6 @@ mod tests {
             combined_raw,
             ffi::AVSEEK_FLAG_BACKWARD as i32 | ffi::AVSEEK_FLAG_ANY as i32
         );
-        // as_raw 与 Into 结果一致
         assert_eq!(AVSeekFlag::BYTE.as_raw(), i32::from(AVSeekFlag::BYTE));
     }
 

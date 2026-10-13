@@ -505,9 +505,6 @@ impl HWContext {
     ///
     /// 仅共享访问 device_ctx：`hwframe_ctx_alloc` 内部只做 av_buffer_ref（原子），
     /// 每次调用都新建独立的 AVHWFramesContext，由调用方（codec_ctx）独占持有。
-    /// `pool_size` is [`i32`] — the type of `AVHWFramesContext::initial_pool_size` —
-    /// so it reaches FFmpeg exactly as the caller wrote it, with no narrowing and
-    /// therefore no way for a value to be silently reinterpreted on the way in.
     pub(crate) fn create_hw_frames_ctx(
         &self,
         width: u32,

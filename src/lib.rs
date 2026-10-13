@@ -1,3 +1,54 @@
+//! Safe Rust bindings over the FFmpeg `libav*` family (through
+//! [rsmpeg](https://github.com/larksuite/rsmpeg)), covering the common media
+//! pipeline: demux/decode → filter/scale/resample → encode → mux.
+//!
+//! # Mental model
+//!
+//! Four verbs, one type each:
+//!
+//! | Direction | Type | Reads / writes |
+//! |---|---|---|
+//! | container → frames | [`Demuxer`] / [`Decoder`] | packets, decoded [`MediaFrame`]s |
+//! | frames → container | [`Encoder`] / [`Muxer`] | frames in, packets out |
+//! | bytes ↔ container | [`StreamReader`] / [`StreamWriter`] | any [`Reader`] / [`Writer`] |
+//! | frame data | [`MediaFrame`] | ndarray-backed, convertible across pixel formats |
+//!
+//! [`Demuxer`]: mux::Demuxer
+//! [`Decoder`]: decode::Decoder
+//! [`Encoder`]: encode::Encoder
+//! [`Muxer`]: mux::Muxer
+//! [`StreamReader`]: io::StreamReader
+//! [`StreamWriter`]: io::StreamWriter
+//! [`Reader`]: io::Reader
+//! [`Writer`]: io::Writer
+//! [`MediaFrame`]: frame::MediaFrame
+//!
+//! Sources and destinations are named through one abstraction,
+//! [`Location`]: a local path, a `PathBuf` or a URL are the
+//! same call, so `StreamReader::new("/tmp/a.mp4")` and
+//! `StreamReader::new("http://host/a.mp4")` are interchangeable.
+//!
+//! # No setup call
+//!
+//! Regular files, buffers and network sources work without any initialization —
+//! reach for the type you need. The one exception is **capture devices**
+//! (webcam, microphone, screen grab): those need [`init()`] once before the
+//! first `Decoder`, because FFmpeg's device registry is not populated
+//! otherwise and the failure looks like an unopenable input.
+//!
+//! # Choosing an FFmpeg version
+//!
+//! Exactly one `ffmpegN` cargo feature must be enabled (default: `ffmpeg9`);
+//! see the [feature table in the README](https://github.com/dromara/rsmedia#cargo-features).
+//!
+//! # Errors and logging
+//!
+//! Fallible APIs return [`Result<T>`](error::Result) with
+//! [`RsmediaError`], which distinguishes *unsupported*
+//! (this platform/build cannot do it), *invalid config* (caller mistake) and
+//! *other* (I/O and runtime failures). FFmpeg's own diagnostics go through the
+//! [`tracing`] facade — install a subscriber (or set `RUST_LOG`) to see them.
+
 #[macro_use]
 mod macros;
 

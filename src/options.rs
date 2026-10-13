@@ -525,7 +525,8 @@ mod tests {
 
     #[test]
     fn test_options_empty_to_dict_is_none() {
-        // 根治旧实现：空 Options 物化为 None，不再携带 key="" 的脏条目。
+        // 空 Options 必须物化为 None：rsmpeg 表示不了空字典，携带 key=""
+        // 的脏条目会让 libav 在每次 open() 时报 `Option '' not found`。
         let opts = Options::new();
         assert!(opts.into_dict().is_none());
     }
