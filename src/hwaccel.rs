@@ -1424,7 +1424,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn test_amf_config_builder() {
-        let config = HWDeviceConfig::amf(Some("0".to_string()));
+        let config = HWDeviceConfig::amf("0");
         assert_eq!(config.device_type, HWDeviceType::D3D11VA);
         assert_eq!(config.hw_pixel_format, PixelFormat::D3D11);
         assert_eq!(config.sw_pixel_format, PixelFormat::NV12);
