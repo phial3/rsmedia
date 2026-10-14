@@ -109,6 +109,13 @@ ffi_enum!(
     ICC_PROFILES => ffi::AV_CODEC_FLAG2_ICC_PROFILES;
 });
 
+/// A codec implementation (encoder or decoder) plus its capability queries.
+///
+/// Lookup by [`AVCodecID`](ffi::AVCodecID) or name with [`CodecConfig::new`] /
+/// [`CodecConfig::new_with_name`], or enumerate everything in the build with
+/// [`CodecConfig::all`] / [`encoders`](CodecConfig::encoders) /
+/// [`decoders`](CodecConfig::decoders). The `supported_*` accessors report the
+/// codec's declared constraints; `None` means "no restriction declared".
 pub struct CodecConfig {
     codec: AVCodecRef<'static>,
     #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
@@ -116,6 +123,13 @@ pub struct CodecConfig {
 }
 
 impl CodecConfig {
+    /// Look up a codec by id; prefers an encoder when both an encoder and a
+    /// decoder exist for the id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::Unsupported`] when neither an encoder nor a
+    /// decoder for `id` is compiled into this FFmpeg build.
     pub fn new(id: ffi::AVCodecID) -> Result<Self> {
         let codec = AVCodec::find_encoder(id)
             .or_else(|| AVCodec::find_decoder(id))
@@ -135,6 +149,13 @@ impl CodecConfig {
         }
     }
 
+    /// Look up a codec by name (e.g. `"libx264"`); encoder first, like
+    /// [`CodecConfig::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsmediaError::Unsupported`] when no codec with that name is
+    /// compiled into this FFmpeg build.
     pub fn new_with_name(codec_name: &CStr) -> Result<Self> {
         let codec = AVCodec::find_encoder_by_name(codec_name)
             .or_else(|| AVCodec::find_decoder_by_name(codec_name))
@@ -206,6 +227,14 @@ impl CodecConfig {
 }
 
 impl CodecConfig {
+    /// Pixel formats the codec declares support for.
+    ///
+    /// `None` means "no restriction" — that is how FFmpeg spells an empty
+    /// list. The slice borrows from `self`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if FFmpeg fails to query the codec's configuration.
     pub fn supported_pixel_formats(&self) -> Result<Option<&[ffi::AVPixelFormat]>> {
         #[cfg(feature = "ffmpeg6")]
         {
@@ -218,6 +247,11 @@ impl CodecConfig {
         }
     }
 
+    /// Sample formats the codec declares support for; `None` = no restriction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if FFmpeg fails to query the codec's configuration.
     pub fn supported_sample_formats(&self) -> Result<Option<&[ffi::AVSampleFormat]>> {
         #[cfg(feature = "ffmpeg6")]
         {
@@ -259,6 +293,11 @@ impl CodecConfig {
         }
     }
 
+    /// Sample rates (Hz) the codec declares support for; `None` = no restriction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if FFmpeg fails to query the codec's configuration.
     pub fn supported_sample_rates(&self) -> Result<Option<&[i32]>> {
         #[cfg(feature = "ffmpeg6")]
         {
@@ -315,9 +354,6 @@ impl CodecConfig {
             Some(counts)
         }
     }
-
-    ///////////////
-    ///////////////
 
     /// 查询结果为 `None`（FFmpeg 未限制，支持所有值）或查询失败（如媒体类型
     /// 不匹配的配置项）时按"支持"处理，避免误拦合法帧。

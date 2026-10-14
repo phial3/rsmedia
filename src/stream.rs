@@ -1,3 +1,16 @@
+//! What a stream *is*: its media type and its codec parameters.
+//!
+//! Two pieces:
+//!
+//! * [`MediaType`] — video / audio / subtitle / … , the classification every
+//!   builder and stream lookup is keyed by.
+//! * [`StreamInfo`] — a detached snapshot of one stream's parameters
+//!   (codec, format, dimensions, time base, …), the value you read from an
+//!   input to configure an encoder or to duplicate a stream into a muxer.
+//!
+//! [`StreamInfo::find_decoder_name`] / [`find_encoder_name`](StreamInfo::find_encoder_name)
+//! resolve the codec *names* a stream's parameters map to in this FFmpeg build.
+
 use crate::error::{Result, RsmediaError};
 use crate::fmt::{FrameFormat, SampleFormat};
 use crate::hwaccel::HWDeviceType;
@@ -47,14 +60,19 @@ impl Display for MediaType {
     }
 }
 
-/// Holds transferable stream information. This can be used to duplicate stream settings for the
-/// purpose of transmuxing or transcoding.
+/// A snapshot of one stream's codec parameters, detached from any container.
 ///
-/// Every numeric field mirrors the width of the corresponding `AVCodecParameters`
-/// / `AVStream` field (`i32` / `i64`), so a `StreamInfo` can be written back to
-/// FFmpeg without a range check. The high-level API
-/// ([`EncoderBuilder`](crate::EncoderBuilder), [`MediaFrame`](crate::MediaFrame))
-/// uses `u32` for the non-negative quantities instead; cast at that boundary.
+/// This is the currency of transmux/transcode setup: read it from an input
+/// (a [`Demuxer`](crate::mux::Demuxer), a [`StreamReader`](crate::io::StreamReader)
+/// or an [`AVStream`]), then hand it to
+/// [`Muxer::add_copy_stream`](crate::mux::Muxer::add_copy_stream) to duplicate
+/// the stream bit-exactly, or read it to configure an encoder for that stream
+/// (see the transcode example in the crate docs).
+///
+/// Numeric fields mirror the widths of the corresponding
+/// `AVCodecParameters` / `AVStream` fields, so a `StreamInfo` round-trips back
+/// to FFmpeg without range checks; the high-level builders take `u32` for the
+/// non-negative quantities and cast at that boundary.
 #[derive(Clone)]
 pub struct StreamInfo {
     /// id

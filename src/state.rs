@@ -1,4 +1,4 @@
-//! 编解码器上下文与滤镜图共用的推进状态。
+//! The advance state shared by codec contexts and filter graphs.
 
 /// FFmpeg 处理单元（`AVCodecContext` / `AVFilterGraph`）的推进阶段。
 ///

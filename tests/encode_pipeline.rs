@@ -306,7 +306,7 @@ mod video {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
-            builder = builder.with_options(Some(Into::into(opts)));
+            builder = builder.with_options(Into::into(opts));
         }
         let video_encoder = builder.build()?;
         let encoder_time_base = video_encoder.time_base();
@@ -857,19 +857,17 @@ mod video {
                             common::remove_test_output(&path);
 
                             // 编码
-                            let enc_bare = EncoderBuilder::new_video(w, h)
+                            let mut enc_builder = EncoderBuilder::new_video(w, h)
                                 .with_codec_name(codec)
-                                .with_fps(fps)
-                                .with_filters(if delayed {
-                                    Some(vec![Filter::new(
-                                        "framerate",
-                                        MediaType::VIDEO,
-                                        "framerate=fps=30".to_string(),
-                                    )])
-                                } else {
-                                    None
-                                })
-                                .build()?;
+                                .with_fps(fps);
+                            if delayed {
+                                enc_builder = enc_builder.with_filters(vec![Filter::new(
+                                    "framerate",
+                                    MediaType::VIDEO,
+                                    "framerate=fps=30".to_string(),
+                                )]);
+                            }
+                            let enc_bare = enc_builder.build()?;
                             let enc_tb = enc_bare.time_base();
                             let mut muxer = rsmedia::mux::Muxer::new(&path)?;
                             let v_idx = muxer.add_encoder(enc_bare)?;

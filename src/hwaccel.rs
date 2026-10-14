@@ -68,16 +68,16 @@ impl HWDeviceConfig {
     /// 设备标识：NVIDIA CUDA 用 GPU 编号字符串（如 `"0"`），VAAPI 用 DRM 渲染节点
     /// 路径（如 `"/dev/dri/renderD128"`），QSV 用设备序号。
     ///
-    /// 参数取 `impl Into<Option<_>>`，因此"总是有值"时裸传值即可、"无值"写 `None`
-    /// （表示让后端自选默认设备），都不需要 `Some(...)` 包装。
-    pub fn with_device_id(mut self, device_id: impl Into<Option<String>>) -> Self {
-        self.device_id = device_id.into();
+    /// 参数取 `impl Into<String>`：字符串字面量可直接传入，无需 `to_string()`；
+    /// 要让后端自选默认设备，跳过本 setter 即可（字段默认为 `None`）。
+    pub fn with_device_id(mut self, device_id: impl Into<String>) -> Self {
+        self.device_id = Some(device_id.into());
         self
     }
 
     /// 打开设备时的附加（设备类型相关）选项。
-    pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-        self.options = options.into();
+    pub fn with_options(mut self, options: Options) -> Self {
+        self.options = Some(options);
         self
     }
 
@@ -87,35 +87,35 @@ impl HWDeviceConfig {
     /// 是格式映射的唯一真相源：本构造器、[`Self::new`] 与平台自动选择
     /// （[`Self::auto_platform`]）都走这里，避免同一设备类型出现两套说法。
     fn default_for(device_type: HWDeviceType, device_id: Option<String>) -> Self {
-        Self::new(device_type).with_device_id(device_id)
+        let mut this = Self::new(device_type);
+        this.device_id = device_id;
+        this
     }
 
     /// build CUDA HWDeviceConfig
     ///
-    /// `device_id` 为 GPU 编号字符串（如 `Some("0".to_string())`），与其他设备
-    /// 构造器的类型保持一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。
-    /// 该参数是 `impl Into<Option<String>>`，因此 `None` 表示让后端自选默认设备
-    /// （CUDA 即 0 号卡），但要传值必须给 **`String`** —— `&str` 不会自动转换，
-    /// 需 `.to_string()`。
-    pub fn cuda(device_id: impl Into<Option<String>>) -> Self {
-        Self::default_for(HWDeviceType::CUDA, device_id.into())
+    /// `device_id` 为 GPU 编号字符串（如 `"0"`），与其他设备构造器的类型保持
+    /// 一致（VAAPI 传 DRM 设备路径、QSV 传设备序号等）。
+    /// 参数是 `impl Into<String>`，字符串字面量可直接传入。
+    pub fn cuda(device_id: impl Into<String>) -> Self {
+        Self::default_for(HWDeviceType::CUDA, Some(device_id.into()))
     }
 
     /// build VAAPI HWDeviceConfig
     ///
     /// `device_id` 一般是 DRM 渲染节点路径（如 `"/dev/dri/renderD128"`）。
-    pub fn vaapi(device_id: impl Into<Option<String>>) -> Self {
-        Self::default_for(HWDeviceType::VAAPI, device_id.into())
+    pub fn vaapi(device_id: impl Into<String>) -> Self {
+        Self::default_for(HWDeviceType::VAAPI, Some(device_id.into()))
     }
 
     /// build VULKAN HWDeviceConfig
-    pub fn vulkan(device_id: impl Into<Option<String>>) -> Self {
-        Self::default_for(HWDeviceType::VULKAN, device_id.into())
+    pub fn vulkan(device_id: impl Into<String>) -> Self {
+        Self::default_for(HWDeviceType::VULKAN, Some(device_id.into()))
     }
 
     /// build QSV (Intel Quick Sync Video) HWDeviceConfig
-    pub fn qsv(device_id: impl Into<Option<String>>) -> Self {
-        Self::default_for(HWDeviceType::QSV, device_id.into())
+    pub fn qsv(device_id: impl Into<String>) -> Self {
+        Self::default_for(HWDeviceType::QSV, Some(device_id.into()))
     }
 
     /// build AMD AMF HWDeviceConfig（Windows 平台，基于 D3D11 设备）。
@@ -129,8 +129,8 @@ impl HWDeviceConfig {
     /// （本 crate 仅在 `ffmpeg8`/`ffmpeg9` feature 下建模它）；要直接用那条路径，
     /// 请用 [`Self::new`] 自行指定 `HWDeviceType::AMF` + `PixelFormat::AMF_SURFACE`。
     #[cfg(target_os = "windows")]
-    pub fn amf(device_id: impl Into<Option<String>>) -> Self {
-        Self::default_for(HWDeviceType::D3D11VA, device_id.into())
+    pub fn amf(device_id: impl Into<String>) -> Self {
+        Self::default_for(HWDeviceType::D3D11VA, Some(device_id.into()))
     }
 
     /// 按当前平台自动选择最佳可用的硬件加速配置。
@@ -505,9 +505,6 @@ impl HWContext {
     ///
     /// 仅共享访问 device_ctx：`hwframe_ctx_alloc` 内部只做 av_buffer_ref（原子），
     /// 每次调用都新建独立的 AVHWFramesContext，由调用方（codec_ctx）独占持有。
-    /// `pool_size` is [`i32`] — the type of `AVHWFramesContext::initial_pool_size` —
-    /// so it reaches FFmpeg exactly as the caller wrote it, with no narrowing and
-    /// therefore no way for a value to be silently reinterpreted on the way in.
     pub(crate) fn create_hw_frames_ctx(
         &self,
         width: u32,
@@ -1427,7 +1424,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn test_amf_config_builder() {
-        let config = HWDeviceConfig::amf(Some("0".to_string()));
+        let config = HWDeviceConfig::amf("0");
         assert_eq!(config.device_type, HWDeviceType::D3D11VA);
         assert_eq!(config.hw_pixel_format, PixelFormat::D3D11);
         assert_eq!(config.sw_pixel_format, PixelFormat::NV12);

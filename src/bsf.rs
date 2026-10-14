@@ -1,19 +1,23 @@
-//! Bitstream filter（`AVBSFContext`）：**不解码**地重写压缩包的封装格式。
+//! Bitstream filters (`AVBSFContext`)
 //!
-//! 与 [`Encoder`](crate::Encoder) 的转码路径相对，bitstream filter 工作在
-//! **包级别**：只调整参数集位置、NALU 边界表示、音频帧头等容器约定，编码数据
-//! 本身不变——零质量损失，开销可忽略。典型场景：
+//! Where the transcoding path through [`Encoder`](crate::Encoder) re-encodes,
+//! a bitstream filter works at the **packet level**: it only adjusts container
+//! conventions such as parameter-set placement, NALU boundary representation
+//! and audio frame headers. The coded data itself is unchanged — zero quality
+//! loss, negligible cost. Typical uses:
 //!
-//! - `h264_mp4toannexb` / `hevc_mp4toannexb`：MP4/MKV（avcC/hvcC）→ TS/裸流
-//!   （Annex B 起始码 + 参数集内联）——转封装 TS/IPTV 的刚需；
-//! - `aac_adtstoasc`：ADTS（TS）→ raw + ASC（MP4/M4A），不做则报
-//!   `Malformed AAC bitstream detected`。
+//! - `h264_mp4toannexb` / `hevc_mp4toannexb`: MP4/MKV (avcC/hvcC) → TS/raw
+//!   streams (Annex B start codes + inlined parameter sets) — the standard fix
+//!   for remuxing to TS/IPTV;
+//! - `aac_adtstoasc`: ADTS (TS) → raw + ASC (MP4/M4A); without it FFmpeg fails
+//!   with `Malformed AAC bitstream detected`.
 //!
-//! 注意：与 `ffmpeg` CLI 不同（CLI 在 mux 时自动插入所需 bsf），库用户必须
-//! 显式创建并在包通路上驱动它；过滤后输出流的 codecpar 应以
-//! [`Bsf::par_out`] 为准再交给 [`Muxer`](crate::Muxer)。
+//! Note: unlike the `ffmpeg` CLI (which inserts the filter it needs while
+//! muxing), a library user must create the filter and drive it on the packet
+//! path explicitly; the output stream's codecpar should be taken from
+//! [`Bsf::par_out`] before being handed to [`Muxer`](crate::Muxer).
 //!
-//! # 用法
+//! # Usage
 //!
 //! ```no_run
 //! use rsmedia::bsf::Bsf;

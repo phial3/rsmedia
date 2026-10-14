@@ -1,9 +1,10 @@
-//! 统一媒体格式定义：采样格式与帧格式。
+//! Unified media-format definitions: sample formats and frame formats.
 //!
-//! 本模块集中存放与媒体格式相关的通用类型：
-//! - [`SampleFormat`]：音频采样格式（对应 FFmpeg `AV_SAMPLE_FMT_*`）；
-//! - [`FrameFormat`]：帧格式的统一表示（视频=像素格式 / 音频=采样格式），
-//!   同时用作滤镜图的输入格式声明（见 [`crate::filter::Filter::with_input_format`]）。
+//! This module collects the format-related types shared across the crate:
+//! - [`SampleFormat`]: audio sample format (FFmpeg `AV_SAMPLE_FMT_*`);
+//! - [`FrameFormat`]: the unified frame-format representation (video = pixel
+//!   format / audio = sample format), also used as a filter graph's input
+//!   format declaration (see [`crate::filter::Filter::with_input_format`]).
 
 use crate::pixel::PixelFormat;
 use crate::strutils;
@@ -44,14 +45,11 @@ ffi_enum_from!(
     /// Generated from one `variant => constant` table with a two-way `From`. A value the table
     /// does not list panics instead of degrading to `NONE`: silently treating an unknown format
     /// as `NONE` would risk encoding into the wrong format, which is far harder to diagnose than
-    /// a fast failure.
+    /// a fast failure. `AV_SAMPLE_FMT_NONE` itself is a listed value, so it still converts to
+    /// `NONE`.
     ///
-    /// `AV_SAMPLE_FMT_NONE` itself is a listed value, so it still converts to `NONE`.
-    ///
-    /// Since `ffi::AVSampleFormat` **is** `c_int`, the generated conversions *are* the `i32` ones:
-    /// `i32::from(SampleFormat::FLTP)` and `SampleFormat::from(raw_i32)` both exist (the latter
-    /// panics on an unlisted value, so prefer [`from_ffi_checked`](SampleFormat::from_ffi_checked)
-    /// for values coming from FFmpeg).
+    /// Prefer [`from_ffi_checked`](SampleFormat::from_ffi_checked) over the panicking `From` for
+    /// values coming from FFmpeg.
     SampleFormat => ffi::AVSampleFormat,
     repr = i32,
     fallback = panic {

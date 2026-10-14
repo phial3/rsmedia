@@ -36,6 +36,9 @@ use yuv::{
 ///
 /// The bound is what the sample helpers rely on: signed/unsigned integers and
 /// floats that can be cloned, defaulted, compared and cast between one another.
+/// A frame's `T` must match its format's per-sample width — `u8` for 8-bit
+/// video, `u16` for 9..16-bit, the sample size for audio (`i16` for `S16`,
+/// `f32` for `FLTP`, ...); the constructors reject a mismatch.
 pub trait ElementType:
     'static
     + Send
@@ -616,18 +619,14 @@ pub struct MediaFrame<T> {
     /// `set_time_base` only when the pts is not already counted in the encoder's
     /// time base.
     pub time_base: Rational,
-    /// 媒体类型（仅 Video / Audio 二者之一）。
-    /// only for Video / Audio: [`MediaType`]
+    /// 媒体类型（仅 Video / Audio 二者之一，见 [`MediaType`]）。
     pub media_type: MediaType,
     // Video
     /// 仅视频字段：图像宽度（像素）。
     ///
-    /// `u32` — a width is non-negative by nature, so a negative is unrepresentable.
-    /// It is cast to FFmpeg's `int` (`AVFrame.width`) only at the FFI boundary.
+    /// Cast to FFmpeg's `int` (`AVFrame.width`) only at the FFI boundary.
     pub width: u32,
     /// 仅视频字段：图像高度（像素）。
-    ///
-    /// `u32` for the same reason as [`width`](Self::width).
     pub height: u32,
     /// 仅视频字段：图像类型（I/P/B 帧等，`AVPictureType`）。
     pub pict_type: ffi::AVPictureType,
@@ -637,14 +636,15 @@ pub struct MediaFrame<T> {
     /// 与编码器的目标率是两个量：二者不同时编码器会自动重采样，因此这里应填数据的真实
     /// 速率。`0` 表示未声明，编码器接收该帧时按自己的目标率补齐。
     ///
-    /// `u32` — a rate is non-negative by nature; cast to FFmpeg's `int`
-    /// (`AVFrame.sample_rate`) only at the FFI boundary.
+    /// Cast to FFmpeg's `int` (`AVFrame.sample_rate`) only at the FFI boundary.
     pub sample_rate: u32,
-    /// 仅音频字段：本帧采样数（每通道）。`u32` — a count is non-negative by
-    /// nature; cast to FFmpeg's `int` (`AVFrame.nb_samples`) at the boundary.
+    /// 仅音频字段：本帧采样数（每通道）。
+    ///
+    /// Cast to FFmpeg's `int` (`AVFrame.nb_samples`) at the boundary.
     pub nb_samples: u32,
-    /// 仅音频字段：声道数。`u32` — a count is non-negative by nature; cast to
-    /// FFmpeg's `c_int` (`AVChannelLayout.nb_channels`) at the boundary.
+    /// 仅音频字段：声道数。
+    ///
+    /// Cast to FFmpeg's `c_int` (`AVChannelLayout.nb_channels`) at the boundary.
     /// [`MediaFrame::new_audio`] rejects a zero count.
     pub nb_channels: u32,
     /// 是否为关键帧（`AV_FRAME_FLAG_KEY`）。
@@ -655,8 +655,8 @@ pub struct MediaFrame<T> {
     pub key_frame: bool,
     /// 帧标志（`AV_FRAME_FLAG_*` 组合，见 [`AVFrameFlag`]）。
     ///
-    /// The raw `AVFrame.flags` mirror (`i32`, FFmpeg's own width for the field). See
-    /// it through the typed table with [`FlagSet::from_bits`](crate::FlagSet::from_bits).
+    /// The raw `AVFrame.flags` mirror. See it through the typed table with
+    /// [`FlagSet::from_bits`](crate::FlagSet::from_bits).
     pub flags: i32,
     /// 编码质量（1 ~ FF_LAMBDA_MAX，越小越好；未设置时默认 0）。
     pub quality: i32,
@@ -782,6 +782,8 @@ where
     ///
     /// Derived from the format ([`PixelFormat::data_layout`] /
     /// [`SampleFormat::data_layout`]), so it applies to video and audio alike.
+    /// Panics for a video format without whole-sample planes, as
+    /// [`PixelFormat::data_layout`] does.
     pub fn data_layout(&self) -> Result<DataLayout> {
         if self.media_type == MediaType::VIDEO {
             let format = self
@@ -804,6 +806,9 @@ where
     /// （见 [`PixelFormat::data_layout`]）：packed 格式为单个
     /// `(height, width, elements_per_pixel)` 数组，planar 格式为每平面一个数组。
     /// 传入 `ndarray::Array3` / `Vec<Array2>` 会分别视为交错 / 平面帧。
+    ///
+    /// 零尺寸或无法整样本平面化的格式（位流 / 调色板 / 硬件）会 panic，
+    /// 与 [`PixelFormat::data_layout`] 的契约一致。
     ///
     /// 时间基保持未设置：分辨率里没有帧率信息，而编码器会用自己的输入时间基解释
     /// pts（见 [`time_base`](Self::time_base)）。要按自己的时间基表达 pts 时再调
@@ -893,11 +898,9 @@ where
     /// 格式）都会让跨 FFI 的拷贝越界，因此必须在能造出这种帧的地方就拒绝，而不是等到
     /// [`to_avframe`](Self::to_avframe)。
     fn validated(self) -> Result<Self> {
-        // 音频的声道数/采样数必须为正。否则平面布局是空列表、`matches` 会接受，
-        // 一个"没有声道"的帧就能一路走到 FFmpeg。两者都是 `i32`（FFmpeg 的宽度），
-        // 所以判据是 `<= 0` 而不是 `== 0`——`nb_samples` 为负时同样要在这里被拒，
-        // 否则它会一路走到 `data_layout` 的 `as usize`。视频侧的等价约束由
-        // `PixelFormat::data_layout` 对 0 尺寸返回 `None` 覆盖，无需在此重复。
+        // 音频的声道数/采样数必须为正：否则平面布局是空列表、`matches` 会接受，
+        // 一个"没有声道"的帧就能一路走到 FFmpeg。视频侧的等价约束由
+        // `PixelFormat::data_layout` 的零尺寸 panic 覆盖，无需在此重复。
         if self.media_type == MediaType::AUDIO && (self.nb_channels == 0 || self.nb_samples == 0) {
             return Err(RsmediaError::msg(format!(
                 "Audio frame needs a positive sample and channel count, got {} samples x {} channels",
@@ -987,11 +990,10 @@ where
     /// [`FrameFormat::Sample`] for audio.
     ///
     /// DATA frames carry a placeholder `[`FrameFormat::Pixel(PixelFormat::NONE)`]`
-    /// as their format — see [`Default`](Self::default). `None` used to stand in
-    /// for that placeholder, but no documented constructor produces a DATA frame
-    /// (only `Default` does), so the `Option` merely hid a value that is always
-    /// present; callers like [`Self::data_layout`] already branch on
-    /// [`media_type`](Self#structfield.media_type) rather than on this getter.
+    /// as their format — see [`Default`](Self::default) — but no documented
+    /// constructor produces one, so the value is always present. Branch on
+    /// [`media_type`](Self#structfield.media_type) (as [`Self::data_layout`]
+    /// does) rather than inferring the media kind from this getter.
     #[inline]
     pub fn format(&self) -> FrameFormat {
         self.format
@@ -1013,7 +1015,14 @@ where
     ///
     /// The layout comes from FFmpeg: video planes are read at the size the pixel
     /// format's descriptor gives, dropping the row padding `linesize` may add,
-    /// and audio planes are read contiguously.
+    /// and audio planes are read contiguously. A source `time_base` of `0/0` is
+    /// inferred as `1/sample_rate` for audio and warned about for video.
+    ///
+    /// # Errors
+    ///
+    /// `Err` when the frame carries neither audio samples nor video dimensions,
+    /// its format is not modelled by this crate, or `T`'s width does not match
+    /// the format's element size.
     pub fn from_avframe(frame: &AVFrame) -> Result<Self> {
         if plane_ptr(frame, 0).is_null() {
             return Err(RsmediaError::msg(
@@ -1298,6 +1307,9 @@ where
     }
 
     /// 转换为新 `AVFrame`：采样按布局拷进 FFmpeg 分配的带对齐缓冲。
+    ///
+    /// `data` 是公开字段、构造后仍可改写，因此这里重新校验布局与元素宽度，
+    /// 不符时返回 `Err` 而不是拷越界。
     pub fn to_avframe(&self) -> Result<AVFrame> {
         let layout = self.data_layout()?;
         if !self.data.matches(&layout) {

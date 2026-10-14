@@ -185,10 +185,8 @@ ffi_enum!(
 );
 
 impl AVLogLevel {
-    /// FFmpeg 数值语义的啰嗦程度。
-    ///
-    /// 级别值随啰嗦程度单调递增（`AV_LOG_QUIET = -8` 最安静，`AV_LOG_TRACE`
-    /// 最啰嗦）；用 `i32` 作判别类型后判别值本身就是正确的排序键。
+    /// FFmpeg 数值语义的啰嗦程度：级别值随啰嗦程度单调递增
+    /// （`AV_LOG_QUIET = -8` 最安静，`AV_LOG_TRACE` 最啰嗦）。
     fn severity(self) -> i32 {
         self as i32
     }
@@ -196,8 +194,7 @@ impl AVLogLevel {
 
 /// 啰嗦程度排序：`QUIET < PANIC < … < DEBUG < TRACE`。
 ///
-/// 手写而非宏派生：位标志类枚举（[`AVLogFlag`]）根本不该有顺序，宏派生在
-/// 本工具链上按判别值比较，对负级别并不可靠——这正是本枚举选择 `i32` 的原因。
+/// 手写而非宏派生：宏派生在本工具链上按判别值比较，对含负值的级别不可靠。
 impl Ord for AVLogLevel {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.severity().cmp(&other.severity())
@@ -287,8 +284,7 @@ mod tests {
     #[test]
     fn test_level_ordering_matches_verbosity() {
         // 数值语义：级别越大越啰嗦，set_level 打印 <= 自身的消息。
-        // 关键回归：QUIET 的 FFmpeg 值是 -8，i32 判别值直接保留负号；
-        // 若误用 u32 判别（或按回绕值派生），QUIET 会变成"最啰嗦"。
+        // 关键回归：QUIET 的 FFmpeg 值是 -8（负值），排序必须保留负号。
         assert_eq!(AVLogLevel::QUIET.severity(), -8);
         assert!(AVLogLevel::QUIET < AVLogLevel::PANIC);
         assert!(AVLogLevel::QUIET < AVLogLevel::INFO);

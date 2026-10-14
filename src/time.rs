@@ -367,9 +367,9 @@ impl Time {
     ///
     /// # Arguments
     ///
-    /// * `nth` - Denominator of the time in seconds as in `1 / nth`. [`i32`]
-    ///   because that is the width of `AVRational`'s fields: the value the caller
-    ///   writes is the value FFmpeg reads, with no narrowing in between.
+    /// * `nth` - Denominator of the time in seconds as in `1 / nth`; it is
+    ///   handed to [`Rational`] unchanged, so what the caller writes is what
+    ///   FFmpeg reads.
     ///
     /// # Errors
     ///
@@ -422,13 +422,11 @@ impl Time {
     ///
     /// # Arguments
     ///
-    /// * `time` - Relative time in `time_base` units. [`i64`] because that is
-    ///   FFmpeg's own timestamp width (`AVFrame.pts`, `AVPacket.pts`).
+    /// * `time` - Relative time in `time_base` units.
     /// * `base_den` - Time base denominator i.e. time base is `1 / base_den`.
-    ///   [`i32`], like `AVRational`'s fields.
     ///
-    /// Both are the widths FFmpeg reads back, so neither is narrowed on the way
-    /// in — see [`Self::from_nth_of_a_second`].
+    /// Both are FFmpeg's own widths (`AVFrame.pts` / `AVRational`'s fields), so
+    /// values reach FFmpeg unchanged — see [`Self::from_nth_of_a_second`].
     ///
     /// # Errors
     ///
@@ -990,9 +988,8 @@ mod tests {
         Ok(())
     }
 
-    /// Both arguments are FFmpeg's own widths (`int64_t` ticks, `int` denominator),
-    /// so the only case left to reject is `1 / 0`. Ticks used to be `usize`, which
-    /// wraps to `-1` past `i64::MAX` on a 64-bit target; they are `i64` now.
+    /// Both arguments are FFmpeg's own widths (`int64_t` ticks, `int`
+    /// denominator), so the only case left to reject is `1 / 0`.
     #[test]
     fn test_from_units_rejects_a_zero_denominator() -> Result<()> {
         assert!(Time::from_units(1, 0).unwrap_err().is_invalid_config());

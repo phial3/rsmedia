@@ -1,7 +1,8 @@
 /// Represents width and height in a tuple.
 type Dims = (u32, u32);
 
-/// Represents the possible resize strategies.
+/// Resize target for a decode output: how the source frame's dimensions map onto
+/// `Exact`/`Fit`/`FitEven`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Resize {
     /// When resizing with `Resize::Exact`, each frame will be resized to the exact width and height
@@ -12,24 +13,24 @@ pub enum Resize {
     /// already fits is returned unchanged, so the result is never larger than the source.
     Fit(u32, u32),
     /// Like [`Resize::Fit`], but both sides are then rounded **down** to an even value
-    /// independently, so the aspect ratio holds only up to one pixel. Resizing using
-    /// this method can fail if there exist no dimensions that fit these constraints.
+    /// independently, so the aspect ratio holds only up to one pixel. `compute_for` returns
+    /// [`None`] if no dimensions fit these constraints (e.g. a 1-pixel bound).
     ///
-    /// Note that this resizing method is especially useful since some encoders only accept frames
-    /// with dimensions that are divisible by 2.
+    /// Useful because some encoders only accept frames with dimensions divisible by 2
+    /// (4:2:0 chroma, H.264).
     FitEven(u32, u32),
 }
 
 impl Resize {
     /// Compute the dimensions after resizing depending on the resize strategy.
     ///
-    /// # Arguments
+    /// `dims` is the source `(width, height)`; the variants carry the target bound.
     ///
-    /// * `dims` - Input dimensions (width and height).
-    ///
-    /// # Return value
-    ///
-    /// Tuple of width and height with dimensions after resizing.
+    /// Returns the resized `(width, height)`, or [`None`] when the strategy has no
+    /// positive result for these inputs (degenerate source dimensions, or a bound that
+    /// rounds a side down to 0). [`Decoder`](crate::Decoder) reports `None` as
+    /// [`RsmediaError::InvalidConfig`](crate::RsmediaError::InvalidConfig) rather than
+    /// scaling into a 0-sized frame.
     pub fn compute_for(self, dims: Dims) -> Option<Dims> {
         match self {
             Resize::Exact(w, h) => Some((w, h)),
@@ -43,14 +44,11 @@ impl Resize {
 /// original aspect ratio and **never upscaling**: a source that already fits comes back verbatim,
 /// so the result is bounded by the source as well as by `w_max` / `h_max`.
 ///
-/// # Arguments
+/// Scaling is a single `f32` multiply-and-truncate, so the result **rounds down** on both sides
+/// and the aspect ratio is preserved only up to one pixel.
 ///
-/// * `dims` - Original dimensions: width and height.
-/// * `fit_dims` - Dimensions to fit in: width and height.
-///
-/// # Return value
-///
-/// The fitted dimensions if they exist and are positive and more than zero.
+/// Returns the fitted dimensions, or [`None`] when there is no positive result (a zero source
+/// side, or a bound small enough that a side truncates to 0).
 fn calculate_fit_dims(dims: (u32, u32), fit_dims: (u32, u32)) -> Option<(u32, u32)> {
     let (w, h) = dims;
     let (w_max, h_max) = fit_dims;
@@ -77,18 +75,11 @@ fn calculate_fit_dims(dims: (u32, u32), fit_dims: (u32, u32)) -> Option<(u32, u3
 ///
 /// The two sides are rounded down to an even value **independently** after the single scaling pass,
 /// so the aspect ratio is only preserved up to one pixel (`100x99` in `100x100` gives `100x98`).
+/// That is also applied to a source that already fits: `FitEven` is the right choice when the
+/// encoder (e.g. H.264 with 4:2:0 chroma) demands even sides, and it costs up to one pixel per side.
 ///
-/// Note that this method will even reduce the dimensions to even width and height if they already
-/// fit in `fit_dims`.
-///
-/// # Arguments
-///
-/// * `dims` - Original dimensions: width and height.
-/// * `fit_dims` - Dimensions to fit in: width and height.
-///
-/// # Return value
-///
-/// The fitted dimensions if they exist and are positive and more than zero.
+/// Returns the fitted dimensions, or [`None`] when there is no positive even result — e.g. a bound
+/// of 1 pixel, or a 1-pixel source, whose sides both round down to 0.
 fn calculate_fit_dims_even(dims: (u32, u32), fit_dims: (u32, u32)) -> Option<(u32, u32)> {
     let (w, h) = dims;
     if w == 0 || h == 0 {
@@ -96,8 +87,8 @@ fn calculate_fit_dims_even(dims: (u32, u32), fit_dims: (u32, u32)) -> Option<(u3
     }
 
     // 只缩放一次（与 `calculate_fit_dims` 相同，且绝不放大），然后把宽、高**各自**
-    // 向下取偶。逐格压低 `w_max`/`h_max` 去凑偶数的旧做法会一路缩过头：
-    // 100x99 配 100x100 会一直缩到 50x50，而不是 100x98。
+    // 向下取偶。逐格压低 `w_max`/`h_max` 去凑偶数的做法会一路缩过头：
+    // 100x99 配 100x100 会缩到 50x50，而不是 100x98。
     let (out_w, out_h) = calculate_fit_dims(dims, fit_dims)?;
     let (out_w, out_h) = (out_w & !1, out_h & !1);
     if out_w == 0 || out_h == 0 {

@@ -1,9 +1,10 @@
 //! 麦克风流式录音示例 —— `cpal` 采集 + rsmedia [`PcmSink`](rsmedia::pcm::PcmSink) 编码封装。
 //!
 //! 演示「cpal 桥」的核心用法：cpal 输入回调把交错 PCM 块直接投递给
-//! `PcmSink`，由 rsmedia 完成重采样（设备 48kHz → 编码器 44.1kHz 亦可）、
-//! AAC 编码与 M4A 封装 —— 内存占用 O(1)，不缓存整段录音
+//! `PcmSink`，由 rsmedia 完成 AAC 编码与 M4A 封装 —— 内存占用 O(1)，不缓存整段录音
 //! （对比 `audio_recorder.rs` 的全量缓存 WAV 方案，长录音不再爆内存）。
+//! 设备与编码器规格不同时（48kHz → 44.1kHz 等），转换由 `Encoder` 自己的
+//! 重采样器完成，`PcmSink` 只负责把交错 PCM 包成帧。
 //!
 //! ```text
 //! 麦克风 --cpal 回调(交错 PCM 块)--> mpsc channel --> PcmSink --> AAC/M4A
@@ -85,7 +86,7 @@ fn main() -> Result<()> {
 
     // ---- rsmedia 侧：Encoder（默认 AAC）+ Muxer + PcmSink ----
     // 编码器规格可以与设备不同（例：设备 48kHz 单声道 -> 编码器 44.1kHz 立体声），
-    // PcmSink 内部的持久重采样器会自动完成格式/采样率/声道数转换。
+    // 采样率/声道/采样格式的转换由 Encoder 自己的重采样器完成。
     let encoder = Encoder::new_audio(channels as u32, rate, rsmedia::SampleFormat::FLTP)?;
     let mut muxer = Muxer::new(&output)?;
     let audio_index = muxer.add_encoder(encoder)?;
@@ -110,7 +111,7 @@ fn main() -> Result<()> {
     });
     println!("开始录音，最长 {seconds}s，按回车提前结束...");
 
-    // ---- 主循环：取块 -> PcmSink（内部完成重采样/凑帧/编码/封装）----
+    // ---- 主循环：取块 -> PcmSink（内部成帧/编码/封装，转换交给编码器）----
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut printed_sec = 0u64;
     loop {
@@ -145,18 +146,10 @@ fn main() -> Result<()> {
         write_chunk(&mut sink, chunk)?;
     }
 
-    // ---- 收尾：冲刷重采样器尾样 + 编码器剩余样本 + 写 trailer ----
+    // ---- 收尾：冲刷编码器、写 trailer（PcmSink 不自持重采样器，尾样由编码器排空）----
     // （忘记调用时 Drop 亦可兜底，但显式 finish 能感知错误）
     let recorded_samples = sink.input_samples();
-    // 输出侧计数（编码器采样率下）：输入经重采样后样本数可能不同
-    let out_samples = sink.output_samples();
-    let out_duration = sink.output_duration()?;
     sink.finish()?;
-    println!(
-        "输出侧：{out_samples} samples / {:.3}s（编码器采样率下）",
-        out_duration.as_secs_f64()
-    );
-
     let recorded_secs = recorded_samples as f64 / rate as f64;
     let size = std::fs::metadata(&output)?.len();
     println!(

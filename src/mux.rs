@@ -1,3 +1,45 @@
+//! Read and write media containers — no codec knowledge required.
+//!
+//! [`Muxer`] writes packets or frames into an output container;
+//! [`Demuxer`] reads every stream of an input container back out. Both speak
+//! the same [`Location`] abstraction as the rest of
+//! the crate, so a path and a URL are interchangeable.
+//!
+//! # Muxer: two kinds of output stream
+//!
+//! | Registered with | Fed with | Result |
+//! |---|---|---|
+//! | [`add_encoder`](Muxer::add_encoder) | [`mux`](Muxer::mux) (frames) | re-encoded; the muxer **owns** the encoder |
+//! | [`add_copy_stream`](Muxer::add_copy_stream) | [`mux_packet`](Muxer::mux_packet) (packets) | bit-exact copy, no decode/encode |
+//!
+//! A transcode therefore registers encoders and pushes frames; a remux
+//! registers copy streams and pushes packets. Mixing them (a frame into a copy
+//! stream, a packet into an encoder stream) is an [`InvalidConfig`] error.
+//!
+//! Timestamps are rescaled into each output stream's time base on write, and
+//! packets are interleaved by the container unless
+//! [`set_interleaved(false)`](Muxer::set_interleaved) opts out.
+//!
+//! # Demuxer
+//!
+//! [`demux`](Demuxer::demux) yields `(stream_index, AVFrame)` pairs — it decodes
+//! every stream through the decoders [`Demuxer::new`](Demuxer::new) builds for
+//! it; [`demux_packet`](Demuxer::demux_packet) hands out raw packets for
+//! remuxing; [`new_passthrough`](Demuxer::new_passthrough) skips decoding
+//! entirely.
+//!
+//! # Finishing
+//!
+//! Always call [`finish`](Muxer::finish) and propagate its error: it flushes
+//! the encoders' delay buffers and writes the trailer. Forgetting it is not
+//! fatal — [`Drop`] writes the trailer as a fallback — but the failure is then
+//! only visible in the logs. [`into_writer`](Muxer::into_writer) likewise
+//! finishes before handing the writer back.
+//!
+//! A muxer is [`Send`] but **not** [`Sync`] — one muxer, one thread.
+//!
+//! [`InvalidConfig`]: crate::RsmediaError::InvalidConfig
+
 use crate::bsf::Bsf;
 use crate::decode::{Decoder, DecoderBuilder};
 use crate::encode::{Encoder, EncoderBuilder};
@@ -107,7 +149,7 @@ pub struct Muxer<W: Writer> {
     have_written_trailer: bool,
 }
 
-/// 见 [`Muxer::resources`]。
+/// [`Muxer`] 的全部 FFmpeg 资源与用户数据（见 [`Muxer::resources`] 字段的说明）。
 #[derive(Default)]
 struct MuxerResources {
     streams: Vec<MuxerStream>,
@@ -181,7 +223,10 @@ impl MuxerStream {
 
 impl Muxer<StreamWriter> {
     pub fn new(destination: impl Into<Location>) -> Result<Self> {
-        Self::new_with_options(destination, None)
+        let writer = crate::io::StreamWriterBuilder::new(destination)
+            .build()
+            .context("Failed to open output")?;
+        Ok(Self::new_from_writer(writer))
     }
 
     /// 打开输出并透传 **muxer 选项**（`movflags`、`frag_keyframe`、
@@ -204,10 +249,7 @@ impl Muxer<StreamWriter> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_with_options(
-        destination: impl Into<Location>,
-        options: impl Into<Option<Options>>,
-    ) -> Result<Self> {
+    pub fn new_with_options(destination: impl Into<Location>, options: Options) -> Result<Self> {
         let writer = crate::io::StreamWriterBuilder::new(destination)
             .with_options(options)
             .build()
@@ -261,10 +303,7 @@ impl Muxer<StreamWriter> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_segmented(
-        pattern: impl Into<Location>,
-        options: impl Into<Option<Options>>,
-    ) -> Result<Self> {
+    pub fn new_segmented(pattern: impl Into<Location>, options: Options) -> Result<Self> {
         let writer = crate::io::StreamWriterBuilder::new(pattern)
             .with_format("segment")
             .with_options(options)
@@ -376,6 +415,13 @@ impl<W: Writer> Muxer<W> {
         }
     }
 
+    /// 添加一个**编码流**：`encoder` 的所有权移交给 muxer（帧经
+    /// [`Self::mux`] 送入，[`Self::finish`] flush 其延迟缓冲）。
+    ///
+    /// 返回输出流的 index，后续 [`Self::mux`] / [`Self::set_stream_metadata`]
+    /// 都以它指代这条流。所有流都必须在 header 写出前注册——header 在首个
+    /// `mux`/`mux_packet` 时惰性写出，之后再加流返回 `InvalidConfig`（底层
+    /// `AVFormatContext` 的流数组已固定，越界索引会 SIGSEGV）。
     pub fn add_encoder(&mut self, encoder: Encoder) -> Result<usize> {
         self.ensure_streams_open()?;
         let stream_idx = self
@@ -805,7 +851,6 @@ impl<W: Writer> Muxer<W> {
         // 1) 逐章分配节点。用 Rust Vec 暂存所有权，以便失败时统一释放。
         let mut chapter_nodes: Vec<*mut ffi::AVChapter> = Vec::with_capacity(count);
         for (i, chapter) in self.resources.chapters.iter().enumerate() {
-            // Millisecond time base: times are stored as whole milliseconds.
             let start_ms = (chapter.start * 1000.0).round() as i64;
             let end_ms = (chapter.end * 1000.0).round() as i64;
             let chapter_ptr = unsafe {
@@ -982,9 +1027,11 @@ impl<W: Writer> Muxer<W> {
     /// Mux a single frame through an encoder stream.
     ///
     /// 只适用于通过 [`Self::add_encoder`] 添加的编码流；若目标是透传流
-    /// （[`Self::add_copy_stream`]），应改用 [`Self::mux_packet`]。
+    /// （[`Self::add_copy_stream`]），应改用 [`Self::mux_packet`]。拿透传流
+    /// 调用会返回 `InvalidConfig`，且不会写出 header。
     ///
-    /// # Arguments
+    /// 帧的 `time_base` 有效时 pts 按它解释，否则按编码器时间基解释；两者都
+    /// 会在写出前换算到输出流的（header 之后的）时间基。
     ///
     /// 产出的字节留在 writer 里，由调用方取（缓冲型 writer 见
     /// [`BufferWriter::take_written`](crate::io::BufferWriter::take_written) 与
@@ -1094,7 +1141,6 @@ impl<W: Writer> Muxer<W> {
         let enc_time_base = encoder.time_base();
         let packets = encoder.encode_subtitle_segment(segment)?;
 
-        // 字幕段通常是 0/1 个 packet。
         for mut packet in packets {
             // 与 `mux` 一致：归一化在写包前应用（字幕包的 pts/dts 在编码器的
             // 1/1000 时间基里），基准与音视频流共享，不破坏同步。
@@ -1111,7 +1157,8 @@ impl<W: Writer> Muxer<W> {
         Ok(())
     }
 
-    /// Mux a raw (decoded_source / remux) packet through a **copy stream**.
+    /// Mux a raw packet through a **copy stream** (remux: no decode, no
+    /// re-encode).
     ///
     /// 用于 remux（转封装）：直接把 demuxer 读到的原始 `AVPacket` 写入输出
     /// 容器，不解码、不重编码。pts/dts 从源流时间基（`add_copy_stream` 记录）
@@ -1222,8 +1269,15 @@ impl<W: Writer> Muxer<W> {
         Ok(())
     }
 
-    /// Signal to the muxer that writing has finished. This will cause a trailer to be written if
-    /// the container format has one.
+    /// Signal to the muxer that writing has finished: drains every encoder's
+    /// delay buffer and each copy stream's bitstream filter, then writes the
+    /// trailer if the container format has one.
+    ///
+    /// **Always call this and propagate its error** — it is where buffered
+    /// packets and the trailer actually reach the output. It is idempotent (a
+    /// second call is a no-op) and a no-op when nothing was ever muxed.
+    /// Skipping it is not fatal — [`Drop`] writes the trailer as a fallback —
+    /// but the failure is then only visible in the logs.
     pub fn finish(&mut self) -> Result<()> {
         // 从未 mux 过任何数据（header 也尚未写入）：没有实际内容需要 flush，
         // 直接空操作返回，不产生"无头"的残缺输出。
@@ -1372,8 +1426,57 @@ pub struct Demuxer<R: Reader> {
 }
 
 impl Demuxer<StreamReader> {
+    /// Opens `source` and builds a decoder for every stream that has one
+    /// (decode mode: [`demux`](Self::demux) then yields frames).
+    ///
+    /// The container format is detected from the content; streams with no
+    /// decoder in this FFmpeg build (chapter tracks, attached pictures, ...)
+    /// are skipped instead of failing the whole demuxer. For raw packets
+    /// instead of frames use [`new_passthrough`](Self::new_passthrough). To
+    /// pass protocol or demuxer options — `rtsp_transport`, `reconnect`,
+    /// `user_agent`, … — use
+    /// [`new_with_options`](Self::new_with_options), which is the read-side
+    /// counterpart of [`Muxer::new_with_options`].
     pub fn new(source: impl Into<Location>) -> Result<Self> {
         let reader = StreamReader::new(source)?;
+        Self::new_from_reader(reader, None, None)
+    }
+
+    /// Opens `source` with the given protocol / demuxer options.
+    ///
+    /// This is the read-side counterpart of [`Muxer::new_with_options`]: those
+    /// options are handed to `avformat_open_input`, so they configure the
+    /// **protocol layer** (how the bytes are fetched) and the demuxer — not the
+    /// decoder. Decoder-private AVOptions belong to
+    /// [`DecoderBuilder::with_options`](crate::DecoderBuilder::with_options).
+    ///
+    /// `options` are also visible to the FFmpeg protocol layer first, which is
+    /// what makes transport-level keys such as `rtsp_transport=tcp` work.
+    ///
+    /// ```no_run
+    /// use rsmedia::options::Options;
+    /// use rsmedia::{Demuxer, Reader};
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// let mut options = Options::new();
+    /// options.set("rtsp_transport", "tcp");
+    /// options.set("stimeout", "5000000");
+    ///
+    /// let mut demuxer = Demuxer::new_with_options("rtsp://cam.local/stream", options)?;
+    /// println!("{} stream(s)", demuxer.streams().len());
+    /// # let _ = demuxer.reader.read_packet();
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Options that no layer claims are silently ignored by FFmpeg; the writer
+    /// reports the leftovers when the container header is written (see
+    /// [`StreamReaderBuilder::with_options`](crate::io::StreamReaderBuilder::with_options)).
+    pub fn new_with_options(source: impl Into<Location>, options: Options) -> Result<Self> {
+        let reader = crate::io::StreamReaderBuilder::new(source)
+            .with_options(options)
+            .build()
+            .context("Failed to open input")?;
         Self::new_from_reader(reader, None, None)
     }
 }
@@ -1410,12 +1513,14 @@ impl<R: Reader> Demuxer<R> {
                 stream_info.codec_id, stream_info.index
             )));
         };
-        match DecoderBuilder::new(media_type)
-            .with_codec_name(codec_name.clone())
-            .with_hardware_device(device_config.clone())
-            .with_filters(filters.get(&media_type).cloned())
-            .build_from_reader(reader)
-        {
+        let mut builder = DecoderBuilder::new(media_type).with_codec_name(codec_name.clone());
+        if let Some(cfg) = &device_config {
+            builder = builder.with_hardware_device(cfg.clone());
+        }
+        if let Some(chain) = filters.get(&media_type) {
+            builder = builder.with_filters(chain.clone());
+        }
+        match builder.build_from_reader(reader) {
             Ok(decoder) => Ok(decoder),
             Err(e) if device_type.is_some() => {
                 // 硬件解码器构建失败（如 hw 初始化失败）：回退软件解码器重试，
@@ -1427,9 +1532,11 @@ impl<R: Reader> Demuxer<R> {
                 let software_name = stream_info
                     .find_decoder_name(None)
                     .unwrap_or_else(|| codec_name.clone());
-                DecoderBuilder::new(media_type)
-                    .with_codec_name(software_name)
-                    .with_filters(filters.get(&media_type).cloned())
+                let mut fallback = DecoderBuilder::new(media_type).with_codec_name(software_name);
+                if let Some(chain) = filters.get(&media_type) {
+                    fallback = fallback.with_filters(chain.clone());
+                }
+                fallback
                     .build_from_reader(reader)
                     .context("Failed to build decoder (hw and software both failed)")
             }
@@ -1457,7 +1564,6 @@ impl<R: Reader> Demuxer<R> {
         let mut streams = Vec::new();
         for stream_idx in 0..nb_streams {
             let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
-            // auto detect hardware acceleration decoder codec
             let device_type = device_config.as_ref().map(|c| c.device_type);
             if stream_info.find_decoder_name(device_type).is_none() {
                 // Streams without a registered decoder (chapter tracks,
@@ -1484,10 +1590,8 @@ impl<R: Reader> Demuxer<R> {
     /// 在迭代时丢弃。适合"只抽视频帧/只取音频"的单流场景。
     ///
     /// "最佳"取自 FFmpeg 的 `av_find_best_stream`（与
-    /// `Reader::find_best_stream` 同一判据），
-    /// 找不到该类型的流时返回错误。早先这里取的是"该类型的第一个流"，而容器里的
-    /// 流顺序并不保证最佳流排在最前——`Demuxer::new` 走 `find_best_stream`，
-    /// 两者因此可能选中不同的流。
+    /// `Reader::find_best_stream` 同一判据）——容器里的流顺序并不保证最佳流
+    /// 排在最前，取"该类型的第一个流"可能选错流；找不到该类型的流时返回错误。
     pub fn new_single_stream(
         reader: R,
         media_type: MediaType,
@@ -1684,6 +1788,16 @@ impl<R: Reader> Demuxer<R> {
         })
     }
 
+    /// 读取下一个**解码后的帧**：`(stream_index, AVFrame)`。
+    ///
+    /// 只覆盖构建时选中的流（[`new`](Self::new) = 全部可解码流，
+    /// [`new_single_stream`](Self::new_single_stream) = 单条最佳流），其余流
+    /// 的 packet 被静默丢弃。输入读完后先排空各解码器（含滤镜图）才返回
+    /// `Ok(None)`：提前停止迭代会丢掉解码器里还压着的帧。
+    ///
+    /// 透传模式（[`new_passthrough`](Self::new_passthrough)）没有解码器，本
+    /// 方法返回 `InvalidConfig`，应改用
+    /// [`demux_packet`](Self::demux_packet)。
     pub fn demux(&mut self) -> Result<Option<(usize, AVFrame)>> {
         if self.is_passthrough() {
             return Err(RsmediaError::invalid_config(
@@ -1724,7 +1838,7 @@ impl<R: Reader> Demuxer<R> {
             } else {
                 // 排空阶段：反复 drain 每个尚未结束的解码器，而不是"每轮一次"。
                 //
-                // 两个要点（旧实现两处都做错了）：
+                // 两个要点：
                 // 1. `drain_raw` 返回 `Ok(None)` 在 Drained 态只表示"这一拍没帧"
                 //    （EAGAIN —— 多线程解码、B 帧 lookahead 都会出现），**不是**
                 //    结束信号。据此结束本次 `demux()`，`Iterator::next` 会把
@@ -1825,6 +1939,33 @@ mod tests {
 
     use rsmpeg::avutil::{AVChannelLayout, AVFrame};
     use std::path::Path;
+
+    /// `new_with_options` 必须与 `new` 看到同样的流——它是"带协议选项的 new"，
+    /// 不是另一种打开方式。（读写对称：写出侧早有 `Muxer::new_with_options`。）
+    #[test]
+    fn test_demuxer_new_with_options_matches_new() -> Result<()> {
+        let plain = Demuxer::new("assets/mp4.mp4")?;
+        let plain_streams = plain.streams().len();
+        assert!(plain_streams > 0, "fixture must expose at least one stream");
+
+        let mut options = Options::new();
+        options.set("fflags", "discardcorrupt"); // a real libavformat option
+        let with_options = Demuxer::new_with_options("assets/mp4.mp4", options)?;
+        assert_eq!(
+            plain_streams,
+            with_options.streams().len(),
+            "options must not change which streams are found"
+        );
+
+        // 空选项等价于 `new`，且仍能正常解包。
+        let mut empty = Demuxer::new_with_options("assets/mp4.mp4", Options::new())?;
+        assert_eq!(empty.streams().len(), plain_streams);
+        assert!(
+            empty.reader.read_packet()?.is_some(),
+            "a demuxer built with options must still read packets"
+        );
+        Ok(())
+    }
 
     /// 生成YUV420P格式的视频帧,彩色渐变测试图
     fn generate_video_frame(width: u32, height: u32, frame_index: i64) -> AVFrame {
@@ -2317,23 +2458,9 @@ mod tests {
             );
             muxer.mux(video_frame, video_idx)?;
 
-            // 视频和音频帧不一对一写入,为什么需要这样计算？
-            // 1. 不同的时间基准 ：
-            // - 视频以帧率计算（如30fps）
-            // - 音频以采样率计算（如48000Hz）
-            // 2. 不同的编码要求 ：
-            // - AAC音频编码器要求固定的帧大小（通常是1024个样本）
-            // - 视频编码器（如H.264）有不同的帧大小要求
-            // 3. 同步需求 ：
-            // - 为了保持音视频同步，需要确保每个视频帧对应的音频数据都被正确编码
-            //
-            // 向上取整除法，计算需要生成的音频帧数
-            // 在音频处理中，我们需要知道多少个固定大小的帧能容纳所有样本。如果不向上取整，可能会丢失部分音频数据。
-            // 例如，对于1600个样本和1024大小的帧：
-            // - 1600 / 1024 = 1.56... ≈ 1（向下取整）
-            // - 但1个帧只能容纳1024个样本，剩余576个样本会被丢弃
-            // - 使用向上取整：(1600 + 1024 - 1) / 1024 = 2，确保所有样本都被处理
-            // 这就是为什么在计算音频帧数时使用这个向上取整除法公式的原因
+            // 视频与音频帧不一对一：音频编码器要求固定帧大小（AAC 1024 样本），
+            // 而一个视频帧间隔覆盖的样本数通常不是整数倍，故用向上取整除法算出
+            // 需要补几个音频帧——向下取整会丢掉余下的样本。
             let audio_frames_needed =
                 (audio_samples_per_video_frame as u32).div_ceil(SAMPLES_PER_FRAME);
             for _ in 0..audio_frames_needed {

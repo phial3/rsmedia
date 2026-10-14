@@ -10,11 +10,10 @@ use rsmpeg::swresample::SwrContext;
 ////////////////////////////// Audio Resampler SwrContext /////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// 一组音频格式参数：声道布局 + 采样格式 + 采样率。
+/// 一组音频格式参数：声道布局 + 采样格式 + 采样率，即 `swr_*` 参数的镜像层。
 ///
-/// 这三样在重采样里总是一起出现（输入侧一份、输出侧一份），打包传递有两个好处：
-/// 像 [`SwrContext::new`] 那样 6 个位置参数的调用不会再被写反，各处也不必反复罗列
-/// "布局/格式/采样率"三个字段。
+/// 布局/格式/采样率三者总是一起出现（输入侧一份、输出侧一份），打包传递后
+/// [`SwrContext::new`] 那样 6 个位置参数不再会被写反。
 ///
 /// `pub(crate)`：对外的 [`Resampler::new`] 与 [`convert_frame`] 保留 FFI 镜像签名
 /// （裸 `ffi::AVChannelLayout` / `ffi::AVSampleFormat` / `i32`），在模块边界上转换 ——
@@ -61,6 +60,7 @@ impl AudioSpec {
         }
     }
 
+    /// 归一化后的声道数（UNSPEC 布局按 `nb_channels` 取默认布局后的结果）。
     fn nb_channels(self) -> i32 {
         self.ch_layout.nb_channels
     }
@@ -109,6 +109,9 @@ fn setup_resampler(in_spec: AudioSpec, out_spec: AudioSpec) -> Result<SwrContext
 }
 
 /// 校验重采样输入帧：不支持硬件帧，且采样率/样本数必须有效。
+///
+/// 硬件帧与退化帧都是**调用方喂进来的坏数据**（FFmpeg 自己不会造出来），故走
+/// [`RsmediaError::Unsupported`] / [`RsmediaError::Other`] 而不是让 `swr` 拿到非法输入。
 fn check_resampler_input(src_frame: &AVFrame) -> Result<()> {
     if !src_frame.hw_frames_ctx.is_null() {
         return Err(RsmediaError::unsupported(
@@ -167,28 +170,25 @@ fn with_normalized_layout<R>(
 
 /// Resamples one frame into a new frame, in one call.
 ///
-/// The context is created fresh for this call, so this is for isolated
-/// conversions; a stream should use [`Resampler`] instead, whose delay buffers
-/// carry samples across calls (and whose [`flush`](Resampler::flush) drains the
-/// tail).
+/// The context is created fresh for this call, so this is for isolated conversions; a stream
+/// should use [`Resampler`] instead, whose delay buffers carry samples across calls (and whose
+/// [`flush`](Resampler::flush) drains the tail).
 ///
-/// The output is allocated at the *upper bound* of what the conversion can
-/// produce, so `dst.nb_samples` after the call is the real count. Metadata is
-/// copied from the source frame (pts included), and the result's time base is
-/// `1 / out_sample_rate`.
+/// The output is allocated at the *upper bound* of what the conversion can produce, so
+/// `dst.nb_samples` after the call is the real count. Metadata is copied from the source frame
+/// (pts included), and the result's time base is `1 / out_sample_rate`.
 ///
-/// # Arguments
+/// `src_frame` must be a software frame with a valid sample rate and at least one sample;
+/// `out_*` are the raw `ffi` layout/format/rate types, mirroring `SwrContext`'s own signatures.
+/// An unspecified (`AV_CHANNEL_ORDER_UNSPEC`) output layout is normalised to the default layout
+/// for its channel count.
 ///
-/// * `src_frame` - Decoded frame to convert; must be a software frame with a
-///   valid sample rate and at least one sample.
-/// * `out_ch_layout` - Channel layout of the output.
-/// * `out_sample_fmt` - Sample format of the output.
-/// * `out_sample_rate` - Sample rate of the output.
+/// This is an FFI-level entry point; the high-level audio path goes through [`Resampler`].
 ///
-/// This is an FFI-level entry point — it takes a bare `AVFrame` plus
-/// `ffi::AVChannelLayout` / `ffi::AVSampleFormat` and `i32` rates, mirroring
-/// `SwrContext`'s own signatures. The high-level audio path uses
-/// `MediaFrame`'s `u32` sample rate and converts at this boundary.
+/// # Errors
+///
+/// [`RsmediaError::Unsupported`] for a hardware frame, [`RsmediaError::Other`] for a frame with
+/// no sample rate or no samples, plus whatever context creation or the conversion itself reports.
 pub fn convert_frame(
     src_frame: &AVFrame,
     out_ch_layout: ffi::AVChannelLayout,
@@ -215,15 +215,12 @@ fn convert_with(
     out_spec: AudioSpec,
 ) -> Result<AVFrame> {
     let mut dst_frame = AVFrame::new();
-    // copy props
     imgutils::copy_frame_metadata(src_frame, &mut dst_frame, false)?;
     dst_frame.set_format(out_spec.sample_fmt);
     dst_frame.set_ch_layout(out_spec.ch_layout);
-    // 输出帧的缓冲必须按重采样后的输出样本数分配，而不是简单地使用输入样本数。
-    // 当输入/输出采样率不同时，swr_convert() 会写入比输入样本数更多的输出样本，
-    // 但 FFmpeg 不会自动扩大已分配的输出缓冲（只把放不下的部分存入内部 FIFO），
-    // 若这里 nb_samples 设得过小，将导致 swr_convert 越界写。
-    // 用 swr_get_out_samples() 得到所需输出样本数的上界来分配缓冲。
+    // 输出缓冲必须按**重采样后的**样本数上界分配，不能沿用输入样本数：采样率不同时
+    // `swr_convert` 写出的样本多于输入，而 FFmpeg 不会替已分配的缓冲扩容（放不下的部分
+    // 存进内部 FIFO），nb_samples 给小了就是越界写。用 `swr_get_out_samples()` 的上界分配。
     let out_samples = resampler.get_out_samples(src_frame.nb_samples).max(1);
     dst_frame.set_nb_samples(out_samples);
     dst_frame.set_sample_rate(out_spec.sample_rate);
@@ -236,11 +233,6 @@ fn convert_with(
         .alloc_buffer()
         .context("Failed to allocate destination frame buffer")?;
 
-    // 转换输入 AVFrame 中的样本并将其写入输出 AVFrame。
-    // 输入和输出 AVFrame 必须设置通道布局、采样率和格式。
-    // 如果输出 AVFrame 没有分配数据指针，则将在调用 av_frame_get_buffer() 分配帧时设置 nb_samples 字段。
-    // 输出的 AVFrame 可以是 NULL，或者分配的样本少于所需的数量。在这种情况下，未写入输出的剩余样本将被添加到内部 FIFO 缓冲区，在下次调用此函数时返回。
-    // 如果转换采样率，内部重采样延迟缓冲区中可能会有剩余数据。要以输出方式获取这些数据，请调用此函数，并输入 NULL。
     resampler
         .convert_frame(src_frame, &mut dst_frame)
         .context("Failed to convert frame.")?;
@@ -274,18 +266,17 @@ fn is_spec_change_error(err: &RsmediaError) -> bool {
 /// 把一帧重采样到目标格式；**已经是目标格式、或者是空帧就原样返回**。
 ///
 /// 解码与编码三处共用这一条路径，是音频侧对应 [`Scaler::scale_if_needed`] 的入口。
-/// 其中「目标 == 现状」是最常见的：解码输出与「进滤镜图前」的目标布局/采样率就是帧自己的，
-/// 只有采样格式是配置决定的目标值，因此目标与现状是否一致只在这里判一次，调用方不必各写
-/// 一遍。空帧（`nb_samples < 1`）一并放行：`swr` 无从转换它，[`check_resampler_input`]
-/// 也会拒绝，而调用方要的显然是"把这一帧接着往下送"。
+/// 「目标 == 现状」是最常见的情况：解码输出与「进滤镜图前」的目标布局/采样率就是帧自己的，
+/// 只有采样格式是配置决定的目标值，所以目标是否等于现状只在这里判一次。空帧
+/// （`nb_samples < 1`）一并放行：`swr` 无从转换它，[`check_resampler_input`] 也会拒绝，
+/// 而调用方要的显然是"把这一帧接着往下送"。
 ///
 /// 需要转换时才建立（或复用）上下文 —— **输入格式要到第一帧才知道**，调用方手上只有目标
-/// 格式，而建上下文输入输出两侧都得给全，所以 `slot` 是 [`Option`]`<Resampler>`：`None`
-/// 表示"还没有帧决定过输入格式"。已经有一个、但输出格式与本次不同时按本次的格式重建
-/// （解码与「进滤镜图前」的输出布局/采样率取自帧本身，帧一变输出侧就跟着变）；输入格式的
-/// 变化不在这里比较，交给 FFmpeg 报告（`AVERROR_INPUT_CHANGED` /
-/// `AVERROR_OUTPUT_CHANGED`）—— 它能看出我们比不出来的情况，例如 UNSPEC 布局按声道数
-/// 补出的默认布局与显式布局之间的差别。
+/// 格式，故 `slot` 是 [`Option`]`<Resampler>`，`None` 表示"还没有帧决定过输入格式"。
+/// 已有的上下文输出格式与本次不同时按本次重建（解码与「进滤镜图前」的输出布局/采样率取自
+/// 帧本身，帧一变输出侧就跟着变）；**输入格式的变化不在这里比较**，交给 FFmpeg 报告
+/// （`AVERROR_INPUT_CHANGED` / `AVERROR_OUTPUT_CHANGED`）—— 它能看出我们比不出来的情况，
+/// 例如 UNSPEC 布局按声道数补出的默认布局与显式布局之间的差别。
 ///
 /// # Errors
 ///
@@ -316,14 +307,13 @@ pub(crate) fn resample_if_needed(
 
 /// Persistent streaming resampler.
 ///
-/// Unlike [`convert_frame`] (which creates a temporary context on each call),
-/// `Resampler` holds a reusable `SwrContext` for continuous streaming input:
-/// when resampling (different input/output sample rates), the internal filter
-/// delay buffers samples between calls and outputs them with subsequent data;
-/// at the end, [`Resampler::flush_frames`] must be called to drain the tail,
-/// otherwise the last few milliseconds of samples will be lost. A context whose
-/// output sample rate equals its input rate does no resampling and keeps no
-/// delay, so draining one that only converts the sample format is a no-op.
+/// Unlike [`convert_frame`] (which creates a temporary context on each call), `Resampler`
+/// holds a reusable `SwrContext` for continuous streaming input: when resampling (different
+/// input/output sample rates), the internal filter delay buffers samples between calls and
+/// outputs them with subsequent data; at the end, [`Resampler::flush_frames`] must be called
+/// to drain the tail, otherwise the last few milliseconds of samples will be lost. A context
+/// whose output sample rate equals its input rate does no resampling and keeps no delay, so
+/// draining one that only converts the sample format is a no-op.
 ///
 /// Three ways to drive it, in increasing order of how much the caller has to arrange:
 ///
@@ -340,6 +330,9 @@ pub(crate) fn resample_if_needed(
 ///
 /// A frame that no longer matches the context is absorbed by rebuilding it — see
 /// [`Resampler::convert_frame_owned`].
+///
+/// Not `Sync`: the context is driven through a raw pointer, so a `Resampler` stays on one
+/// thread, next to the pipeline that owns it.
 pub struct Resampler {
     swr: SwrContext,
     /// 上下文构建时用的**输出格式**（声道布局已归一化）。

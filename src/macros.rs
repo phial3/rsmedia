@@ -750,8 +750,8 @@ macro_rules! impl_codec_builder_setters {
         /// [`Self::with_thread_count`]/[`Self::with_flags`]/[`Self::with_flags2`]/
         /// [`Self::with_thread_type`]）；编码器另有 `b`/`maxrate`/`bufsize`/`crf`/
         /// `profile`/`level`/`g`/`bf`，解码器另有 `skip_frame`/`err_detect`。
-        pub fn with_options(mut self, options: impl Into<Option<Options>>) -> Self {
-            self.codec_opts = options.into();
+        pub fn with_options(mut self, options: Options) -> Self {
+            self.codec_opts = Some(options);
             self
         }
 
@@ -759,22 +759,17 @@ macro_rules! impl_codec_builder_setters {
         ///
         /// 解码器：作用于**解码后**的帧（缩放/叠加/去噪…），滤镜输出即
         /// [`decode`](crate::Decoder::decode) 交付的帧。编码器：作用于**编码前**的帧。
-        pub fn with_filters(mut self, filters: impl Into<Option<Vec<Filter>>>) -> Self {
-            self.filters = filters.into();
+        pub fn with_filters(mut self, filters: Vec<Filter>) -> Self {
+            self.filters = Some(filters);
             self
         }
 
         /// Enable hardware acceleration with the specified device type.
         ///
-        /// * `device_config` - Device to use for hardware acceleration. Accepts a
-        ///   [`HWDeviceConfig`] directly, or `None` to decode/encode on the CPU —
-        ///   the same `impl Into<Option<_>>` shape [`Self::with_options`] uses, so
-        ///   a device chosen at runtime needs no `Some(...)` wrapper.
-        pub fn with_hardware_device(
-            mut self,
-            device_config: impl Into<Option<HWDeviceConfig>>,
-        ) -> Self {
-            self.hw_device_config = device_config.into();
+        /// * `device_config` - Device to use for hardware acceleration; to stay on
+        ///   the CPU, simply skip this setter.
+        pub fn with_hardware_device(mut self, device_config: HWDeviceConfig) -> Self {
+            self.hw_device_config = Some(device_config);
             self
         }
 
@@ -794,7 +789,7 @@ macro_rules! impl_codec_builder_setters {
         /// # fn main() -> rsmedia::Result<()> {
         /// let config = HWDeviceConfig::auto_platform()?;
         /// let encoder = EncoderBuilder::new_video(3840, 2160)
-        ///     .with_hardware_device(Some(config))
+        ///     .with_hardware_device(config)
         ///     .with_hw_pool_size(4) // 4K 下只预占约 48MB 显存
         ///     .build()?;
         /// # drop(encoder);
