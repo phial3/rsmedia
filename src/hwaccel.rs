@@ -1,6 +1,6 @@
 use crate::error::{Context, Result, RsmediaError};
 use crate::pixel::PixelFormat;
-use crate::{Options, imgutils, strutils};
+use crate::{AVOptions, imgutils, strutils};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -25,7 +25,7 @@ pub struct HWDeviceConfig {
     pub hw_pixel_format: PixelFormat,
     pub sw_pixel_format: PixelFormat,
     pub device_id: Option<String>,
-    pub options: Option<Options>,
+    pub options: Option<AVOptions>,
 }
 
 impl HWDeviceConfig {
@@ -76,7 +76,7 @@ impl HWDeviceConfig {
     }
 
     /// 打开设备时的附加（设备类型相关）选项。
-    pub fn with_options(mut self, options: Options) -> Self {
+    pub fn with_options(mut self, options: AVOptions) -> Self {
         self.options = Some(options);
         self
     }

@@ -52,6 +52,7 @@
 //! ```
 
 use crate::error::{Context, Result, RsmediaError};
+use crate::options::AVOptions;
 use crate::time::Rational;
 
 use rsmpeg::avcodec::{
@@ -94,7 +95,30 @@ impl Bsf {
     /// * `name` - filter 名（如 `h264_mp4toannexb`，完整列表见 [`Bsf::list`]）
     /// * `codecpar` - 输入流的 codec 参数（决定 filter 是否适用该 codec）
     /// * `time_base` - 输入包的时间基（写入 `AVBSFContext.time_base_in`）
+    ///
+    /// 需要给 filter 传私有选项时（`h264_metadata`、`hevc_metadata`、`setts`
+    /// 这类 filter 的全部行为都由选项描述）改用 [`Self::new_with_options`]。
     pub fn new(name: &str, codecpar: &AVCodecParameters, time_base: Rational) -> Result<Self> {
+        Self::new_with_options(name, codecpar, time_base, AVOptions::new())
+    }
+
+    /// [`Self::new`] 的带私有选项版本。
+    ///
+    /// `options` 是 **filter 自己的 AVOption**，写进 `AVBSFContext.priv_data`；
+    /// 必须在 `av_bsf_init` 之前设置，`init` 之后上下文即冻结。这是让
+    /// `h264_metadata` / `hevc_metadata` / `setts` 这类 filter 真正可用的唯一入口 ——
+    /// 它们没有任何无选项的默认行为，能创建而不能配置等于不可用。
+    ///
+    /// 认不出的键**不会**被静默丢弃：FFmpeg 的 `av_opt_set_dict` 只消费认得的键，
+    /// 其余的留在字典里；此处据此返回 [`RsmediaError::InvalidConfig`]，消息里点出
+    /// 全部未生效的键名（传错键名是这类 API 最常见的错误，静默忽略会让用户以为
+    /// 配置已生效）。
+    pub fn new_with_options(
+        name: &str,
+        codecpar: &AVCodecParameters,
+        time_base: Rational,
+        options: AVOptions,
+    ) -> Result<Self> {
         let name_c = CString::new(name).context(format!("bsf name {name:?}"))?;
         let filter = AVBitStreamFilter::find_by_name(&name_c).ok_or_else(|| {
             RsmediaError::unsupported(format!(
@@ -104,11 +128,55 @@ impl Bsf {
         let mut ctx = AVBSFContextUninit::new(&filter);
         ctx.set_par_in(codecpar);
         ctx.set_time_base_in(time_base.into());
+        Self::apply_private_options(&mut ctx, name, options)?;
         let inner = ctx.init()?;
         Ok(Self {
             inner,
             flushed: false,
         })
+    }
+
+    /// 把 filter 的私有选项写进 `AVBSFContext.priv_data`。
+    ///
+    /// 必须在 `av_bsf_init` 之前调用：init 会把上下文冻结，之后再写 `priv_data`
+    /// 不会重新配置 filter。
+    fn apply_private_options(
+        ctx: &mut AVBSFContextUninit,
+        name: &str,
+        options: AVOptions,
+    ) -> Result<()> {
+        if options.is_empty() {
+            return Ok(());
+        }
+        let Some(dict) = options.into_dict() else {
+            return Ok(());
+        };
+        let mut raw = dict.into_raw().as_ptr();
+
+        // SAFETY: `ctx` 由 `av_bsf_alloc` 创建，`priv_data` 是它拥有的可写上下文，
+        // 且此处仍在 `init` 之前（尚未冻结）；`raw` 是刚物化的合法字典。
+        let priv_data = unsafe { (*ctx.as_mut_ptr()).priv_data };
+        let ret = unsafe { ffi::av_opt_set_dict(priv_data, &mut raw) };
+
+        // `av_opt_set_dict` 只消费认得的键，剩下的留在 `raw` 里。无论成败都必须
+        // 释放，否则会留下一处只在"传错键名"时才出现的泄漏。
+        // SAFETY: `raw` 由 `into_raw` 转移而来，所有权归本函数。
+        let unmatched = unsafe { AVOptions::from_raw_dict(raw) };
+        // SAFETY: 同上，`raw` 仍是一个有效（可能为空的）字典。
+        unsafe { ffi::av_dict_free(&mut raw) };
+
+        if !unmatched.is_empty() {
+            let keys: Vec<&str> = unmatched.iter().map(|(key, _)| key.as_str()).collect();
+            return Err(RsmediaError::invalid_config(format!(
+                "bitstream filter '{name}' does not take option(s): {}",
+                keys.join(", ")
+            )));
+        }
+        if ret < 0 {
+            return Err(RsmediaError::av_error(ret)
+                .with_context(format!("Failed to configure bitstream filter '{name}'")));
+        }
+        Ok(())
     }
 
     /// 本 filter 的名字（如 `h264_mp4toannexb`）。
@@ -352,5 +420,37 @@ mod tests {
         assert!(err.is_unsupported(), "{err}");
         assert!(!err.is_invalid_config(), "{err}");
         assert!(err.to_string().contains("no_such_bsf"), "{err}");
+    }
+
+    /// filter 的私有选项必须在 `av_bsf_init` 之前写进 `priv_data` —— 否则
+    /// `h264_metadata` / `hevc_metadata` / `setts` 这类"行为完全由选项描述"的
+    /// filter 根本不可用（能创建、不能配置）。
+    #[test]
+    fn test_bsf_private_options_are_applied() {
+        let codecpar = AVCodecParameters::new();
+        let time_base = Rational::new(1, 30).unwrap();
+
+        // 认得的选项：正常创建。
+        let mut options = AVOptions::new();
+        options.set("ts", "0");
+        match Bsf::new_with_options("setts", &codecpar, time_base, options) {
+            Ok(bsf) => assert_eq!(bsf.name(), "setts"),
+            Err(e) if e.is_unsupported() => {
+                println!("SKIP: 'setts' is not in this FFmpeg build");
+                return;
+            }
+            Err(e) => panic!("a recognised option must not fail: {e}"),
+        }
+
+        // 认不得的选项：报 `InvalidConfig` 并点出键名，而不是静默丢掉。
+        let mut bad = AVOptions::new();
+        bad.set("definitely_not_an_option", "1");
+        let err = Bsf::new_with_options("setts", &codecpar, time_base, bad)
+            .expect_err("unknown private option must be rejected");
+        assert!(err.is_invalid_config(), "{err}");
+        assert!(
+            err.to_string().contains("definitely_not_an_option"),
+            "the error must name the offending option: {err}"
+        );
     }
 }

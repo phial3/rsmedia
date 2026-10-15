@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use rsmedia::Rational;
 use rsmedia::error::Context;
-use rsmedia::options::Options;
+use rsmedia::options::AVOptions;
 use rsmedia::strutils;
 use rsmedia::{
     CodecConfig, DecoderBuilder, EncoderBuilder, Filter, MediaFrame, MediaType, PixelFormat,
@@ -1323,7 +1323,7 @@ mod video {
         let pattern = common::test_output_path("encode_segments", "segment_%03d.mp4");
         let dir = pattern.parent().expect("pattern has a parent dir");
 
-        let mut options = Options::new();
+        let mut options = AVOptions::new();
         options.set("segment_time", "1");
         options.set("reset_timestamps", "1");
         let mut muxer =

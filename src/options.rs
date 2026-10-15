@@ -1,3 +1,72 @@
+//! Option dictionaries, and where FFmpeg consumes each one.
+//!
+//! [`AVOptions`] is a plain string key/value bag: it knows nothing about FFmpeg and
+//! validates nothing when you set a key. What a key *means* — and whether it means
+//! anything at all — is decided entirely by the FFmpeg object the dictionary is
+//! finally handed to. FFmpeg **silently ignores** keys that object does not declare,
+//! so a misspelled key, and equally a well-formed key that belongs to a *different*
+//! layer, does nothing and reports nothing.
+//!
+//! # Where a dictionary is consumed
+//!
+//! An `AVOptions` reaches FFmpeg through seven entry points. Choose the one whose
+//! **layer** matches the key you want to set:
+//!
+//! | rsmedia entry point | FFmpeg call | the keys configure |
+//! |---|---|---|
+//! | [`EncoderBuilder::with_options`] | `avcodec_open2` | the **video/audio encoder**'s private options (`preset`, `crf`, `x264-params`, `rc`, `profile`, …) |
+//! | [`DecoderBuilder::with_options`] | `avcodec_open2` | the **decoder**'s private options (`threads`, `skip_frame`, …) |
+//! | [`DecoderBuilder::with_input_options`] | `avformat_open_input` | the **input demuxer / capture device / protocol** options (`framerate`, `video_size`, `input_format`, …) |
+//! | [`StreamReaderBuilder::with_options`] and [`Demuxer::new_with_options`] | `avformat_open_input` (protocol layer first, then the demuxer) | **read-side** protocol + demuxer options (`rtsp_transport`, `timeout`, `user_agent`, `fflags`, …) |
+//! | [`StreamWriterBuilder::with_options`] and [`Muxer::new_with_options`] | `avio_open2`, then whatever is left at `avformat_write_header` | **write-side** protocol options first, then **muxer** private options (`movflags`, `flvflags`, `hls_time`, `segment_time`, …) |
+//! | [`Bsf::new_with_options`] | `av_opt_set_dict` on `AVBSFContext.priv_data` | **bitstream filter** options (`aud`, `ts`, `h264_metadata` parameters, …) |
+//! | [`HWDeviceConfig::with_options`] | `av_hwdevice_ctx_create` | **hardware device** options (device-type dependent) |
+//!
+//! The rule of thumb: **codec options go through a builder's `with_options`; container,
+//! protocol and device options go through a reader or writer** (`avformat_*` /
+//! `avio_*`). The two never mix — `preset` handed to a reader is ignored exactly as
+//! `movflags` handed to an encoder is.
+//!
+//! # Finding which key belongs to which layer
+//!
+//! FFmpeg lists each layer's keys through `ffmpeg -h`:
+//!
+//! ```text
+//! ffmpeg -h encoder=libx264      # encoder private options
+//! ffmpeg -h decoder=h264         # decoder private options
+//! ffmpeg -h muxer=flv            # muxer private options
+//! ffmpeg -h demuxer=rtsp         # demuxer private options
+//! ffmpeg -h protocol=tcp         # protocol options
+//! ffmpeg -h bsf=h264_metadata    # bitstream filter options
+//! ```
+//!
+//! A key that does not show up for the layer you are targeting will not take effect
+//! here either.
+//!
+//! # Presets
+//!
+//! The `preset_*` constructors are named after the layer they target.
+//! `preset_avformat_*` builds **container / protocol / muxer** options — hand those to
+//! a reader, a writer, a [`Muxer`] or a [`Demuxer`]. `preset_<codec>`, such as
+//! [`AVOptions::preset_h264`], builds **codec** options — hand those to an
+//! [`EncoderBuilder`].
+//!
+//! [`Metadata`] is not an option dictionary for any FFmpeg call: it is this same map
+//! type, used for the string metadata carried by frames, streams and containers.
+//!
+//! [`EncoderBuilder::with_options`]: crate::EncoderBuilder::with_options
+//! [`DecoderBuilder::with_options`]: crate::DecoderBuilder::with_options
+//! [`DecoderBuilder::with_input_options`]: crate::DecoderBuilder::with_input_options
+//! [`StreamReaderBuilder::with_options`]: crate::io::StreamReaderBuilder::with_options
+//! [`Demuxer::new_with_options`]: crate::Demuxer::new_with_options
+//! [`StreamWriterBuilder::with_options`]: crate::io::StreamWriterBuilder::with_options
+//! [`Muxer::new_with_options`]: crate::Muxer::new_with_options
+//! [`Bsf::new_with_options`]: crate::Bsf::new_with_options
+//! [`HWDeviceConfig::with_options`]: crate::HWDeviceConfig::with_options
+//! [`Muxer`]: crate::Muxer
+//! [`Demuxer`]: crate::Demuxer
+//! [`EncoderBuilder`]: crate::EncoderBuilder
+
 use crate::strutils;
 
 use rsmpeg::avutil::{AVDictionary, AVDictionaryRef};
@@ -8,16 +77,19 @@ use std::ptr::NonNull;
 
 /// A wrapper type for ffmpeg options.
 ///
+/// See the [module documentation](self) for the FFmpeg entry points a dictionary
+/// can be handed to and which keys belong to which layer.
+///
 /// Internally backed by a [`BTreeMap<String, String>`] (key-sorted, so the
 /// type derives a deterministic `Hash`) and lazily materialized into an
 /// [`AVDictionary`] at the FFI boundary
-/// ([`Options::into_dict`]/[`Options::to_dict`]).
+/// ([`AVOptions::into_dict`]/[`AVOptions::to_dict`]).
 ///
 /// This avoids a subtle defect of building AVDictionary directly: rsmpeg
 /// cannot represent an *empty* dictionary (FFmpeg uses a NULL pointer), so
 /// previous eager construction always carried a junk `key=""` entry that made
 /// libav log `Option '' not found` on every `open()`. With lazy
-/// materialization an empty `Options` converts to `None`.
+/// materialization an empty `AVOptions` converts to `None`.
 ///
 /// FFmpeg Documentation: <https://ffmpeg.org/doxygen/trunk/>
 ///
@@ -27,21 +99,22 @@ use std::ptr::NonNull;
 /// # Example
 ///
 /// ```ignore
-/// let mut opts = Options::new();
+/// let mut opts = AVOptions::new();
 /// opts.set("threads", "4");
-/// opts.merge(Options::preset_h264()); // preset keys win
+/// opts.merge(AVOptions::preset_h264()); // preset keys win
 /// ```
 #[derive(Clone, Default, Hash, PartialEq, Eq)]
-pub struct Options(BTreeMap<String, String>);
+pub struct AVOptions(BTreeMap<String, String>);
 
-/// Alias of [`Options`] for the string key/value metadata carried by media
+/// Alias of [`AVOptions`] for the string key/value metadata carried by media
 /// structures — `AVFrame.metadata`, container-level and per-stream metadata.
 ///
 /// Use it in field/parameter positions to express "this is a metadata map",
-/// reserving the [`Options`] name for encoder/muxer option sets.
-pub type Metadata = Options;
+/// reserving the [`AVOptions`] name for option dictionaries that are handed to
+/// FFmpeg (see the [module documentation](self) for where those go).
+pub type Metadata = AVOptions;
 
-impl Options {
+impl AVOptions {
     /// Creates an empty options set.
     pub fn new() -> Self {
         Self(BTreeMap::new())
@@ -86,7 +159,7 @@ impl Options {
 
     /// Merges `other` into `self`; entries from `other` win on conflicts
     /// (same overwrite semantics as `av_dict_copy` with flags 0).
-    pub fn merge(&mut self, other: Options) {
+    pub fn merge(&mut self, other: AVOptions) {
         self.0.extend(other.0);
     }
 
@@ -99,7 +172,7 @@ impl Options {
         Self::build(self.0.iter())
     }
 
-    /// Consuming variant of [`Options::to_dict`].
+    /// Consuming variant of [`AVOptions::to_dict`].
     pub fn into_dict(self) -> Option<AVDictionary> {
         Self::build(self.0)
     }
@@ -157,7 +230,7 @@ impl Options {
     /// structs expose (e.g. `AVFrame.metadata`, `AVStream.metadata`).
     ///
     /// FFmpeg represents an empty dictionary as a null pointer, so a null `dict`
-    /// yields an empty `Options`. Non-UTF-8 entries are skipped with a warning.
+    /// yields an empty `AVOptions`. Non-UTF-8 entries are skipped with a warning.
     ///
     /// # Safety
     ///
@@ -177,7 +250,7 @@ impl Options {
     ///
     /// This is the write counterpart of [`from_raw_dict`](Self::from_raw_dict) for
     /// metadata slots embedded in FFmpeg structs (`AVFrame.metadata`,
-    /// `AVStream.metadata`, ...). An empty `Options` just frees the slot and leaves
+    /// `AVStream.metadata`, ...). An empty `AVOptions` just frees the slot and leaves
     /// a null pointer — FFmpeg's representation of "no metadata". Ownership of the
     /// freshly built dictionary is transferred to `*dest`.
     ///
@@ -193,20 +266,29 @@ impl Options {
         }
     }
 
-    /// Creates options such that ffmpeg will prefer TCP transport when reading RTSP stream (over
-    /// the default UDP format). It also adds some options to reduce the socket and I/O timeouts to
-    /// 16 seconds.
+    /// Options that make ffmpeg prefer TCP transport when reading an RTSP stream (over
+    /// the default UDP format), and shorten the socket / I/O timeouts to 16 seconds.
     ///
     /// This sets the `rtsp_transport` to `tcp` in ffmpeg options,
-    /// it also sets `rw_timeout` and `stimeout` to lower (more sane) values. Both are protocol
-    /// options carrying **microseconds**, so the value below is 16 s, not 16.
+    /// it also sets `rw_timeout` and `timeout` to lower (more sane) values. Both carry
+    /// **microseconds**, so the value below is 16 s, not 16.
+    ///
+    /// **Target layer: input protocol + demuxer.** Hand these to a reader —
+    /// [`StreamReaderBuilder::with_options`](crate::io::StreamReaderBuilder::with_options)
+    /// or [`Demuxer::new_with_options`](crate::Demuxer::new_with_options) — never to an
+    /// encoder.
+    ///
+    /// `timeout` is the **rtsp demuxer** option (`ffmpeg -h demuxer=rtsp`). Its former
+    /// name `stimeout` no longer exists anywhere: FFmpeg 6.1, 7.1, 8.1 and 9.0 all
+    /// reject `-stimeout` with `Unrecognized option` (verified), so a key by that name
+    /// was silently ignored on every build this crate supports.
     pub fn preset_avformat_rtsp_transport_tcp() -> Self {
         let mut opts = Self::new();
         opts
             // These can't be too low because ffmpeg takes its sweet time
             .set("rtsp_transport", "tcp")
             .set("rw_timeout", "16000000")
-            .set("stimeout", "16000000");
+            .set("timeout", "16000000");
         opts
     }
 
@@ -215,7 +297,11 @@ impl Options {
     ///
     /// This modifies the `movflags` key to supported fragmented output. The muxer output will not
     /// have a header and each packet contains enough metadata to be streamed without the header.
-    /// Muxer output should be compatiable with MSE.
+    /// Muxer output should be compatible with MSE.
+    ///
+    /// **Target layer: output muxer** (`mov`/`mp4`). Hand these to a writer or
+    /// [`Muxer::new_with_options`](crate::Muxer::new_with_options); `movflags` is a
+    /// muxer private option consumed at `avformat_write_header`.
     pub fn preset_avformat_fragmented_mov() -> Self {
         let mut opts = Self::new();
         opts.set(
@@ -230,6 +316,12 @@ impl Options {
     /// Every key below is one FFmpeg actually reads: `live` and `write_metaf` are **not** AVOptions
     /// of the FLV muxer (nor of `AVFormatContext`), so setting them silently did nothing — "no
     /// metadata" is a `flvflags` value, not a separate key.
+    ///
+    /// **Target layer: output muxer** (`flv`). Hand these to a writer or
+    /// [`Muxer::new_with_options`](crate::Muxer::new_with_options); they are consumed at
+    /// `avformat_write_header`. (`flvflags` is the FLV muxer's own option; `chunk_size`
+    /// and `fflags` are read by the generic format layer — all three verified with
+    /// `ffmpeg -h muxer=flv` / the value lists in `ffmpeg -h full`.)
     pub fn preset_avformat_flv() -> Self {
         let mut opts = Self::new();
         opts
@@ -242,7 +334,13 @@ impl Options {
         opts
     }
 
-    /// Default avcodec options for a libx264 encoder.
+    /// Default private options for a **libx264 encoder**.
+    ///
+    /// **Target layer: codec (encoder).** Hand these to
+    /// [`EncoderBuilder::with_options`](crate::EncoderBuilder::with_options); they are
+    /// consumed at `avcodec_open2`. Keys such as `preset`, `profile` and `x264-params`
+    /// do not exist for the format or protocol layers (see the
+    /// [module documentation](self)).
     pub fn preset_h264() -> Self {
         let mut opts = Self::new();
         opts
@@ -251,11 +349,16 @@ impl Options {
             // baseline,main,high
             .set("profile", "high")
             // 场景切换敏感度
-            .set("scenecut", "0");
+            .set("x264-params", "scenecut=0");
         opts
     }
 
-    /// Options for a libx264 encoder that are tuned for low-latency encoding such as for real-time streaming.
+    /// Private options for a **libx264 encoder**, tuned for low-latency encoding such
+    /// as real-time streaming.
+    ///
+    /// **Target layer: codec (encoder).** Hand these to
+    /// [`EncoderBuilder::with_options`](crate::EncoderBuilder::with_options); consumed at
+    /// `avcodec_open2`.
     pub fn preset_h264_realtime() -> Self {
         // 基址复用 preset_h264()，只覆盖低延迟所需的差异键，避免重复定义公共键值。
         let mut opts = Self::preset_h264();
@@ -274,8 +377,8 @@ impl Options {
             .set("crf", "23")
             // 周期内部刷新替代关键帧
             .set("intra-refresh", "1")
-            // 参考帧数量
-            .set("refs", "3")
+            // 参考帧数量：intra-refresh 要求 refs == 1
+            .set("refs", "1")
             // GOP=60（2秒@30fps）
             .set("g", "60")
             // 禁用 B 帧
@@ -295,20 +398,24 @@ impl Options {
             .set("partitions", "all")
             // 最小关键帧间隔
             .set("keyint_min", "30")
-            // 强制恒定帧率
-            .set("force-cfr", "1")
-            // 启用切片线程
-            .set("sliced_threads", "1")
-            // 禁用前瞻同步
-            .set("sync-lookahead", "0")
             // 减少前瞻帧数
             .set("rc-lookahead", "10");
         opts
     }
 
-    /// h264_nvenc options only
+    /// Private options for the **`h264_nvenc` encoder** only.
     ///
-    /// FFMpeg with NVENC:
+    /// **Target layer: codec (encoder).** Hand these to
+    /// [`EncoderBuilder::with_options`](crate::EncoderBuilder::with_options); consumed at
+    /// `avcodec_open2`. They are NVENC-private keys and mean nothing to any other
+    /// encoder, nor to the format/protocol layers.
+    ///
+    /// None of the FFmpeg builds this crate is tested against contains NVENC, so the key
+    /// names below are **not** exercised by the test suite; they follow the NVENC option
+    /// table (`preset`, `tune`, `rc`, `no-scenecut`, `zerolatency`, `delay`, `surfaces`,
+    /// `weighted_pred`, `b_ref_mode`, `spatial-aq`, `temporal-aq`, `aq-strength`, …).
+    ///
+    /// FFmpeg with NVENC:
     /// <https://superuser.com/questions/1296374/best-settings-for-ffmpeg-with-nvenc>
     ///
     /// NVENC Preset Migration Guide:
@@ -357,56 +464,56 @@ impl Options {
     }
 }
 
-/// `HashMap<String, String>` -> `Options`
-impl From<HashMap<String, String>> for Options {
+/// `HashMap<String, String>` -> `AVOptions`
+impl From<HashMap<String, String>> for AVOptions {
     fn from(item: HashMap<String, String>) -> Self {
         Self(item.into_iter().collect())
     }
 }
 
-/// `BTreeMap<String, String>` -> `Options` (zero-copy: shares the internal
+/// `BTreeMap<String, String>` -> `AVOptions` (zero-copy: shares the internal
 /// representation).
-impl From<BTreeMap<String, String>> for Options {
+impl From<BTreeMap<String, String>> for AVOptions {
     fn from(item: BTreeMap<String, String>) -> Self {
         Self(item)
     }
 }
 
-/// `Options` -> `BTreeMap<String, String>` (zero-copy: yields the internal
+/// `AVOptions` -> `BTreeMap<String, String>` (zero-copy: yields the internal
 /// representation).
-impl From<Options> for BTreeMap<String, String> {
-    fn from(item: Options) -> Self {
+impl From<AVOptions> for BTreeMap<String, String> {
+    fn from(item: AVOptions) -> Self {
         item.0
     }
 }
 
-/// `Options` -> `HashMap<String, String>`
-impl From<Options> for HashMap<String, String> {
-    fn from(item: Options) -> Self {
+/// `AVOptions` -> `HashMap<String, String>`
+impl From<AVOptions> for HashMap<String, String> {
+    fn from(item: AVOptions) -> Self {
         item.0.into_iter().collect()
     }
 }
 
 /// Borrowing conversion (clones the entries).
-impl From<&Options> for HashMap<String, String> {
-    fn from(item: &Options) -> Self {
+impl From<&AVOptions> for HashMap<String, String> {
+    fn from(item: &AVOptions) -> Self {
         item.0.clone().into_iter().collect()
     }
 }
 
-impl FromIterator<(String, String)> for Options {
+impl FromIterator<(String, String)> for AVOptions {
     fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
         Self(iter.into_iter().collect())
     }
 }
 
-impl std::fmt::Debug for Options {
+impl std::fmt::Debug for AVOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&self.0, f)
     }
 }
 
-impl std::fmt::Display for Options {
+impl std::fmt::Display for AVOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, f)
     }
@@ -485,13 +592,13 @@ mod tests {
 
     #[test]
     fn test_options_debug() {
-        let opts = Options::preset_h264_realtime();
+        let opts = AVOptions::preset_h264_realtime();
         println!("{:?}", opts);
     }
 
     #[test]
     fn test_options_basic_ops() {
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         assert!(opts.is_empty());
 
         opts.set("threads", "4").set("preset", "fast");
@@ -511,10 +618,10 @@ mod tests {
 
     #[test]
     fn test_options_merge_other_wins() {
-        let mut base = Options::new();
+        let mut base = AVOptions::new();
         base.set("preset", "medium").set("crf", "23");
 
-        let mut overlay = Options::new();
+        let mut overlay = AVOptions::new();
         overlay.set("crf", "18").set("tune", "film");
 
         base.merge(overlay);
@@ -525,19 +632,19 @@ mod tests {
 
     #[test]
     fn test_options_empty_to_dict_is_none() {
-        // 空 Options 必须物化为 None：rsmpeg 表示不了空字典，携带 key=""
+        // 空 AVOptions 必须物化为 None：rsmpeg 表示不了空字典，携带 key=""
         // 的脏条目会让 libav 在每次 open() 时报 `Option '' not found`。
-        let opts = Options::new();
+        let opts = AVOptions::new();
         assert!(opts.into_dict().is_none());
     }
 
     #[test]
     fn test_options_dict_roundtrip() {
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         opts.set("crf", "23").set("profile", "high");
 
         let dict = opts.to_dict().expect("non-empty must materialize");
-        let back = Options::from_dict(&dict);
+        let back = AVOptions::from_dict(&dict);
         assert_eq!(back.get("crf"), Some("23"));
         assert_eq!(back.get("profile"), Some("high"));
         assert_eq!(back.len(), 2);
@@ -548,7 +655,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("a".to_string(), "1".to_string());
 
-        let opts: Options = map.clone().into();
+        let opts: AVOptions = map.clone().into();
         assert_eq!(opts.get("a"), Some("1"));
 
         let back: HashMap<String, String> = opts.into();
@@ -561,7 +668,7 @@ mod tests {
         map.insert("a".to_string(), "1".to_string());
         map.insert("b".to_string(), "2".to_string());
 
-        let opts: Options = map.clone().into();
+        let opts: AVOptions = map.clone().into();
         assert_eq!(opts.get("b"), Some("2"));
 
         let back: BTreeMap<String, String> = opts.into();
@@ -570,8 +677,8 @@ mod tests {
 
     #[test]
     fn test_options_from_raw_dict_null_is_empty() {
-        // FFmpeg 的空字典就是 NULL 指针：from_raw_dict(NULL) 必须得到空 Options。
-        let opts = unsafe { Options::from_raw_dict(std::ptr::null_mut()) };
+        // FFmpeg 的空字典就是 NULL 指针：from_raw_dict(NULL) 必须得到空 AVOptions。
+        let opts = unsafe { AVOptions::from_raw_dict(std::ptr::null_mut()) };
         assert!(opts.is_empty());
     }
 
@@ -579,14 +686,14 @@ mod tests {
     fn test_options_raw_dict_read() {
         let mut dict = AVDictionary::new(c"title", c"hello", 0);
         // SAFETY: `dict` 是合法字典，且在本调用期间存活。
-        let opts = unsafe { Options::from_raw_dict(dict.as_mut_ptr()) };
+        let opts = unsafe { AVOptions::from_raw_dict(dict.as_mut_ptr()) };
         assert_eq!(opts.get("title"), Some("hello"));
         assert_eq!(opts.len(), 1);
     }
 
     #[test]
     fn test_options_write_into_raw_dict_roundtrip() {
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         opts.set("title", "hello").set("artist", "rsmedia");
 
         let mut dest: *mut ffi::AVDictionary = std::ptr::null_mut();
@@ -595,7 +702,7 @@ mod tests {
         assert!(!dest.is_null(), "non-empty options must materialize");
 
         // SAFETY: `dest` 刚由 to_dict 物化，合法且存活。
-        let back = unsafe { Options::from_raw_dict(dest) };
+        let back = unsafe { AVOptions::from_raw_dict(dest) };
         assert_eq!(back.get("title"), Some("hello"));
         assert_eq!(back.get("artist"), Some("rsmedia"));
 
@@ -608,17 +715,17 @@ mod tests {
     fn test_options_write_into_raw_dict_empty_stores_null() {
         let mut dest: *mut ffi::AVDictionary = std::ptr::null_mut();
         // SAFETY: `dest` 为 NULL。
-        unsafe { Options::new().write_into_raw_dict(&mut dest) };
+        unsafe { AVOptions::new().write_into_raw_dict(&mut dest) };
         assert!(
             dest.is_null(),
-            "empty Options must store NULL (no metadata)"
+            "empty AVOptions must store NULL (no metadata)"
         );
 
-        // 已有内容时写入空 Options：旧字典被释放并清回 NULL。
+        // 已有内容时写入空 AVOptions：旧字典被释放并清回 NULL。
         let owned = AVDictionary::new(c"title", c"hello", 0);
         let mut dest = owned.into_raw().as_ptr();
         // SAFETY: `dest` 指向刚转移的合法字典。
-        unsafe { Options::new().write_into_raw_dict(&mut dest) };
+        unsafe { AVOptions::new().write_into_raw_dict(&mut dest) };
         assert!(dest.is_null());
     }
 
@@ -629,12 +736,12 @@ mod tests {
         // the fix: the conversion itself decides, so there is no second,
         // drifting `contains('\0')` check whose removal could turn this into a
         // panic.
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         opts.set("bad\0key", "value").set("preset", "ba\0d");
         opts.set("threads", "4");
 
         let dict = opts.to_dict().expect("a surviving entry must materialize");
-        let back = Options::from_dict(&dict);
+        let back = AVOptions::from_dict(&dict);
         assert_eq!(back.len(), 1, "only the well-formed entry survives");
         assert_eq!(back.get("threads"), Some("4"));
     }
@@ -643,16 +750,16 @@ mod tests {
     fn test_options_presets_fixed_keys() {
         // "profile:v"/"b:v" 是 ffmpeg CLI 语法，AVOption 查找不到会被静默
         // 忽略；preset 必须使用真正的 AVOption 名。
-        assert_eq!(Options::preset_h264().get("profile"), Some("high"));
-        assert_eq!(Options::preset_h264().get("profile:v"), None);
+        assert_eq!(AVOptions::preset_h264().get("profile"), Some("high"));
+        assert_eq!(AVOptions::preset_h264().get("profile:v"), None);
 
-        let rt = Options::preset_h264_realtime();
+        let rt = AVOptions::preset_h264_realtime();
         assert_eq!(rt.get("profile"), Some("main"));
         assert_eq!(rt.get("b"), Some("3000k"));
         assert_eq!(rt.get("b:v"), None);
-        // x264opts 是 CLI 组合器，AVOption 中不存在
+        // `x264opts`/`x264-params` 是 libx264 真实存在的 AVOption
         assert_eq!(rt.get("x264opts"), None);
 
-        assert_eq!(Options::preset_h264_nvenc().get("b"), Some("4000k"));
+        assert_eq!(AVOptions::preset_h264_nvenc().get("b"), Some("4000k"));
     }
 }

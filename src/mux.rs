@@ -48,7 +48,7 @@ use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, StreamReader, StreamWriter, Writer};
 use crate::location::Location;
-use crate::options::{Metadata, Options};
+use crate::options::{AVOptions, Metadata};
 use crate::stream::{MediaType, StreamInfo};
 use crate::subtitle::SubtitleSegment;
 use crate::time::Rational;
@@ -238,10 +238,10 @@ impl Muxer<StreamWriter> {
     ///
     /// ```no_run
     /// use rsmedia::mux::Muxer;
-    /// use rsmedia::options::Options;
+    /// use rsmedia::options::AVOptions;
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut opts = Options::new();
+    /// let mut opts = AVOptions::new();
     /// // MP4 落盘后把 moov 移到文件头，便于边下边播。
     /// opts.set("movflags", "+faststart");
     /// let mut muxer = Muxer::new_with_options("/tmp/out.mp4", opts)?;
@@ -249,7 +249,7 @@ impl Muxer<StreamWriter> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_with_options(destination: impl Into<Location>, options: Options) -> Result<Self> {
+    pub fn new_with_options(destination: impl Into<Location>, options: AVOptions) -> Result<Self> {
         let writer = crate::io::StreamWriterBuilder::new(destination)
             .with_options(options)
             .build()
@@ -282,11 +282,11 @@ impl Muxer<StreamWriter> {
     ///
     /// ```no_run
     /// use rsmedia::mux::Muxer;
-    /// use rsmedia::options::Options;
+    /// use rsmedia::options::AVOptions;
     /// use rsmedia::{EncoderBuilder, MediaFrame, PixelFormat};
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut opts = Options::new();
+    /// let mut opts = AVOptions::new();
     /// opts.set("segment_time", "10");
     /// opts.set("reset_timestamps", "1");
     /// let mut muxer = Muxer::new_segmented("/tmp/out_%03d.mp4", opts)?;
@@ -303,7 +303,7 @@ impl Muxer<StreamWriter> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_segmented(pattern: impl Into<Location>, options: Options) -> Result<Self> {
+    pub fn new_segmented(pattern: impl Into<Location>, options: AVOptions) -> Result<Self> {
         let writer = crate::io::StreamWriterBuilder::new(pattern)
             .with_format("segment")
             .with_options(options)
@@ -1243,7 +1243,8 @@ impl<W: Writer> Muxer<W> {
     /// use rsmedia::subtitle::SubtitleSegment;
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut muxer = Muxer::new("out.mp4")?;
+    /// let path = std::env::temp_dir().join("rsmedia_subtitle_demo.mp4");
+    /// let mut muxer = Muxer::new(&path)?;
     /// let encoder = rsmedia::encode::EncoderBuilder::new_subtitle()
     ///     .with_codec_name("mov_text")
     ///     .with_subtitle_header("[Script Info]\nScriptType: v4.00+\n")
@@ -1407,8 +1408,11 @@ impl DemuxerStream {
 ///
 /// Two construction modes:
 /// - **Decode mode** ([`new`](Demuxer::new) / [`new_from_reader`](Demuxer::new_from_reader) /
-///   [`new_single_stream`](Demuxer::new_single_stream)): iteration yields decoded
-///   `AVFrame`s.
+///   [`new_single_stream`](Demuxer::new_single_stream) /
+///   [`new_with_streams`](Demuxer::new_with_streams)): iteration yields decoded `AVFrame`s.
+///   The three reader-based constructors differ only in which streams get a decoder: all
+///   decodable streams, the best stream of one media type, or an explicit subset of
+///   container stream indices.
 /// - **Passthrough mode** ([`new_passthrough`](Demuxer::new_passthrough)): no decoder is
 ///   built; [`demux_packet`](Demuxer::demux_packet) / [`packets`](Demuxer::packets) yield
 ///   raw `AVPacket`s for remuxing (re-wrapping without decode or re-encode).
@@ -1454,11 +1458,11 @@ impl Demuxer<StreamReader> {
     /// what makes transport-level keys such as `rtsp_transport=tcp` work.
     ///
     /// ```no_run
-    /// use rsmedia::options::Options;
+    /// use rsmedia::options::AVOptions;
     /// use rsmedia::{Demuxer, Reader};
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut options = Options::new();
+    /// let mut options = AVOptions::new();
     /// options.set("rtsp_transport", "tcp");
     /// options.set("stimeout", "5000000");
     ///
@@ -1469,10 +1473,10 @@ impl Demuxer<StreamReader> {
     /// # }
     /// ```
     ///
-    /// Options that no layer claims are silently ignored by FFmpeg; the writer
+    /// AVOptions that no layer claims are silently ignored by FFmpeg; the writer
     /// reports the leftovers when the container header is written (see
     /// [`StreamReaderBuilder::with_options`](crate::io::StreamReaderBuilder::with_options)).
-    pub fn new_with_options(source: impl Into<Location>, options: Options) -> Result<Self> {
+    pub fn new_with_options(source: impl Into<Location>, options: AVOptions) -> Result<Self> {
         let reader = crate::io::StreamReaderBuilder::new(source)
             .with_options(options)
             .build()
@@ -1592,9 +1596,54 @@ impl<R: Reader> Demuxer<R> {
     /// "最佳"取自 FFmpeg 的 `av_find_best_stream`（与
     /// `Reader::find_best_stream` 同一判据）——容器里的流顺序并不保证最佳流
     /// 排在最前，取"该类型的第一个流"可能选错流；找不到该类型的流时返回错误。
+    ///
+    /// 这是 [`new_with_streams`](Self::new_with_streams) 在"只有一条流"时的特例。
     pub fn new_single_stream(
         reader: R,
         media_type: MediaType,
+        filters: impl Into<Option<Vec<Filter>>>,
+        device_config: impl Into<Option<HWDeviceConfig>>,
+    ) -> Result<Demuxer<R>> {
+        let (stream_index, _codec_name) = reader.find_best_stream(media_type)?;
+        Self::new_with_streams(reader, [stream_index], filters, device_config)
+    }
+
+    /// 任意选流子集：只为 `stream_indices` 点名的流构建解码器，其余流的 packet
+    /// 在迭代时丢弃。
+    ///
+    /// 这是解码模式下选流的通用形式，[`new_from_reader`](Self::new_from_reader)
+    /// （全部可解码流）与 [`new_single_stream`](Self::new_single_stream)（某类型的
+    /// 最佳流）都是它的特例。
+    ///
+    /// - `stream_indices` 是**容器流索引**，与 [`Self::stream_info`] /
+    ///   [`Self::nb_streams`] 同一套编号。重复项自动去重，返回的 [`Self::streams`]
+    ///   一律按**容器顺序**排列，与传入顺序无关。
+    /// - 空名单合法：不构建任何解码器，[`demux`](Self::demux) 直接返回 `Ok(None)`
+    ///   （与容器里没有可解码流时的行为一致）。
+    /// - 越界索引报 [`RsmediaError::InvalidConfig`]，消息里带 `nb_streams`。
+    /// - 点了名却**不可解码**的流（章节轨、附件、本构建没有解码器的编码）报
+    ///   [`RsmediaError::Unsupported`]，而不是像 [`new_from_reader`](Self::new_from_reader)
+    ///   那样静默跳过：调用方明确要了这条流，少给一条必须让它知道，而不是让它以为
+    ///   自己拿到的是全部。
+    ///
+    /// ```no_run
+    /// use rsmedia::io::StreamReader;
+    /// use rsmedia::mux::Demuxer;
+    ///
+    /// # fn main() -> rsmedia::Result<()> {
+    /// // 容器里 4 条流，只要第 0 条和第 2 条。
+    /// let reader = StreamReader::new("movie.mkv")?;
+    /// let mut demuxer = Demuxer::new_with_streams(reader, [0, 2], None, None)?;
+    ///
+    /// while let Some((stream_index, _frame)) = demuxer.demux()? {
+    ///     println!("frame from stream {stream_index}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_with_streams(
+        reader: R,
+        stream_indices: impl IntoIterator<Item = usize>,
         filters: impl Into<Option<Vec<Filter>>>,
         device_config: impl Into<Option<HWDeviceConfig>>,
     ) -> Result<Demuxer<R>> {
@@ -1602,13 +1651,29 @@ impl<R: Reader> Demuxer<R> {
         let device_config: Option<HWDeviceConfig> = device_config.into();
         let filter_map = group_filters(filters);
 
-        let (stream_index, _codec_name) = reader.find_best_stream(media_type)?;
-        let stream_info = StreamInfo::from_reader(&reader, stream_index)?;
-        let decoder = Self::build_decoder(&reader, &stream_info, &device_config, &filter_map)?;
+        let nb_streams = reader.input().nb_streams as usize;
+        let mut selected: Vec<usize> = stream_indices.into_iter().collect();
+        selected.sort_unstable();
+        selected.dedup();
+
+        let mut streams = Vec::with_capacity(selected.len());
+        for stream_idx in selected {
+            if stream_idx >= nb_streams {
+                return Err(RsmediaError::invalid_config(format!(
+                    "stream index {stream_idx} out of range (nb_streams={nb_streams})"
+                )));
+            }
+            let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
+            // 不做 `find_decoder_name` 预检后跳过：`build_decoder` 自己就会为"没有
+            // 解码器"返回 `Unsupported`（消息里带 codec_id 与流号），正是本方法
+            // 想要的策略——显式点名了就要么给流、要么报错。
+            let decoder = Self::build_decoder(&reader, &stream_info, &device_config, &filter_map)?;
+            streams.push(DemuxerStream::new(decoder, stream_info));
+        }
 
         Ok(Self {
             reader,
-            streams: vec![DemuxerStream::new(decoder, stream_info)],
+            streams,
             passthrough: false,
         })
     }
@@ -1791,7 +1856,8 @@ impl<R: Reader> Demuxer<R> {
     /// 读取下一个**解码后的帧**：`(stream_index, AVFrame)`。
     ///
     /// 只覆盖构建时选中的流（[`new`](Self::new) = 全部可解码流，
-    /// [`new_single_stream`](Self::new_single_stream) = 单条最佳流），其余流
+    /// [`new_single_stream`](Self::new_single_stream) = 单条最佳流，
+    /// [`new_with_streams`](Self::new_with_streams) = 点名的那几条），其余流
     /// 的 packet 被静默丢弃。输入读完后先排空各解码器（含滤镜图）才返回
     /// `Ok(None)`：提前停止迭代会丢掉解码器里还压着的帧。
     ///
@@ -1815,10 +1881,11 @@ impl<R: Reader> Demuxer<R> {
                             .iter_mut()
                             .find(|s| s.stream_index == stream_idx)
                         else {
-                            // Packets of skipped streams (chapter tracks,
-                            // unselected streams in single-stream mode, ...)
-                            // are dropped.
-                            tracing::debug!("Dropping packet of undecodable stream {stream_idx}");
+                            // Packets of streams with no decoder bound to them:
+                            // chapter tracks and other undecodable streams skipped by
+                            // `new_from_reader`, and streams left out of the selection by
+                            // `new_single_stream` / `new_with_streams`.
+                            tracing::debug!("Dropping packet of stream {stream_idx}: not selected");
                             continue;
                         };
                         if let Some(frame) = demux_stream.decoder.decode_raw_packet(&packet)? {
@@ -1948,7 +2015,7 @@ mod tests {
         let plain_streams = plain.streams().len();
         assert!(plain_streams > 0, "fixture must expose at least one stream");
 
-        let mut options = Options::new();
+        let mut options = AVOptions::new();
         options.set("fflags", "discardcorrupt"); // a real libavformat option
         let with_options = Demuxer::new_with_options("assets/mp4.mp4", options)?;
         assert_eq!(
@@ -1958,7 +2025,7 @@ mod tests {
         );
 
         // 空选项等价于 `new`，且仍能正常解包。
-        let mut empty = Demuxer::new_with_options("assets/mp4.mp4", Options::new())?;
+        let mut empty = Demuxer::new_with_options("assets/mp4.mp4", AVOptions::new())?;
         assert_eq!(empty.streams().len(), plain_streams);
         assert!(
             empty.reader.read_packet()?.is_some(),
@@ -2282,7 +2349,7 @@ mod tests {
         let encoder = Encoder::new_video(width, height)?;
         let time_base = encoder.time_base();
 
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         opts.set("movflags", "+faststart");
         let mut muxer = Muxer::new_with_options(&output_path, opts)?;
         let index = muxer.add_encoder(encoder)?;
@@ -2982,6 +3049,25 @@ mod tests {
         Ok(())
     }
 
+    /// 写一个 video + audio 的测试文件，好让"选哪条流/选几条流"真的有得选。
+    fn write_two_stream_file(path: &Path) -> Result<()> {
+        let mut muxer = Muxer::new(path)?;
+        let video_index = muxer.add_encoder(Encoder::new_video(64, 64)?)?;
+        let audio_index = muxer.add_encoder(Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?)?;
+        for frame_index in 0..5i64 {
+            let mut frame = generate_video_frame(64, 64, frame_index);
+            frame.set_pts(frame_index);
+            muxer.mux(frame, video_index)?;
+        }
+        for index in 0..5i64 {
+            let mut audio = generate_audio_sine_wave_frame(440.0, 2, 1024, 44_100)?;
+            audio.set_pts(index * 1024);
+            muxer.mux(audio, audio_index)?;
+        }
+        muxer.finish()?;
+        Ok(())
+    }
+
     /// 单流模式只为 `media_type` 的**最佳流**建解码器（与
     /// `Reader::find_best_stream` 同一判据），其余流的 packet 被丢弃。
     #[test]
@@ -2989,24 +3075,7 @@ mod tests {
         let path = crate::test_support::test_output_path("mux", "test_demux_single_stream.mp4");
 
         // 先写一个 video + audio 的文件，好让"选哪条流"真的有得选。
-        {
-            let mut muxer = Muxer::new(&path)?;
-            let video_index = muxer.add_encoder(Encoder::new_video(64, 64)?)?;
-            let audio_index =
-                muxer.add_encoder(Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?)?;
-            for frame_index in 0..5i64 {
-                let mut frame = generate_video_frame(64, 64, frame_index);
-                frame.set_pts(frame_index);
-                muxer.mux(frame, video_index)?;
-            }
-            for index in 0..5i64 {
-                let audio = generate_audio_sine_wave_frame(440.0, 2, 1024, 44_100)?;
-                let mut audio = audio;
-                audio.set_pts(index * 1024);
-                muxer.mux(audio, audio_index)?;
-            }
-            muxer.finish()?;
-        }
+        write_two_stream_file(&path)?;
 
         let reader = StreamReader::new(&path)?;
         let (expected_index, _) = reader.find_best_stream(MediaType::VIDEO)?;
@@ -3027,6 +3096,94 @@ mod tests {
         assert!(
             !demuxer.is_passthrough(),
             "single-stream mode decodes, it is not a passthrough demuxer"
+        );
+
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// `new_with_streams` 只为点名的那几条流建解码器，其余流的 packet 被丢弃；
+    /// 重复项去重，`streams()` 按**容器顺序**排列（与传入顺序无关）。
+    #[test]
+    fn test_demux_with_streams_selects_the_requested_subset() -> Result<()> {
+        let path = crate::test_support::test_output_path("mux", "test_stream_subset.mp4");
+        write_two_stream_file(&path)?;
+
+        let reader = StreamReader::new(&path)?;
+        let nb = reader.input().nb_streams as usize;
+        assert_eq!(nb, 2, "fixture must have exactly two streams");
+        let (video_index, _) = reader.find_best_stream(MediaType::VIDEO)?;
+        let audio_index = (0..nb)
+            .find(|i| *i != video_index)
+            .expect("two distinct streams");
+
+        // 只要音频：视频的 packet 应被丢光，迭代里只出现音频流。
+        let mut demuxer = Demuxer::new_with_streams(reader, [audio_index], None, None)?;
+        assert_eq!(demuxer.streams().len(), 1);
+        assert_eq!(demuxer.streams()[0].stream_index, audio_index);
+        let mut decoded = 0usize;
+        while let Some((index, _frame)) = demuxer.demux()? {
+            assert_eq!(index, audio_index, "only the selected stream may appear");
+            decoded += 1;
+        }
+        assert!(decoded > 0, "subset selection decoded nothing");
+
+        // 两条都点名、其中一条重复：去重后 2 条，且按容器顺序（升序）排列。
+        let reader = StreamReader::new(&path)?;
+        let both =
+            Demuxer::new_with_streams(reader, [audio_index, video_index, video_index], None, None)?;
+        let indices: Vec<usize> = both.streams().iter().map(|s| s.stream_index).collect();
+        let mut expected = vec![video_index, audio_index];
+        expected.sort_unstable();
+        assert_eq!(
+            indices, expected,
+            "streams() must be deduplicated and in container order"
+        );
+
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// 越界索引报 `InvalidConfig`（消息里带 `nb_streams`），而不是 panic 或静默丢弃。
+    #[test]
+    fn test_demux_with_streams_rejects_out_of_range_index() -> Result<()> {
+        let path = crate::test_support::test_output_path("mux", "test_stream_subset_oob.mp4");
+        write_two_stream_file(&path)?;
+
+        let reader = StreamReader::new(&path)?;
+        let nb = reader.input().nb_streams as usize;
+        // `Demuxer` 没有 `Debug`（它持有 reader 与解码器），故用 `match` 而非 `expect_err`。
+        let err = match Demuxer::new_with_streams(reader, [0, nb], None, None) {
+            Ok(_) => panic!("an out-of-range index must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.is_invalid_config(), "{err}");
+        assert!(
+            err.to_string().contains(&format!("nb_streams={nb}")),
+            "the error must report the stream count: {err}"
+        );
+
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// 空名单是合法状态（不建解码器、也不迭代出帧），不是错误 —— 与"容器里没有
+    /// 可解码流"时的行为一致。
+    #[test]
+    fn test_demux_with_streams_empty_subset_yields_nothing() -> Result<()> {
+        let path = crate::test_support::test_output_path("mux", "test_stream_subset_empty.mp4");
+        write_two_stream_file(&path)?;
+
+        let reader = StreamReader::new(&path)?;
+        let mut demuxer = Demuxer::new_with_streams(reader, [], None, None)?;
+        assert!(demuxer.streams().is_empty());
+        assert!(
+            !demuxer.is_passthrough(),
+            "an empty decode-mode selection is not passthrough mode"
+        );
+        assert!(
+            demuxer.demux()?.is_none(),
+            "no stream is selected, so no frame can come out"
         );
 
         crate::test_support::remove_test_output(&path);
@@ -3119,7 +3276,7 @@ mod tests {
             {
                 let mut muxer = Muxer::new(&path)?;
                 muxer.set_normalize_timestamps(normalize);
-                let mut options = crate::Options::new();
+                let mut options = crate::AVOptions::new();
                 options.set("preset", "ultrafast");
                 let encoder = EncoderBuilder::new_video(64, 64)
                     .with_fps(25.0)

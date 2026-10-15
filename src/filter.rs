@@ -492,7 +492,7 @@ fn duration_literal(duration: Duration) -> String {
 /// and does accept fractional dB, gain and frequency (31.5 Hz is a standard 1/3-octave
 /// centre), so a narrower parameter type would reject values FFmpeg takes.
 ///
-/// Options FFmpeg declares `<float>` are still `f32` inside FFmpeg; a wider value is
+/// AVOptions FFmpeg declares `<float>` are still `f32` inside FFmpeg; a wider value is
 /// rounded there, exactly as it would be from the `ffmpeg` CLI.
 fn number(value: impl Into<f64>) -> String {
     format!("{}", value.into())
@@ -2378,13 +2378,11 @@ fn is_valid_label(label: &str) -> bool {
 /// pad 数精确校验接线，动态滤镜的 pad 由标签数量生成、交由 FFmpeg 在 `config`
 /// 阶段核对选项。
 fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
-    let filter = get_by_name(name)?;
-    if filter.is_none() {
+    let Some(filter) = get_by_name(name)? else {
         return Err(RsmediaError::unsupported(format!(
             "filter '{name}' is not available in this FFmpeg build"
         )));
-    }
-    let filter = filter.unwrap();
+    };
     // SAFETY: `filter` 指向 FFmpeg 的静态滤镜定义，`avfilter_filter_pad_count` 只读
     // 其中以 NULL 结尾的 pad 数组（`is_output = 0` 取输入侧）。
     let pads = unsafe { ffi::avfilter_filter_pad_count(filter.as_ptr(), 0) } as usize;
@@ -2402,13 +2400,11 @@ fn filter_input_pads(name: &str) -> Result<(usize, bool)> {
 /// ——多标一个标签会生成 `filter[a][b]` 这种 pad 数对不上的描述，FFmpeg 只会给出一句
 /// 难懂的解析错误，所以在这里提前拒掉。
 fn filter_output_pads(name: &str) -> Result<(usize, bool)> {
-    let filter = get_by_name(name)?;
-    if filter.is_none() {
+    let Some(filter) = get_by_name(name)? else {
         return Err(RsmediaError::unsupported(format!(
             "filter '{name}' is not available in this FFmpeg build"
         )));
-    }
-    let filter = filter.unwrap();
+    };
     // SAFETY: 同 `filter_input_pads`，`is_output = 1` 取输出侧。
     let pads = unsafe { ffi::avfilter_filter_pad_count(filter.as_ptr(), 1) } as usize;
     Ok((

@@ -169,11 +169,13 @@ impl Rational {
     /// # Ok::<(), rsmedia::RsmediaError>(())
     /// ```
     pub const fn unit(den: i32) -> Self {
-        assert!(den > 0, "a unit fraction's denominator must be positive");
-        Self {
-            num: 1,
-            den: NonZeroI32::new(den).unwrap(),
-        }
+        // One check instead of an `assert!` followed by a `NonZeroI32::new(..).unwrap()`:
+        // the constructor already answers the whole question, and a `let .. else` keeps
+        // the bad `den` a compile error in a `const` context, as the docs promise.
+        let Some(den) = NonZeroI32::new(den) else {
+            panic!("a unit fraction's denominator must be positive");
+        };
+        Self { num: 1, den }
     }
 
     /// The numerator. May be negative — a time base is not required to be positive.

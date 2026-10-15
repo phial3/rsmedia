@@ -14,7 +14,7 @@
 mod common;
 
 use common::{gradient_video_frame, sine_audio_frame, test_output_path};
-use rsmedia::{DecoderBuilder, EncoderBuilder, MediaType, Options, Quality};
+use rsmedia::{AVOptions, DecoderBuilder, EncoderBuilder, MediaType, Quality};
 
 use std::ffi::CString;
 use std::time::Instant;
@@ -41,7 +41,7 @@ fn video_roundtrip(
     codec_name: &str,
     container: &str,
     quality: Option<Quality>,
-    extra_options: Option<Options>,
+    extra_options: Option<AVOptions>,
 ) -> anyhow::Result<()> {
     if !encoder_available(codec_name) {
         println!("SKIP  {label}: encoder '{codec_name}' not in this FFmpeg build");
@@ -242,7 +242,7 @@ fn matrix_video_mpeg4() -> anyhow::Result<()> {
 /// tiny round-trip fast.
 #[test]
 fn matrix_video_vp9() -> anyhow::Result<()> {
-    let mut opts = Options::new();
+    let mut opts = AVOptions::new();
     opts.set("cpu-used", "8").set("row-mt", "1");
     video_roundtrip(
         "vp9",

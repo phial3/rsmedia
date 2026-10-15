@@ -633,7 +633,7 @@ macro_rules! ffi_enum {
 /// name** in both builders, so one definition expands verbatim into each `impl` block: the
 /// semantics and the documentation of a shared option exist once, one edit reaches both sides,
 /// and a drift such as "the encoder grew `with_flags2`, the decoder did not" cannot happen.
-/// Options that belong to one side only (the encoder's bit rate / quality / profile, the
+/// AVOptions that belong to one side only (the encoder's bit rate / quality / profile, the
 /// decoder's output format / discard granularity, …) stay in their own file.
 ///
 /// To add a shared option: add the method and its documentation here, then add a field of the
@@ -750,7 +750,7 @@ macro_rules! impl_codec_builder_setters {
         /// [`Self::with_thread_count`]/[`Self::with_flags`]/[`Self::with_flags2`]/
         /// [`Self::with_thread_type`]）；编码器另有 `b`/`maxrate`/`bufsize`/`crf`/
         /// `profile`/`level`/`g`/`bf`，解码器另有 `skip_frame`/`err_detect`。
-        pub fn with_options(mut self, options: Options) -> Self {
+        pub fn with_options(mut self, options: AVOptions) -> Self {
             self.codec_opts = Some(options);
             self
         }

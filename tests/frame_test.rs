@@ -1096,7 +1096,7 @@ fn test_avframe_roundtrip_preserves_all_modelled_fields() -> Result<()> {
     assert_eq!(
         media.metadata.get("title"),
         Some("hello"),
-        "metadata should be copied into the Options map"
+        "metadata should be copied into the AVOptions map"
     );
     assert_eq!(media.side_data.len(), 1);
     assert_eq!(media.side_data[0].type_, ffi::AV_FRAME_DATA_DISPLAYMATRIX);
