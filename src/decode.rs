@@ -63,7 +63,7 @@ use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::{Reader, StreamReader, StreamReaderBuilder};
 use crate::location::Location;
-use crate::options::Options;
+use crate::options::AVOptions;
 use crate::pixel::PixelFormat;
 use crate::resample;
 use crate::resize::Resize;
@@ -167,7 +167,7 @@ pub struct DecoderBuilder {
     thread_count: Option<i32>,
     media_type: MediaType,
     codec_name: Option<String>,
-    codec_opts: Option<Options>,
+    codec_opts: Option<AVOptions>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
     /// 硬件帧池的预分配表面数（`None` = [`crate::hwaccel::DEFAULT_HW_POOL_SIZE`]）。
@@ -202,7 +202,7 @@ pub struct DecoderBuilder {
     ///
     /// 与 `codec_opts` 严格分开：后者写进 `avcodec_open2`，管的是**编解码器**
     /// 参数（`preset`/`tune`…）。采集设备的端点参数只被 demuxer 认，两处互不通用。
-    input_opts: Option<Options>,
+    input_opts: Option<AVOptions>,
 }
 
 impl DecoderBuilder {
@@ -428,10 +428,10 @@ impl DecoderBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use rsmedia::{DecoderBuilder, MediaType, Options};
+    /// use rsmedia::{DecoderBuilder, MediaType, AVOptions};
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut opts = Options::new();
+    /// let mut opts = AVOptions::new();
     /// opts.set("framerate", "30");
     /// opts.set("video_size", "1280x720");
     ///
@@ -466,7 +466,7 @@ impl DecoderBuilder {
     ///
     /// 仅作用于 [`build`](Self::build)；[`build_from_reader`](Self::build_from_reader)
     /// 的输入由你自己打开，参数已在那一侧传过，本设置会被忽略。
-    pub fn with_input_options(mut self, options: Options) -> Self {
+    pub fn with_input_options(mut self, options: AVOptions) -> Self {
         self.input_opts = Some(options);
         self
     }
@@ -1910,7 +1910,7 @@ mod tests {
         crate::init()?;
 
         // 真实设备会用的键。lavfi 忽略它们，但参数本身不应导致构建失败。
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         opts.set("framerate", "30");
         opts.set("video_size", "1280x720");
         DecoderBuilder::new(MediaType::VIDEO)
@@ -1919,7 +1919,7 @@ mod tests {
             .build("testsrc=size=320x240:rate=30")?;
 
         // 未知的输入键同样被 FFmpeg 容忍（与 StreamReaderBuilder 一致）。
-        let mut bogus = Options::new();
+        let mut bogus = AVOptions::new();
         bogus.set("definitely_not_a_real_option", "1");
         DecoderBuilder::new(MediaType::VIDEO)
             .with_input_format("lavfi")

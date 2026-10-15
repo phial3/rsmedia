@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
         .with_hardware_device(HWDeviceConfig::auto_platform()?)
         // libx264, libx265, h264_nvenc, h264_vaapi
         // .with_codec_name("h264_nvenc")
-        // .with_options(Options::preset_h264_nvenc())
+        // .with_options(AVOptions::preset_h264_nvenc())
         .with_filters(filters)
         .build()
         .expect("failed to create encoder");

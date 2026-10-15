@@ -28,7 +28,7 @@ use rsmedia::Rational;
 use rsmedia::filter::{Filter, FilterGraphBuilder, FilterNode, VideoEndpoint, video};
 use rsmedia::io::BufferWriter;
 use rsmedia::{
-    DecoderBuilder, EncoderBuilder, MediaFrame, MediaType, Options, PixelFormat, StreamReader,
+    AVOptions, DecoderBuilder, EncoderBuilder, MediaFrame, MediaType, PixelFormat, StreamReader,
 };
 
 /// 合成模式源图尺寸：故意用非 295:413 比例的底图，验证裁剪。
@@ -306,7 +306,7 @@ fn encode_to_size(frame: &MediaFrame<u8>, min_bytes: u64, max_bytes: u64) -> Res
 /// 固定量化质量用 `qmin = qmax = N` 钉死（mjpeg 有效范围 2~31，N 越大质量越
 /// 低、体积越小），等价于 CLI 的 `-qmin/-qmax`。
 fn encode_jpeg(frame: &MediaFrame<u8>, qscale: u32) -> Result<Vec<u8>> {
-    let mut options = Options::new();
+    let mut options = AVOptions::new();
     options.set("qmin", qscale.to_string());
     options.set("qmax", qscale.to_string());
 

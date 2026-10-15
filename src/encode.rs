@@ -44,7 +44,7 @@ use crate::fmt::{FrameFormat, SampleFormat};
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
-use crate::options::{CRF_CAPABLE_CODECS, Options, Quality, VideoProfile};
+use crate::options::{AVOptions, CRF_CAPABLE_CODECS, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
 use crate::resample;
 use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler, VideoSpec};
@@ -112,7 +112,7 @@ pub struct EncoderBuilder {
     thread_count: Option<i32>,
     media_type: MediaType,
     codec_name: Option<String>,
-    codec_opts: Option<Options>,
+    codec_opts: Option<AVOptions>,
     level: Option<String>,
     quality: Option<Quality>,
     profile: Option<VideoProfile>,
@@ -961,8 +961,8 @@ impl EncoderBuilder {
     /// 补充 builder 未建模的键——同一个键两边都给时以透传为准（typed setter 写的
     /// 是 `AVCodecContext` 字段，`avcodec_open2` 在字段写入之后才应用这个字典，
     /// 见 `with_options` 的文档）。
-    fn build_codec_options(&self, use_crf: bool, user_opts: Option<Options>) -> Options {
-        let mut opts = Options::new();
+    fn build_codec_options(&self, use_crf: bool, user_opts: Option<AVOptions>) -> AVOptions {
+        let mut opts = AVOptions::new();
         if use_crf && let Some(Quality::Crf(crf)) = &self.quality {
             opts.set("crf", crf.to_string());
         }

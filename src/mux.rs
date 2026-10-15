@@ -48,7 +48,7 @@ use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, StreamReader, StreamWriter, Writer};
 use crate::location::Location;
-use crate::options::{Metadata, Options};
+use crate::options::{AVOptions, Metadata};
 use crate::stream::{MediaType, StreamInfo};
 use crate::subtitle::SubtitleSegment;
 use crate::time::Rational;
@@ -238,10 +238,10 @@ impl Muxer<StreamWriter> {
     ///
     /// ```no_run
     /// use rsmedia::mux::Muxer;
-    /// use rsmedia::options::Options;
+    /// use rsmedia::options::AVOptions;
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut opts = Options::new();
+    /// let mut opts = AVOptions::new();
     /// // MP4 落盘后把 moov 移到文件头，便于边下边播。
     /// opts.set("movflags", "+faststart");
     /// let mut muxer = Muxer::new_with_options("/tmp/out.mp4", opts)?;
@@ -249,7 +249,7 @@ impl Muxer<StreamWriter> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_with_options(destination: impl Into<Location>, options: Options) -> Result<Self> {
+    pub fn new_with_options(destination: impl Into<Location>, options: AVOptions) -> Result<Self> {
         let writer = crate::io::StreamWriterBuilder::new(destination)
             .with_options(options)
             .build()
@@ -282,11 +282,11 @@ impl Muxer<StreamWriter> {
     ///
     /// ```no_run
     /// use rsmedia::mux::Muxer;
-    /// use rsmedia::options::Options;
+    /// use rsmedia::options::AVOptions;
     /// use rsmedia::{EncoderBuilder, MediaFrame, PixelFormat};
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut opts = Options::new();
+    /// let mut opts = AVOptions::new();
     /// opts.set("segment_time", "10");
     /// opts.set("reset_timestamps", "1");
     /// let mut muxer = Muxer::new_segmented("/tmp/out_%03d.mp4", opts)?;
@@ -303,7 +303,7 @@ impl Muxer<StreamWriter> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_segmented(pattern: impl Into<Location>, options: Options) -> Result<Self> {
+    pub fn new_segmented(pattern: impl Into<Location>, options: AVOptions) -> Result<Self> {
         let writer = crate::io::StreamWriterBuilder::new(pattern)
             .with_format("segment")
             .with_options(options)
@@ -1454,11 +1454,11 @@ impl Demuxer<StreamReader> {
     /// what makes transport-level keys such as `rtsp_transport=tcp` work.
     ///
     /// ```no_run
-    /// use rsmedia::options::Options;
+    /// use rsmedia::options::AVOptions;
     /// use rsmedia::{Demuxer, Reader};
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut options = Options::new();
+    /// let mut options = AVOptions::new();
     /// options.set("rtsp_transport", "tcp");
     /// options.set("stimeout", "5000000");
     ///
@@ -1469,10 +1469,10 @@ impl Demuxer<StreamReader> {
     /// # }
     /// ```
     ///
-    /// Options that no layer claims are silently ignored by FFmpeg; the writer
+    /// AVOptions that no layer claims are silently ignored by FFmpeg; the writer
     /// reports the leftovers when the container header is written (see
     /// [`StreamReaderBuilder::with_options`](crate::io::StreamReaderBuilder::with_options)).
-    pub fn new_with_options(source: impl Into<Location>, options: Options) -> Result<Self> {
+    pub fn new_with_options(source: impl Into<Location>, options: AVOptions) -> Result<Self> {
         let reader = crate::io::StreamReaderBuilder::new(source)
             .with_options(options)
             .build()
@@ -1948,7 +1948,7 @@ mod tests {
         let plain_streams = plain.streams().len();
         assert!(plain_streams > 0, "fixture must expose at least one stream");
 
-        let mut options = Options::new();
+        let mut options = AVOptions::new();
         options.set("fflags", "discardcorrupt"); // a real libavformat option
         let with_options = Demuxer::new_with_options("assets/mp4.mp4", options)?;
         assert_eq!(
@@ -1958,7 +1958,7 @@ mod tests {
         );
 
         // 空选项等价于 `new`，且仍能正常解包。
-        let mut empty = Demuxer::new_with_options("assets/mp4.mp4", Options::new())?;
+        let mut empty = Demuxer::new_with_options("assets/mp4.mp4", AVOptions::new())?;
         assert_eq!(empty.streams().len(), plain_streams);
         assert!(
             empty.reader.read_packet()?.is_some(),
@@ -2282,7 +2282,7 @@ mod tests {
         let encoder = Encoder::new_video(width, height)?;
         let time_base = encoder.time_base();
 
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         opts.set("movflags", "+faststart");
         let mut muxer = Muxer::new_with_options(&output_path, opts)?;
         let index = muxer.add_encoder(encoder)?;
@@ -3119,7 +3119,7 @@ mod tests {
             {
                 let mut muxer = Muxer::new(&path)?;
                 muxer.set_normalize_timestamps(normalize);
-                let mut options = crate::Options::new();
+                let mut options = crate::AVOptions::new();
                 options.set("preset", "ultrafast");
                 let encoder = EncoderBuilder::new_video(64, 64)
                     .with_fps(25.0)

@@ -96,7 +96,7 @@ pub use io::{AVSeekFlag, DynWriter, Reader, Seekable, Writer};
 pub use io::{StreamReader, StreamReaderBuilder, StreamWriter, StreamWriterBuilder};
 pub use location::{Location, Url};
 pub use mux::{Chapter, Demuxer, Muxer};
-pub use options::{Metadata, Options, Quality, VideoProfile};
+pub use options::{AVOptions, Metadata, Quality, VideoProfile};
 pub use pcm::{PcmSink, PcmSpec};
 pub use pixel::PixelFormat;
 pub use resample::Resampler;

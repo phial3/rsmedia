@@ -1,5 +1,5 @@
 use rsmedia::{
-    EncoderBuilder, MediaType, Options, PixelFormat, SampleFormat, StreamWriterBuilder,
+    AVOptions, EncoderBuilder, MediaType, PixelFormat, SampleFormat, StreamWriterBuilder,
     error::RsmediaError,
     mux::{Demuxer, Muxer},
 };
@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
 
     let stream_writer = StreamWriterBuilder::new("/tmp/output.mov")
         .with_format("mov")
-        .with_options(Options::preset_avformat_fragmented_mov())
+        .with_options(AVOptions::preset_avformat_fragmented_mov())
         .build()?;
     let mut muxer = Muxer::new_from_writer(stream_writer);
 

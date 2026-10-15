@@ -11,13 +11,13 @@ use std::ptr::NonNull;
 /// Internally backed by a [`BTreeMap<String, String>`] (key-sorted, so the
 /// type derives a deterministic `Hash`) and lazily materialized into an
 /// [`AVDictionary`] at the FFI boundary
-/// ([`Options::into_dict`]/[`Options::to_dict`]).
+/// ([`AVOptions::into_dict`]/[`AVOptions::to_dict`]).
 ///
 /// This avoids a subtle defect of building AVDictionary directly: rsmpeg
 /// cannot represent an *empty* dictionary (FFmpeg uses a NULL pointer), so
 /// previous eager construction always carried a junk `key=""` entry that made
 /// libav log `Option '' not found` on every `open()`. With lazy
-/// materialization an empty `Options` converts to `None`.
+/// materialization an empty `AVOptions` converts to `None`.
 ///
 /// FFmpeg Documentation: <https://ffmpeg.org/doxygen/trunk/>
 ///
@@ -27,21 +27,21 @@ use std::ptr::NonNull;
 /// # Example
 ///
 /// ```ignore
-/// let mut opts = Options::new();
+/// let mut opts = AVOptions::new();
 /// opts.set("threads", "4");
-/// opts.merge(Options::preset_h264()); // preset keys win
+/// opts.merge(AVOptions::preset_h264()); // preset keys win
 /// ```
 #[derive(Clone, Default, Hash, PartialEq, Eq)]
-pub struct Options(BTreeMap<String, String>);
+pub struct AVOptions(BTreeMap<String, String>);
 
-/// Alias of [`Options`] for the string key/value metadata carried by media
+/// Alias of [`AVOptions`] for the string key/value metadata carried by media
 /// structures — `AVFrame.metadata`, container-level and per-stream metadata.
 ///
 /// Use it in field/parameter positions to express "this is a metadata map",
-/// reserving the [`Options`] name for encoder/muxer option sets.
-pub type Metadata = Options;
+/// reserving the [`AVOptions`] name for encoder/muxer option sets.
+pub type Metadata = AVOptions;
 
-impl Options {
+impl AVOptions {
     /// Creates an empty options set.
     pub fn new() -> Self {
         Self(BTreeMap::new())
@@ -86,7 +86,7 @@ impl Options {
 
     /// Merges `other` into `self`; entries from `other` win on conflicts
     /// (same overwrite semantics as `av_dict_copy` with flags 0).
-    pub fn merge(&mut self, other: Options) {
+    pub fn merge(&mut self, other: AVOptions) {
         self.0.extend(other.0);
     }
 
@@ -99,7 +99,7 @@ impl Options {
         Self::build(self.0.iter())
     }
 
-    /// Consuming variant of [`Options::to_dict`].
+    /// Consuming variant of [`AVOptions::to_dict`].
     pub fn into_dict(self) -> Option<AVDictionary> {
         Self::build(self.0)
     }
@@ -157,7 +157,7 @@ impl Options {
     /// structs expose (e.g. `AVFrame.metadata`, `AVStream.metadata`).
     ///
     /// FFmpeg represents an empty dictionary as a null pointer, so a null `dict`
-    /// yields an empty `Options`. Non-UTF-8 entries are skipped with a warning.
+    /// yields an empty `AVOptions`. Non-UTF-8 entries are skipped with a warning.
     ///
     /// # Safety
     ///
@@ -177,7 +177,7 @@ impl Options {
     ///
     /// This is the write counterpart of [`from_raw_dict`](Self::from_raw_dict) for
     /// metadata slots embedded in FFmpeg structs (`AVFrame.metadata`,
-    /// `AVStream.metadata`, ...). An empty `Options` just frees the slot and leaves
+    /// `AVStream.metadata`, ...). An empty `AVOptions` just frees the slot and leaves
     /// a null pointer — FFmpeg's representation of "no metadata". Ownership of the
     /// freshly built dictionary is transferred to `*dest`.
     ///
@@ -255,7 +255,7 @@ impl Options {
         opts
     }
 
-    /// Options for a libx264 encoder that are tuned for low-latency encoding such as for real-time streaming.
+    /// AVOptions for a libx264 encoder that are tuned for low-latency encoding such as for real-time streaming.
     pub fn preset_h264_realtime() -> Self {
         // 基址复用 preset_h264()，只覆盖低延迟所需的差异键，避免重复定义公共键值。
         let mut opts = Self::preset_h264();
@@ -357,56 +357,56 @@ impl Options {
     }
 }
 
-/// `HashMap<String, String>` -> `Options`
-impl From<HashMap<String, String>> for Options {
+/// `HashMap<String, String>` -> `AVOptions`
+impl From<HashMap<String, String>> for AVOptions {
     fn from(item: HashMap<String, String>) -> Self {
         Self(item.into_iter().collect())
     }
 }
 
-/// `BTreeMap<String, String>` -> `Options` (zero-copy: shares the internal
+/// `BTreeMap<String, String>` -> `AVOptions` (zero-copy: shares the internal
 /// representation).
-impl From<BTreeMap<String, String>> for Options {
+impl From<BTreeMap<String, String>> for AVOptions {
     fn from(item: BTreeMap<String, String>) -> Self {
         Self(item)
     }
 }
 
-/// `Options` -> `BTreeMap<String, String>` (zero-copy: yields the internal
+/// `AVOptions` -> `BTreeMap<String, String>` (zero-copy: yields the internal
 /// representation).
-impl From<Options> for BTreeMap<String, String> {
-    fn from(item: Options) -> Self {
+impl From<AVOptions> for BTreeMap<String, String> {
+    fn from(item: AVOptions) -> Self {
         item.0
     }
 }
 
-/// `Options` -> `HashMap<String, String>`
-impl From<Options> for HashMap<String, String> {
-    fn from(item: Options) -> Self {
+/// `AVOptions` -> `HashMap<String, String>`
+impl From<AVOptions> for HashMap<String, String> {
+    fn from(item: AVOptions) -> Self {
         item.0.into_iter().collect()
     }
 }
 
 /// Borrowing conversion (clones the entries).
-impl From<&Options> for HashMap<String, String> {
-    fn from(item: &Options) -> Self {
+impl From<&AVOptions> for HashMap<String, String> {
+    fn from(item: &AVOptions) -> Self {
         item.0.clone().into_iter().collect()
     }
 }
 
-impl FromIterator<(String, String)> for Options {
+impl FromIterator<(String, String)> for AVOptions {
     fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
         Self(iter.into_iter().collect())
     }
 }
 
-impl std::fmt::Debug for Options {
+impl std::fmt::Debug for AVOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&self.0, f)
     }
 }
 
-impl std::fmt::Display for Options {
+impl std::fmt::Display for AVOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self, f)
     }
@@ -485,13 +485,13 @@ mod tests {
 
     #[test]
     fn test_options_debug() {
-        let opts = Options::preset_h264_realtime();
+        let opts = AVOptions::preset_h264_realtime();
         println!("{:?}", opts);
     }
 
     #[test]
     fn test_options_basic_ops() {
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         assert!(opts.is_empty());
 
         opts.set("threads", "4").set("preset", "fast");
@@ -511,10 +511,10 @@ mod tests {
 
     #[test]
     fn test_options_merge_other_wins() {
-        let mut base = Options::new();
+        let mut base = AVOptions::new();
         base.set("preset", "medium").set("crf", "23");
 
-        let mut overlay = Options::new();
+        let mut overlay = AVOptions::new();
         overlay.set("crf", "18").set("tune", "film");
 
         base.merge(overlay);
@@ -525,19 +525,19 @@ mod tests {
 
     #[test]
     fn test_options_empty_to_dict_is_none() {
-        // 空 Options 必须物化为 None：rsmpeg 表示不了空字典，携带 key=""
+        // 空 AVOptions 必须物化为 None：rsmpeg 表示不了空字典，携带 key=""
         // 的脏条目会让 libav 在每次 open() 时报 `Option '' not found`。
-        let opts = Options::new();
+        let opts = AVOptions::new();
         assert!(opts.into_dict().is_none());
     }
 
     #[test]
     fn test_options_dict_roundtrip() {
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         opts.set("crf", "23").set("profile", "high");
 
         let dict = opts.to_dict().expect("non-empty must materialize");
-        let back = Options::from_dict(&dict);
+        let back = AVOptions::from_dict(&dict);
         assert_eq!(back.get("crf"), Some("23"));
         assert_eq!(back.get("profile"), Some("high"));
         assert_eq!(back.len(), 2);
@@ -548,7 +548,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("a".to_string(), "1".to_string());
 
-        let opts: Options = map.clone().into();
+        let opts: AVOptions = map.clone().into();
         assert_eq!(opts.get("a"), Some("1"));
 
         let back: HashMap<String, String> = opts.into();
@@ -561,7 +561,7 @@ mod tests {
         map.insert("a".to_string(), "1".to_string());
         map.insert("b".to_string(), "2".to_string());
 
-        let opts: Options = map.clone().into();
+        let opts: AVOptions = map.clone().into();
         assert_eq!(opts.get("b"), Some("2"));
 
         let back: BTreeMap<String, String> = opts.into();
@@ -570,8 +570,8 @@ mod tests {
 
     #[test]
     fn test_options_from_raw_dict_null_is_empty() {
-        // FFmpeg 的空字典就是 NULL 指针：from_raw_dict(NULL) 必须得到空 Options。
-        let opts = unsafe { Options::from_raw_dict(std::ptr::null_mut()) };
+        // FFmpeg 的空字典就是 NULL 指针：from_raw_dict(NULL) 必须得到空 AVOptions。
+        let opts = unsafe { AVOptions::from_raw_dict(std::ptr::null_mut()) };
         assert!(opts.is_empty());
     }
 
@@ -579,14 +579,14 @@ mod tests {
     fn test_options_raw_dict_read() {
         let mut dict = AVDictionary::new(c"title", c"hello", 0);
         // SAFETY: `dict` 是合法字典，且在本调用期间存活。
-        let opts = unsafe { Options::from_raw_dict(dict.as_mut_ptr()) };
+        let opts = unsafe { AVOptions::from_raw_dict(dict.as_mut_ptr()) };
         assert_eq!(opts.get("title"), Some("hello"));
         assert_eq!(opts.len(), 1);
     }
 
     #[test]
     fn test_options_write_into_raw_dict_roundtrip() {
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         opts.set("title", "hello").set("artist", "rsmedia");
 
         let mut dest: *mut ffi::AVDictionary = std::ptr::null_mut();
@@ -595,7 +595,7 @@ mod tests {
         assert!(!dest.is_null(), "non-empty options must materialize");
 
         // SAFETY: `dest` 刚由 to_dict 物化，合法且存活。
-        let back = unsafe { Options::from_raw_dict(dest) };
+        let back = unsafe { AVOptions::from_raw_dict(dest) };
         assert_eq!(back.get("title"), Some("hello"));
         assert_eq!(back.get("artist"), Some("rsmedia"));
 
@@ -608,17 +608,17 @@ mod tests {
     fn test_options_write_into_raw_dict_empty_stores_null() {
         let mut dest: *mut ffi::AVDictionary = std::ptr::null_mut();
         // SAFETY: `dest` 为 NULL。
-        unsafe { Options::new().write_into_raw_dict(&mut dest) };
+        unsafe { AVOptions::new().write_into_raw_dict(&mut dest) };
         assert!(
             dest.is_null(),
-            "empty Options must store NULL (no metadata)"
+            "empty AVOptions must store NULL (no metadata)"
         );
 
-        // 已有内容时写入空 Options：旧字典被释放并清回 NULL。
+        // 已有内容时写入空 AVOptions：旧字典被释放并清回 NULL。
         let owned = AVDictionary::new(c"title", c"hello", 0);
         let mut dest = owned.into_raw().as_ptr();
         // SAFETY: `dest` 指向刚转移的合法字典。
-        unsafe { Options::new().write_into_raw_dict(&mut dest) };
+        unsafe { AVOptions::new().write_into_raw_dict(&mut dest) };
         assert!(dest.is_null());
     }
 
@@ -629,12 +629,12 @@ mod tests {
         // the fix: the conversion itself decides, so there is no second,
         // drifting `contains('\0')` check whose removal could turn this into a
         // panic.
-        let mut opts = Options::new();
+        let mut opts = AVOptions::new();
         opts.set("bad\0key", "value").set("preset", "ba\0d");
         opts.set("threads", "4");
 
         let dict = opts.to_dict().expect("a surviving entry must materialize");
-        let back = Options::from_dict(&dict);
+        let back = AVOptions::from_dict(&dict);
         assert_eq!(back.len(), 1, "only the well-formed entry survives");
         assert_eq!(back.get("threads"), Some("4"));
     }
@@ -643,16 +643,16 @@ mod tests {
     fn test_options_presets_fixed_keys() {
         // "profile:v"/"b:v" 是 ffmpeg CLI 语法，AVOption 查找不到会被静默
         // 忽略；preset 必须使用真正的 AVOption 名。
-        assert_eq!(Options::preset_h264().get("profile"), Some("high"));
-        assert_eq!(Options::preset_h264().get("profile:v"), None);
+        assert_eq!(AVOptions::preset_h264().get("profile"), Some("high"));
+        assert_eq!(AVOptions::preset_h264().get("profile:v"), None);
 
-        let rt = Options::preset_h264_realtime();
+        let rt = AVOptions::preset_h264_realtime();
         assert_eq!(rt.get("profile"), Some("main"));
         assert_eq!(rt.get("b"), Some("3000k"));
         assert_eq!(rt.get("b:v"), None);
         // x264opts 是 CLI 组合器，AVOption 中不存在
         assert_eq!(rt.get("x264opts"), None);
 
-        assert_eq!(Options::preset_h264_nvenc().get("b"), Some("4000k"));
+        assert_eq!(AVOptions::preset_h264_nvenc().get("b"), Some("4000k"));
     }
 }

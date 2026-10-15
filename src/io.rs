@@ -32,7 +32,7 @@
 //! deadline or an external abort switch, checked from FFmpeg's own callback
 //! context — the standard fix for "the read never returns".
 //!
-//! # Options hygiene
+//! # AVOptions hygiene
 //!
 //! Builder options are consumed by the layer that understands them (avio
 //! protocol first, then the demuxer/muxer); anything left over is reported as a
@@ -42,7 +42,7 @@ use crate::error::{Context, Result, RsmediaError};
 use crate::flags::FlagSet;
 use crate::init::{AVLogFlag, AVLogLevel};
 use crate::location::Location;
-use crate::options::Options;
+use crate::options::AVOptions;
 use crate::stream::MediaType;
 use crate::time::Rational;
 use crate::{strutils, time};
@@ -424,8 +424,8 @@ macro_rules! impl_reader_builder_setters {
         ///
         /// # Arguments
         ///
-        /// * `options` - Options to pass on to input.
-        pub fn with_options(mut self, options: Options) -> Self {
+        /// * `options` - AVOptions to pass on to input.
+        pub fn with_options(mut self, options: AVOptions) -> Self {
             self.spec.options = Some(options);
             self
         }
@@ -452,8 +452,8 @@ macro_rules! impl_writer_builder_setters {
         ///
         /// # Arguments
         ///
-        /// * `options` - Options to pass on to output.
-        pub fn with_options(mut self, options: Options) -> Self {
+        /// * `options` - AVOptions to pass on to output.
+        pub fn with_options(mut self, options: AVOptions) -> Self {
             self.spec.options = Some(options);
             self
         }
@@ -476,7 +476,7 @@ macro_rules! impl_writer_builder_setters {
 fn open_input_custom(
     io_context: AVIOContextCustom,
     format: Option<&str>,
-    options: Option<Options>,
+    options: Option<AVOptions>,
     interrupt: Option<&Interrupt>,
     dump_name: &std::ffi::CStr,
 ) -> Result<AVFormatContextInput> {
@@ -716,7 +716,7 @@ fn open_input_with_interrupt(
 #[derive(Default)]
 struct ReaderSpec<'a> {
     format: Option<&'a str>,
-    options: Option<Options>,
+    options: Option<AVOptions>,
     interrupt: Option<Interrupt>,
 }
 
@@ -731,8 +731,8 @@ struct ReaderSpec<'a> {
 /// ```no_run
 /// use std::path::Path;
 /// use rsmedia::io::StreamReaderBuilder;
-/// use rsmedia::Options;
-/// let mut options = Options::new();
+/// use rsmedia::AVOptions;
+/// let mut options = AVOptions::new();
 /// options.set("rtsp_transport", "tcp");
 ///
 /// let mut reader = StreamReaderBuilder::new("my_file.mp4")
@@ -1304,7 +1304,7 @@ impl<W: Writer + ?Sized> Writer for Box<W> {
 /// 内存 / 自定义 IO writer 则必填，两者的存储类型不同。
 #[derive(Default)]
 struct WriterSpec {
-    options: Option<Options>,
+    options: Option<AVOptions>,
 }
 
 /// 三个内置 Writer 的共享内核：输出上下文、options、header 状态，以及
@@ -1527,9 +1527,9 @@ impl<'a> StreamWriterBuilder<'a> {
 ///
 /// ```no_run
 /// use rsmedia::io::StreamWriterBuilder;
-/// use rsmedia::Options;
+/// use rsmedia::AVOptions;
 ///
-/// let mut options = Options::new();
+/// let mut options = AVOptions::new();
 /// options.set("movflags", "frag_keyframe+empty_moov");
 ///
 /// let mut writer = StreamWriterBuilder::new("my_file.mp4")
@@ -2163,13 +2163,13 @@ mod tests {
     use super::*;
     use crate::EncoderBuilder;
     use crate::mux::{Demuxer, Muxer};
-    use crate::options::Options;
+    use crate::options::AVOptions;
     use crate::pixel::PixelFormat;
     use crate::{DecoderBuilder, MediaType};
     use rsmpeg::avutil::AVFrame;
 
-    fn options_of(pairs: &[(&str, &str)]) -> Options {
-        let mut o = Options::new();
+    fn options_of(pairs: &[(&str, &str)]) -> AVOptions {
+        let mut o = AVOptions::new();
         for (k, v) in pairs {
             o.set(*k, *v);
         }
@@ -2177,7 +2177,7 @@ mod tests {
     }
 
     /// mux 到一个单视频流的小文件（header 会被真正写出，选项 dict 因此被消费）。
-    fn write_one_frame_mp4(path: &std::path::Path, options: Options) -> Result<()> {
+    fn write_one_frame_mp4(path: &std::path::Path, options: AVOptions) -> Result<()> {
         let _ = std::fs::remove_file(path);
         let mut muxer = Muxer::new_with_options(path, options)?;
         let encoder = EncoderBuilder::new_video(64, 64).build()?;
@@ -2230,7 +2230,7 @@ mod tests {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("no_options.mp4");
 
-        write_one_frame_mp4(&path, Options::new())?;
+        write_one_frame_mp4(&path, AVOptions::new())?;
         assert!(std::fs::metadata(&path)?.len() > 0);
         Ok(())
     }
@@ -2421,7 +2421,7 @@ mod tests {
 
         let reader = StreamReaderBuilder::new(&pattern)
             .with_format("image2")
-            .with_options(Options::from_iter([(
+            .with_options(AVOptions::from_iter([(
                 "framerate".to_string(),
                 "5".to_string(),
             )]))
