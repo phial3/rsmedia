@@ -98,6 +98,12 @@ pub struct EncoderBuilder {
     /// = 交给 x264，`medium` preset 下是 3，见 [`Self::with_max_b_frames`]）。
     max_b_frames: Option<i32>,
     frame_rate: Rational,
+    /// 输出采样宽高比（`AVCodecContext.sample_aspect_ratio`）。
+    ///
+    /// `None`（默认）= **不设置**，编码器因此采用输入帧自带的
+    /// `sample_aspect_ratio` —— 变形（anamorphic）素材的原始像素比例得以保留。
+    /// `Some` = 显式覆盖（需要强制方形像素时用）。
+    sample_aspect_ratio: Option<Rational>,
     /// config
     global_header: bool,
     /// `AVCodecContext.flags`（`AV_CODEC_FLAG_*`）中由调用方显式设置的部分。
@@ -404,6 +410,39 @@ impl EncoderBuilder {
         self
     }
 
+    /// Set the output sample aspect ratio (SAR) — the shape of one pixel.
+    ///
+    /// **Leaving this unset (the default) is the right choice for nearly every
+    /// caller**: the encoder then takes the SAR from each input frame, so a
+    /// source with non-square pixels (anamorphic DVD, some camcorders,
+    /// already-cropped streams) keeps its original display geometry through the
+    /// encode. Only set it to *force* the output SAR — e.g. to square up a
+    /// stream whose incoming SAR is wrong, or to tag a raw pixel buffer that
+    /// carries no SAR at all.
+    ///
+    /// Passing [`Rational::ONE`] reproduces the older behaviour of stamping
+    /// `1:1` unconditionally, which erased the aspect ratio of anamorphic
+    /// sources.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use rsmedia::{EncoderBuilder, Rational};
+    /// # fn main() -> rsmedia::error::Result<()> {
+    /// // Keep whatever SAR the frames carry (default).
+    /// let _keep = EncoderBuilder::new_video(1920, 1080).build()?;
+    /// // Force square pixels.
+    /// let _square = EncoderBuilder::new_video(1920, 1080)
+    ///     .with_sample_aspect_ratio(Rational::ONE)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_sample_aspect_ratio(mut self, sample_aspect_ratio: impl Into<Rational>) -> Self {
+        self.sample_aspect_ratio = Some(sample_aspect_ratio.into());
+        self
+    }
+
     /// explicit media type, default is `MediaType::VIDEO`
     pub fn with_media_type(mut self, media_type: MediaType) -> Self {
         self.media_type = media_type;
@@ -535,7 +574,14 @@ impl EncoderBuilder {
             // `time_base() -> 输出流时间基` 换算），故 pkt_timebase 与它一致。
             encoder.set_pkt_timebase(self.effective_time_base()?.into());
             encoder.set_pix_fmt(pixel_format.into());
-            encoder.set_sample_aspect_ratio(Rational::ONE.into());
+            // SAR 默认**不写入**：`AVCodecContext.sample_aspect_ratio` 留空，编码器就会
+            // 采用每个输入帧自带的 `sample_aspect_ratio`，变形素材的原始比例因此得以
+            // 保留。此前这里无条件写 `Rational::ONE`，把任何非方形像素的源都抹成方形
+            // —— 实测：带 SAR=16/15 的输入在写 1:1 时输出 1:1，不写时输出 16/15；
+            // 而不带 SAR 的输入两种写法都是 1:1，故对方形像素源零行为变化。
+            if let Some(sample_aspect_ratio) = self.sample_aspect_ratio {
+                encoder.set_sample_aspect_ratio(sample_aspect_ratio.into());
+            }
         } else if media_type == MediaType::AUDIO {
             if !config.supports_channel_count(self.nb_channels as i32) {
                 return Err(RsmediaError::InvalidConfig(format!(
@@ -1071,7 +1117,10 @@ impl EncoderBuilder {
             input_time_base,
             pixel_format,
             sample_format,
-            encode_ctx.sample_aspect_ratio.into(),
+            // 滤镜图 buffer 源的初始 SAR：未显式指定时保持 1:1（与不接滤镜时一致）。
+            // 这只影响建图初值 —— 帧送到源时自带的 SAR 会在 `av_buffersrc_add_frame`
+            // 里更新链路 SAR，故变形素材经滤镜链仍能保住原始比例。
+            self.sample_aspect_ratio.unwrap_or(Rational::ONE),
         )?;
         self.apply_filter_output(filter_graph.as_mut(), &mut encode_ctx)?;
 
@@ -1124,6 +1173,7 @@ impl Default for EncoderBuilder {
             max_bit_rate: None,
             buffer_size: None,
             frame_rate: Rational::integer(Self::FRAME_RATE),
+            sample_aspect_ratio: None,
             fps: None,
             gop_size: None,
             max_b_frames: None,
@@ -3183,6 +3233,42 @@ mod tests {
             encoder.time_base(),
             Rational::new(1_001, 30_000).unwrap(),
             "编码器时间基应当是帧率的倒数"
+        );
+        Ok(())
+    }
+
+    /// SAR 默认**不写进**编码器：`AVCodecContext.sample_aspect_ratio` 保持未指定，
+    /// 编码器因此采用输入帧自带的值，变形（anamorphic）素材的原始像素比例得以保留。
+    ///
+    /// 回归点：此前这里无条件写 `Rational::ONE`，把任何非方形像素的源都抹成方形。
+    /// 实测依据：带 SAR=16/15 的输入在 `-aspect 1:1` 时输出 1:1、不写 aspect
+    /// 时输出 16/15。
+    #[test]
+    fn test_sample_aspect_ratio_defaults_to_unset() -> Result<()> {
+        if !default_video_encoder_available() {
+            println!(
+                "SKIP: {} is not in this FFmpeg build",
+                EncoderBuilder::VIDEO_CODEC_NAME
+            );
+            return Ok(());
+        }
+
+        let sar = Rational::new(16, 15).unwrap();
+
+        let untouched = EncoderBuilder::new_video(64, 64).build()?;
+        assert_eq!(
+            Rational::from(untouched.codecpar().sample_aspect_ratio),
+            Rational::ZERO,
+            "默认必须是「未指定」，编码器才能继承输入帧的 SAR"
+        );
+
+        let forced = EncoderBuilder::new_video(64, 64)
+            .with_sample_aspect_ratio(sar)
+            .build()?;
+        assert_eq!(
+            Rational::from(forced.codecpar().sample_aspect_ratio),
+            sar,
+            "显式指定的 SAR 必须落到输出"
         );
         Ok(())
     }
