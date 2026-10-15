@@ -1243,7 +1243,8 @@ impl<W: Writer> Muxer<W> {
     /// use rsmedia::subtitle::SubtitleSegment;
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut muxer = Muxer::new("out.mp4")?;
+    /// let path = std::env::temp_dir().join("rsmedia_subtitle_demo.mp4");
+    /// let mut muxer = Muxer::new(&path)?;
     /// let encoder = rsmedia::encode::EncoderBuilder::new_subtitle()
     ///     .with_codec_name("mov_text")
     ///     .with_subtitle_header("[Script Info]\nScriptType: v4.00+\n")
