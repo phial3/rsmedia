@@ -782,14 +782,24 @@ where
     ///
     /// Derived from the format ([`PixelFormat::data_layout`] /
     /// [`SampleFormat::data_layout`]), so it applies to video and audio alike.
-    /// Panics for a video format without whole-sample planes, as
-    /// [`PixelFormat::data_layout`] does.
+    ///
+    /// A video format with no whole-sample planes — bitstream, paletted or hardware —
+    /// is an `Err`, **not** the panic [`PixelFormat::data_layout`] raises for it: a
+    /// frame's format may come from a decoder (8-bit paletted BMPs decode to `pal8`),
+    /// so getting it right is not the caller's to guarantee.
     pub fn data_layout(&self) -> Result<DataLayout> {
         if self.media_type == MediaType::VIDEO {
             let format = self
                 .format
                 .into_pixel()
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
+            if !format.is_plane_storable() {
+                return Err(RsmediaError::unsupported(format!(
+                    "pixel format {} cannot be stored as sample planes: a bitstream, paletted \
+                     or hardware format has no whole-sample layout",
+                    format.get_pix_fmt_name()
+                )));
+            }
             Ok(format.data_layout(self.width, self.height))
         } else {
             let format = self
@@ -1021,8 +1031,9 @@ where
     /// # Errors
     ///
     /// `Err` when the frame carries neither audio samples nor video dimensions,
-    /// its format is not modelled by this crate, or `T`'s width does not match
-    /// the format's element size.
+    /// its format is not modelled by this crate, its format has no whole-sample
+    /// planes (see [`Self::data_layout`]), or `T`'s width does not match the
+    /// format's element size.
     pub fn from_avframe(frame: &AVFrame) -> Result<Self> {
         if plane_ptr(frame, 0).is_null() {
             return Err(RsmediaError::msg(
@@ -1531,6 +1542,16 @@ where
         }
         if self.format == FrameFormat::Pixel(dst_fmt) {
             return Ok(self.clone());
+        }
+        // Same reason as `Self::data_layout`: swscale has no layout to write for a
+        // format without whole-sample planes, so report it instead of letting
+        // `data_layout` panic on a format that is merely a bad choice of target.
+        if !dst_fmt.is_plane_storable() {
+            return Err(RsmediaError::invalid_config(format!(
+                "pixel format {} cannot be stored as sample planes, so it cannot be a \
+                 conversion target",
+                dst_fmt.get_pix_fmt_name()
+            )));
         }
         let dst_layout = dst_fmt.data_layout(self.width, self.height);
         // `read_samples::<T>` reads `size_of::<T>()`-wide elements, so a target
@@ -2174,6 +2195,47 @@ mod tests {
     fn data_layout_panics_on_fractional_elements_per_pixel() {
         // 情形 6：uyyvyy411 每 4 像素占 6 字节，无法用整元素数组表达。
         let _ = PixelFormat::UYYVYY411.data_layout(8, 7);
+    }
+
+    /// **调色板格式走帧这条路时必须是 `Err`，不是 panic。**
+    ///
+    /// 上面那几个 panic 属于 `PixelFormat::data_layout`：格式由调用方亲手挑，写错了
+    /// 是调用方的问题。但帧的格式可能来自**解码器**（8 位调色板 BMP 的解码输出就是
+    /// `pal8`，`decode.rs` 的 `MediaFrame::from_avframe` 正坐在解码管线上），此时
+    /// panic 会把"文件长得奇怪"变成"进程终止"。
+    ///
+    /// 洞在哪儿：`from_avframe` 原有两道守卫（`from_ffi_checked` 拦未收录格式、
+    /// `bytes_per_component` 拦无固定分量宽度）**都拦不住 pal8** —— 它确有 8 位分量，
+    /// 第一道守卫给出 `Some(1)`。于是它会一路走到 `data_layout` 的 panic 分支。
+    #[test]
+    fn from_avframe_reports_a_paletted_frame_instead_of_panicking() {
+        // 守卫的依据，同时也是这个洞的成因。
+        assert!(PixelFormat::PAL8.bytes_per_component().is_some());
+        assert!(!PixelFormat::PAL8.is_plane_storable());
+
+        let mut av = MediaFrame::<u8>::new_video_frame(8, 8, PixelFormat::RGB24)
+            .unwrap()
+            .to_avframe()
+            .unwrap();
+        // 只改 `format`，平面缓冲仍是 RGB24 的形状：守卫必须赶在读数据之前。
+        av.set_format(PixelFormat::PAL8.into());
+        let err = MediaFrame::<u8>::from_avframe(&av).unwrap_err();
+        assert!(
+            err.to_string().contains("pal8"),
+            "expected a pal8 error, got: {err}"
+        );
+    }
+
+    /// `convert_to` 的文档写的是 "Fails for … `dst` formats with no sample planes"，
+    /// 所以它也必须报错 —— 曾经这里是 panic。
+    #[test]
+    fn convert_to_reports_a_non_storable_target() {
+        let frame = MediaFrame::<u8>::new_video_frame(8, 8, PixelFormat::RGB24).unwrap();
+        let err = frame.convert_to(PixelFormat::PAL8).unwrap_err();
+        assert!(
+            err.to_string().contains("pal8"),
+            "expected a pal8 error, got: {err}"
+        );
     }
 
     /// 元素宽度不符的帧在**构造点**就被拒绝，而不是等到 `to_avframe`。
