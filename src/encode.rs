@@ -1728,26 +1728,32 @@ impl Encoder {
     /// 不足 `frame_size` 的剩余样本，由 `flush` 阶段作为末帧截取。
     fn buffer_audio_frame(&mut self, frame: AVFrame) -> Result<()> {
         let frame_size = self.frame_size();
-        if self.audio_fifo.is_none() {
-            let channels = self.ch_layout().nb_channels;
-            let sample_fmt = self.sample_fmt() as _;
-            // 首次缓冲时以首帧 pts（编码器时间基下的样本位置，`assign_pts_sample_rate` 已
-            // 完成换算/自动编号的对齐）播种样本计数器；未设置则保持 0 起步。
-            if frame.pts != ffi::AV_NOPTS_VALUE {
-                self.next_pts = frame.pts;
-            }
-            self.audio_fifo = Some(AVAudioFifo::new(sample_fmt, channels, frame_size));
-        }
+        let fifo = self.ensure_audio_fifo(&frame, frame_size);
         // SAFETY: `frame` is an allocated `AVFrame` whose `data[0]` holds at least `nb_samples`
-        // interleaved samples; `audio_fifo` is `Some` as just set in the branch above, and
-        // `write` copies exactly `nb_samples` samples from that buffer.
+        // interleaved samples; `fifo` is the fifo built for that frame's format, and `write`
+        // copies exactly `nb_samples` samples from that buffer.
         unsafe {
-            self.audio_fifo
-                .as_mut()
-                .unwrap()
-                .write(frame.data.as_ptr(), frame.nb_samples)?;
+            fifo.write(frame.data.as_ptr(), frame.nb_samples)?;
         }
         self.drain_audio_fifo(frame_size)
+    }
+
+    /// 音频 fifo：首次使用时按首帧的布局建立，之后原样取回。
+    ///
+    /// 把"建立"与"取用"合成一个返回值，取用点就不必再断言 fifo 非空。建立时以首帧
+    /// pts（编码器时间基下的样本位置，`assign_pts_sample_rate` 已完成换算/自动编号的
+    /// 对齐）播种样本计数器；未设置则保持 0 起步。
+    fn ensure_audio_fifo(&mut self, frame: &AVFrame, frame_size: i32) -> &mut AVAudioFifo {
+        if let Some(fifo) = self.audio_fifo.as_mut() {
+            return fifo;
+        }
+        let channels = self.ch_layout().nb_channels;
+        let sample_fmt = self.sample_fmt() as _;
+        if frame.pts != ffi::AV_NOPTS_VALUE {
+            self.next_pts = frame.pts;
+        }
+        self.audio_fifo
+            .insert(AVAudioFifo::new(sample_fmt, channels, frame_size))
     }
 
     /// 从 `audio_fifo` 中取出满帧长样本，拼成帧送编码器，直至剩余不足一帧。

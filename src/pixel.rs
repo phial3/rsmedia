@@ -542,10 +542,12 @@ impl PixelFormat {
             // Interleaved: one plane of `2^log2_chroma_w`-pixel row units, each unit
             // holding the largest component step in bytes (`yuyv422`: 4 bytes = 2
             // elements per 2-pixel unit, `rgb24`: 3 elements per 1-pixel unit).
+            // `components` is non-zero (rejected above), so there is no empty-iterator
+            // case to guard, and every step is clamped at zero, so seeding the fold with
+            // 0 cannot change the maximum either.
             let max_step = (0..components)
                 .map(|c| desc.comp[c].step.max(0) as usize)
-                .max()
-                .expect("a format with non-zero components always yields a step");
+                .fold(0, usize::max);
             let unit_pixels = 1usize << desc.log2_chroma_w;
             // Elements per pixel. A horizontally subsampled packed format can store a
             // fractional number of elements per pixel (`uyyvyy411`: 6 elements per 4

@@ -291,18 +291,19 @@ pub(crate) fn resample_if_needed(
         return Ok(src_frame);
     }
     let out_spec = out_spec.normalized();
-    let stale = slot
-        .as_ref()
-        .is_some_and(|resampler| resampler.out_spec != out_spec);
-    if slot.is_none() || stale {
-        *slot = Some(Resampler::build(
+    // "需要就重建"与"拿到可变引用"由同一次判断产出：`filter` 挑出输出格式仍相符的
+    // 上下文，落空的那个分支用 `insert` 就地重建，于是取用点不必再断言 `slot` 非空。
+    let resampler = match slot
+        .as_mut()
+        .filter(|resampler| resampler.out_spec == out_spec)
+    {
+        Some(resampler) => resampler,
+        None => slot.insert(Resampler::build(
             AudioSpec::from_frame(&src_frame),
             out_spec,
-        )?);
-    }
-    slot.as_mut()
-        .expect("filled just above")
-        .convert_frame_owned(&src_frame)
+        )?),
+    };
+    resampler.convert_frame_owned(&src_frame)
 }
 
 /// Persistent streaming resampler.
