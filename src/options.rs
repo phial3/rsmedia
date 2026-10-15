@@ -1,3 +1,72 @@
+//! Option dictionaries, and where FFmpeg consumes each one.
+//!
+//! [`AVOptions`] is a plain string key/value bag: it knows nothing about FFmpeg and
+//! validates nothing when you set a key. What a key *means* — and whether it means
+//! anything at all — is decided entirely by the FFmpeg object the dictionary is
+//! finally handed to. FFmpeg **silently ignores** keys that object does not declare,
+//! so a misspelled key, and equally a well-formed key that belongs to a *different*
+//! layer, does nothing and reports nothing.
+//!
+//! # Where a dictionary is consumed
+//!
+//! An `AVOptions` reaches FFmpeg through seven entry points. Choose the one whose
+//! **layer** matches the key you want to set:
+//!
+//! | rsmedia entry point | FFmpeg call | the keys configure |
+//! |---|---|---|
+//! | [`EncoderBuilder::with_options`] | `avcodec_open2` | the **video/audio encoder**'s private options (`preset`, `crf`, `x264-params`, `rc`, `profile`, …) |
+//! | [`DecoderBuilder::with_options`] | `avcodec_open2` | the **decoder**'s private options (`threads`, `skip_frame`, …) |
+//! | [`DecoderBuilder::with_input_options`] | `avformat_open_input` | the **input demuxer / capture device / protocol** options (`framerate`, `video_size`, `input_format`, …) |
+//! | [`StreamReaderBuilder::with_options`] and [`Demuxer::new_with_options`] | `avformat_open_input` (protocol layer first, then the demuxer) | **read-side** protocol + demuxer options (`rtsp_transport`, `timeout`, `user_agent`, `fflags`, …) |
+//! | [`StreamWriterBuilder::with_options`] and [`Muxer::new_with_options`] | `avio_open2`, then whatever is left at `avformat_write_header` | **write-side** protocol options first, then **muxer** private options (`movflags`, `flvflags`, `hls_time`, `segment_time`, …) |
+//! | [`Bsf::new_with_options`] | `av_opt_set_dict` on `AVBSFContext.priv_data` | **bitstream filter** options (`aud`, `ts`, `h264_metadata` parameters, …) |
+//! | [`HWDeviceConfig::with_options`] | `av_hwdevice_ctx_create` | **hardware device** options (device-type dependent) |
+//!
+//! The rule of thumb: **codec options go through a builder's `with_options`; container,
+//! protocol and device options go through a reader or writer** (`avformat_*` /
+//! `avio_*`). The two never mix — `preset` handed to a reader is ignored exactly as
+//! `movflags` handed to an encoder is.
+//!
+//! # Finding which key belongs to which layer
+//!
+//! FFmpeg lists each layer's keys through `ffmpeg -h`:
+//!
+//! ```text
+//! ffmpeg -h encoder=libx264      # encoder private options
+//! ffmpeg -h decoder=h264         # decoder private options
+//! ffmpeg -h muxer=flv            # muxer private options
+//! ffmpeg -h demuxer=rtsp         # demuxer private options
+//! ffmpeg -h protocol=tcp         # protocol options
+//! ffmpeg -h bsf=h264_metadata    # bitstream filter options
+//! ```
+//!
+//! A key that does not show up for the layer you are targeting will not take effect
+//! here either.
+//!
+//! # Presets
+//!
+//! The `preset_*` constructors are named after the layer they target.
+//! `preset_avformat_*` builds **container / protocol / muxer** options — hand those to
+//! a reader, a writer, a [`Muxer`] or a [`Demuxer`]. `preset_<codec>`, such as
+//! [`AVOptions::preset_h264`], builds **codec** options — hand those to an
+//! [`EncoderBuilder`].
+//!
+//! [`Metadata`] is not an option dictionary for any FFmpeg call: it is this same map
+//! type, used for the string metadata carried by frames, streams and containers.
+//!
+//! [`EncoderBuilder::with_options`]: crate::EncoderBuilder::with_options
+//! [`DecoderBuilder::with_options`]: crate::DecoderBuilder::with_options
+//! [`DecoderBuilder::with_input_options`]: crate::DecoderBuilder::with_input_options
+//! [`StreamReaderBuilder::with_options`]: crate::io::StreamReaderBuilder::with_options
+//! [`Demuxer::new_with_options`]: crate::Demuxer::new_with_options
+//! [`StreamWriterBuilder::with_options`]: crate::io::StreamWriterBuilder::with_options
+//! [`Muxer::new_with_options`]: crate::Muxer::new_with_options
+//! [`Bsf::new_with_options`]: crate::Bsf::new_with_options
+//! [`HWDeviceConfig::with_options`]: crate::HWDeviceConfig::with_options
+//! [`Muxer`]: crate::Muxer
+//! [`Demuxer`]: crate::Demuxer
+//! [`EncoderBuilder`]: crate::EncoderBuilder
+
 use crate::strutils;
 
 use rsmpeg::avutil::{AVDictionary, AVDictionaryRef};
@@ -7,6 +76,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ptr::NonNull;
 
 /// A wrapper type for ffmpeg options.
+///
+/// See the [module documentation](self) for the FFmpeg entry points a dictionary
+/// can be handed to and which keys belong to which layer.
 ///
 /// Internally backed by a [`BTreeMap<String, String>`] (key-sorted, so the
 /// type derives a deterministic `Hash`) and lazily materialized into an
@@ -38,7 +110,8 @@ pub struct AVOptions(BTreeMap<String, String>);
 /// structures — `AVFrame.metadata`, container-level and per-stream metadata.
 ///
 /// Use it in field/parameter positions to express "this is a metadata map",
-/// reserving the [`AVOptions`] name for encoder/muxer option sets.
+/// reserving the [`AVOptions`] name for option dictionaries that are handed to
+/// FFmpeg (see the [module documentation](self) for where those go).
 pub type Metadata = AVOptions;
 
 impl AVOptions {
@@ -193,20 +266,29 @@ impl AVOptions {
         }
     }
 
-    /// Creates options such that ffmpeg will prefer TCP transport when reading RTSP stream (over
-    /// the default UDP format). It also adds some options to reduce the socket and I/O timeouts to
-    /// 16 seconds.
+    /// Options that make ffmpeg prefer TCP transport when reading an RTSP stream (over
+    /// the default UDP format), and shorten the socket / I/O timeouts to 16 seconds.
     ///
     /// This sets the `rtsp_transport` to `tcp` in ffmpeg options,
-    /// it also sets `rw_timeout` and `stimeout` to lower (more sane) values. Both are protocol
-    /// options carrying **microseconds**, so the value below is 16 s, not 16.
+    /// it also sets `rw_timeout` and `timeout` to lower (more sane) values. Both carry
+    /// **microseconds**, so the value below is 16 s, not 16.
+    ///
+    /// **Target layer: input protocol + demuxer.** Hand these to a reader —
+    /// [`StreamReaderBuilder::with_options`](crate::io::StreamReaderBuilder::with_options)
+    /// or [`Demuxer::new_with_options`](crate::Demuxer::new_with_options) — never to an
+    /// encoder.
+    ///
+    /// `timeout` is the **rtsp demuxer** option (`ffmpeg -h demuxer=rtsp`). Its former
+    /// name `stimeout` no longer exists anywhere: FFmpeg 6.1, 7.1, 8.1 and 9.0 all
+    /// reject `-stimeout` with `Unrecognized option` (verified), so a key by that name
+    /// was silently ignored on every build this crate supports.
     pub fn preset_avformat_rtsp_transport_tcp() -> Self {
         let mut opts = Self::new();
         opts
             // These can't be too low because ffmpeg takes its sweet time
             .set("rtsp_transport", "tcp")
             .set("rw_timeout", "16000000")
-            .set("stimeout", "16000000");
+            .set("timeout", "16000000");
         opts
     }
 
@@ -215,7 +297,11 @@ impl AVOptions {
     ///
     /// This modifies the `movflags` key to supported fragmented output. The muxer output will not
     /// have a header and each packet contains enough metadata to be streamed without the header.
-    /// Muxer output should be compatiable with MSE.
+    /// Muxer output should be compatible with MSE.
+    ///
+    /// **Target layer: output muxer** (`mov`/`mp4`). Hand these to a writer or
+    /// [`Muxer::new_with_options`](crate::Muxer::new_with_options); `movflags` is a
+    /// muxer private option consumed at `avformat_write_header`.
     pub fn preset_avformat_fragmented_mov() -> Self {
         let mut opts = Self::new();
         opts.set(
@@ -230,6 +316,12 @@ impl AVOptions {
     /// Every key below is one FFmpeg actually reads: `live` and `write_metaf` are **not** AVOptions
     /// of the FLV muxer (nor of `AVFormatContext`), so setting them silently did nothing — "no
     /// metadata" is a `flvflags` value, not a separate key.
+    ///
+    /// **Target layer: output muxer** (`flv`). Hand these to a writer or
+    /// [`Muxer::new_with_options`](crate::Muxer::new_with_options); they are consumed at
+    /// `avformat_write_header`. (`flvflags` is the FLV muxer's own option; `chunk_size`
+    /// and `fflags` are read by the generic format layer — all three verified with
+    /// `ffmpeg -h muxer=flv` / the value lists in `ffmpeg -h full`.)
     pub fn preset_avformat_flv() -> Self {
         let mut opts = Self::new();
         opts
@@ -242,7 +334,13 @@ impl AVOptions {
         opts
     }
 
-    /// Default avcodec options for a libx264 encoder.
+    /// Default private options for a **libx264 encoder**.
+    ///
+    /// **Target layer: codec (encoder).** Hand these to
+    /// [`EncoderBuilder::with_options`](crate::EncoderBuilder::with_options); they are
+    /// consumed at `avcodec_open2`. Keys such as `preset`, `profile` and `x264-params`
+    /// do not exist for the format or protocol layers (see the
+    /// [module documentation](self)).
     pub fn preset_h264() -> Self {
         let mut opts = Self::new();
         opts
@@ -251,11 +349,16 @@ impl AVOptions {
             // baseline,main,high
             .set("profile", "high")
             // 场景切换敏感度
-            .set("scenecut", "0");
+            .set("x264-params", "scenecut=0");
         opts
     }
 
-    /// AVOptions for a libx264 encoder that are tuned for low-latency encoding such as for real-time streaming.
+    /// Private options for a **libx264 encoder**, tuned for low-latency encoding such
+    /// as real-time streaming.
+    ///
+    /// **Target layer: codec (encoder).** Hand these to
+    /// [`EncoderBuilder::with_options`](crate::EncoderBuilder::with_options); consumed at
+    /// `avcodec_open2`.
     pub fn preset_h264_realtime() -> Self {
         // 基址复用 preset_h264()，只覆盖低延迟所需的差异键，避免重复定义公共键值。
         let mut opts = Self::preset_h264();
@@ -274,8 +377,8 @@ impl AVOptions {
             .set("crf", "23")
             // 周期内部刷新替代关键帧
             .set("intra-refresh", "1")
-            // 参考帧数量
-            .set("refs", "3")
+            // 参考帧数量：intra-refresh 要求 refs == 1
+            .set("refs", "1")
             // GOP=60（2秒@30fps）
             .set("g", "60")
             // 禁用 B 帧
@@ -295,20 +398,24 @@ impl AVOptions {
             .set("partitions", "all")
             // 最小关键帧间隔
             .set("keyint_min", "30")
-            // 强制恒定帧率
-            .set("force-cfr", "1")
-            // 启用切片线程
-            .set("sliced_threads", "1")
-            // 禁用前瞻同步
-            .set("sync-lookahead", "0")
             // 减少前瞻帧数
             .set("rc-lookahead", "10");
         opts
     }
 
-    /// h264_nvenc options only
+    /// Private options for the **`h264_nvenc` encoder** only.
     ///
-    /// FFMpeg with NVENC:
+    /// **Target layer: codec (encoder).** Hand these to
+    /// [`EncoderBuilder::with_options`](crate::EncoderBuilder::with_options); consumed at
+    /// `avcodec_open2`. They are NVENC-private keys and mean nothing to any other
+    /// encoder, nor to the format/protocol layers.
+    ///
+    /// None of the FFmpeg builds this crate is tested against contains NVENC, so the key
+    /// names below are **not** exercised by the test suite; they follow the NVENC option
+    /// table (`preset`, `tune`, `rc`, `no-scenecut`, `zerolatency`, `delay`, `surfaces`,
+    /// `weighted_pred`, `b_ref_mode`, `spatial-aq`, `temporal-aq`, `aq-strength`, …).
+    ///
+    /// FFmpeg with NVENC:
     /// <https://superuser.com/questions/1296374/best-settings-for-ffmpeg-with-nvenc>
     ///
     /// NVENC Preset Migration Guide:
@@ -650,7 +757,7 @@ mod tests {
         assert_eq!(rt.get("profile"), Some("main"));
         assert_eq!(rt.get("b"), Some("3000k"));
         assert_eq!(rt.get("b:v"), None);
-        // x264opts 是 CLI 组合器，AVOption 中不存在
+        // `x264opts`/`x264-params` 是 libx264 真实存在的 AVOption
         assert_eq!(rt.get("x264opts"), None);
 
         assert_eq!(AVOptions::preset_h264_nvenc().get("b"), Some("4000k"));
