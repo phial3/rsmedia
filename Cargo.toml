@@ -59,7 +59,7 @@ futures = "0.3"
 num_cpus = "1.17"
 tokio = { version = "1", features = ["full"] }
 cpal = "0.18"
-rodio = { version = "0.22", features = ["symphonia-all", "tracing"] }
+rodio = { version = "0.23", features = ["symphonia-all", "tracing"] }
 
 [package.metadata.docs.rs]
 features = ["default"]
