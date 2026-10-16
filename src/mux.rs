@@ -1915,7 +1915,7 @@ impl<R: Reader> Demuxer<R> {
                 //    fps/framerate 这类有延迟的）仍可能压着帧，按 `is_flushed`
                 //    跳过会丢掉它们。
                 //
-                // 循环以 `MAX_DRAIN_ITERATIONS` 为上限，与 `Decoder::drain` 一致：
+                // 循环以 `MAX_EAGAIN_RETRIES` 为上限，与 `Decoder::drain` 一致：
                 // 个别编解码器在 EOS 后可能一直回"暂无帧"，没有上限就是挂死。
                 let mut drain_iterations = 0usize;
                 loop {
@@ -1944,10 +1944,10 @@ impl<R: Reader> Demuxer<R> {
                         return Ok(None);
                     }
                     drain_iterations += 1;
-                    if drain_iterations >= crate::MAX_DRAIN_ITERATIONS {
+                    if drain_iterations >= crate::MAX_EAGAIN_RETRIES {
                         tracing::warn!(
                             "Demuxer: decoders produced no frame after {} drain iterations; ending demux()",
-                            crate::MAX_DRAIN_ITERATIONS
+                            crate::MAX_EAGAIN_RETRIES
                         );
                         return Ok(None);
                     }

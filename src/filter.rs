@@ -3113,16 +3113,16 @@ impl FilterGraph {
                     // EAGAIN：图里仍有缓冲帧要出，继续拉取；但个别滤镜可能一直回
                     // EAGAIN 而不进入 Flushed，故设上限收尾（与解码/编码排空一致）。
                     // 触顶时不能静默返回半截结果：残留帧会被丢掉，必须让调用者知道。
-                    if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
+                    if drained_iterations >= crate::MAX_EAGAIN_RETRIES {
                         tracing::error!(
                             "Filter graph keeps returning EAGAIN while flushing; \
                              giving up after {} iterations",
-                            crate::MAX_DRAIN_ITERATIONS
+                            crate::MAX_EAGAIN_RETRIES
                         );
                         return Err(RsmediaError::msg(format!(
                             "Filter graph stalled while flushing: still no output after {} \
                              iterations; {} already-dequeued frames are discarded",
-                            crate::MAX_DRAIN_ITERATIONS,
+                            crate::MAX_EAGAIN_RETRIES,
                             frames.len()
                         )));
                     }

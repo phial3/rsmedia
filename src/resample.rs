@@ -548,9 +548,10 @@ impl Resampler {
     /// keeps no delay at all.
     ///
     /// `swr` need not hand everything over in a single call, so this loops until a call
-    /// comes back empty. The loop is bounded by `MAX_DRAIN_ITERATIONS` — the same cap
-    /// every drain loop in this crate uses — because an unbounded one would let "finish
-    /// this audio stream" hang forever.
+    /// comes back empty, so an unbounded loop would let "finish this audio stream"
+    /// hang forever. That loop is bounded by `MAX_DRAIN_OUTPUTS` (a count of produced
+    /// frames), not by `MAX_EAGAIN_RETRIES` — `swr` answers every call at once rather
+    /// than asking to be retried later.
     ///
     /// # Errors
     ///
@@ -559,7 +560,7 @@ impl Resampler {
     pub fn flush_frames(&mut self) -> Result<Vec<AVFrame>> {
         let capacity = self.out_spec.sample_rate.max(1);
         let mut frames = Vec::new();
-        for _ in 0..crate::MAX_DRAIN_ITERATIONS {
+        for _ in 0..crate::MAX_DRAIN_OUTPUTS {
             let mut dst = self.alloc_out_frame(capacity)?;
             self.flush(&mut dst)?;
             if dst.nb_samples <= 0 {
@@ -569,7 +570,7 @@ impl Resampler {
         }
         Err(RsmediaError::msg(format!(
             "Resampler keeps producing samples while draining ({} iterations); giving up",
-            crate::MAX_DRAIN_ITERATIONS
+            crate::MAX_DRAIN_OUTPUTS
         )))
     }
 }

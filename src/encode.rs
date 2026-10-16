@@ -1849,7 +1849,7 @@ impl Encoder {
     /// 向编码器发送一帧（或 EOF）已就绪的输入；若编码器缓冲已满（EAGAIN），
     /// 先排空已就绪包再重试。
     ///
-    /// 重试次数有上限（[`crate::MAX_DRAIN_ITERATIONS`]）：个别编码器在 EOS 之后
+    /// 重试次数有上限（[`crate::MAX_EAGAIN_RETRIES`]）：个别编码器在 EOS 之后
     /// 会持续返回 EAGAIN 而不再产出包，无上限循环会挂死；达到上限即报错，
     /// 而不是无限等待。
     fn send_frame_with_retry(&mut self, frame: Option<&AVFrame>) -> Result<()> {
@@ -1859,10 +1859,10 @@ impl Encoder {
                 Ok(()) => return Ok(()),
                 Err(rsmpeg::error::RsmpegError::SendFrameAgainError) => {
                     retries += 1;
-                    if retries > crate::MAX_DRAIN_ITERATIONS {
+                    if retries > crate::MAX_EAGAIN_RETRIES {
                         return Err(RsmediaError::msg(format!(
                             "Encoder keeps returning EAGAIN after {} retries (eof: {}); aborting",
-                            crate::MAX_DRAIN_ITERATIONS,
+                            crate::MAX_EAGAIN_RETRIES,
                             frame.is_none()
                         )));
                     }
@@ -2308,11 +2308,11 @@ impl Encoder {
                     if self.is_drained() {
                         tracing::debug!("Encoder drained, try send new frame again.");
                         drained_iterations += 1;
-                        if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
+                        if drained_iterations >= crate::MAX_EAGAIN_RETRIES {
                             return Err(RsmediaError::msg(format!(
                                 "Encoder keeps returning EAGAIN after EOF for {} iterations; \
                                  flush aborted after {written_packets} packet(s), output is truncated",
-                                crate::MAX_DRAIN_ITERATIONS
+                                crate::MAX_EAGAIN_RETRIES
                             )));
                         }
                         continue;
@@ -3135,7 +3135,7 @@ mod tests {
                     // 持续不推进说明编码器异常，避免死循环。
                     eagain += 1;
                     assert!(
-                        eagain < crate::MAX_DRAIN_ITERATIONS,
+                        eagain < crate::MAX_EAGAIN_RETRIES,
                         "hardware encoder did not reach EOF after draining"
                     );
                 }

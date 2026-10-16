@@ -1273,7 +1273,7 @@ impl Decoder {
     /// （见 `avcodec_decode_subtitle2` 文档）；`AV_CODEC_CAP_DELAY` 的解码器可能
     /// 仍缓存若干条。循环有上限，避免损坏的流让公开 API 转不出来。
     fn drain_subtitle(&mut self) -> Result<Option<SubtitleSegment>> {
-        for _ in 0..crate::MAX_DRAIN_ITERATIONS {
+        for _ in 0..crate::MAX_DRAIN_OUTPUTS {
             match self.decode_subtitle_packet(None)? {
                 Some(subtitle) => {
                     if let Some(segment) = SubtitleSegment::from_avsubtitle(&subtitle) {
@@ -1289,7 +1289,7 @@ impl Decoder {
         }
         Err(RsmediaError::msg(format!(
             "Subtitle decoder keeps returning subtitles after EOF ({} iterations); giving up",
-            crate::MAX_DRAIN_ITERATIONS
+            crate::MAX_DRAIN_OUTPUTS
         )))
     }
 
@@ -1361,10 +1361,10 @@ impl Decoder {
                 Ok(()) => return Ok(()),
                 Err(rsmpeg::error::RsmpegError::DecoderFullError) => {
                     retries += 1;
-                    if retries > crate::MAX_DRAIN_ITERATIONS {
+                    if retries > crate::MAX_EAGAIN_RETRIES {
                         return Err(RsmediaError::msg(format!(
                             "Decoder keeps returning EAGAIN after {} retries (eof: {}); aborting",
-                            crate::MAX_DRAIN_ITERATIONS,
+                            crate::MAX_EAGAIN_RETRIES,
                             packet.is_none()
                         )));
                     }
@@ -1739,11 +1739,11 @@ where
                         // 有上限的继续排空：解码器若一直回 EAGAIN 而从不报 EOF，
                         // 说明状态机已坏（或码流异常），必须报错而不是当作正常
                         // 结束 —— 否则调用方会把截断的输出当成完整结果。
-                        if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
+                        if drained_iterations >= crate::MAX_EAGAIN_RETRIES {
                             return Err(RsmediaError::msg(format!(
                                 "Decoder keeps returning EAGAIN after EOF, aborting after {} \
                                  iterations",
-                                crate::MAX_DRAIN_ITERATIONS
+                                crate::MAX_EAGAIN_RETRIES
                             )));
                         }
                         drained_iterations += 1;
@@ -1801,13 +1801,13 @@ impl Drop for Decoder {
             };
 
             if eos_sent {
-                // 兜底上限见 `MAX_DRAIN_ITERATIONS`。
+                // 兜底上限见 `MAX_EAGAIN_RETRIES`。
                 let mut iterations = 0usize;
                 loop {
-                    if iterations >= crate::MAX_DRAIN_ITERATIONS {
+                    if iterations >= crate::MAX_EAGAIN_RETRIES {
                         tracing::warn!(
                             "Decoder drain exceeded {} iterations, forcing EOF.",
-                            crate::MAX_DRAIN_ITERATIONS
+                            crate::MAX_EAGAIN_RETRIES
                         );
                         break;
                     }
