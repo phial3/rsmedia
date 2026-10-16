@@ -774,6 +774,22 @@ impl<T: ElementType> Default for MediaFrame<T> {
     }
 }
 
+/// 视频格式的采样平面布局，不可整样本平面化的格式返回 `Err`。
+///
+/// [`PixelFormat::data_layout`] 对这类格式 panic，而帧的格式可能来自解码器（8 位
+/// 调色板 BMP 解出来就是 `pal8`），不是调用方能保证的事。`new_video` 与
+/// `new_video_frame` 共用这里，两个相邻构造器不会对同一份输入给出不同答案。
+fn storable_video_layout(format: PixelFormat, width: u32, height: u32) -> Result<DataLayout> {
+    if !format.is_plane_storable() {
+        return Err(RsmediaError::unsupported(format!(
+            "pixel format {} cannot be stored as sample planes: a bitstream, paletted \
+             or hardware format has no whole-sample layout",
+            format.get_pix_fmt_name()
+        )));
+    }
+    Ok(format.data_layout(width, height))
+}
+
 impl<T> MediaFrame<T>
 where
     T: ElementType,
@@ -793,14 +809,7 @@ where
                 .format
                 .into_pixel()
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
-            if !format.is_plane_storable() {
-                return Err(RsmediaError::unsupported(format!(
-                    "pixel format {} cannot be stored as sample planes: a bitstream, paletted \
-                     or hardware format has no whole-sample layout",
-                    format.get_pix_fmt_name()
-                )));
-            }
-            Ok(format.data_layout(self.width, self.height))
+            storable_video_layout(format, self.width, self.height)
         } else {
             let format = self
                 .format
@@ -817,8 +826,9 @@ where
     /// `(height, width, elements_per_pixel)` 数组，planar 格式为每平面一个数组。
     /// 传入 `ndarray::Array3` / `Vec<Array2>` 会分别视为交错 / 平面帧。
     ///
-    /// 零尺寸或无法整样本平面化的格式（位流 / 调色板 / 硬件）会 panic，
-    /// 与 [`PixelFormat::data_layout`] 的契约一致。
+    /// 零宽高会 panic，与 [`PixelFormat::data_layout`] 的契约一致；无法整样本
+    /// 平面化的格式（位流 / 调色板 / 硬件）则返回 `Err`
+    /// （见 [`data_layout`](Self::data_layout) 的理由）。
     ///
     /// 时间基保持未设置：分辨率里没有帧率信息，而编码器会用自己的输入时间基解释
     /// pts（见 [`time_base`](Self::time_base)）。要按自己的时间基表达 pts 时再调
@@ -844,7 +854,7 @@ where
     ///
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
     pub fn new_video_frame(width: u32, height: u32, format: PixelFormat) -> Result<Self> {
-        let layout = format.data_layout(width, height);
+        let layout = storable_video_layout(format, width, height)?;
         Self::new_video(width, height, format, FrameData::zeros(&layout))
     }
 
@@ -2223,6 +2233,36 @@ mod tests {
         assert!(
             err.to_string().contains("pal8"),
             "expected a pal8 error, got: {err}"
+        );
+    }
+
+    /// `new_video_frame` 必须与相邻的 `new_video` 对同一份输入给出同一个答案。
+    ///
+    /// `new_video_frame` 得先按格式算出布局才能造零数组，而它调的是会 panic 的
+    /// `PixelFormat::data_layout`，绕过了 `MediaFrame::data_layout` 那道守卫
+    /// （`new_video` 走 `validated`，到的是后者）。于是两个构造器在同一个格式上
+    /// 不一致：一个返回 `Err`，一个直接终止进程。
+    #[test]
+    fn new_video_frame_reports_an_unstorable_format_instead_of_panicking() {
+        // 带数据进来的那条路：早已是 Err。
+        let with_data = MediaFrame::<u8>::new_video(
+            8,
+            8,
+            PixelFormat::PAL8,
+            ndarray::Array3::<u8>::zeros((8, 8, 1)),
+        )
+        .expect_err("new_video with pal8 must fail");
+        assert!(
+            with_data.to_string().contains("pal8"),
+            "expected a pal8 error, got: {with_data}"
+        );
+
+        // 这条曾经 panic。
+        let zeroed = MediaFrame::<u8>::new_video_frame(8, 8, PixelFormat::PAL8)
+            .expect_err("new_video_frame must report the same way, not panic");
+        assert!(
+            zeroed.to_string().contains("pal8"),
+            "expected a pal8 error, got: {zeroed}"
         );
     }
 
