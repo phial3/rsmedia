@@ -1427,6 +1427,16 @@ pub struct Demuxer<R: Reader> {
     /// an empty `streams` is also a valid decode-mode state (a container with no
     /// decodable stream), and callers must be able to tell the two apart.
     passthrough: bool,
+    /// Set once a step has failed, so the iterators end instead of handing the same
+    /// error out forever.
+    ///
+    /// A failing demux on recoverable-looking input (a truncated file, a network
+    /// reader) fails again identically on every retry, and `Iterator` has no way to
+    /// say "stop": without this, `for result in &mut demuxer` never terminates, and
+    /// `collect()` hangs instead of stopping at the first error. A direct call to
+    /// [`demux`](Self::demux) / [`demux_packet`](Self::demux_packet) is unaffected —
+    /// only the iteration entry points honour the latch.
+    failed: bool,
 }
 
 impl Demuxer<StreamReader> {
@@ -1587,6 +1597,7 @@ impl<R: Reader> Demuxer<R> {
             reader,
             streams,
             passthrough: false,
+            failed: false,
         })
     }
 
@@ -1675,6 +1686,7 @@ impl<R: Reader> Demuxer<R> {
             reader,
             streams,
             passthrough: false,
+            failed: false,
         })
     }
 
@@ -1690,6 +1702,7 @@ impl<R: Reader> Demuxer<R> {
             reader,
             streams: Vec::new(),
             passthrough: true,
+            failed: false,
         })
     }
 
@@ -1846,10 +1859,21 @@ impl<R: Reader> Demuxer<R> {
     /// }
     /// ```
     pub fn packets(&mut self) -> impl Iterator<Item = Result<(usize, AVPacket)>> + '_ {
-        std::iter::from_fn(|| match self.demux_packet() {
-            Ok(Some(item)) => Some(Ok(item)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
+        std::iter::from_fn(|| {
+            // 错误只交付一次后就停止迭代：出错的输入下一次调用会以同样的方式继续
+            // 出错，而迭代器本身无法表达"结束"——不用 latch 记住这一步，`collect()`
+            // 会挂死、`for` 循环永不停歇。直接调 `demux_packet` 不受影响。
+            if self.failed {
+                return None;
+            }
+            match self.demux_packet() {
+                Ok(Some(item)) => Some(Ok(item)),
+                Ok(None) => None,
+                Err(e) => {
+                    self.failed = true;
+                    Some(Err(e))
+                }
+            }
         })
     }
 
@@ -1978,10 +2002,18 @@ impl<R: Reader> Iterator for Demuxer<R> {
     type Item = Result<(usize, AVFrame)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // 同 [`packets`](Self::packets)：错误交付一次后结束迭代，
+        // 避免失败的输入把迭代变成永不终止的错误流。
+        if self.failed {
+            return None;
+        }
         match self.demux() {
             Ok(Some(item)) => Some(Ok(item)),
             Ok(None) => None,
-            Err(e) => Some(Err(e)),
+            Err(e) => {
+                self.failed = true;
+                Some(Err(e))
+            }
         }
     }
 }
