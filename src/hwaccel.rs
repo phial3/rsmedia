@@ -597,6 +597,13 @@ impl HWContext {
             return self.hw_upload(codec_ctx, &sw);
         }
 
+        // `av_hwframe_map` 只搬数据与 frames context，不搬帧属性：新建的 `dst` 到这里
+        // 仍是 `AVFrame::new()` 的默认值（pts 为 `AV_NOPTS_VALUE`、无 duration / SAR /
+        // side-data）。照这样送进编码器，出来的包时间戳是错的。三条出口里只有这条是
+        // 零拷贝通路，另外两条（同 frames context 原样返回、download + upload）都保留
+        // 属性，所以这里必须显式补上，三者才一致。
+        self.copy_frame_props(&src, &mut dst)?;
+
         tracing::debug!(
             "Mapped HW frame into the codec frames context: {} {}x{}",
             PixelFormat::name_of(dst.format),
