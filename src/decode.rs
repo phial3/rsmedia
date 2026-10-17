@@ -167,6 +167,8 @@ pub struct DecoderBuilder {
     thread_count: Option<i32>,
     media_type: MediaType,
     codec_name: Option<String>,
+    /// 显式绑定的**容器流索引**（`build_from_reader` 生效）。`None` 时自动选"最佳流"。
+    stream_index: Option<usize>,
     codec_opts: Option<AVOptions>,
     filters: Option<Vec<Filter>>,
     hw_device_config: Option<HWDeviceConfig>,
@@ -216,6 +218,7 @@ impl DecoderBuilder {
             media_type,
             filters: None,
             codec_name: None,
+            stream_index: None,
             codec_opts: None,
             hw_device_config: None,
             hw_pool_size: None,
@@ -239,6 +242,25 @@ impl DecoderBuilder {
     // 与 EncoderBuilder 共有的那批 setter：定义与文档在 `macros.rs` 的宏里，
     // 改一次两端同时生效（见 `impl_codec_builder_setters` 的说明）。
     impl_codec_builder_setters!();
+
+    /// Bind the decoder to one **specific container stream index** instead of
+    /// the media type's "best" stream.
+    ///
+    /// 默认（不调用本方法）行为不变：`build_from_reader` 用
+    /// `Reader::find_best_stream(media_type)` 选流。设置后 `build_from_reader`
+    /// 直接绑定该容器索引的流：
+    /// - 流的媒体类型必须与 builder 一致，否则 [`RsmediaError::InvalidConfig`]；
+    /// - 未显式给定 [`with_codec_name`](Self::with_codec_name) 时，从流的
+    ///   `codecpar.codec_id` 反查本构建可用的解码器名；
+    /// - codecpar / 时间基 / 帧率全部取自立点流，不做"最佳流"替代。
+    ///
+    /// 多流代理解码（[`Demuxer`](crate::mux::Demuxer)）必须用它：同一容器可能
+    /// 有两条同类型流（如 44.1 kHz 与 8 kHz 各一条 AAC），"最佳流"的参数只对
+    /// 其中一条正确 —— 绑定错流时第二流按错误参数解码，产出静默错位的帧。
+    pub fn with_stream_index(mut self, index: usize) -> Self {
+        self.stream_index = Some(index);
+        self
+    }
 
     /// Set the resize strategy applied to decoded video frames.
     ///
@@ -706,27 +728,66 @@ impl DecoderBuilder {
     ///
     /// 高级/内部场景使用（如 mux 多流共享同一 reader）。解码时需每帧传入
     /// reader，且不支持 seek。
+    ///
+    /// 输入流绑定规则（见 [`with_stream_index`](Self::with_stream_index)）：
+    /// - 未设置 → 绑定 `find_best_stream(media_type)` 为该媒体类型选出的
+    ///   "最佳流"（独立构建场景的默认语义）；
+    /// - 设置后 → 绑定指定的容器流索引，流媒体类型必须与本 builder 一致
+    ///   （不一致 `InvalidConfig`）。**同类型多流容器必须走这条路**："最佳流"
+    ///   的 codecpar/时间基只对其中一条流正确。
+    ///
+    /// codec 解析规则（见 [`with_codec_name`](Self::with_codec_name)）：调用方
+    /// 指定的名字最优先（异种 decoder 场景，如 hwaccel 变体 `h264_cuvid`，只能
+    /// 按名查）；未指定时**直取 `AVCodec` 句柄** —— 从绑定的流
+    /// `codecpar.codec_id` 一次查找直达，不做"流 → 名字 → codec"的 round-trip。
     pub fn build_from_reader<R: Reader>(mut self, reader: &R) -> Result<Decoder> {
         let media_type = self.media_type;
-        let (stream_index, codec_name) = reader.find_best_stream(media_type)?;
-        let input_stream =
-            reader
-                .input()
-                .streams()
-                .get(stream_index)
-                .ok_or(RsmediaError::invalid_config(format!(
-                    "stream: {stream_index} not found!"
-                )))?;
 
-        // 优先用调用方指定的解码器名，否则用流自带的名字（`find_best_stream`
-        // 的返回值）。
-        let codec_name = self.codec_name.as_deref().unwrap_or(&codec_name);
-        let codec = AVCodec::find_decoder_by_name(&strutils::str_to_cstring(codec_name)?)
-            .ok_or_else(|| {
-                RsmediaError::unsupported(format!(
-                    "decoder '{codec_name}' is not available in this FFmpeg build"
-                ))
-            })?;
+        // 绑定输入流
+        let (stream_index, input_stream) = match self.stream_index {
+            Some(index) => {
+                let input_stream = reader.stream_at(index)?;
+                let stream_type = MediaType::from_ffi_checked(input_stream.codecpar().codec_type)
+                    .unwrap_or(MediaType::UNKNOWN);
+                if stream_type != media_type {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "decoder builder is for {media_type:?}, but stream {index} is \
+                         {stream_type:?} — bind a matching stream, or leave \
+                         with_stream_index unset to pick the best one by media type"
+                    )));
+                }
+                (index, input_stream)
+            }
+            None => {
+                // `find_best_stream` 也回传 codec 名，这里同样取之不用：
+                // 解码器句柄在 ② 里由绑定流的 codecpar 统一直取。
+                let (index, _codec_name) = reader.find_best_stream(media_type)?;
+                (index, reader.stream_at(index)?)
+            }
+        };
+
+        // codec 句柄单点解析：
+        // - 指定的名字最优先
+        // - 未点名时直接从**绑定流**的 `codecpar.codec_id` 取 `AVCodec` 句柄
+        let codec = match &self.codec_name {
+            Some(name) => {
+                let name_c = strutils::str_to_cstring(name)?;
+                AVCodec::find_decoder_by_name(&name_c).ok_or_else(|| {
+                    RsmediaError::unsupported(format!(
+                        "decoder '{name}' is not available in this FFmpeg build"
+                    ))
+                })?
+            }
+            None => {
+                let codec_id = input_stream.codecpar().codec_id;
+                AVCodec::find_decoder(codec_id).ok_or_else(|| {
+                    RsmediaError::unsupported(format!(
+                        "no decoder for codec_id {codec_id:#x} of stream {stream_index} \
+                         is available in this FFmpeg build"
+                    ))
+                })?
+            }
+        };
 
         let duration = Time::new(Some(input_stream.duration), input_stream.time_base.into());
         let nb_frames = input_stream.nb_frames;

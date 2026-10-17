@@ -1527,7 +1527,9 @@ impl<R: Reader> Demuxer<R> {
                 stream_info.codec_id, stream_info.index
             )));
         };
-        let mut builder = DecoderBuilder::new(media_type).with_codec_name(codec_name.clone());
+        let mut builder = DecoderBuilder::new(media_type)
+            .with_codec_name(codec_name.clone())
+            .with_stream_index(stream_info.index);
         if let Some(cfg) = &device_config {
             builder = builder.with_hardware_device(cfg.clone());
         }
@@ -1546,7 +1548,9 @@ impl<R: Reader> Demuxer<R> {
                 let software_name = stream_info
                     .find_decoder_name(None)
                     .unwrap_or_else(|| codec_name.clone());
-                let mut fallback = DecoderBuilder::new(media_type).with_codec_name(software_name);
+                let mut fallback = DecoderBuilder::new(media_type)
+                    .with_codec_name(software_name)
+                    .with_stream_index(stream_info.index);
                 if let Some(chain) = filters.get(&media_type) {
                     fallback = fallback.with_filters(chain.clone());
                 }
@@ -1565,6 +1569,13 @@ impl<R: Reader> Demuxer<R> {
     ///
     /// `filters` 按媒体类型分组，`device_config` 为可选的硬件加速配置；两者都
     /// 接受「值本身或 `None`」，不需要包 `Some`。
+    ///
+    /// **字幕流被跳过**（与章节轨/附件同一待遇）：字幕解码器只支持
+    /// `avcodec_decode_subtitle2` 通道，与 [`demux`](Self::demux) 驱动的帧
+    /// API 不兼容 —— 为字幕流构建解码器会把问题埋进迭代里（实测把字幕包
+    /// 路由进去，libavcodec 的断言直接 `abort()` 崩进程）。字幕内容走
+    /// [`new_passthrough`](Self::new_passthrough) + `mux_packet` 按字节搬包，
+    /// 或 `Decoder::new_subtitle` + `decode_subtitle_segment` 解成文本段落。
     pub fn new_from_reader(
         reader: R,
         filters: impl Into<Option<Vec<Filter>>>,
@@ -1579,6 +1590,21 @@ impl<R: Reader> Demuxer<R> {
         for stream_idx in 0..nb_streams {
             let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
             let device_type = device_config.as_ref().map(|c| c.device_type);
+            if stream_info.media_type == MediaType::SUBTITLE {
+                // 字幕流跳过：字幕解码器只支持 `avcodec_decode_subtitle2` 通道
+                // （发 AVSubtitle），不支持 send/receive **帧** API ——
+                // `demux()` 驱动帧 API，把字幕包路由进去实测会让 libavcodec
+                // 的断言直接 `abort()` 崩进程（rsmpeg 层无 Err 可捕获）。
+                // 字幕内容走两条既有通道：`Demuxer::new_passthrough` +
+                // `mux_packet`（按字节搬包），或专门的
+                // `Decoder::new_subtitle` + `decode_subtitle_segment`（解成`SubtitleSegment`）
+                tracing::debug!(
+                    "Skipping stream {stream_idx}: subtitle stream (frame-API decode is \
+                     not supported for subtitles; use new_passthrough + mux_packet for \
+                     copy, or Decoder::new_subtitle for SubtitleSegment decoding)"
+                );
+                continue;
+            }
             if stream_info.find_decoder_name(device_type).is_none() {
                 // Streams without a registered decoder (chapter tracks,
                 // attached pictures, binary data, ...) are skipped instead of
@@ -1635,7 +1661,9 @@ impl<R: Reader> Demuxer<R> {
     /// - 点了名却**不可解码**的流（章节轨、附件、本构建没有解码器的编码）报
     ///   [`RsmediaError::Unsupported`]，而不是像 [`new_from_reader`](Self::new_from_reader)
     ///   那样静默跳过：调用方明确要了这条流，少给一条必须让它知道，而不是让它以为
-    ///   自己拿到的是全部。
+    ///   自己拿到的是全部。字幕流在此处**永远**报 `Unsupported`（帧 API 驱动字幕
+    ///   解码器会崩，见 [`new_from_reader`](Self::new_from_reader) 的说明），即使
+    ///   本构建里有字幕解码器。
     ///
     /// ```no_run
     /// use rsmedia::io::StreamReader;
@@ -1675,6 +1703,17 @@ impl<R: Reader> Demuxer<R> {
                 )));
             }
             let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
+            if stream_info.media_type == MediaType::SUBTITLE {
+                // 显式点名了字幕流：不能给（frame-API demux() 驱动字幕解码器=
+                // libavcodec abort 崩溃，见 `new_from_reader` 的注释），也不能
+                // 静默跳过（调用方明确要了这条流）。报 `Unsupported` 并指路。
+                return Err(RsmediaError::unsupported(format!(
+                    "stream {stream_idx} is a subtitle stream and cannot be driven by the \
+                     frame-API demux() path: use Demuxer::new_passthrough + Muxer::add_copy_stream \
+                     to copy the track bit-exactly, or Decoder::new_subtitle + \
+                     decode_subtitle_segment to decode it into SubtitleSegments"
+                )));
+            }
             // 不做 `find_decoder_name` 预检后跳过：`build_decoder` 自己就会为"没有
             // 解码器"返回 `Unsupported`（消息里带 codec_id 与流号），正是本方法
             // 想要的策略——显式点名了就要么给流、要么报错。

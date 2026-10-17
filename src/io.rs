@@ -51,7 +51,7 @@ use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
 use rsmpeg::avformat::{
     AVFormatContextInput, AVFormatContextOutput, AVIOContextContainer, AVIOContextCustom,
-    AVInputFormat, ReadPacketCallback, SeekCallback, WritePacketCallback,
+    AVInputFormat, AVStream, ReadPacketCallback, SeekCallback, WritePacketCallback,
 };
 use rsmpeg::avutil::{AVDictionary, AVMem};
 use rsmpeg::error::RsmpegError;
@@ -123,8 +123,9 @@ pub trait Reader {
     /// Read the next packet. Returns `None` on EOF.
     ///
     /// 成功时返回 `(packet 所属流的 index, packet)`；调用方如需更多流信息
-    /// （time_base、metadata 等），可通过 `self.input().streams().get(index)`
-    /// 直接使用 rsmpeg 的 [`AVStream`](rsmpeg::avformat::AVStream)。
+    /// （time_base、metadata 等），可通过 [`stream_at`](Self::stream_at)
+    /// 按索引取流，或经 `self.input()` 直接使用 rsmpeg 的
+    /// [`AVStream`](rsmpeg::avformat::AVStream)。
     fn read_packet(&mut self) -> Result<Option<(usize, AVPacket)>> {
         match self.input_mut().read_packet() {
             Ok(Some(pkt)) => Ok(Some((pkt.stream_index as usize, pkt))),
@@ -133,11 +134,40 @@ pub trait Reader {
         }
     }
 
+    /// 按容器索引取第 `index` 条流（`AVFormatContextInput::streams()` 的越界
+    /// 安全封装）。
+    ///
+    /// 库内"reader 里按索引取流"的唯一定义点：解码侧多流代理绑定、
+    /// `StreamInfo::from_reader`、subtitle 专用通道一概走这里，越界统一为
+    /// [`RsmediaError::InvalidConfig`]（消息带 `nb_streams`）。
+    ///
+    /// 返回的引用经 `AVStreamRef` 的 deref 呈现为 `&AVStream`，生命周期即
+    /// `&self` 的借用期。
+    fn stream_at(&self, index: usize) -> Result<&AVStream> {
+        self.input()
+            .streams()
+            .get(index)
+            .ok_or_else(|| {
+                RsmediaError::invalid_config(format!(
+                    "stream index {index} not found (nb_streams={})",
+                    self.input().nb_streams
+                ))
+            })
+            .map(|stream| &**stream)
+    }
+
     /// Find the best stream
     ///
     /// # Arguments
     ///
     /// * `media_type` - MediaType maybe Video, Audio, etc.
+    ///
+    /// 返回的 `(索引, codec 名)` 中**名字是参考信息**：它只是"最佳流"默认软解
+    /// decoder 的名字。实际要打开解码器时请以流 `codecpar.codec_id` 的
+    /// [`AVCodec::find_decoder`](rsmpeg::avcodec::AVCodec::find_decoder) 为准
+    /// （Demuxer 逐流构建、subtitle 专用通道都是这一判据），异种 decoder
+    /// hwaccel 变体则由调用方按名另行指定 —— 不要把这里的名字当作解码器
+    /// 判据的权威来源。
     fn find_best_stream(&self, media_type: MediaType) -> Result<(usize, String)> {
         self.input()
             .find_best_stream(media_type as _)?
@@ -1171,6 +1201,25 @@ pub trait Writer {
 
     /// Obtain mutable reference to output context.
     fn output_mut(&mut self) -> &mut AVFormatContextOutput;
+
+    /// 按输出容器索引取第 `index` 条流（[`Reader::stream_at`](Reader::stream_at)
+    /// 的写侧对称方法）。
+    ///
+    /// 越界统一为 [`RsmediaError::InvalidConfig`]（消息带 `nb_streams`）。注意
+    /// 输出侧的流是**逐步注册**的（[`add_stream`](Self::add_stream)），该索引
+    /// 语义只在 `write_header` 前稳定。
+    fn stream_at(&self, index: usize) -> Result<&AVStream> {
+        self.output()
+            .streams()
+            .get(index)
+            .ok_or_else(|| {
+                RsmediaError::invalid_config(format!(
+                    "stream index {index} not found (nb_streams={})",
+                    self.output().nb_streams
+                ))
+            })
+            .map(|stream| &**stream)
+    }
 
     /// new stream
     ///

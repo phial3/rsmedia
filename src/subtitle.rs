@@ -380,7 +380,7 @@ mod tests {
         let mut reader = StreamReader::new(&path)?;
         let (index, _) = reader.find_best_stream(crate::MediaType::SUBTITLE)?;
         let (codec_id, stream_tb) = {
-            let stream = reader.input().streams().get(index).unwrap();
+            let stream = reader.stream_at(index)?;
             (stream.codecpar().codec_id, stream.time_base)
         };
         assert_eq!(
@@ -505,7 +505,7 @@ mod tests {
         // Copy codec parameters to output stream (clone to release the borrow
         // on reader before calling copy_subtitle_stream which needs &mut reader).
         let (codecpar, src_tb) = {
-            let src_stream = reader.input().streams().get(in_index).unwrap();
+            let src_stream = reader.stream_at(in_index)?;
             (
                 src_stream.codecpar().clone(),
                 Rational::from(src_stream.time_base),
@@ -561,7 +561,7 @@ mod tests {
         let mut reader = StreamReader::new(&path)?;
         let (index, _) = reader.find_best_stream(crate::MediaType::SUBTITLE)?;
         let (codec_id, stream_tb) = {
-            let stream = reader.input().streams().get(index).unwrap();
+            let stream = reader.stream_at(index)?;
             (stream.codecpar().codec_id, stream.time_base)
         };
         assert_eq!(
