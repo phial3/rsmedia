@@ -1813,7 +1813,14 @@ impl BufferWriter {
     /// 会在 trailer 阶段回写 header 的格式（mp4 / mov / wav）拿不到那部分字节，
     /// 完整输出请用 [`into_bytes`](Self::into_bytes)。
     pub fn take_written(&mut self) -> Bytes {
-        let mut st = self.state.lock().expect("mem writer state poisoned");
+        // 毒化容错：state 只暴露 `data`/`delivered` 两个字段，持锁方 panic 的最坏
+        // 后果是这一对字段短暂不一致 —— 字节仍在缓冲里。与其在增量读取处把毒化
+        // 放大成 panic（调用方一个崩溃就传染此后所有取写操作），不如照常取出
+        // 已写入的部分；数据是否完整的判断留给交付方。
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let delta = Bytes::copy_from_slice(&st.data[st.delivered..]);
         st.delivered = st.data.len();
         delta
@@ -1830,7 +1837,11 @@ impl BufferWriter {
         // 先释放 format context（连带 IO 回调释放其持有的 state 引用）
         drop(output);
         match Arc::try_unwrap(state) {
-            Ok(st) => Vec::from(st.into_inner().expect("mem writer state poisoned").data),
+            Ok(st) => Vec::from(
+                st.into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .data,
+            ),
             // 不可达：output 已 drop，回调持有的 Arc 引用随之释放。
             // 用 panic（fail-fast）而非静默返回空 Vec，避免数据无声丢失。
             Err(_) => panic!("BufferWriter: state still referenced after context drop"),

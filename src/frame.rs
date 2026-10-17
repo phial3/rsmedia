@@ -780,6 +780,14 @@ impl<T: ElementType> Default for MediaFrame<T> {
 /// 调色板 BMP 解出来就是 `pal8`），不是调用方能保证的事。`new_video` 与
 /// `new_video_frame` 共用这里，两个相邻构造器不会对同一份输入给出不同答案。
 fn storable_video_layout(format: PixelFormat, width: u32, height: u32) -> Result<DataLayout> {
+    // 零尺寸与"不可平面存储"同等地走 `Err`：帧的格式/尺寸随时来自解码器或直接
+    // 来自用户，`PixelFormat::data_layout` 的 zero-dimension panic 是给"调用方
+    // 已检查"的场合的兜底，这里就是那个"调用方"。
+    if width == 0 || height == 0 {
+        return Err(RsmediaError::invalid_config(format!(
+            "video frame needs a positive size, got {width}x{height}"
+        )));
+    }
     if !format.is_plane_storable() {
         return Err(RsmediaError::unsupported(format!(
             "pixel format {} cannot be stored as sample planes: a bitstream, paletted \
@@ -799,10 +807,10 @@ where
     /// Derived from the format ([`PixelFormat::data_layout`] /
     /// [`SampleFormat::data_layout`]), so it applies to video and audio alike.
     ///
-    /// A video format with no whole-sample planes — bitstream, paletted or hardware —
-    /// is an `Err`, **not** the panic [`PixelFormat::data_layout`] raises for it: a
-    /// frame's format may come from a decoder (8-bit paletted BMPs decode to `pal8`),
-    /// so getting it right is not the caller's to guarantee.
+    /// 帧的格式/尺寸随时来自解码器或直接来自用户，因此本方法**不依赖
+    /// [`PixelFormat::data_layout`] 的 panic 契约**：不可平面存储的格式
+    /// （位流 / 调色板 / 硬件，8-bit 调色板 BMP 就解成 `pal8`）与零尺寸
+    /// 都在前置检查里转为 `Err`。
     pub fn data_layout(&self) -> Result<DataLayout> {
         if self.media_type == MediaType::VIDEO {
             let format = self
@@ -811,6 +819,13 @@ where
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
             storable_video_layout(format, self.width, self.height)
         } else {
+            if self.nb_samples == 0 || self.nb_channels == 0 {
+                return Err(RsmediaError::invalid_config(format!(
+                    "audio frame needs a positive sample and channel count, \
+                     got {} samples x {} channels",
+                    self.nb_samples, self.nb_channels
+                )));
+            }
             let format = self
                 .format
                 .into_sample()
@@ -826,8 +841,10 @@ where
     /// `(height, width, elements_per_pixel)` 数组，planar 格式为每平面一个数组。
     /// 传入 `ndarray::Array3` / `Vec<Array2>` 会分别视为交错 / 平面帧。
     ///
-    /// 零宽高会 panic，与 [`PixelFormat::data_layout`] 的契约一致；无法整样本
-    /// 平面化的格式（位流 / 调色板 / 硬件）则返回 `Err`
+    /// 零宽高返回 `Err`（帧尺寸随时来自用户构造或解码产物，构造器必须直接
+    /// 拒绝而不是依赖底层布局 API 的 panic 契约）；无法整样本平面化的格式
+    /// （位流 / 调色板 / 硬件）同样返回 `Err`
+    /// （见 [`data_layout`](Self::data_layout) 的理由）。
     /// （见 [`data_layout`](Self::data_layout) 的理由）。
     ///
     /// 时间基保持未设置：分辨率里没有帧率信息，而编码器会用自己的输入时间基解释
@@ -919,8 +936,9 @@ where
     /// [`to_avframe`](Self::to_avframe)。
     fn validated(self) -> Result<Self> {
         // 音频的声道数/采样数必须为正：否则平面布局是空列表、`matches` 会接受，
-        // 一个"没有声道"的帧就能一路走到 FFmpeg。视频侧的等价约束由
-        // `PixelFormat::data_layout` 的零尺寸 panic 覆盖，无需在此重复。
+        // 一个"没有声道"的帧就能一路走到 FFmpeg。视频侧的等价约束（正尺寸）由
+        // `storable_video_layout` 的零尺寸 `Err` 覆盖 —— 不再依赖底层
+        // `PixelFormat::data_layout` 的 panic 兜底。
         if self.media_type == MediaType::AUDIO && (self.nb_channels == 0 || self.nb_samples == 0) {
             return Err(RsmediaError::msg(format!(
                 "Audio frame needs a positive sample and channel count, got {} samples x {} channels",
@@ -1867,12 +1885,20 @@ fn yuv420p_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
 }
 
 /// Checks `data` against the layout `format` requires at `width` x `height`.
+///
+/// 零尺寸在这里前置拒绝：`check_layout` 的宽高来自调用点的用户数据，不应让
+/// 坏尺寸触达 [`PixelFormat::data_layout`] 的 panic 兜底。
 fn check_layout<T>(
     data: &FrameData<T>,
     format: PixelFormat,
     width: u32,
     height: u32,
 ) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(RsmediaError::invalid_config(format!(
+            "video frame needs a positive size, got {width}x{height}"
+        )));
+    }
     let layout = format.data_layout(width, height);
     if data.matches(&layout) {
         Ok(())
