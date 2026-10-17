@@ -905,6 +905,11 @@ impl EncoderBuilder {
                 time_base: input_time_base,
                 frame_rate: self.frame_rate,
                 pixel_aspect,
+                // 编码器侧的输入色彩取决于调用方实际推入的帧（builder 尚无
+                // 色彩配置项），保持 UNSPECIFIED：buffer 源不写 color args，
+                // 与旧行为一致。
+                color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+                color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
             }),
             MediaType::AUDIO => FilterParams::Audio(AudioParams {
                 nb_channels: self.nb_channels as i32,

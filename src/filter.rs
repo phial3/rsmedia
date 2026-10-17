@@ -2177,6 +2177,18 @@ pub struct VideoParams {
     pub frame_rate: Rational,
     /// 像素宽高比；[`Rational::ZERO`] 表示未知。
     pub pixel_aspect: Rational,
+    /// 这一帧的 YUV 色度坐标（`AVColorSpace`，如 BT709）；[`ffi::AVCOL_SPC_UNSPECIFIED`]
+    /// 表示未知 —— buffer 源据此声明进图帧的色彩描述符（FFmpeg ≥7.1 才接受，
+    /// 6.1 无此参数；未指定时不写入 args，行为与从前一致）。
+    ///
+    /// 声明了它，图内就能按帧与输出色彩不匹配自动插转（7.1+）——否则
+    /// full/limited range 不匹配的画面直接被原样送进编码器，出来的就是
+    /// 过饱和/发灰的帧。
+    pub color_space: ffi::AVColorSpace,
+    /// 这一帧的亮度取值范围（`AVColorRange`：TV/MPEG 或 PC/JPEG 限幅）；
+    /// [`ffi::AVCOL_RANGE_UNSPECIFIED`] 表示未知。与 [`Self::color_space`](Self::color_space)
+    /// 一同进 buffer 源 args（FFmpeg ≥7.1）。
+    pub color_range: ffi::AVColorRange,
 }
 
 /// Audio filter parameters — the single-input / single-output linear chain
@@ -2255,6 +2267,11 @@ pub struct VideoEndpoint {
     pub frame_rate: Rational,
     /// 像素宽高比。
     pub pixel_aspect: Rational,
+    /// 进图帧的 YUV 色度坐标（`AVColorSpace`）；[`ffi::AVCOL_SPC_UNSPECIFIED`] 表示未知。
+    /// 见 [`VideoParams::color_space`](VideoParams::color_space)。
+    pub color_space: ffi::AVColorSpace,
+    /// 进图帧的亮度取值范围（`AVColorRange`）；[`ffi::AVCOL_RANGE_UNSPECIFIED`] 表示未知。
+    pub color_range: ffi::AVColorRange,
 }
 
 impl VideoEndpoint {
@@ -2264,7 +2281,8 @@ impl VideoEndpoint {
     /// 倒数），写反了编译得过、要到出片才看得出错。用下面的 `with_*` 逐个按名字设置。
     ///
     /// 默认值：时间基与帧率 [`Rational::ZERO`]（`buffer` 源会直接拒绝 `time_base=0/1`，
-    /// 不会静默建出一个错的图）、像素宽高比 [`Rational::ONE`]（1:1，最常见的情形）。
+    /// 不会静默建出一个错的图）、像素宽高比 [`Rational::ONE`]（1:1，最常见的情形）、
+    /// 色彩描述符 UNSPECIFIED（buffer 源不写 color args，保持旧语义）。
     pub fn new(width: u32, height: u32, format: PixelFormat) -> Self {
         Self {
             width,
@@ -2273,6 +2291,8 @@ impl VideoEndpoint {
             time_base: Rational::ZERO,
             frame_rate: Rational::ZERO,
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         }
     }
 
@@ -2335,6 +2355,8 @@ impl From<VideoParams> for VideoEndpoint {
             time_base: params.time_base,
             frame_rate: params.frame_rate,
             pixel_aspect: params.pixel_aspect,
+            color_space: params.color_space,
+            color_range: params.color_range,
         }
     }
 }
@@ -2348,6 +2370,17 @@ impl From<AudioParams> for AudioEndpoint {
             time_base: params.time_base,
         }
     }
+}
+
+/// 色彩描述符是否值得写进 buffer 源 args：UNSPECIFIED 没有信息量，RESERVED 是
+/// "FFmpeg 留着不用"的占位（写了只会在协商阶段制造噪声）。
+fn is_known_color_space(space: ffi::AVColorSpace) -> bool {
+    !matches!(space, ffi::AVCOL_SPC_UNSPECIFIED | ffi::AVCOL_SPC_RESERVED)
+}
+
+/// 亮度取值范围已声明的判定：MPEG(TV)/JPEG(PC) 之外都是"未知"。
+fn is_known_color_range(range: ffi::AVColorRange) -> bool {
+    matches!(range, ffi::AVCOL_RANGE_MPEG | ffi::AVCOL_RANGE_JPEG)
 }
 
 impl From<VideoParams> for Endpoint {
@@ -2711,7 +2744,7 @@ impl FilterGraph {
     ) -> Result<AVFilterContextMut<'_>> {
         // buffer 源按"这一路实际推入的帧格式"配置；sink 仍按目标格式约束。二者
         // 不同时（如 GIF 调色板链 RGB→pal8），格式转换由图内的滤镜完成。
-        let args = CString::new(format!(
+        let mut args = format!(
             "width={}:height={}:pix_fmt={}:time_base={}/{}:frame_rate={}/{}:pixel_aspect={}/{}",
             endpoint.width,
             endpoint.height,
@@ -2722,7 +2755,25 @@ impl FilterGraph {
             endpoint.frame_rate.den(),
             endpoint.pixel_aspect.num(),
             endpoint.pixel_aspect.den(),
-        ))?;
+        );
+        // 色彩描述符。实测的选项键名矩阵（C 探针，6.1/7.1/8.1/9.0 各一遍）：
+        // - 6.1 的 buffer 源**没有**颜色选项：color_space/color_space/range/
+        //   color_range 一律 "Option not found"（构建即 EINVAL）；
+        // - 7.1+ 接受但键名是 `colorspace` 与 `range`（不是 buffersrc.h 结构体
+        //   字段名里的 color_space/color_range），int 或具名常量皆可——用数值
+        //   （AVCOL_* 枚举值横跨版本稳定，具名表有增改风险）。
+        // 未指定的颜色元数据不写入：0（UNSPEC 侧 0=RESERVED/2=UNSPECIFIED 类）
+        // 没有信息量，写了还可能让本可协商的滤镜图误判。
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        {
+            if is_known_color_space(endpoint.color_space) {
+                args.push_str(&format!(":colorspace={}", endpoint.color_space as i32));
+            }
+            if is_known_color_range(endpoint.color_range) {
+                args.push_str(&format!(":range={}", endpoint.color_range as i32));
+            }
+        }
+        let args = CString::new(args)?;
 
         let buffersrc = get_by_name("buffer")?.ok_or_else(|| {
             RsmediaError::unsupported("filter 'buffer' is not available in this FFmpeg build")
@@ -4499,6 +4550,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let poisoned = Filter::new("null", MediaType::VIDEO, "null=a\0b".to_string());
         let err = match FilterGraph::build(&params, &[poisoned]) {
@@ -4839,6 +4892,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let filter = video::hflip();
 
@@ -5275,6 +5330,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
         let mut graph = FilterGraph::build(&params, &[null])?;
@@ -5314,6 +5371,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
         let mut graph = FilterGraph::build(&params, &[null])?;
@@ -5629,6 +5688,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let filters = vec![Filter::new(
             "rsmedia_no_such_filter",
@@ -5663,6 +5724,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
 
         let err = FilterGraph::build(&params, &[]).unwrap_err();

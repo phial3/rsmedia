@@ -72,7 +72,7 @@ use crate::state::ProcessState;
 use crate::stream::{MediaType, StreamInfo};
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
-use crate::time::{Rational, Time};
+use crate::time::{Rational, Rescale, Time};
 
 use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket, AVSubtitle};
@@ -683,6 +683,49 @@ impl DecoderBuilder {
     ///
     /// sink 端格式 = 解码输出格式：图内负责把链的输出转回来，`MediaFrame` 因此
     /// 拿到的仍是 `with_pix_fmt` / `with_sample_fmt` 承诺的格式。
+    /// 收集并校验滤镜链声明的图输入格式（[`Filter::with_input_format`]）。
+    ///
+    /// - 多条滤镜各自声明时必须**一致**（同一格式）：这个声明的意义是"帧进图前
+    ///   先转成它、图内 buffer 源按它声明"，链上各条各说各话没有可行实现；
+    /// - 声明必须与滤镜的媒体类型同族（视频滤镜配采样格式同样不可实现）。
+    ///
+    /// 老行为取"链上第一条声明"且不校验：后面的声明被静默忽略、冲突根本不报
+    /// —— 静默建出与声明不符的图，属于"构造即可触发"的缺陷，现在 loud fail。
+    fn resolve_filter_input_format(&self) -> Result<Option<FrameFormat>> {
+        let Some(filters) = self.filters.as_ref() else {
+            return Ok(None);
+        };
+        let mut declared: Option<FrameFormat> = None;
+        for filter in filters {
+            let Some(fmt) = filter.input_format() else {
+                continue;
+            };
+            if let Some(prev) = declared {
+                if prev != fmt {
+                    return Err(RsmediaError::invalid_config(format!(
+                        "filters declare conflicting input formats: {prev:?} vs {fmt:?} — \
+                         all `with_input_format` declarations in one chain must agree"
+                    )));
+                }
+            } else {
+                declared = Some(fmt);
+            }
+            let media_type = filter.media_type();
+            let same_family = matches!(
+                (media_type, fmt),
+                (MediaType::VIDEO, FrameFormat::Pixel { .. })
+                    | (MediaType::AUDIO, FrameFormat::Sample { .. })
+            );
+            if !same_family {
+                return Err(RsmediaError::invalid_config(format!(
+                    "filter for {media_type:?} declares input format {fmt:?} — a cross-type \
+                     format declaration has no workable implementation"
+                )));
+            }
+        }
+        Ok(declared)
+    }
+
     fn build_filter_params(
         &self,
         ctx: &AVCodecContext,
@@ -703,6 +746,12 @@ impl DecoderBuilder {
                 time_base: ctx.time_base.into(),
                 frame_rate: ctx.framerate.into(),
                 pixel_aspect: ctx.sample_aspect_ratio.into(),
+                // 图输入（源侧）色彩描述符：解码上下文在 `apply_codecpar` 时已把
+                // 流的色彩元数据拷进 AVCodecContext。进图帧携带同样的元数据，
+                // 源侧如实声明后 7.1+ 的图能自动插转，避免 full/limited range
+                // 错位直进编码器。
+                color_space: ctx.colorspace,
+                color_range: ctx.color_range,
             })),
             MediaType::AUDIO => {
                 // sink 格式 = 解码输出采样格式（未指定则保留原生）。
@@ -834,18 +883,31 @@ impl DecoderBuilder {
         // 滤镜链声明的图输入格式（见 [`Filter::with_input_format`]）：帧在进图
         // 之前会被转成它，图内 buffer 源按同一格式声明，两者必须一致（声明与
         // 实喂不符会被 av_buffersrc 拒绝）。未声明时图输入 = 解码输出格式，
-        // 零额外转换，与从前完全一致。
-        let filter_input_format = self
-            .filters
-            .as_ref()
-            .and_then(|filters| filters.iter().find_map(|f| f.input_format()));
+        // 零额外转换，与从前完全一致。多条声明冲突 / 跨类型声明在这里直接
+        // 报 `InvalidConfig`（见 [`Self::resolve_filter_input_format`]）。
+        let filter_input_format = self.resolve_filter_input_format()?;
 
         let filter_graph = match self.filters.take() {
             Some(filters) => {
+                // 滤镜图输入端点按 resize 折算后的尺寸声明：帧在进图**之前**会被
+                // swscale 缩放到 resize 的目标尺寸（`receive_normalized_frame` 步骤 2），
+                // 而 buffersrc 的端点参数在 build 时定格 —— 若仍声明 codecpar 尺寸，
+                // 实喂帧与声明不符，`av_buffersrc` 会以 EINVAL 直接拒绝。
+                let (filter_w, filter_h) = match self.resize {
+                    Some(resize) => resize.compute_for((init_width, init_height)).ok_or_else(
+                        || {
+                            RsmediaError::invalid_config(format!(
+                                "the resize configuration {resize:?} yields no valid size for a \
+                                 {init_width}x{init_height} stream"
+                            ))
+                        },
+                    )?,
+                    None => (init_width, init_height),
+                };
                 let params = self.build_filter_params(
                     &decode_ctx,
-                    init_width,
-                    init_height,
+                    filter_w,
+                    filter_h,
                     output_pix_fmt,
                     output_sample_fmt,
                     filter_input_format,
@@ -1521,6 +1583,8 @@ impl Decoder {
 
     /// Discards the decoder's buffered frames and resets it to a clean state.
     ///
+    /// 冲刷解码器与整条流水线的中间缓冲，回到可继续解码的状态。
+    ///
     /// This is `avcodec_flush_buffers`: after a seek the decoder still holds
     /// frames from the old position, and this drops them so decoding restarts at
     /// the new one. It is deliberately **not** named `flush` — on an
@@ -1530,12 +1594,19 @@ impl Decoder {
     /// The filter graph is part of the pipeline and holds frames of its own
     /// (a delay filter such as `fps` keeps one, and anything queued behind it
     /// stays inside the graph). `avcodec_flush_buffers` knows nothing about it, so
-    /// this rebuilds the graph as well; without that, frames from **before** the
+    /// this rebuilds the graph as well; without that, frames from **before the
     /// seek would be emitted after it.
     ///
     /// `pending_frames` is part of the pipeline for the same
     /// reason: those frames were already decoded, so dropping the codec's buffers
     /// without dropping them would deliver pre-seek pictures after the seek.
+    ///
+    /// 同时把解码**阶段**重置回 `Normal`：本 API 的调用时点就是 "seek 之后要
+    /// 重新喂包"，可上一轮若已 `drain` 到过 `Drained`（EOS 已送出），FFmpeg 只会
+    /// 回 "Decoder is already flushed"/EINVAL —— 缓冲清空了，阶段却还锁在
+    /// "禁止送包"上，调用方只会拿到一句让人摸不着头脑的报错。既然两边缓冲与
+    /// 滤镜图都已重建，把阶段一并带回起点才是完整语义（与 [`reset`](Self::reset)
+    /// 的差别只剩"是否显式声明这是重启"），已到达 EOF 的调用无需 reset 即可重来。
     pub fn flush_buffers(&mut self) -> Result<()> {
         // SAFETY: `self.context` is a live decoder context we exclusively own (`&mut self`);
         // `avcodec_flush_buffers` only resets its internal buffers.
@@ -1543,6 +1614,7 @@ impl Decoder {
             ffi::avcodec_flush_buffers(self.context.as_mut_ptr());
         }
         self.pending_frames.clear();
+        self.state = ProcessState::Normal;
         self.rebuild_filter_graph()
     }
 
@@ -1593,10 +1665,23 @@ impl Decoder {
                                 && !chain.graph.is_flushed()
                             {
                                 match chain.graph.process_frame(None)? {
-                                    Some(frame) => return Ok(Some(frame)),
+                                    Some(frame) => {
+                                        // 冲刷出来的缓冲帧同样归一化（见下）。
+                                        let graph_tb = Rational::from(frame.time_base);
+                                        return Ok(Some(
+                                            self.normalize_frame_time_base(frame, Some(graph_tb)),
+                                        ));
+                                    }
                                     None => {
-                                        // 已无更多缓冲帧（graph 此时已 Flushed）
-                                        debug_assert!(chain.graph.is_flushed());
+                                        // 理论上到这里 graph 应已 Flushed；个别 FFmpeg
+                                        // 版本在图内还有排队帧时可能尚未置 EOF，断言式
+                                        // 检查会在 debug 构建误伤（D3）。宽松处理：本拍
+                                        // 返回 None，外层循环（is_finished 谓词）会继续
+                                        // 拉取直到排空，不丢帧。
+                                        tracing::debug!(
+                                            "graph produced no frame, flushed={}",
+                                            chain.graph.is_flushed()
+                                        );
                                     }
                                 }
                             }
@@ -1680,7 +1765,12 @@ impl Decoder {
         if let Some(chain) = self.filter_graph.as_mut() {
             // filter process
             match chain.graph.process_frame(Some(raw_frame))? {
-                Some(filtered_frame) => Ok(Some(filtered_frame)),
+                Some(filtered_frame) => {
+                    let graph_tb = Rational::from(filtered_frame.time_base);
+                    Ok(Some(
+                        self.normalize_frame_time_base(filtered_frame, Some(graph_tb)),
+                    ))
+                }
                 // `process_frame` 返回 `None` 有两种来源：图还需要更多输入（`EAGAIN`，状态
                 // 仍是 `Normal`——上一帧已被图吸收但还没攒够帧），或已经排空完毕
                 // （EOF）。两种都让外层循环继续驱动解码器，无需区分。
@@ -1694,9 +1784,54 @@ impl Decoder {
                 }
             }
         } else {
-            // 如果没有 Filter Graph，直接返回 CPU 帧
-            Ok(Some(raw_frame))
+            // 无滤镜图：pts 已是流时间基单位（`pkt_timebase` 即绑定流的时间基），只缺
+            // time_base 标注 —— 解码器从不填 `AVFrame.time_base`，不补上则下游
+            // [`MediaFrame::from_avframe`](crate::MediaFrame::from_avframe) 拿到
+            // "数值有单位却没声明单位"，视频帧每帧刷一次警告。
+            Ok(Some(self.normalize_frame_time_base(raw_frame, None)))
         }
+    }
+
+    /// 把本解码器产出的帧统一到**绑定流的时间基**（`pkt_timebase` 同款）。
+    ///
+    /// 解码直出的帧 pts 都在流时间基里（送包前 `set_pkt_timebase` 声明了单位），
+    /// 但解码器从不填 `AVFrame.time_base`；滤镜图输出的帧恰恰相反：`time_base`
+    /// 有效（buffersink 填的输出链时间基，帧率被 `fps` 改写后是 1/out_fps），
+    /// 但那不是流时间基。
+    ///
+    /// `src_tb = None` 表示"解码直出，仅需补 time_base 标注"；`Some` 则表示
+    /// "出自滤镜图输出链"，pts/duration 一并重换算。离开本解码器的帧一律
+    /// time_base = 流时间基、pts/duration 与之同单位 —— Encoder 的 assign_pts、
+    /// MediaFrame::from_avframe 与 mux 的透传链路因此拿到的是自洽的三元组。
+    ///
+    /// 流时间基无效（极端裸流容器未标 tb）时保持原样返回，不猜单位。
+    fn normalize_frame_time_base(&self, mut frame: AVFrame, src_tb: Option<Rational>) -> AVFrame {
+        let dst_tb = self.time_base();
+        if dst_tb.num() <= 0 {
+            return frame;
+        }
+        match src_tb {
+            // 解码直出：pts/duration 已在流时间基，只补标注。
+            None => frame.set_time_base(dst_tb.into()),
+            Some(src) if src.num() > 0 && src != dst_tb => {
+                if frame.pts != ffi::AV_NOPTS_VALUE {
+                    frame.set_pts(frame.pts.rescale(src, dst_tb));
+                }
+                if frame.duration != ffi::AV_NOPTS_VALUE {
+                    let duration = frame.duration;
+                    // SAFETY: `frame` 由本函数局部独占；写 duration 只改元数据
+                    // （rsmpeg 未暴露 duration setter，走 `UnsafeDerefMut`）。
+                    unsafe {
+                        frame.deref_mut().duration =
+                            avutil::av_rescale_q(duration, src.into(), dst_tb.into());
+                    }
+                }
+                frame.set_time_base(dst_tb.into());
+            }
+            // 图输出 tb 恰等于流 tb（未改帧率的常见情形）或不有效：只补标注。
+            Some(_) => frame.set_time_base(dst_tb.into()),
+        }
+        frame
     }
 
     /// 把解码出的音频帧转成目标采样格式（声道布局与采样率不变）。
@@ -2031,6 +2166,162 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// D1 回归：解码直出的帧自带**流时间基**标注。
+    ///
+    /// 解码器从不填 `AVFrame.time_base`，老代码把 0/0 的帧原样交出去 —— 下游
+    /// （MediaFrame::from_avframe / Encoder::assign_pts）拿到"数值有单位却没
+    /// 声明单位"的帧，视频帧每帧刷一次警告、音频帧被误推断成 1/sample_rate。
+    #[test]
+    fn test_decode_output_frames_carry_stream_time_base() -> Result<()> {
+        let mut reader = StreamReader::new("assets/mp4.mp4")?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+        let stream_tb = decoder.time_base();
+        assert!(stream_tb.num() > 0, "fixture 视频流应有有效时间基");
+
+        for i in 0..5 {
+            let Some(frame) = decoder.decode_raw(&mut reader)? else {
+                assert!(i > 0, "fixture 视频流应至少解出一帧");
+                break;
+            };
+            assert_eq!(
+                Rational::from(frame.time_base),
+                stream_tb,
+                "解码输出帧必须声明流时间基"
+            );
+            assert!(frame.pts != ffi::AV_NOPTS_VALUE, "解码输出帧的 pts 应有效");
+        }
+        Ok(())
+    }
+
+    /// D1 回归（滤镜图输出）：buffersink 输出链的时间基被归一化回流时间基。
+    ///
+    /// 图输出帧的 time_base（buffersink 填写）在 scale（不改帧率）后与流相同 ——
+    /// 归一化是一次恒等换算，pts 与无滤镜直出逐帧相等、标注统一为流时间基。
+    #[test]
+    fn test_filtered_decode_frames_carry_stream_time_base() -> Result<()> {
+        let mut raw_reader = StreamReader::new("assets/mp4.mp4")?;
+        let mut raw_decoder =
+            DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&raw_reader)?;
+        let stream_tb = raw_decoder.time_base();
+
+        let mut filtered_reader = StreamReader::new("assets/mp4.mp4")?;
+        let filters = vec![filter::video::scale(640, 360, None)?];
+        let mut filtered = DecoderBuilder::new(MediaType::VIDEO)
+            .with_filters(filters)
+            .build_from_reader(&filtered_reader)?;
+
+        for i in 0..5 {
+            let Some(raw) = raw_decoder.decode_raw(&mut raw_reader)? else {
+                assert!(i > 0, "fixture 视频流应至少解出一帧");
+                break;
+            };
+            let Some(out) = filtered.decode_raw(&mut filtered_reader)? else {
+                panic!("滤镜图（scale 无延迟）不应比直出少出帧 {i}");
+            };
+
+            assert_eq!(
+                Rational::from(out.time_base),
+                stream_tb,
+                "滤镜图输出帧也必须声明流时间基"
+            );
+            assert_eq!(
+                out.pts, raw.pts,
+                "恒等换算后 pts 应与直出逐帧相等（帧 {i}）"
+            );
+        }
+        Ok(())
+    }
+
+    /// D2 回归：`flush_buffers` 也会重置解码阶段 —— 推到 EOF 后（甚至 drain
+    /// 过）seek 校验后直接 flush_buffers，无需 `reset()` 即可回到可继续解码态。
+    #[test]
+    fn test_flush_buffers_resets_phase_after_eof() -> Result<()> {
+        let mut reader = StreamReader::new("assets/mp4.mp4")?;
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO).build_from_reader(&reader)?;
+
+        while decoder.decode_raw(&mut reader)?.is_some() {}
+        assert!(decoder.is_flushed(), "预热：测试先推到 EOF");
+
+        decoder.flush_buffers()?;
+        assert!(
+            !decoder.is_flushed(),
+            "flush_buffers() 必须把阶段带回 Normal（老代码锁在 Flushed）"
+        );
+
+        // 阶段复位后重新驱动：reader 已耗尽 → 走 drain → 再次 EOF，全程不该报
+        // "cannot send packets after flushed"。
+        assert!(decoder.decode_raw(&mut reader)?.is_none());
+        assert!(decoder.is_flushed());
+        Ok(())
+    }
+
+    /// Graph2 回归：`with_resize` + `with_filters` 组合时，buffer 源端点按
+    /// **resize 后**的尺寸声明。
+    ///
+    /// 帧进图之前已被 swscale 缩到 resize 目标尺寸，而 buffersrc 的端点参数在
+    /// build 时定格 —— 老代码仍声明 codecpar 尺寸，实喂帧与声明不符，
+    /// `av_buffersrc` 以 EINVAL 拒绝（构造即触发）。图内 scale 再缩到 160x90。
+    #[test]
+    fn test_resize_with_filter_graph_declares_resized_size() -> Result<()> {
+        let mut reader = StreamReader::new("assets/mp4.mp4")?;
+        let filters = vec![filter::video::scale(160, 90, None)?];
+        let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
+            .with_resize(Resize::Exact(320, 180))
+            .with_filters(filters)
+            .build_from_reader(&reader)?;
+
+        let first = decoder
+            .decode_raw(&mut reader)?
+            .expect("fixture 视频流应至少解出一帧");
+        assert_eq!(
+            (first.width, first.height),
+            (160, 90),
+            "最终输出应为图内 scale 的目标尺寸"
+        );
+        Ok(())
+    }
+
+    /// Graph3 回归：链内 `with_input_format` 冲突必须 loud fail（InvalidConfig），
+    /// 不能像老代码那样静默取第一条、把其余当不存在。
+    #[test]
+    fn test_conflicting_input_formats_are_rejected() -> Result<()> {
+        let filters = vec![
+            filter::video::scale(320, 240, None)?.with_input_format(PixelFormat::YUV420P),
+            filter::video::scale(320, 240, None)?.with_input_format(PixelFormat::RGB24),
+        ];
+        let err = match DecoderBuilder::new(MediaType::VIDEO)
+            .with_filters(filters)
+            .build_from_reader(&StreamReader::new("assets/mp4.mp4")?)
+        {
+            Ok(_) => panic!("conflicting declarations must fail to build"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("conflicting input formats"),
+            "错误信息应当指明冲突：{err:#}"
+        );
+        Ok(())
+    }
+
+    /// Graph3 回归：跨类型声明（视频滤镜配采样格式）没有可行实现，直接拒绝。
+    #[test]
+    fn test_cross_type_input_format_is_rejected() -> Result<()> {
+        let filters =
+            vec![filter::video::scale(320, 240, None)?.with_input_format(SampleFormat::FLTP)];
+        let err = match DecoderBuilder::new(MediaType::VIDEO)
+            .with_filters(filters)
+            .build_from_reader(&StreamReader::new("assets/mp4.mp4")?)
+        {
+            Ok(_) => panic!("cross-type declaration must fail to build"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("cross-type"),
+            "错误信息应当指明跨类型：{err:#}"
+        );
         Ok(())
     }
 

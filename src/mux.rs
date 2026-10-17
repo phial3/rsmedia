@@ -1888,6 +1888,32 @@ impl<R: Reader> Demuxer<R> {
         self.passthrough
     }
 
+    /// 冲刷所有解码流，让解码从新位置干净起步。
+    ///
+    /// 调用时机：对底层 reader 完成 **seek** 之后（如
+    /// [`StreamReader::seek_to_timestamp`](crate::io::StreamReader::seek_to_timestamp)）。
+    /// seek 只移动读取位置，解码器与滤镜图里还压着 seek **之前**解出的帧——
+    /// DTS/PTS 还没来得及交给调用方的、滤镜（fps/aresample 等）攒着的都会在
+    /// seek 之后的下一次迭代里旧账新算地冒出来。本方法把它们全部丢弃，并
+    /// 把解码阶段重置回 `Normal`（与 [`Decoder::flush_buffers`](crate::Decoder::flush_buffers)
+    /// 同一语义：上一轮若已 drain 通过 EOF，这里照样允许重新喂包）。
+    ///
+    /// 透传模式没有解码器，本方法是 no-op。
+    pub fn flush(&mut self) -> Result<()> {
+        for demux_stream in &mut self.streams {
+            demux_stream.decoder.flush_buffers().with_context(|| {
+                format!(
+                    "Failed to flush the decoder of stream {}",
+                    demux_stream.stream_index
+                )
+            })?;
+        }
+        if self.passthrough {
+            tracing::debug!("Demuxer::flush() on a passthrough demuxer: nothing to do");
+        }
+        Ok(())
+    }
+
     /// 读取下一个**原始 packet**（不解码）。
     ///
     /// 透传模式（[`new_passthrough`](Self::new_passthrough)）的主迭代入口，
@@ -3458,6 +3484,121 @@ mod tests {
         crate::test_support::remove_test_output(&path2);
         drop(muxer);
         crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// D1+E1 端到端回归：解码→编码转码（mp4→mkv）的轨道时长与源一致。
+    ///
+    /// 原缺陷链叠加在"单帧"上看不出来：解码产物帧没有 time_base 标注（编码侧
+    /// 无从换算 duration，mp4 源 30fps 每帧 512 tick @1/15360 被按 1/30 解释成
+    /// 17s/帧）+ flush 时缺 duration 的包按满帧补。修后转码轨时长畸变消失：
+    /// mkv 视频轨的末包终点 ≈ 源视频轨时长（±0.5s 容差；老缺陷形态是虚高
+    /// 数百倍）。
+    #[test]
+    fn test_transcode_track_duration_matches_source() -> Result<()> {
+        let src_path = "assets/mp4.mp4";
+        let out_path = crate::test_support::test_output_path("mux", "test_transcode_duration.mkv");
+        // 源时长（块外断言还要用；no-video-stream 的 Skip 分支直接返回）
+        let src_secs;
+        {
+            // 源参数（时长/尺寸/帧率）
+            let probe = Demuxer::new(src_path)?;
+            let Some(vstream) = probe
+                .streams()
+                .iter()
+                .find(|s| s.media_type == MediaType::VIDEO)
+            else {
+                println!("SKIP: fixture has no video stream");
+                return Ok(());
+            };
+            let v_info = vstream.stream_info.clone();
+            let v_src_index = vstream.stream_index;
+            src_secs = crate::Time::new(Some(v_info.duration), v_info.time_base).as_secs() as f64;
+            let fps = {
+                let r = rsmpeg::avutil::av_q2d(v_info.avg_frame_rate.into());
+                if r <= 0.0 { 25.0 } else { r }
+            };
+            drop(probe);
+
+            // 解码 → 重编码（换容器）
+            let mut demuxer = Demuxer::new(src_path)?;
+            let mut muxer = Muxer::new(&out_path)?;
+            let mut options = crate::AVOptions::new();
+            options.set("preset", "ultrafast");
+            let encoder = EncoderBuilder::new_video(v_info.width, v_info.height)
+                .with_fps(fps as f32)
+                .with_options(options)
+                .build()?;
+            let enc_index = muxer.add_encoder(encoder)?;
+            while let Some((stream, frame)) = demuxer.demux()? {
+                if stream == v_src_index {
+                    muxer.mux(frame, enc_index).context("mux video frame")?;
+                }
+            }
+            muxer.finish()?;
+        }
+
+        // 读回转码产物：视频轨最后一个包的终点（末包 pts + duration）
+        let mut passthrough = Demuxer::new_passthrough(StreamReader::new(&out_path)?)?;
+        let (out_v_index, out_tb) = {
+            let mut found: Option<(usize, Rational)> = None;
+            for (i, s) in passthrough.reader.input().streams().iter().enumerate() {
+                if s.codecpar().codec_type == ffi::AVMEDIA_TYPE_VIDEO {
+                    found = Some((i, s.time_base.into()));
+                    break;
+                }
+            }
+            found.expect("encoded fixture must keep the video stream")
+        };
+        let mut end_us: i64 = 0;
+        for result in passthrough.packets() {
+            let (stream, packet) = result?;
+            if stream != out_v_index {
+                continue;
+            }
+            if packet.pts == ffi::AV_NOPTS_VALUE {
+                continue;
+            }
+            let end_ticks = if packet.duration > 0 {
+                packet.pts + packet.duration
+            } else {
+                packet.pts
+            };
+            let us = rsmpeg::avutil::av_rescale_q(end_ticks, out_tb.into(), ffi::AV_TIME_BASE_Q);
+            end_us = end_us.max(us);
+        }
+        let out_secs = end_us as f64 / 1_000_000.0;
+
+        assert!(
+            (out_secs - src_secs).abs() < 0.5,
+            "转码轨时长应≈源（{src_secs:.3}s），实际 {out_secs:.3}s —— 老缺陷形态是虚高数百倍"
+        );
+        crate::test_support::remove_test_output(&out_path);
+        Ok(())
+    }
+
+    /// F4 回归：`Demuxer::flush()` 把每个解码流带回头看可继续解码的状态，且
+    /// 对解码模式可重复调用是安全操作。
+    #[test]
+    fn test_demuxer_flush_restarts_decoders() -> Result<()> {
+        let mut demuxer = Demuxer::new("assets/mp4.mp4")?;
+        // 先解出几帧，确有缓冲后再冲刷
+        let mut served = 0usize;
+        for _ in 0..3 {
+            if demuxer.demux()?.is_some() {
+                served += 1;
+            }
+        }
+        assert!(served > 0, "fixture 应解出至少一帧");
+
+        demuxer.flush().context("flush after seek")?;
+
+        // 冲刷后迭代应仍可用（从流当前位置继续出帧）。
+        assert!(demuxer.demux()?.is_some(), "flush 后应能继续出帧");
+
+        // 透传模式：flush 是 no-op，不得报错。
+        let mut passthrough = Demuxer::new_passthrough(StreamReader::new("assets/mp4.mp4")?)?;
+        passthrough.flush()?;
         Ok(())
     }
 
