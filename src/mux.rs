@@ -141,10 +141,12 @@ pub struct Muxer<W: Writer> {
     /// `true` 时把提交进来的时间戳整体平移到 0 起点，见
     /// [`Muxer::set_normalize_timestamps`]。
     normalize_timestamps: bool,
-    /// 归一化基准（微秒，`AV_TIME_BASE`），首个带有效时间戳的提交单元建立。
+    /// 归一化基准（微秒，`AV_TIME_BASE`），由**首个带有效时间戳的提交单元**建立：
+    /// 取该提交单元的 `min(pts, dts)` —— B 帧源首包 dts < pts 是常态，单锚 pts 会
+    /// 把归一化后的首包 dts 弄成负值，恰是本特性要避免的。
     /// 存微秒而**不是**某个流的时间基单位：视频（1/fps）与音频（1/sample_rate）
     /// 减的必须是同一物理时刻，否则会破坏音视频同步。
-    pts_base_us: Option<i64>,
+    ts_base_us: Option<i64>,
     have_written_header: bool,
     have_written_trailer: bool,
 }
@@ -326,7 +328,7 @@ impl<W: Writer> Muxer<W> {
             // 默认不平移：库不悄悄改用户给的时间戳，需要的人显式开启
             // （live 采集的 wallclock/epoch 时间戳等，见 set_normalize_timestamps）。
             normalize_timestamps: false,
-            pts_base_us: None,
+            ts_base_us: None,
             have_written_header: false,
             have_written_trailer: false,
         }
@@ -374,7 +376,11 @@ impl<W: Writer> Muxer<W> {
     ///
     /// 只做整体平移，帧间间隔（真实到达节奏、卡顿造成的 PTS 跳变）完全保留；
     /// 基准跨流共享同一物理时刻（内部按微秒存储、逐流换算回各自时间基），
-    /// 因此音视频同步不受影响。`AV_NOPTS_VALUE`（未设 pts，由编码器自动编号）
+    /// 因此音视频同步不受影响。基准由**提交顺序**决定：首个带有效时间戳的
+    /// 提交单元的 `min(pts, dts)` 落在 0 —— 若先提交一条起点明显晚于其它流的
+    /// （如先字幕后视频），提交流会被整体平移成负值；需要确定性行为时，先提交
+    /// 主 A/V 流或在写入任何数据前保持关闭并自行转好时间戳。
+    /// `AV_NOPTS_VALUE`（未设 pts，由编码器自动编号）
     /// 原样透传，也不参与基准建立。
     ///
     /// 应在写入任何数据**之前**调用；header 写出后才开启时基准只能从下一个提交
@@ -387,30 +393,49 @@ impl<W: Writer> Muxer<W> {
             );
         }
         self.normalize_timestamps = normalize;
-        self.pts_base_us = None;
+        self.ts_base_us = None;
         self
     }
 
-    /// 把一个时间戳平移到归一化基准（`tb` 是该值当前所在的时间基）。
-    ///
-    /// 首个有效时间戳建立基准并把自身恰好平移到 0（避免换算取整后首帧落在 ±1 tick）；
-    /// 后续值减去同一基准。未开启归一化或时间戳为 `AV_NOPTS_VALUE` 时原样返回。
+    /// 归一化单个时间戳（只有 pts 可用的提交单元：编码帧路径）。
     fn normalize_ts(&mut self, ts: i64, tb: Rational) -> i64 {
-        if !self.normalize_timestamps || ts == ffi::AV_NOPTS_VALUE {
-            return ts;
+        self.normalize_ts_pair(ts, ffi::AV_NOPTS_VALUE, tb).0
+    }
+
+    /// 归一化一对 pts/dts（packet 路径）。
+    ///
+    /// 基准锚定**首个带有效时间戳的提交单元**：取它的 `min(pts, dts)` 恰好平移到
+    /// 0（避免换算取整后首帧落在 ±1 tick）。单锚 pts 会出事故：B 帧源的首包
+    /// dts < pts 是常态，归一化后首包 dts 变负——恰是本特性（负 dts 让 FLV 等
+    /// muxer 报错）想避免的。后续值减去同一基准；未开启归一化原样返回，本条
+    /// `pts`/`dts` 全无效的不锚定基准，等下一条。
+    fn normalize_ts_pair(&mut self, pts: i64, dts: i64, tb: Rational) -> (i64, i64) {
+        if !self.normalize_timestamps {
+            return (pts, dts);
         }
-        // FFmpeg 的 `AV_TIME_BASE_Q` 就是 1/1000000，即 [`TIME_BASE`]
-        match self.pts_base_us {
-            Some(base_us) => {
+        let shift = |ts: i64, base_us: i64| -> i64 {
+            if ts == ffi::AV_NOPTS_VALUE {
+                ts
+            } else {
+                // FFmpeg 的 `AV_TIME_BASE_Q` 就是 1/1000000，即 [`TIME_BASE`]
                 ts - rsmpeg::avutil::av_rescale_q(base_us, TIME_BASE.into(), tb.into())
             }
+        };
+        match self.ts_base_us {
+            Some(base_us) => (shift(pts, base_us), shift(dts, base_us)),
             None => {
-                self.pts_base_us = Some(rsmpeg::avutil::av_rescale_q(
-                    ts,
-                    tb.into(),
-                    TIME_BASE.into(),
-                ));
-                0
+                let base = [pts, dts]
+                    .into_iter()
+                    .filter(|ts| *ts != ffi::AV_NOPTS_VALUE)
+                    .min()
+                    .map(|ts| rsmpeg::avutil::av_rescale_q(ts, tb.into(), TIME_BASE.into()));
+                match base {
+                    Some(base_us) => {
+                        self.ts_base_us = Some(base_us);
+                        (shift(pts, base_us), shift(dts, base_us))
+                    }
+                    None => (pts, dts),
+                }
             }
         }
     }
@@ -1144,8 +1169,7 @@ impl<W: Writer> Muxer<W> {
         for mut packet in packets {
             // 与 `mux` 一致：归一化在写包前应用（字幕包的 pts/dts 在编码器的
             // 1/1000 时间基里），基准与音视频流共享，不破坏同步。
-            let pts = self.normalize_ts(packet.pts, enc_time_base);
-            let dts = self.normalize_ts(packet.dts, enc_time_base);
+            let (pts, dts) = self.normalize_ts_pair(packet.pts, packet.dts, enc_time_base);
             if pts != packet.pts {
                 packet.set_pts(pts);
             }
@@ -1215,8 +1239,7 @@ impl<W: Writer> Muxer<W> {
     ) -> Result<()> {
         // 与 `mux` 一致：归一化在写包前应用（透传包的 pts/dts 在源流时间基里），
         // 基准与编码流共享同一物理时刻。
-        let pts = self.normalize_ts(packet.pts, src_time_base);
-        let dts = self.normalize_ts(packet.dts, src_time_base);
+        let (pts, dts) = self.normalize_ts_pair(packet.pts, packet.dts, src_time_base);
         if pts != packet.pts {
             packet.set_pts(pts);
         }
@@ -3401,6 +3424,120 @@ mod tests {
             EPOCH_TICKS * 40_000,
             "normalize=false 时 FLV 承载不了 epoch 起点"
         );
+        Ok(())
+    }
+
+    /// F3 回归：归一化基准锚定首个提交单元的 `min(pts, dts)`，不是单独的 pts。
+    ///
+    /// B 帧源首包 dts < pts 是常态：老代码锚 pts（30）后，同包 dts 被减成 **-2**
+    /// （负 dts，FLV mo 直接报错）；修后基准取 min=28，首包 dts=0。
+    #[test]
+    fn test_normalize_anchor_uses_min_pts_dts() -> Result<()> {
+        let path = crate::test_support::test_output_path("mux", "test_norm_anchor.mp4");
+        let mut muxer = Muxer::new(&path)?;
+        muxer.set_normalize_timestamps(true);
+        let tb = Rational::new(1, 30).unwrap();
+
+        // 首包：pts=30 tick（1.0s），dts=28 tick（B 帧延迟）。
+        let (pts, dts) = muxer.normalize_ts_pair(30, 28, tb);
+        assert_eq!((pts, dts), (2, 0), "基准锚 min(pts,dts)：首包 dts 不得为负");
+        // 后续包减同一基准，相对间隔保留。
+        let (pts, dts) = muxer.normalize_ts_pair(31, 29, tb);
+        assert_eq!((pts, dts), (3, 1));
+        // 未提交任何有效时间戳（全 NOPTS）不锚定，等下一条。
+        let path2 = crate::test_support::test_output_path("mux", "test_norm_anchor2.mp4");
+        let mut muxer2 = Muxer::new(&path2)?;
+        muxer2.set_normalize_timestamps(true);
+        let (pts, dts) = muxer2.normalize_ts_pair(ffi::AV_NOPTS_VALUE, ffi::AV_NOPTS_VALUE, tb);
+        assert_eq!(
+            (pts, dts),
+            (ffi::AV_NOPTS_VALUE, ffi::AV_NOPTS_VALUE),
+            "全 NOPTS 不锁基准"
+        );
+        drop(muxer2);
+        crate::test_support::remove_test_output(&path2);
+        drop(muxer);
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// E3 回归：FIFO 切出的**短末帧** duration 按实际样本数补，不按满帧长虚高。
+    ///
+    /// 1500 样本 = 1024（满帧）+ 476（尾帧）：全部按满帧补时轨尾虚高 ~12ms
+    /// （AAC 尾帧被补成 1024/44100 ≈ 23ms 而不是 476/44100 ≈ 10.8ms）。
+    #[test]
+    fn test_audio_tail_end_matches_actual_samples() -> Result<()> {
+        let aac_available = {
+            let name = std::ffi::CString::new("aac").unwrap();
+            rsmpeg::avcodec::AVCodec::find_encoder_by_name(&name).is_some()
+        };
+        if !aac_available {
+            println!("SKIP: aac encoder not available in this FFmpeg build");
+            return Ok(());
+        }
+        let path = crate::test_support::test_output_path("mux", "test_audio_tail.mp4");
+        {
+            let mut muxer = Muxer::new(&path)?;
+            let encoder =
+                EncoderBuilder::new_audio(128_000, 2, 44_100, crate::SampleFormat::FLTP).build()?;
+            let index = muxer.add_encoder(encoder)?;
+            for samples in [1024u32, 476u32] {
+                // 两帧都不带 pts：固定帧长音频由 FIFO 按已输出样本数编号。
+                let mut frame = AVFrame::new();
+                frame.set_format(crate::SampleFormat::FLTP.into());
+                frame.set_sample_rate(44_100);
+                frame.set_nb_samples(samples as i32);
+                frame.set_ch_layout(
+                    AVChannelLayout::from_mask(0x3)
+                        .context("stereo mask")?
+                        .into_inner(),
+                );
+                frame.alloc_buffer().context("audio frame buffer")?;
+                // av_frame_get_buffer 不清缓冲：f32 帧填 0（静音）。不填则会拿到
+                // 未初始化内存 —— 并发测试堆重用下出现 NaN/Inf，aac 编码 EINVAL。
+                // SAFETY：缓冲 refcount=1 本函数独占；FLTP 两平面各 nb_samples × f32。
+                unsafe {
+                    let raw = frame.deref_mut();
+                    for plane in raw.data.iter().take(2) {
+                        if plane.is_null() {
+                            break;
+                        }
+                        std::slice::from_raw_parts_mut(
+                            *plane,
+                            samples as usize * std::mem::size_of::<f32>(),
+                        )
+                        .fill(0);
+                    }
+                }
+                frame.set_pts(ffi::AV_NOPTS_VALUE);
+                muxer.mux(frame, index)?;
+            }
+            muxer.finish()?;
+        }
+
+        let reader = StreamReader::new(&path)?;
+        let tb = reader.input().streams()[0].time_base;
+        let mut demuxer = Demuxer::new_passthrough(reader)?;
+        let end_us = demuxer
+            .packets()
+            .filter_map(|item| {
+                item.ok().map(|(_, packet)| {
+                    rsmpeg::avutil::av_rescale_q(
+                        packet.pts + packet.duration,
+                        tb,
+                        ffi::AV_TIME_BASE_Q,
+                    )
+                })
+            })
+            .max()
+            .expect("audio packets exist");
+
+        // 修后：0 + 1024 + 476 = 1500 样本 @ 44100 = 34.0ms；全部按满帧补是 46.4ms。
+        assert!(
+            (20_000..40_000).contains(&end_us),
+            "轨尾 end 应≈34.0ms（1500 样本），实际 {end_us}µs —— 满帧补全是 ~46.4ms"
+        );
+        crate::test_support::remove_test_output(&path);
         Ok(())
     }
 

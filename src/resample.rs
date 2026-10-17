@@ -1,7 +1,8 @@
 use crate::error::{Context, Result, RsmediaError};
-use crate::time::Rational;
+use crate::time::{Rational, Rescale};
 use crate::{SampleFormat, imgutils};
 
+use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avutil::{AVChannelLayout, AVFrame, AVSamples};
 use rsmpeg::ffi;
 use rsmpeg::swresample::SwrContext;
@@ -224,11 +225,27 @@ fn convert_with(
     let out_samples = resampler.get_out_samples(src_frame.nb_samples).max(1);
     dst_frame.set_nb_samples(out_samples);
     dst_frame.set_sample_rate(out_spec.sample_rate);
-    dst_frame.set_time_base(
-        Rational::new(1, out_spec.sample_rate)
-            .unwrap_or(Rational::ZERO)
-            .into(),
-    );
+    // 输出时间基固定为 1/out_rate；props 拷来的 pts/duration 还是源帧时间基里的
+    // 数值 —— 与 encode 侧同一道理，不重换算就是"旧时间基数值按新时间基解释"。
+    // 换算后帧的 pts/duration 单位与 time_base 自洽（内部编码路径的源帧已被赋过
+    // 输出时间基，src_tb == out_tb，恒等路径自然跳过）。
+    let out_tb = Rational::new(1, out_spec.sample_rate).unwrap_or(Rational::ZERO);
+    let src_tb = Rational::from(src_frame.time_base);
+    if out_tb.num() > 0 && src_tb.num() > 0 && src_tb != out_tb {
+        if dst_frame.pts != ffi::AV_NOPTS_VALUE {
+            dst_frame.set_pts(dst_frame.pts.rescale(src_tb, out_tb));
+        }
+        // duration 由 av_frame_copy_props 拷入，同样还带着源时间基的数值。
+        if dst_frame.duration != ffi::AV_NOPTS_VALUE {
+            let duration = dst_frame.duration;
+            // SAFETY: `dst_frame` 本函数局部独占；写 duration 只改元数据。
+            unsafe {
+                dst_frame.deref_mut().duration =
+                    rsmpeg::avutil::av_rescale_q(duration, src_tb.into(), out_tb.into());
+            }
+        }
+    }
+    dst_frame.set_time_base(out_tb.into());
     dst_frame
         .alloc_buffer()
         .context("Failed to allocate destination frame buffer")?;
@@ -1153,6 +1170,56 @@ mod tests {
         );
         assert_eq!(out.format, ffi::AV_SAMPLE_FMT_FLTP);
         assert_eq!(out.sample_rate, 48_000);
+        Ok(())
+    }
+
+    /// E1 回归（重采样路径）：convert_with 把 pts/duration 与 time_base 一起换算进
+    /// 输出时间基。老代码只重置 time_base 为 1/out_rate、pts/duration 原样拷贝
+    ///（av_frame_copy_props）—— "旧时间基数值按新时间基解释"。
+    #[test]
+    fn test_convert_rescales_pts_and_duration_to_output_tb() -> Result<()> {
+        // 源：44100Hz 立体声 s16，pts=4410（0.1s @ 1/44100），duration=1024。
+        let mut src = AVFrame::new();
+        src.set_format(ffi::AV_SAMPLE_FMT_S16);
+        src.set_sample_rate(44_100);
+        src.set_nb_samples(1024);
+        src.set_ch_layout(
+            AVChannelLayout::from_mask(0x3)
+                .expect("stereo mask is valid")
+                .into_inner(),
+        );
+        src.set_time_base(Rational::new(1, 44_100).unwrap().into());
+        src.alloc_buffer()
+            .context("source frame buffer allocation failed")?;
+        src.set_pts(4410);
+        unsafe {
+            src.deref_mut().duration = 1024;
+        }
+
+        let dst = convert_frame(
+            &src,
+            AVChannelLayout::from_mask(0x3)
+                .expect("stereo mask is valid")
+                .into_inner(),
+            ffi::AV_SAMPLE_FMT_S16,
+            48_000,
+        )?;
+
+        // 0.1s @ 1/48000 == 4800；duration 按同一规则换算。
+        assert_eq!(dst.pts, 4800, "pts 应换算到 1/48000（0.1s）");
+        let expected_duration = rsmpeg::avutil::av_rescale_q(
+            1024,
+            Rational::new(1, 44_100).unwrap().into(),
+            Rational::new(1, 48_000).unwrap().into(),
+        );
+        assert_eq!(
+            dst.duration, expected_duration,
+            "duration 应换算到 1/48000（老代码原样是 1024）"
+        );
+        assert_eq!(
+            dst.sample_rate, 48_000,
+            "sanity: the output frames rate should carry the target rate"
+        );
         Ok(())
     }
 }
