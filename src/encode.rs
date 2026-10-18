@@ -869,6 +869,17 @@ impl EncoderBuilder {
         ))
     }
 
+    /// 收集并校验滤镜链声明的图输入格式（[`Filter::with_input_format`]）。
+    ///
+    /// 校验规则与错误信息见 `filter::resolve_declared_input_format`（编码/解码
+    /// 两侧共用同一份裁决，不允许各自漂移）。
+    fn resolve_filter_input_format(&self) -> Result<Option<FrameFormat>> {
+        let Some(filters) = self.filters.as_ref() else {
+            return Ok(None);
+        };
+        crate::filter::resolve_declared_input_format(filters)
+    }
+
     /// 构造滤镜图。
     ///
     /// 返回图本身，以及滤镜链声明的**输入格式**（未声明时为 `None`，调用方按
@@ -891,8 +902,9 @@ impl EncoderBuilder {
 
         // 滤镜链可声明要求的输入格式（如 GIF 调色板链要求 RGB 输入、输出
         // pal8；音频链可声明输入采样格式）；未声明时输入格式=编码器协商格式
-        // （src/sink 同格式，零行为变化）。
-        let input_format = filters.iter().find_map(|f| f.input_format());
+        // （src/sink 同格式，零行为变化）。多条声明必须一致且与滤镜媒体类型
+        // 同族，冲突/跨类型声明在 `resolve_filter_input_format` 里 loud fail。
+        let input_format = self.resolve_filter_input_format()?;
 
         let params = match self.media_type {
             MediaType::VIDEO => FilterParams::Video(VideoParams {
@@ -2769,6 +2781,54 @@ mod tests {
 
         // 正常尺寸不受影响（防止校验过严）。
         assert!(EncoderBuilder::new_video(8, 8).build().is_ok());
+    }
+
+    /// Graph3 编码侧回归：链内 `with_input_format` 冲突必须在 `build()` 就
+    /// loud fail（InvalidConfig），不能像老代码那样 `find_map` 静默取第一条、
+    /// 把其余声明当不存在（解码侧同款校验见 decode.rs 的对应测试）。
+    ///
+    /// 用原生 `mpeg4` 而非默认的 libx264，避免"构建未编入 x264"的环境差异；
+    /// 本测试只验证校验逻辑，不做任何编码。
+    #[test]
+    fn test_conflicting_filter_input_formats_are_rejected_on_encode() -> Result<()> {
+        let filters = vec![
+            crate::filter::video::scale(320, 240, None)?.with_input_format(PixelFormat::YUV420P),
+            crate::filter::video::scale(160, 120, None)?.with_input_format(PixelFormat::RGB24),
+        ];
+        let err = match EncoderBuilder::new_video(64, 64)
+            .with_codec_name("mpeg4")
+            .with_filters(filters)
+            .build()
+        {
+            Ok(_) => panic!("conflicting declarations must fail to build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("conflicting input formats"),
+            "错误信息应当指明冲突：{err:#}"
+        );
+        Ok(())
+    }
+
+    /// Graph3 编码侧回归：跨类型声明（视频滤镜配采样格式）没有可行实现，直接拒绝。
+    #[test]
+    fn test_cross_type_filter_input_format_is_rejected_on_encode() -> Result<()> {
+        let filters = vec![
+            crate::filter::video::scale(320, 240, None)?.with_input_format(SampleFormat::FLTP),
+        ];
+        let err = match EncoderBuilder::new_video(64, 64)
+            .with_codec_name("mpeg4")
+            .with_filters(filters)
+            .build()
+        {
+            Ok(_) => panic!("cross-type declaration must fail to build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("cross-type"),
+            "错误信息应当指明跨类型：{err:#}"
+        );
+        Ok(())
     }
 
     /// `with_max_bit_rate`/`with_buffer_size` 的非正值不写进 `rc_*` 字段：

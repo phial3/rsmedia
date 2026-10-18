@@ -137,8 +137,16 @@ fn check_resampler_input(src_frame: &AVFrame) -> Result<()> {
 /// unspecified layout as the default one is what FFmpeg itself does; this is the
 /// one place that decision is made, for input frames and output layouts alike.
 fn default_layout_for(layout: ffi::AVChannelLayout) -> Option<ffi::AVChannelLayout> {
-    (layout.order == ffi::AV_CHANNEL_ORDER_UNSPEC && layout.nb_channels > 0)
-        .then(|| AVChannelLayout::from_nb_channels(layout.nb_channels).into_inner())
+    if layout.order != ffi::AV_CHANNEL_ORDER_UNSPEC || layout.nb_channels <= 0 {
+        return None;
+    }
+    let default = AVChannelLayout::from_nb_channels(layout.nb_channels).into_inner();
+    // IO-F3：`av_channel_layout_default` 超出内建表时静默退化为 UNSPEC
+    //（nb_channels 保留）—— 用 UNSPEC 去"替换 UNSPEC"等于没换，`swr_convert`
+    // 的 INPUT/OUTPUT_CHANGED 报错依旧。只有拿到**非 UNSPEC** 且声道数匹配的
+    // 结果才替换；否则保持原样交给调用方去见 FFmpeg 自己的错误。
+    (default.order != ffi::AV_CHANNEL_ORDER_UNSPEC && default.nb_channels == layout.nb_channels)
+        .then_some(default)
 }
 
 /// 采样格式的可读名称；未收录的取值退化为原始整数（来自外部的值不 panic）。

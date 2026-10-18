@@ -465,13 +465,20 @@ mod tests {
         assert!(content.contains("Hello World"), "content:\n{content}");
         assert!(content.contains("Second subtitle"), "content:\n{content}");
         assert!(content.contains("Third subtitle"), "content:\n{content}");
-        // 序号行（SRT 序号 1..N）
-        for serial in ["1", "2", "3"] {
-            assert!(
-                content.lines().any(|l| l.trim() == serial),
-                "missing SRT serial {serial}, content:\n{content}"
-            );
-        }
+        // 序号行：SRT 序号由 **muxer** 在写包时生成（libavformat/srtenc.c 的
+        // `index`：write_header 归 1、每写出一包 +1）—— 因此这里断言的是
+        // "无重复的完整 1..N 序列"。老断言只查"某个数字存在"，包被重复写出
+        // （序号重复）检测不到；序号也必须按顺序出现。
+        let serials: Vec<&str> = content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        assert_eq!(
+            serials,
+            ["1", "2", "3"],
+            "SRT 序号应为不重复、按序的 1..N 序列，content:\n{content}"
+        );
 
         test_support::remove_test_output(&path);
         Ok(())

@@ -108,6 +108,48 @@ impl Filter {
     }
 }
 
+/// 收集并校验滤镜链声明的图输入格式（[`Filter::with_input_format`]）。
+///
+/// 编码侧与解码侧共用同一份裁决：
+///
+/// - 多条滤镜各自声明时必须**一致**（同一格式）：这个声明的意义是"帧进图前
+///   先转成它、图内 buffer 源按它声明"，链上各条各说各话没有可行实现；
+/// - 声明必须与滤镜的媒体类型同族（视频滤镜配采样格式同样不可实现）。
+///
+/// 老行为取"链上第一条声明"且不校验：后面的声明被静默忽略、冲突根本不报
+/// —— 静默建出与声明不符的图，属于"构造即可触发"的缺陷，现在 loud fail。
+pub(crate) fn resolve_declared_input_format(filters: &[Filter]) -> Result<Option<FrameFormat>> {
+    let mut declared: Option<FrameFormat> = None;
+    for filter in filters {
+        let Some(fmt) = filter.input_format() else {
+            continue;
+        };
+        if let Some(prev) = declared {
+            if prev != fmt {
+                return Err(RsmediaError::invalid_config(format!(
+                    "filters declare conflicting input formats: {prev:?} vs {fmt:?} — \
+                     all `with_input_format` declarations in one chain must agree"
+                )));
+            }
+        } else {
+            declared = Some(fmt);
+        }
+        let media_type = filter.media_type();
+        let same_family = matches!(
+            (media_type, fmt),
+            (MediaType::VIDEO, FrameFormat::Pixel { .. })
+                | (MediaType::AUDIO, FrameFormat::Sample { .. })
+        );
+        if !same_family {
+            return Err(RsmediaError::invalid_config(format!(
+                "filter for {media_type:?} declares input format {fmt:?} — a cross-type \
+                 format declaration has no workable implementation"
+            )));
+        }
+    }
+    Ok(declared)
+}
+
 /// 滤镜图中的一个**节点**：一个 [`Filter`] 加上它在图里的接线。
 ///
 /// [`Filter`] 只描述「滤镜是什么」，接线（这一路输入来自哪个上游、输出叫什么名字）
@@ -147,10 +189,15 @@ pub struct FilterNode {
     /// 各路输入分别接到哪个上游标签，顺序即滤镜的输入 pad 顺序。
     /// 空 = 自动接线（接在链尾；链首接图的首个输入）。
     inputs: Vec<String>,
-    /// 各输出 pad 的标签，顺序即滤镜的输出 pad 顺序；空 = 由构建器自动分配一个
-    /// `n{序号}`（自动分配**只给一个**标签：单输出 pad 的滤镜正好够用；多输出滤镜
-    /// 不标注的话，静态 pad 会在建图时因个数不符报 `InvalidConfig`，而动态 pad 的
-    /// `split`/`asplit` 会安静地只生成 1 路输出）。
+    /// 各输出 pad 的标签，顺序即滤镜的输出 pad 顺序；空 = 由构建器自动分配
+    /// **一个** `n{节点序号}`（数字是节点在整个图中的下标，不是 pad 下标）：
+    /// 单输出 pad 的滤镜正好够用；多输出滤镜（`split` / `asplit`）必须用
+    /// [`with_outputs`](Self::with_outputs) 逐 pad 标注 —— 静态 pad 在建图时因
+    /// 个数不符报 `InvalidConfig`；动态 pad（pad 数由滤镜自己的 `outputs=` 选项
+    /// 决定，构建期看不到）则由 FFmpeg 在图配置阶段拒掉，错误信息里带着出错的
+    /// 图描述（如 `Failed to configure filter graph ... split=2[only_one]`）。
+    /// 两条路径都是**响亮失败**，不存在"少标几个 pad、安静地只保留一路输出"
+    /// 这种用法。
     outputs: Vec<String>,
 }
 

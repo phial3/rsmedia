@@ -685,45 +685,13 @@ impl DecoderBuilder {
     /// 拿到的仍是 `with_pix_fmt` / `with_sample_fmt` 承诺的格式。
     /// 收集并校验滤镜链声明的图输入格式（[`Filter::with_input_format`]）。
     ///
-    /// - 多条滤镜各自声明时必须**一致**（同一格式）：这个声明的意义是"帧进图前
-    ///   先转成它、图内 buffer 源按它声明"，链上各条各说各话没有可行实现；
-    /// - 声明必须与滤镜的媒体类型同族（视频滤镜配采样格式同样不可实现）。
-    ///
-    /// 老行为取"链上第一条声明"且不校验：后面的声明被静默忽略、冲突根本不报
-    /// —— 静默建出与声明不符的图，属于"构造即可触发"的缺陷，现在 loud fail。
+    /// 校验规则与错误信息见 `filter::resolve_declared_input_format`（编码/解码
+    /// 两侧共用同一份裁决，不允许各自漂移）。
     fn resolve_filter_input_format(&self) -> Result<Option<FrameFormat>> {
         let Some(filters) = self.filters.as_ref() else {
             return Ok(None);
         };
-        let mut declared: Option<FrameFormat> = None;
-        for filter in filters {
-            let Some(fmt) = filter.input_format() else {
-                continue;
-            };
-            if let Some(prev) = declared {
-                if prev != fmt {
-                    return Err(RsmediaError::invalid_config(format!(
-                        "filters declare conflicting input formats: {prev:?} vs {fmt:?} — \
-                         all `with_input_format` declarations in one chain must agree"
-                    )));
-                }
-            } else {
-                declared = Some(fmt);
-            }
-            let media_type = filter.media_type();
-            let same_family = matches!(
-                (media_type, fmt),
-                (MediaType::VIDEO, FrameFormat::Pixel { .. })
-                    | (MediaType::AUDIO, FrameFormat::Sample { .. })
-            );
-            if !same_family {
-                return Err(RsmediaError::invalid_config(format!(
-                    "filter for {media_type:?} declares input format {fmt:?} — a cross-type \
-                     format declaration has no workable implementation"
-                )));
-            }
-        }
-        Ok(declared)
+        crate::filter::resolve_declared_input_format(filters)
     }
 
     fn build_filter_params(

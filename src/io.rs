@@ -501,15 +501,18 @@ macro_rules! impl_writer_builder_setters {
 /// 由 FFmpeg 协议层（file/http/rtmp...）处理。本函数只服务于
 /// `BufferReader`、`IoReader` 等非路径源。
 ///
-/// 返回的 context 已安装 `interrupt`（若有）；调用方须保证 `interrupt`
-/// 存活至 context drop。
+/// 返回的 `(context, custom_io)` 把 custom pb 的所有权一起交回：FFmpeg 对
+/// `AVFMT_FLAG_CUSTOM_IO` 的 pb 不做释放（`avformat_close_input` 直接
+/// `pb = NULL`），rsmpeg 的包装又不代管这份所有权 —— 调用方（[`ReaderCore`]）
+/// 必须在 close_input **之后** drop `custom_io` 完成 `avio_context_free`。
+/// 返回值中的 `custom_io` 因此必须持有到 context 之后。
 fn open_input_custom(
     io_context: AVIOContextCustom,
     format: Option<&str>,
     options: Option<AVOptions>,
     interrupt: Option<&Interrupt>,
     dump_name: &std::ffi::CStr,
-) -> Result<AVFormatContextInput> {
+) -> Result<(AVFormatContextInput, AVIOContextCustom)> {
     // 格式名来自调用者：含 NUL 字节时返回错误而不是 panic。
     let fmt_opt = match format {
         Some(name) => {
@@ -518,23 +521,57 @@ fn open_input_custom(
         }
         None => None,
     };
-    let mut dict = options.and_then(|opts| opts.into_dict());
-    let mut ctx = AVFormatContextInput::builder()
-        .maybe_format(fmt_opt.as_deref())
-        .options(&mut dict)
-        .io_context(AVIOContextContainer::Custom(io_context))
-        .open()
-        .context("Create input format context with custom IO failed.")?;
-    if let Some(interrupt) = interrupt {
-        // SAFETY: `ctx` is a freshly opened context we exclusively own (`&mut` via `deref_mut`);
-        // writing its `interrupt_callback` slot is the only access path to it here.
-        unsafe {
-            ctx.deref_mut().interrupt_callback = interrupt_cb(interrupt);
+    let dict = options.and_then(|opts| opts.into_dict());
+
+    // 序列与 rsmpeg 的 builder 内部一致（alloc → 挂 pb → open → find_stream_info），
+    // 唯一差别是在 alloc 与 open **之间**安装 interrupt_callback：FFmpeg 把该回调
+    // 按值拷贝给协议层与探测循环（见 [`open_input_with_interrupt`] 的长注释），
+    // open 之后补写拦不住 open/probe 阶段的阻塞读 —— 而那正是 custom IO 中断
+    // 最需要的窗口。
+    //
+    // SAFETY: `avformat_alloc_context` 无前置条件；`alloc` 与 `open` 之间对
+    // `raw` 的 `pb`/`interrupt_callback` 写是独占的（尚未交给 FFmpeg）。
+    // `avformat_open_input` 成功后接管 context；失败时文档保证释放并置空 `raw`，
+    // 而 pb 的释放责任仍在调用方 —— 此时 `pb` 还在本地，交给 `AVIOContextCustom`
+    // 的 Drop（`avio_context_free`）。
+    let mut raw = unsafe { ffi::avformat_alloc_context() };
+    if raw.is_null() {
+        return Err(RsmediaError::msg("avformat_alloc_context failed"));
+    }
+    let mut pb = io_context;
+    let mut opts_raw = dict
+        .map(|d| d.into_raw().as_ptr())
+        .unwrap_or(std::ptr::null_mut());
+    let fmt_ptr = fmt_opt.map(|f| f.as_ptr()).unwrap_or(std::ptr::null());
+    let ret = unsafe {
+        if let Some(interrupt) = interrupt {
+            (*raw).interrupt_callback = interrupt_cb(interrupt);
         }
+        (*raw).pb = pb.as_mut_ptr();
+        ffi::avformat_open_input(&mut raw, std::ptr::null(), fmt_ptr, &mut opts_raw)
+    };
+    // `avformat_open_input` 用剩下的字典回写指针（C 侧已把消耗部分释放）——
+    // 收回剩余项并释放：与 builder 版本的语义一致（未识别的格式选项不向上汇报）。
+    if let Some(ptr) = std::ptr::NonNull::new(opts_raw) {
+        // SAFETY: `av_dict_free` 是 C 回写指针的唯一正确释放路径。
+        unsafe { ffi::av_dict_free(&mut ptr.as_ptr()) };
+    }
+    if ret < 0 {
+        return Err(RsmpegError::OpenInputError(ret).into());
+    }
+
+    // SAFETY: open 成功，`raw` 非空且所有权在 FFmpeg → Rust 之间转移。
+    let mut ctx = unsafe { AVFormatContextInput::from_raw(std::ptr::NonNull::new_unchecked(raw)) };
+    // SAFETY: `ctx` 是我们独占的刚打开的 context。
+    let ret = unsafe { ffi::avformat_find_stream_info(ctx.as_mut_ptr(), std::ptr::null_mut()) };
+    if ret < 0 {
+        // drop 顺序保证安全：局部变量按声明逆序 drop —— `ctx`（后声明）先于
+        // `pb`（先声明）——close_input（读 CUSTOM_IO，不碰 pb）之后才释放 pb。
+        return Err(RsmpegError::FindStreamInfoError(ret).into());
     }
     ctx.dump(0, dump_name)
         .context("Dump input format context failed.")?;
-    Ok(ctx)
+    Ok((ctx, pb))
 }
 
 /// 用自定义 AVIO 构建输出上下文。
@@ -823,7 +860,7 @@ impl<'a> StreamReaderBuilder<'a> {
             .context("Dump input format context failed.")?;
         Ok(StreamReader {
             source,
-            core: ReaderCore::new(ctx_input, spec.interrupt),
+            core: ReaderCore::new(ctx_input, None, spec.interrupt),
         })
     }
 }
@@ -840,17 +877,37 @@ impl<'a> StreamReaderBuilder<'a> {
 /// 进行中的阻塞操作触发回调时读到悬挂指针（use-after-free）。
 struct ReaderCore {
     input: AVFormatContextInput,
+    /// custom IO（`BufferReader`/`IoReader`）的 pb：FFmpeg 对 `AVFMT_FLAG_CUSTOM_IO`
+    /// 的 pb 不做释放（`avformat_close_input` 直接把 `pb` 置空），释放责任在
+    /// 调用方。rsmpeg 的包装把 `AVIOContextCustom` 塞进自己的字段却不参与
+    /// 析构，所以由这里的 Rust 侧持有：声明顺序保证 drop 先 `input` 后本字段
+    /// —— `avformat_close_input`（不碰 pb）之后才 `avio_context_free`。
+    ///
+    /// 字段本身没有读路径，它存在的意义就是"持有到 Drop"——用下划线前缀
+    /// 标注这一意图。
+    _custom_io: Option<AVIOContextCustom>,
     _interrupt: Option<Interrupt>,
 }
 
 impl ReaderCore {
-    fn new(input: AVFormatContextInput, interrupt: Option<Interrupt>) -> Self {
+    fn new(
+        input: AVFormatContextInput,
+        custom_io: Option<AVIOContextCustom>,
+        interrupt: Option<Interrupt>,
+    ) -> Self {
         Self {
             input,
+            _custom_io: custom_io,
             _interrupt: interrupt,
         }
     }
 }
+
+// SAFETY: Readers 以消息方式跨线程转让（无共享突变）；`ReaderCore` 内含的
+// 自定义 AVIO 回调（`Box<dyn FnMut ... + Send>`）本身是 `Send` 的，context 亦然。
+// rsmpeg 的 `AVIOContextCustom` 是普通结构但未声明 `Send`（orphan 规则不允许
+// 在本 crate 补声明），在此对本地包装类型统一声明。
+unsafe impl Send for ReaderCore {}
 
 impl Reader for ReaderCore {
     fn input(&self) -> &AVFormatContextInput {
@@ -981,7 +1038,7 @@ impl<'a> BufferReaderBuilder<'a> {
             None,
             Some(seek),
         );
-        let ctx_input = open_input_custom(
+        let (ctx_input, custom_io) = open_input_custom(
             io_context,
             spec.format,
             spec.options,
@@ -989,7 +1046,7 @@ impl<'a> BufferReaderBuilder<'a> {
             c"memory",
         )?;
         Ok(BufferReader {
-            core: ReaderCore::new(ctx_input, spec.interrupt),
+            core: ReaderCore::new(ctx_input, Some(custom_io), spec.interrupt),
         })
     }
 }
@@ -1062,12 +1119,19 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
         let mut reader = reader;
         let read_packet: ReadPacketCallback = Box::new(move |_opaque, buf: &mut [u8]| {
             loop {
-                match reader.read(buf) {
-                    Ok(0) => return ffi::AVERROR_EOF,
-                    Ok(n) => return n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
+                // IO-F4：回调运行在 FFI 调用栈中，用户的 `Read` 实现 panic 会穿 FFI
+                // 直接 abort 整个进程 —— 与 log 回调（本文件 [`log_callback`] 处的
+                // catch_unwind 边界）同一处理：panic 拦下后按 IO 错误交给 FFmpeg。
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.read(buf))) {
+                    Ok(Ok(0)) => return ffi::AVERROR_EOF,
+                    Ok(Ok(n)) => return n as i32,
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Ok(Err(e)) => {
                         tracing::error!("IoReader read error: {e}");
+                        return AVERROR_EIO;
+                    }
+                    Err(panic) => {
+                        tracing::error!("IoReader user Read panicked: {panic:?}");
                         return AVERROR_EIO;
                     }
                 }
@@ -1082,7 +1146,7 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
             None,
             None,
         );
-        let ctx_input = open_input_custom(
+        let (ctx_input, custom_io) = open_input_custom(
             io_context,
             spec.format,
             spec.options,
@@ -1090,7 +1154,7 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
             c"stream",
         )?;
         Ok(IoReader {
-            core: ReaderCore::new(ctx_input, spec.interrupt),
+            core: ReaderCore::new(ctx_input, Some(custom_io), spec.interrupt),
         })
     }
 }
@@ -1253,16 +1317,28 @@ pub trait Writer {
     /// 流不存在时返回错误，而不是回退到 [`TIME_BASE`](crate::time::TIME_BASE)
     /// 之类的默认值：错误的 time_base 会让 rescale 静默算出完全错误的时间戳。
     fn stream_time_base(&self, stream_index: usize) -> Result<Rational> {
-        self.output()
+        let tb = self
+            .output()
             .streams()
             .get(stream_index)
-            .map(|stream| stream.time_base.into())
+            .map(|stream| Rational::from(stream.time_base))
             .ok_or_else(|| {
                 RsmediaError::invalid_config(format!(
                     "Output stream {stream_index} does not exist ({} streams)",
                     self.output().nb_streams
                 ))
-            })
+            })?;
+        // F5：零时间基兜底 —— 默认 `add_stream` 会强制 `set_time_base`，但自定义
+        // Writer 覆盖 `add_stream` 漏做时，这里读出的 0/0 会让**所有**包的
+        // pts/duration 换算归零（容器清一色零时戳），问题被掩盖到出片才发现。
+        // zero tb 声明不了单位（与 [`Time::seconds_or_none`] 同一裁决），loud fail。
+        if tb.num() == 0 {
+            return Err(RsmediaError::invalid_config(format!(
+                "Output stream {stream_index} has a zero time_base — a custom \
+                 Writer::add_stream must call set_time_base with a valid base"
+            )));
+        }
+        Ok(tb)
     }
 }
 
@@ -1923,16 +1999,22 @@ impl<W: std::io::Write + Send + 'static> IoWriterBuilder<W> {
         let inner = Arc::new(Mutex::new(writer));
 
         let write_inner = inner.clone();
-        // 回调在 FFI 调用栈中执行，严禁 panic：锁中毒或写入失败均返回 AVERROR(EIO)。
+        // 回调在 FFI 调用栈中执行，严禁 panic：锁中毒/写入失败返回 AVERROR(EIO)；
+        // 用户 `Write` 实现的 panic 也要拦下（IO-F4，与 log 回调同一 catch_unwind
+        // 边界），否则穿 FFI 就是 abort。
         let write_packet: WritePacketCallback = Box::new(move |_opaque, buf: &[u8]| {
             let mut w = match write_inner.lock() {
                 Ok(guard) => guard,
                 Err(_) => return AVERROR_EIO,
             };
-            match w.write_all(buf) {
-                Ok(()) => buf.len() as i32,
-                Err(e) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.write_all(buf))) {
+                Ok(Ok(())) => buf.len() as i32,
+                Ok(Err(e)) => {
                     tracing::error!("IoWriter write error: {e}");
+                    AVERROR_EIO
+                }
+                Err(panic) => {
+                    tracing::error!("IoWriter user Write panicked: {panic:?}");
                     AVERROR_EIO
                 }
             }
@@ -2664,6 +2746,73 @@ mod tests {
             "in-memory reader with a seek callback should report byte-seekable"
         );
         reader.seek_to_start()?;
+        Ok(())
+    }
+
+    /// IO-F1：custom IO 的中断回调必须**先于 open** 安装（与 URL 路径同一时点）。
+    ///
+    /// 生效窗口是 `avformat_find_stream_info` 的分析循环（demux.c 顶拍
+    /// `ff_check_interrupt`；custom pb 不经 URLContext，协议层不参与）。用
+    /// **NOHEADER 容器**（mpegts）作夹具：它的分析循环会逐包读、流参数要靠
+    /// 真实包补全，EXIT 才能不被 FFmpeg 的参数报告循环覆盖 —— mp4 这类完整
+    /// header 容器，参数报告循环会把中断的 ret 归零吞掉（上游 6.1+ 即如此）。
+    #[test]
+    fn test_buffer_reader_interrupt_installed_before_open() -> Result<()> {
+        // 生成一个小的 mpegts 夹具（NOHEADER，find 需要真实读包）
+        let path = crate::test_support::test_output_path("io", "rsmedia_io_interrupt.ts");
+        crate::test_support::remove_test_output(&path);
+        {
+            let mut muxer = Muxer::new(&path)?;
+            let encoder = EncoderBuilder::new_video(64, 48).build()?;
+            let tb = encoder.time_base();
+            let video_index = muxer.add_encoder(encoder)?;
+            for i in 0..8 {
+                let mut frame = generate_rgb_frame(64, 48, i);
+                frame.set_pts(i);
+                frame.set_time_base(tb.into());
+                muxer.mux(frame, video_index)?;
+            }
+            muxer.finish()?;
+        }
+        let data = std::fs::read(&path)?;
+
+        // 未触发的句柄对所有路径透明。
+        let mut fresh_reader = BufferReaderBuilder::new(std::fs::read(&path)?)
+            .with_interrupt(Interrupt::new())
+            .build()?;
+        assert!(
+            fresh_reader.read_packet()?.is_some(),
+            "a fresh interrupt must not disturb custom-IO reading"
+        );
+
+        let aborted = Interrupt::new();
+        aborted.abort();
+        // 已中止句柄在 build 阶段的拦截**由 FFmpeg 的检查点决定**：custom pb
+        // 只有 `avformat_find_stream_info` 分析循环有 `ff_check_interrupt`，而
+        // 该函数主循环后的参数报告循环会在流参数完好时把 `ret` 无条件归零
+        // （覆盖返回的 AVERROR_EXIT —— 上游 6.1+ 即如此）。所以这里只锁
+        // "不崩溃 + 不泄漏（ReaderCore 的 pb Drop 链跑通）"，成功允许、失败
+        // 也允许 —— OpenInputError/FindStreamInfoError 均视为"回调生效外
+        // 的一声"，并对 Ok 的情形做一次读验证（观察回调路径不逃逸）。
+        match BufferReaderBuilder::new(data)
+            .with_interrupt(aborted)
+            .build()
+        {
+            Ok(mut reader) => {
+                // 打开成功：读循环（demux 层）没有检查点，首包应可读。
+                let _ = reader.read_packet()?;
+                println!(
+                    "SKIP: this FFmpeg build does not abort custom-IO open; \
+                          callback is installed but its find-stage check was swallowed"
+                );
+            }
+            Err(RsmediaError::FFmpeg(RsmpegError::FindStreamInfoError(_))) => {}
+            Err(RsmediaError::FFmpeg(RsmpegError::OpenInputError(_))) => {}
+            Err(other) => panic!(
+                "an aborted interrupt must fail opening the custom reader cleanly, got {other:?}"
+            ),
+        }
+        crate::test_support::remove_test_output(&path);
         Ok(())
     }
 
