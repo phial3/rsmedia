@@ -1800,16 +1800,19 @@ impl Encoder {
     /// pts（编码器时间基下的样本位置，`assign_pts_sample_rate` 已完成换算/自动编号的
     /// 对齐）播种样本计数器；未设置则保持 0 起步。
     fn ensure_audio_fifo(&mut self, frame: &AVFrame, frame_size: i32) -> &mut AVAudioFifo {
-        if let Some(fifo) = self.audio_fifo.as_mut() {
-            return fifo;
-        }
+        // 借用形状注意：不能把 fifo 借用从提前 `return` 的分支里带出来 ——
+        // `if let Some(fifo) = self.audio_fifo.as_mut() { return fifo; }` 这种写法
+        // 会让稳定版借用检查（NLL 不做路径敏感分析）把借用强行活到函数退出，
+        // 之后任何触碰 `self` 的语句都报 E0502/E0499。这里改成"先建立、后一次性
+        // 取回"（`get_or_insert_with`），全程没有提前返回。建立参数必须先读出来：
+        // 闭包里再经 `self` 读会与 `&mut self.audio_fifo` 冲突。
         let channels = self.ch_layout().nb_channels;
         let sample_fmt = self.sample_fmt() as _;
-        if frame.pts != ffi::AV_NOPTS_VALUE {
+        if self.audio_fifo.is_none() && frame.pts != ffi::AV_NOPTS_VALUE {
             self.next_pts = frame.pts;
         }
         self.audio_fifo
-            .insert(AVAudioFifo::new(sample_fmt, channels, frame_size))
+            .get_or_insert_with(|| AVAudioFifo::new(sample_fmt, channels, frame_size))
     }
 
     /// 从 `audio_fifo` 中取出满帧长样本，拼成帧送编码器，直至剩余不足一帧。
