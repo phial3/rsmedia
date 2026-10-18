@@ -2421,11 +2421,18 @@ impl From<AudioParams> for AudioEndpoint {
 
 /// 色彩描述符是否值得写进 buffer 源 args：UNSPECIFIED 没有信息量，RESERVED 是
 /// "FFmpeg 留着不用"的占位（写了只会在协商阶段制造噪声）。
+///
+/// 只有 7.1+ 的 buffer 源接受颜色选项（见 `create_video_source` 的键名矩阵），
+/// 6.1 下没有调用点，连同定义一起 cfg 掉，避免 dead_code 警告。
+#[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
 fn is_known_color_space(space: ffi::AVColorSpace) -> bool {
     !matches!(space, ffi::AVCOL_SPC_UNSPECIFIED | ffi::AVCOL_SPC_RESERVED)
 }
 
 /// 亮度取值范围已声明的判定：MPEG(TV)/JPEG(PC) 之外都是"未知"。
+///
+/// 与 [`is_known_color_space`] 同理，只在 7.1+ 有调用点。
+#[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
 fn is_known_color_range(range: ffi::AVColorRange) -> bool {
     matches!(range, ffi::AVCOL_RANGE_MPEG | ffi::AVCOL_RANGE_JPEG)
 }
@@ -2791,7 +2798,7 @@ impl FilterGraph {
     ) -> Result<AVFilterContextMut<'_>> {
         // buffer 源按"这一路实际推入的帧格式"配置；sink 仍按目标格式约束。二者
         // 不同时（如 GIF 调色板链 RGB→pal8），格式转换由图内的滤镜完成。
-        let mut args = format!(
+        let args = format!(
             "width={}:height={}:pix_fmt={}:time_base={}/{}:frame_rate={}/{}:pixel_aspect={}/{}",
             endpoint.width,
             endpoint.height,
@@ -2811,15 +2818,20 @@ impl FilterGraph {
         //   （AVCOL_* 枚举值横跨版本稳定，具名表有增改风险）。
         // 未指定的颜色元数据不写入：0（UNSPEC 侧 0=RESERVED/2=UNSPECIFIED 类）
         // 没有信息量，写了还可能让本可协商的滤镜图误判。
+        //
+        // 整个追加过程连同 `mut` 一起 cfg 掉：6.1 下 `args` 只读，`let mut`
+        // 会挨 unused_mut。
         #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
-        {
+        let args = {
+            let mut args = args;
             if is_known_color_space(endpoint.color_space) {
                 args.push_str(&format!(":colorspace={}", endpoint.color_space as i32));
             }
             if is_known_color_range(endpoint.color_range) {
                 args.push_str(&format!(":range={}", endpoint.color_range as i32));
             }
-        }
+            args
+        };
         let args = CString::new(args)?;
 
         let buffersrc = get_by_name("buffer")?.ok_or_else(|| {
