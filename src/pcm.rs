@@ -375,7 +375,25 @@ impl<W: Writer> PcmSink<W> {
     fn input_layout(&self) -> Result<ffi::AVChannelLayout> {
         if self.spec.channel_mask == 0 {
             // FFmpeg's channel count is an `int`; `channels` is validated non-zero.
-            return Ok(AVChannelLayout::from_nb_channels(self.spec.channels as i32).into_inner());
+            let raw = AVChannelLayout::from_nb_channels(self.spec.channels as i32).into_inner();
+            // IO-F3：`av_channel_layout_default` 对没有命名布局的声道数会静默
+            // 退化为 UNSPEC（nb_channels 仍等于请求数）—— 拿这样的布局去建帧，
+            // 下游 swr 会报出难懂的 `AVERROR_INPUT_CHANGED`。构造期 loud fail，
+            // 让调用方补一个明确（显式 mask）的声明。
+            if raw.order == ffi::AV_CHANNEL_ORDER_UNSPEC {
+                return Err(RsmediaError::invalid_config(format!(
+                    "FFmpeg has no default channel layout for {} channels — declare an \
+                     explicit channel mask instead",
+                    self.spec.channels
+                )));
+            }
+            if raw.nb_channels != self.spec.channels as i32 {
+                return Err(RsmediaError::invalid_config(format!(
+                    "FFmpeg's default layout for {} channels claims {} channels",
+                    self.spec.channels, raw.nb_channels
+                )));
+            }
+            return Ok(raw);
         }
         let layout = AVChannelLayout::from_mask(self.spec.channel_mask).ok_or_else(|| {
             RsmediaError::invalid_config(format!(
@@ -457,6 +475,18 @@ impl<W: Writer> PcmSink<W> {
         sample_format: ffi::AVSampleFormat,
     ) -> Result<()> {
         let channels = self.spec.channels as usize;
+        // IO-F2：`AVFrame.data` 只有 `AV_NUM_DATA_POINTERS`（8）个槽位，>8 声道
+        // 需要 `extended_data` 扩展数组。老实现直接 zip 截断 —— 第 9 个之后的
+        // 声道被**静默丢弃**（16 声道源出来一半无声，很难排查）。在支持
+        // `extended_data` 写入之前，loud fail 而不是产出坏文件。
+        if channels > ffi::AV_NUM_DATA_POINTERS as usize {
+            return Err(RsmediaError::invalid_config(format!(
+                "planar input for {channels} channels: writes beyond \
+                 {AV_NUM} channels need extended_data support, which is not implemented — \
+                 declare them interleaved instead",
+                AV_NUM = ffi::AV_NUM_DATA_POINTERS,
+            )));
+        }
         if planes.len() != channels {
             return Err(RsmediaError::invalid_config(format!(
                 "planar input has {} plane(s) but the spec declares {channels} channel(s)",
@@ -1093,6 +1123,77 @@ mod tests {
         assert!(
             kinds.contains(&ffi::AVMEDIA_TYPE_VIDEO) && kinds.contains(&ffi::AVMEDIA_TYPE_AUDIO),
             "expected one video and one audio stream, got {kinds:?}"
+        );
+        Ok(())
+    }
+
+    /// aac 编码器在本 FFmpeg 构建里可用与否（环境差异，缺失时 SKIP）。
+    fn aac_available() -> bool {
+        let name = std::ffi::CString::new("aac").unwrap();
+        rsmpeg::avcodec::AVCodec::find_encoder_by_name(&name).is_some()
+    }
+
+    /// IO-F3 回归：FFmpeg 内建布局表之外、又没有命名布局的声道数（15，
+    /// 介于 7.1 的 8 与 16 ch HEXADECAGONAL 之间），在 `channel_mask` 缺省时
+    /// 必须在**写第一块数据时**拒绝，而不是建出 UNSPEC 布局的帧让
+    /// `swr_convert` 报难懂的 `AVERROR_INPUT_CHANGED`。
+    #[test]
+    fn test_unnamed_channel_count_requires_explicit_mask() -> Result<()> {
+        if !aac_available() {
+            println!("SKIP: aac encoder not available");
+            return Ok(());
+        }
+        let output_path = test_support::test_output_path("pcm", "test_pcm_layout_15ch.m4a");
+        test_support::remove_test_output(&output_path);
+
+        let mut muxer = Muxer::new(&output_path)?;
+        let audio = muxer.add_encoder(
+            EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP).build()?,
+        )?;
+        let mut sink = PcmSink::new(muxer, audio, PcmSpec::new(48_000, 15))?;
+
+        // interleaved 路径：布局校验是写路径的第一道闸（IO-F2 的 >8 槽位
+        // 拦截只在 planar 路径存在，会先触发而盖掉这条错误）。
+        let samples = vec![0.0f32; 128 * 15];
+        let err = match sink.write_f32(&samples) {
+            Ok(_) => panic!("15 unnamed channels must be rejected, not silently built"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("no default channel layout"),
+            "错误信息应指明布局缺位：{err:#}"
+        );
+        Ok(())
+    }
+
+    /// IO-F2 回归：`AVFrame.data` 只有 8 个槽位，>8 声道的 planar 写必须
+    /// loud fail —— 老代码 zip 截断把第 9 个之后的声道**静默丢弃**
+    /// （16 声道源出来一半无声）。用 16（HEXADECAGONAL，FFmpeg 有命名布局，
+    /// 因此不会被 IO-F3 的布局校验拦下）保证测试真的走到写平面这一步。
+    #[test]
+    fn test_planar_write_rejects_more_than_eight_channels() -> Result<()> {
+        if !aac_available() {
+            println!("SKIP: aac encoder not available");
+            return Ok(());
+        }
+        let output_path = test_support::test_output_path("pcm", "test_pcm_layout_16ch.m4a");
+        test_support::remove_test_output(&output_path);
+
+        let mut muxer = Muxer::new(&output_path)?;
+        let audio = muxer.add_encoder(
+            EncoderBuilder::new_audio(128_000, 2, 44_100, SampleFormat::FLTP).build()?,
+        )?;
+        let mut sink = PcmSink::new(muxer, audio, PcmSpec::new(48_000, 16))?;
+
+        let planes: Vec<Vec<f32>> = (0..16).map(|_| vec![0.0f32; 128]).collect();
+        let plane_refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+        let err = match sink.write_planar_f32(&plane_refs) {
+            Ok(_) => panic!("16-channel planar write must be rejected (no extended_data path)"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("extended_data"),
+            "错误信息应指明 extended_data 限制：{err:#}"
         );
         Ok(())
     }

@@ -774,6 +774,30 @@ impl<T: ElementType> Default for MediaFrame<T> {
     }
 }
 
+/// 视频格式的采样平面布局，不可整样本平面化的格式返回 `Err`。
+///
+/// [`PixelFormat::data_layout`] 对这类格式 panic，而帧的格式可能来自解码器（8 位
+/// 调色板 BMP 解出来就是 `pal8`），不是调用方能保证的事。`new_video` 与
+/// `new_video_frame` 共用这里，两个相邻构造器不会对同一份输入给出不同答案。
+fn storable_video_layout(format: PixelFormat, width: u32, height: u32) -> Result<DataLayout> {
+    // 零尺寸与"不可平面存储"同等地走 `Err`：帧的格式/尺寸随时来自解码器或直接
+    // 来自用户，`PixelFormat::data_layout` 的 zero-dimension panic 是给"调用方
+    // 已检查"的场合的兜底，这里就是那个"调用方"。
+    if width == 0 || height == 0 {
+        return Err(RsmediaError::invalid_config(format!(
+            "video frame needs a positive size, got {width}x{height}"
+        )));
+    }
+    if !format.is_plane_storable() {
+        return Err(RsmediaError::unsupported(format!(
+            "pixel format {} cannot be stored as sample planes: a bitstream, paletted \
+             or hardware format has no whole-sample layout",
+            format.get_pix_fmt_name()
+        )));
+    }
+    Ok(format.data_layout(width, height))
+}
+
 impl<T> MediaFrame<T>
 where
     T: ElementType,
@@ -783,25 +807,25 @@ where
     /// Derived from the format ([`PixelFormat::data_layout`] /
     /// [`SampleFormat::data_layout`]), so it applies to video and audio alike.
     ///
-    /// A video format with no whole-sample planes — bitstream, paletted or hardware —
-    /// is an `Err`, **not** the panic [`PixelFormat::data_layout`] raises for it: a
-    /// frame's format may come from a decoder (8-bit paletted BMPs decode to `pal8`),
-    /// so getting it right is not the caller's to guarantee.
+    /// 帧的格式/尺寸随时来自解码器或直接来自用户，因此本方法**不依赖
+    /// [`PixelFormat::data_layout`] 的 panic 契约**：不可平面存储的格式
+    /// （位流 / 调色板 / 硬件，8-bit 调色板 BMP 就解成 `pal8`）与零尺寸
+    /// 都在前置检查里转为 `Err`。
     pub fn data_layout(&self) -> Result<DataLayout> {
         if self.media_type == MediaType::VIDEO {
             let format = self
                 .format
                 .into_pixel()
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
-            if !format.is_plane_storable() {
-                return Err(RsmediaError::unsupported(format!(
-                    "pixel format {} cannot be stored as sample planes: a bitstream, paletted \
-                     or hardware format has no whole-sample layout",
-                    format.get_pix_fmt_name()
+            storable_video_layout(format, self.width, self.height)
+        } else {
+            if self.nb_samples == 0 || self.nb_channels == 0 {
+                return Err(RsmediaError::invalid_config(format!(
+                    "audio frame needs a positive sample and channel count, \
+                     got {} samples x {} channels",
+                    self.nb_samples, self.nb_channels
                 )));
             }
-            Ok(format.data_layout(self.width, self.height))
-        } else {
             let format = self
                 .format
                 .into_sample()
@@ -817,8 +841,11 @@ where
     /// `(height, width, elements_per_pixel)` 数组，planar 格式为每平面一个数组。
     /// 传入 `ndarray::Array3` / `Vec<Array2>` 会分别视为交错 / 平面帧。
     ///
-    /// 零尺寸或无法整样本平面化的格式（位流 / 调色板 / 硬件）会 panic，
-    /// 与 [`PixelFormat::data_layout`] 的契约一致。
+    /// 零宽高返回 `Err`（帧尺寸随时来自用户构造或解码产物，构造器必须直接
+    /// 拒绝而不是依赖底层布局 API 的 panic 契约）；无法整样本平面化的格式
+    /// （位流 / 调色板 / 硬件）同样返回 `Err`
+    /// （见 [`data_layout`](Self::data_layout) 的理由）。
+    /// （见 [`data_layout`](Self::data_layout) 的理由）。
     ///
     /// 时间基保持未设置：分辨率里没有帧率信息，而编码器会用自己的输入时间基解释
     /// pts（见 [`time_base`](Self::time_base)）。要按自己的时间基表达 pts 时再调
@@ -844,7 +871,7 @@ where
     ///
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
     pub fn new_video_frame(width: u32, height: u32, format: PixelFormat) -> Result<Self> {
-        let layout = format.data_layout(width, height);
+        let layout = storable_video_layout(format, width, height)?;
         Self::new_video(width, height, format, FrameData::zeros(&layout))
     }
 
@@ -855,7 +882,8 @@ where
     /// `(1, nb_samples, nb_channels)` 数组。
     ///
     /// 时间基自动取 `1/sample_rate` —— 音频的固有时间基，不需要调用方传递
-    /// （`sample_rate` 为 0 时保持未设置）。
+    /// （`sample_rate` 为 0 时保持未设置）；`sample_rate` 超出 `i32` 域时报
+    /// [`RsmediaError::InvalidConfig`]（FFmpeg 内部的采样率就是 `int`）。
     ///
     /// `sample_rate` 是**源率**（这批样本实际是多少 Hz），与编码器的目标率是两个量：
     /// 二者不同时编码器会自动重采样，所以应当填数据真实的采样率。确实不想声明时可传
@@ -868,10 +896,19 @@ where
         sample_rate: u32,
         data: impl Into<FrameData<T>>,
     ) -> Result<Self> {
+        // S4：`sample_rate` 是 u32，≥2^31 的值 `as i32` 会变成**负数**
+        // （3_000_000_000 → -1_294_967_296），`1/sample_rate` 归一后时间基为负，
+        // 一路写进 AVFrame 后下游 pts→秒 全部反号。FFmpeg 的采样率本体就是 int，
+        // 装不下就 loud fail；0（"不声明采样率"）仍然合法。
+        let sample_rate_i32 = i32::try_from(sample_rate).map_err(|_| {
+            RsmediaError::invalid_config(format!(
+                "sample_rate {sample_rate} does not fit in the i32 used by FFmpeg"
+            ))
+        })?;
         Self {
             format: FrameFormat::Sample(format),
             data: data.into(),
-            time_base: Rational::new(1, sample_rate as i32).unwrap_or(Rational::ZERO),
+            time_base: Rational::new(1, sample_rate_i32).unwrap_or(Rational::ZERO),
             sample_rate,
             nb_samples,
             nb_channels,
@@ -909,8 +946,9 @@ where
     /// [`to_avframe`](Self::to_avframe)。
     fn validated(self) -> Result<Self> {
         // 音频的声道数/采样数必须为正：否则平面布局是空列表、`matches` 会接受，
-        // 一个"没有声道"的帧就能一路走到 FFmpeg。视频侧的等价约束由
-        // `PixelFormat::data_layout` 的零尺寸 panic 覆盖，无需在此重复。
+        // 一个"没有声道"的帧就能一路走到 FFmpeg。视频侧的等价约束（正尺寸）由
+        // `storable_video_layout` 的零尺寸 `Err` 覆盖 —— 不再依赖底层
+        // `PixelFormat::data_layout` 的 panic 兜底。
         if self.media_type == MediaType::AUDIO && (self.nb_channels == 0 || self.nb_samples == 0) {
             return Err(RsmediaError::msg(format!(
                 "Audio frame needs a positive sample and channel count, got {} samples x {} channels",
@@ -1332,6 +1370,22 @@ where
         }
         validate_element_size::<T>(self.format, self.element_size()?)?;
 
+        // S4：`sample_rate` 是 u32 且字段公开（`new_audio` 拦得住构造期，拦不住
+        // 构造后的 `frame.sample_rate = ...`），≥2^31 的值 `as i32` 变成负数 ——
+        // `set_sample_rate` 与 `1/sample_rate` 时间基都会把负值带进 AVFrame。
+        // FFmpeg 的采样率本体就是 int，装不下在这个出口 loud fail（与
+        // `new_audio` 的构造期校验同规格）。
+        let audio_sample_rate = if self.media_type == MediaType::AUDIO {
+            Some(i32::try_from(self.sample_rate).map_err(|_| {
+                RsmediaError::invalid_config(format!(
+                    "sample_rate {} does not fit in the i32 used by FFmpeg",
+                    self.sample_rate
+                ))
+            })?)
+        } else {
+            None
+        };
+
         let mut frame = AVFrame::new();
         frame.set_format(i32::from(self.format));
         if self.media_type == MediaType::VIDEO {
@@ -1339,8 +1393,9 @@ where
             frame.set_height(self.height as i32);
             frame.set_pict_type(self.pict_type);
         } else {
+            // 音频分支：上面必然算出了 `Some`。
             frame.set_nb_samples(self.nb_samples as i32);
-            frame.set_sample_rate(self.sample_rate as i32);
+            frame.set_sample_rate(audio_sample_rate.unwrap_or(0));
             frame.set_ch_layout(
                 AVChannelLayout::from_nb_channels(self.nb_channels as i32).into_inner(),
             );
@@ -1358,8 +1413,8 @@ where
         // 音频采样率推导 `1/sample_rate`，与 `from_avframe` 的推断规则一致。
         let time_base = if self.time_base.num() > 0 {
             self.time_base
-        } else if self.media_type == MediaType::AUDIO && self.sample_rate > 0 {
-            Rational::new(1, self.sample_rate as i32).unwrap_or(Rational::ZERO)
+        } else if let Some(sample_rate) = audio_sample_rate.filter(|rate| *rate > 0) {
+            Rational::new(1, sample_rate).unwrap_or(Rational::ZERO)
         } else {
             self.time_base
         };
@@ -1857,12 +1912,20 @@ fn yuv420p_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
 }
 
 /// Checks `data` against the layout `format` requires at `width` x `height`.
+///
+/// 零尺寸在这里前置拒绝：`check_layout` 的宽高来自调用点的用户数据，不应让
+/// 坏尺寸触达 [`PixelFormat::data_layout`] 的 panic 兜底。
 fn check_layout<T>(
     data: &FrameData<T>,
     format: PixelFormat,
     width: u32,
     height: u32,
 ) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(RsmediaError::invalid_config(format!(
+            "video frame needs a positive size, got {width}x{height}"
+        )));
+    }
     let layout = format.data_layout(width, height);
     if data.matches(&layout) {
         Ok(())
@@ -2223,6 +2286,36 @@ mod tests {
         assert!(
             err.to_string().contains("pal8"),
             "expected a pal8 error, got: {err}"
+        );
+    }
+
+    /// `new_video_frame` 必须与相邻的 `new_video` 对同一份输入给出同一个答案。
+    ///
+    /// `new_video_frame` 得先按格式算出布局才能造零数组，而它调的是会 panic 的
+    /// `PixelFormat::data_layout`，绕过了 `MediaFrame::data_layout` 那道守卫
+    /// （`new_video` 走 `validated`，到的是后者）。于是两个构造器在同一个格式上
+    /// 不一致：一个返回 `Err`，一个直接终止进程。
+    #[test]
+    fn new_video_frame_reports_an_unstorable_format_instead_of_panicking() {
+        // 带数据进来的那条路：早已是 Err。
+        let with_data = MediaFrame::<u8>::new_video(
+            8,
+            8,
+            PixelFormat::PAL8,
+            ndarray::Array3::<u8>::zeros((8, 8, 1)),
+        )
+        .expect_err("new_video with pal8 must fail");
+        assert!(
+            with_data.to_string().contains("pal8"),
+            "expected a pal8 error, got: {with_data}"
+        );
+
+        // 这条曾经 panic。
+        let zeroed = MediaFrame::<u8>::new_video_frame(8, 8, PixelFormat::PAL8)
+            .expect_err("new_video_frame must report the same way, not panic");
+        assert!(
+            zeroed.to_string().contains("pal8"),
+            "expected a pal8 error, got: {zeroed}"
         );
     }
 
@@ -3071,6 +3164,47 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// S4：≥2^31 的采样率在构造期就报 `InvalidConfig` —— 曾经的 `as i32`
+    /// 会把它变成**负数**，`1/sample_rate` 归一后得到负时间基，一路写进
+    /// AVFrame 后下游 pts→秒 全部反号。0（"不声明采样率"）仍然合法。
+    #[test]
+    fn test_audio_sample_rate_beyond_i32_is_rejected_at_construction() {
+        let err =
+            MediaFrame::<u8>::new_audio_frame(SampleFormat::U8, 1, 16, 3_000_000_000).unwrap_err();
+        assert!(err.is_invalid_config(), "{err}");
+        assert!(
+            err.to_string().contains("3000000000"),
+            "the message must name the offending rate: {err}"
+        );
+
+        // 边界：i32::MAX 装得下；u32::MAX 装不下；0 仍然合法（帧上留空）。
+        assert!(
+            MediaFrame::<u8>::new_audio_frame(SampleFormat::U8, 1, 16, i32::MAX as u32).is_ok()
+        );
+        assert!(MediaFrame::<u8>::new_audio_frame(SampleFormat::U8, 1, 16, u32::MAX).is_err());
+        assert!(MediaFrame::<u8>::new_audio_frame(SampleFormat::U8, 1, 16, 0).is_ok());
+    }
+
+    /// S4：`sample_rate` 字段是公开的（构造后仍可改写），`to_avframe` 出口
+    /// 必须再拦一次 —— 负时间基绝不能进 AVFrame；合法值照常推导
+    /// `1/sample_rate`。
+    #[test]
+    fn test_to_avframe_rejects_an_overflowed_public_sample_rate() -> Result<()> {
+        let mut frame = MediaFrame::<u8>::new_audio_frame(SampleFormat::U8, 1, 4, 48_000)?;
+        frame.sample_rate = 3_000_000_000;
+        let err = frame.to_avframe().unwrap_err();
+        assert!(err.is_invalid_config(), "{err}");
+
+        // 正常路径不受影响：时间基留空的帧按采样率推导。
+        let mut frame = MediaFrame::<u8>::new_audio_frame(SampleFormat::U8, 1, 4, 8_000)?;
+        frame.time_base = Rational::ZERO;
+        frame.sample_rate = 96_000;
+        let raw = frame.to_avframe()?;
+        assert_eq!(raw.sample_rate, 96_000);
+        assert_eq!(Rational::from(raw.time_base), Rational::new(1, 96_000)?);
         Ok(())
     }
 }

@@ -312,38 +312,6 @@ impl std::fmt::Display for VideoSpec {
     }
 }
 
-/// 创建软件缩放上下文（按 FFmpeg 版本走新旧 API 路径）：
-/// - FFmpeg 6/7：legacy 路径，`sws_getContext()` 一次性传入源/目标参数完成初始化；
-/// - FFmpeg 8+：modern 全动态路径，`sws_alloc_context()` 分配后仅设置 flags 字段，
-///   尺寸/格式等参数由 `sws_scale_frame()` 从帧属性推导（`sws_init_context()` 自
-///   FFmpeg 8.0 起废弃，FFmpeg 9 起拒绝 legacy/modern API 混用）。
-#[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-fn setup_scaler(src_spec: VideoSpec, dst_spec: VideoSpec, flags: u32) -> Result<SwsContext> {
-    SwsContext::get_context(
-        src_spec.width,
-        src_spec.height,
-        src_spec.pix_fmt.into(),
-        dst_spec.width,
-        dst_spec.height,
-        dst_spec.pix_fmt.into(),
-        flags,
-        None,
-        None,
-        None,
-    )
-    .context("Failed to create swscale context.")
-}
-
-/// FFmpeg 8+ 的全动态路径：签名与 6/7 分支保持一致以便调用方无感切换，但除 flags 外
-/// 的参数（尺寸/格式）在此被忽略 —— 由 [`SwsContext::scale_full_frame`] 从帧属性推导。
-#[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-#[allow(unused_variables)]
-fn setup_scaler(src_spec: VideoSpec, dst_spec: VideoSpec, flags: u32) -> Result<SwsContext> {
-    let mut sws_ctx = SwsContext::alloc().context("Failed to allocate swscale context.")?;
-    sws_ctx.set_flags(flags);
-    Ok(sws_ctx)
-}
-
 /// 按**目标像素格式**修正缩放输出帧的色彩标记。
 ///
 /// 缩放前的 `imgutils::copy_frame_metadata` 把源帧的色域元数据整套搬给了目标帧，换了
@@ -369,51 +337,6 @@ fn fix_output_color_metadata(dst_frame: &mut AVFrame, dst_pix_fmt: PixelFormat) 
         let dst_raw = dst_frame.deref_mut();
         dst_raw.color_range = ffi::AVCOL_RANGE_JPEG;
         dst_raw.chroma_location = ffi::AVCHROMA_LOC_UNSPECIFIED;
-    }
-}
-
-/// FFmpeg 6/7 的 legacy 上下文（`sws_getContext`）在创建时拿不到帧的色域信息，
-/// 输入/输出范围与 YUV↔RGB 系数必须逐帧经 `sws_setColorspaceDetails` 告知，否则
-/// 转换按默认假设进行（例如 limited YUV → RGB 会输出 limited RGB 而非 full range）。
-///
-/// 本转换只换像素格式、不换色度学，故输入/输出用同一套系数（由源帧 `colorspace`
-/// 选出，未指定/未收录时退回 `SWS_CS_DEFAULT`）；亮度/对比度/饱和度不做校正
-/// （`0`/`1<<16`/`1<<16`）。
-///
-/// 返回值 < 0 表示该像素格式组合不支持设置色彩细节（官方文档：`LIBSWSCALE_VERSION_MAJOR
-/// < 7` 时以 -1 表示不支持），与缩放本身无关，只记日志、不失败。
-#[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-fn set_scaler_colorspace_details(sws: &mut SwsContext, src_frame: &AVFrame, dst_frame: &AVFrame) {
-    let colorspace = match src_frame.colorspace {
-        ffi::AVCOL_SPC_BT709 => ffi::SWS_CS_ITU709,
-        ffi::AVCOL_SPC_FCC => ffi::SWS_CS_FCC,
-        ffi::AVCOL_SPC_SMPTE170M | ffi::AVCOL_SPC_BT470BG => ffi::SWS_CS_ITU601,
-        ffi::AVCOL_SPC_SMPTE240M => ffi::SWS_CS_SMPTE240M,
-        ffi::AVCOL_SPC_BT2020_NCL | ffi::AVCOL_SPC_BT2020_CL => ffi::SWS_CS_BT2020,
-        _ => ffi::SWS_CS_DEFAULT,
-    };
-    // Safety: `sws` 是有效上下文，两个帧均为有效 AVFrame；`sws_getCoefficients` 返回
-    // FFmpeg 的静态系数表指针，在进程生命周期内有效。
-    let ret = unsafe {
-        let table = ffi::sws_getCoefficients(colorspace as i32);
-        ffi::sws_setColorspaceDetails(
-            sws.as_mut_ptr(),
-            table,
-            i32::from(src_frame.color_range == ffi::AVCOL_RANGE_JPEG),
-            table,
-            i32::from(dst_frame.color_range == ffi::AVCOL_RANGE_JPEG),
-            0,
-            1 << 16,
-            1 << 16,
-        )
-    };
-    if ret < 0 {
-        tracing::debug!(
-            "sws_setColorspaceDetails is not supported for this conversion (ret: {ret}); \
-             keeping the scaler defaults. src range: {:?}, dst range: {:?}",
-            src_frame.color_range,
-            dst_frame.color_range
-        );
     }
 }
 
@@ -652,9 +575,31 @@ impl Scaler {
             .as_ref()
             .is_some_and(|bound| bound.src_spec == src_spec && bound.dst_spec == dst_spec);
         if !reusable {
-            // 6/7 的 legacy `SwsContext` 在此固定源/目标几何与格式；8+ 的动态上下文只取
-            // flags，几何以帧属性为准——两条路径都按这里的规格调用，故版本间行为一致。
-            let sws = setup_scaler(src_spec, dst_spec, self.flags())?;
+            // 6/7 的 legacy `SwsContext`（`sws_getContext`）在此固定源/目标几何与格式；
+            // 8+ 的 modern 全动态路径只取 flags，几何/格式由 `sws_scale_frame()` 从帧属性
+            // 推导（`sws_init_context()` 自 FFmpeg 8.0 起废弃，FFmpeg 9 起拒绝
+            // legacy/modern API 混用）。两条路径都按这里的规格调用，故版本间行为一致。
+            #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
+            let sws = SwsContext::get_context(
+                src_spec.width,
+                src_spec.height,
+                src_spec.pix_fmt.into(),
+                dst_spec.width,
+                dst_spec.height,
+                dst_spec.pix_fmt.into(),
+                self.flags(),
+                None,
+                None,
+                None,
+            )
+            .context("Failed to create swscale context.")?;
+            #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+            let sws = {
+                let mut sws_ctx =
+                    SwsContext::alloc().context("Failed to allocate swscale context.")?;
+                sws_ctx.set_flags(self.flags());
+                sws_ctx
+            };
             // 池与上下文同生命周期：规格变化重建时旧池一并析构，未归还的缓冲由引用
             // 计数安全释放（不会回到新池里）。
             let pool = if self.pool_enabled {
@@ -691,7 +636,48 @@ impl Scaler {
         fix_output_color_metadata(&mut dst_frame, dst_spec.pix_fmt);
 
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
-        set_scaler_colorspace_details(&mut bound.sws, src_frame, &dst_frame);
+        {
+            // FFmpeg 6/7 的 legacy 上下文（`sws_getContext`）在创建时拿不到帧的色域信息，
+            // 输入/输出范围与 YUV↔RGB 系数必须逐帧经 `sws_setColorspaceDetails` 告知，
+            // 否则转换按默认假设进行（例如 limited YUV → RGB 会输出 limited RGB 而非
+            // full range）。本转换只换像素格式、不换色度学，故输入/输出用同一套系数
+            // （由源帧 `colorspace` 选出，未指定/未收录时退回 `SWS_CS_DEFAULT`）；
+            // 亮度/对比度/饱和度不做校正（`0`/`1<<16`/`1<<16`）。
+            let colorspace = match src_frame.colorspace {
+                ffi::AVCOL_SPC_BT709 => ffi::SWS_CS_ITU709,
+                ffi::AVCOL_SPC_FCC => ffi::SWS_CS_FCC,
+                ffi::AVCOL_SPC_SMPTE170M | ffi::AVCOL_SPC_BT470BG => ffi::SWS_CS_ITU601,
+                ffi::AVCOL_SPC_SMPTE240M => ffi::SWS_CS_SMPTE240M,
+                ffi::AVCOL_SPC_BT2020_NCL | ffi::AVCOL_SPC_BT2020_CL => ffi::SWS_CS_BT2020,
+                _ => ffi::SWS_CS_DEFAULT,
+            };
+            // Safety: `bound.sws` 是有效上下文，两个帧均为有效 AVFrame；
+            // `sws_getCoefficients` 返回 FFmpeg 的静态系数表指针，在进程生命周期内有效。
+            let ret = unsafe {
+                let table = ffi::sws_getCoefficients(colorspace as i32);
+                ffi::sws_setColorspaceDetails(
+                    bound.sws.as_mut_ptr(),
+                    table,
+                    i32::from(src_frame.color_range == ffi::AVCOL_RANGE_JPEG),
+                    table,
+                    i32::from(dst_frame.color_range == ffi::AVCOL_RANGE_JPEG),
+                    0,
+                    1 << 16,
+                    1 << 16,
+                )
+            };
+            // 返回值 < 0 表示该像素格式组合不支持设置色彩细节（官方文档：
+            // `LIBSWSCALE_VERSION_MAJOR < 7` 时以 -1 表示不支持），与缩放本身无关，
+            // 只记日志、不失败。
+            if ret < 0 {
+                tracing::debug!(
+                    "sws_setColorspaceDetails is not supported for this conversion (ret: {ret}); \
+                     keeping the scaler defaults. src range: {:?}, dst range: {:?}",
+                    src_frame.color_range,
+                    dst_frame.color_range
+                );
+            }
+        }
 
         #[cfg(any(feature = "ffmpeg6", feature = "ffmpeg7"))]
         {

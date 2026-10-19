@@ -108,6 +108,48 @@ impl Filter {
     }
 }
 
+/// 收集并校验滤镜链声明的图输入格式（[`Filter::with_input_format`]）。
+///
+/// 编码侧与解码侧共用同一份裁决：
+///
+/// - 多条滤镜各自声明时必须**一致**（同一格式）：这个声明的意义是"帧进图前
+///   先转成它、图内 buffer 源按它声明"，链上各条各说各话没有可行实现；
+/// - 声明必须与滤镜的媒体类型同族（视频滤镜配采样格式同样不可实现）。
+///
+/// 老行为取"链上第一条声明"且不校验：后面的声明被静默忽略、冲突根本不报
+/// —— 静默建出与声明不符的图，属于"构造即可触发"的缺陷，现在 loud fail。
+pub(crate) fn resolve_declared_input_format(filters: &[Filter]) -> Result<Option<FrameFormat>> {
+    let mut declared: Option<FrameFormat> = None;
+    for filter in filters {
+        let Some(fmt) = filter.input_format() else {
+            continue;
+        };
+        if let Some(prev) = declared {
+            if prev != fmt {
+                return Err(RsmediaError::invalid_config(format!(
+                    "filters declare conflicting input formats: {prev:?} vs {fmt:?} — \
+                     all `with_input_format` declarations in one chain must agree"
+                )));
+            }
+        } else {
+            declared = Some(fmt);
+        }
+        let media_type = filter.media_type();
+        let same_family = matches!(
+            (media_type, fmt),
+            (MediaType::VIDEO, FrameFormat::Pixel { .. })
+                | (MediaType::AUDIO, FrameFormat::Sample { .. })
+        );
+        if !same_family {
+            return Err(RsmediaError::invalid_config(format!(
+                "filter for {media_type:?} declares input format {fmt:?} — a cross-type \
+                 format declaration has no workable implementation"
+            )));
+        }
+    }
+    Ok(declared)
+}
+
 /// 滤镜图中的一个**节点**：一个 [`Filter`] 加上它在图里的接线。
 ///
 /// [`Filter`] 只描述「滤镜是什么」，接线（这一路输入来自哪个上游、输出叫什么名字）
@@ -147,10 +189,15 @@ pub struct FilterNode {
     /// 各路输入分别接到哪个上游标签，顺序即滤镜的输入 pad 顺序。
     /// 空 = 自动接线（接在链尾；链首接图的首个输入）。
     inputs: Vec<String>,
-    /// 各输出 pad 的标签，顺序即滤镜的输出 pad 顺序；空 = 由构建器自动分配一个
-    /// `n{序号}`（自动分配**只给一个**标签：单输出 pad 的滤镜正好够用；多输出滤镜
-    /// 不标注的话，静态 pad 会在建图时因个数不符报 `InvalidConfig`，而动态 pad 的
-    /// `split`/`asplit` 会安静地只生成 1 路输出）。
+    /// 各输出 pad 的标签，顺序即滤镜的输出 pad 顺序；空 = 由构建器自动分配
+    /// **一个** `n{节点序号}`（数字是节点在整个图中的下标，不是 pad 下标）：
+    /// 单输出 pad 的滤镜正好够用；多输出滤镜（`split` / `asplit`）必须用
+    /// [`with_outputs`](Self::with_outputs) 逐 pad 标注 —— 静态 pad 在建图时因
+    /// 个数不符报 `InvalidConfig`；动态 pad（pad 数由滤镜自己的 `outputs=` 选项
+    /// 决定，构建期看不到）则由 FFmpeg 在图配置阶段拒掉，错误信息里带着出错的
+    /// 图描述（如 `Failed to configure filter graph ... split=2[only_one]`）。
+    /// 两条路径都是**响亮失败**，不存在"少标几个 pad、安静地只保留一路输出"
+    /// 这种用法。
     outputs: Vec<String>,
 }
 
@@ -2177,6 +2224,18 @@ pub struct VideoParams {
     pub frame_rate: Rational,
     /// 像素宽高比；[`Rational::ZERO`] 表示未知。
     pub pixel_aspect: Rational,
+    /// 这一帧的 YUV 色度坐标（`AVColorSpace`，如 BT709）；[`ffi::AVCOL_SPC_UNSPECIFIED`]
+    /// 表示未知 —— buffer 源据此声明进图帧的色彩描述符（FFmpeg ≥7.1 才接受，
+    /// 6.1 无此参数；未指定时不写入 args，行为与从前一致）。
+    ///
+    /// 声明了它，图内就能按帧与输出色彩不匹配自动插转（7.1+）——否则
+    /// full/limited range 不匹配的画面直接被原样送进编码器，出来的就是
+    /// 过饱和/发灰的帧。
+    pub color_space: ffi::AVColorSpace,
+    /// 这一帧的亮度取值范围（`AVColorRange`：TV/MPEG 或 PC/JPEG 限幅）；
+    /// [`ffi::AVCOL_RANGE_UNSPECIFIED`] 表示未知。与 [`Self::color_space`](Self::color_space)
+    /// 一同进 buffer 源 args（FFmpeg ≥7.1）。
+    pub color_range: ffi::AVColorRange,
 }
 
 /// Audio filter parameters — the single-input / single-output linear chain
@@ -2255,6 +2314,11 @@ pub struct VideoEndpoint {
     pub frame_rate: Rational,
     /// 像素宽高比。
     pub pixel_aspect: Rational,
+    /// 进图帧的 YUV 色度坐标（`AVColorSpace`）；[`ffi::AVCOL_SPC_UNSPECIFIED`] 表示未知。
+    /// 见 [`VideoParams::color_space`](VideoParams::color_space)。
+    pub color_space: ffi::AVColorSpace,
+    /// 进图帧的亮度取值范围（`AVColorRange`）；[`ffi::AVCOL_RANGE_UNSPECIFIED`] 表示未知。
+    pub color_range: ffi::AVColorRange,
 }
 
 impl VideoEndpoint {
@@ -2264,7 +2328,8 @@ impl VideoEndpoint {
     /// 倒数），写反了编译得过、要到出片才看得出错。用下面的 `with_*` 逐个按名字设置。
     ///
     /// 默认值：时间基与帧率 [`Rational::ZERO`]（`buffer` 源会直接拒绝 `time_base=0/1`，
-    /// 不会静默建出一个错的图）、像素宽高比 [`Rational::ONE`]（1:1，最常见的情形）。
+    /// 不会静默建出一个错的图）、像素宽高比 [`Rational::ONE`]（1:1，最常见的情形）、
+    /// 色彩描述符 UNSPECIFIED（buffer 源不写 color args，保持旧语义）。
     pub fn new(width: u32, height: u32, format: PixelFormat) -> Self {
         Self {
             width,
@@ -2273,6 +2338,8 @@ impl VideoEndpoint {
             time_base: Rational::ZERO,
             frame_rate: Rational::ZERO,
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         }
     }
 
@@ -2335,6 +2402,8 @@ impl From<VideoParams> for VideoEndpoint {
             time_base: params.time_base,
             frame_rate: params.frame_rate,
             pixel_aspect: params.pixel_aspect,
+            color_space: params.color_space,
+            color_range: params.color_range,
         }
     }
 }
@@ -2711,7 +2780,7 @@ impl FilterGraph {
     ) -> Result<AVFilterContextMut<'_>> {
         // buffer 源按"这一路实际推入的帧格式"配置；sink 仍按目标格式约束。二者
         // 不同时（如 GIF 调色板链 RGB→pal8），格式转换由图内的滤镜完成。
-        let args = CString::new(format!(
+        let args = format!(
             "width={}:height={}:pix_fmt={}:time_base={}/{}:frame_rate={}/{}:pixel_aspect={}/{}",
             endpoint.width,
             endpoint.height,
@@ -2722,7 +2791,35 @@ impl FilterGraph {
             endpoint.frame_rate.den(),
             endpoint.pixel_aspect.num(),
             endpoint.pixel_aspect.den(),
-        ))?;
+        );
+        // 色彩描述符。实测的选项键名矩阵（C 探针，6.1/7.1/8.1/9.0 各一遍）：
+        // - 6.1 的 buffer 源**没有**颜色选项：color_space/color_space/range/
+        //   color_range 一律 "Option not found"（构建即 EINVAL）;
+        // - 7.1+ 接受但键名是 `colorspace` 与 `range`（不是 buffersrc.h 结构体
+        //   字段名里的 color_space/color_range），int 或具名常量皆可——用数值
+        //   （AVCOL_* 枚举值横跨版本稳定，具名表有增改风险）;
+        // 未指定的颜色元数据不写入：0（UNSPEC 侧 0=RESERVED/2=UNSPECIFIED 类）
+        // 没有信息量，写了还可能让本可协商的滤镜图误判。
+        #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
+        let args = {
+            let mut args = args;
+            // UNSPECIFIED 没有信息量、RESERVED 是 FFmpeg 留着不用的占位，都不写。
+            if !matches!(
+                endpoint.color_space,
+                ffi::AVCOL_SPC_UNSPECIFIED | ffi::AVCOL_SPC_RESERVED
+            ) {
+                args.push_str(&format!(":colorspace={}", endpoint.color_space));
+            }
+            // 颜色范围只认 MPEG(TV)/JPEG(PC) 两种声明，其余按未指定处理。
+            if matches!(
+                endpoint.color_range,
+                ffi::AVCOL_RANGE_MPEG | ffi::AVCOL_RANGE_JPEG
+            ) {
+                args.push_str(&format!(":range={}", endpoint.color_range));
+            }
+            args
+        };
+        let args = CString::new(args)?;
 
         let buffersrc = get_by_name("buffer")?.ok_or_else(|| {
             RsmediaError::unsupported("filter 'buffer' is not available in this FFmpeg build")
@@ -3113,16 +3210,16 @@ impl FilterGraph {
                     // EAGAIN：图里仍有缓冲帧要出，继续拉取；但个别滤镜可能一直回
                     // EAGAIN 而不进入 Flushed，故设上限收尾（与解码/编码排空一致）。
                     // 触顶时不能静默返回半截结果：残留帧会被丢掉，必须让调用者知道。
-                    if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
+                    if drained_iterations >= crate::MAX_EAGAIN_RETRIES {
                         tracing::error!(
                             "Filter graph keeps returning EAGAIN while flushing; \
                              giving up after {} iterations",
-                            crate::MAX_DRAIN_ITERATIONS
+                            crate::MAX_EAGAIN_RETRIES
                         );
                         return Err(RsmediaError::msg(format!(
                             "Filter graph stalled while flushing: still no output after {} \
                              iterations; {} already-dequeued frames are discarded",
-                            crate::MAX_DRAIN_ITERATIONS,
+                            crate::MAX_EAGAIN_RETRIES,
                             frames.len()
                         )));
                     }
@@ -4499,6 +4596,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let poisoned = Filter::new("null", MediaType::VIDEO, "null=a\0b".to_string());
         let err = match FilterGraph::build(&params, &[poisoned]) {
@@ -4839,6 +4938,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let filter = video::hflip();
 
@@ -5275,6 +5376,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
         let mut graph = FilterGraph::build(&params, &[null])?;
@@ -5314,6 +5417,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let null = Filter::new("null", MediaType::VIDEO, "null".to_string());
         let mut graph = FilterGraph::build(&params, &[null])?;
@@ -5629,6 +5734,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
         let filters = vec![Filter::new(
             "rsmedia_no_such_filter",
@@ -5663,6 +5770,8 @@ mod tests {
             time_base: rat(1, 25),
             frame_rate: rat(25, 1),
             pixel_aspect: Rational::ONE,
+            color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+            color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
         });
 
         let err = FilterGraph::build(&params, &[]).unwrap_err();

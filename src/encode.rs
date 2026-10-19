@@ -664,6 +664,15 @@ impl EncoderBuilder {
         if self.global_header {
             flags |= AVCodecFlag::GLOBAL_HEADER.as_raw() as i32;
         }
+        // 无滤镜图时声明"帧 duration 的数值已在编码器 time_base 里"——由
+        // `assign_pts_sample_rate` 换算 pts 的同一处一并换算 duration 保证。FFmpeg
+        // ≥6.1 的 `avcodec_send_frame` 默认**清零**它不信任的 frame.duration
+        // （"值在错误时间基里比没有更糟"），不置位则 libx264 等 opaque 路径拿到
+        // 的 packet duration 恒为 0，转码时长全靠 muxer 兜底。带滤镜图时沿用
+        // 默认清理：滤镜改帧率后帧 duration 的语义归滤镜域，这里不越权背书。
+        if self.filters.as_ref().is_none_or(|f| f.is_empty()) {
+            flags |= AVCodecFlag::FRAME_DURATION.as_raw() as i32;
+        }
         encoder.set_flags(flags);
         if let Some(flags2) = self.flags2 {
             crate::codec::set_flags2(encoder, flags2.bits() as i32);
@@ -860,6 +869,17 @@ impl EncoderBuilder {
         ))
     }
 
+    /// 收集并校验滤镜链声明的图输入格式（[`Filter::with_input_format`]）。
+    ///
+    /// 校验规则与错误信息见 `filter::resolve_declared_input_format`（编码/解码
+    /// 两侧共用同一份裁决，不允许各自漂移）。
+    fn resolve_filter_input_format(&self) -> Result<Option<FrameFormat>> {
+        let Some(filters) = self.filters.as_ref() else {
+            return Ok(None);
+        };
+        crate::filter::resolve_declared_input_format(filters)
+    }
+
     /// 构造滤镜图。
     ///
     /// 返回图本身，以及滤镜链声明的**输入格式**（未声明时为 `None`，调用方按
@@ -882,8 +902,9 @@ impl EncoderBuilder {
 
         // 滤镜链可声明要求的输入格式（如 GIF 调色板链要求 RGB 输入、输出
         // pal8；音频链可声明输入采样格式）；未声明时输入格式=编码器协商格式
-        // （src/sink 同格式，零行为变化）。
-        let input_format = filters.iter().find_map(|f| f.input_format());
+        // （src/sink 同格式，零行为变化）。多条声明必须一致且与滤镜媒体类型
+        // 同族，冲突/跨类型声明在 `resolve_filter_input_format` 里 loud fail。
+        let input_format = self.resolve_filter_input_format()?;
 
         let params = match self.media_type {
             MediaType::VIDEO => FilterParams::Video(VideoParams {
@@ -896,6 +917,11 @@ impl EncoderBuilder {
                 time_base: input_time_base,
                 frame_rate: self.frame_rate,
                 pixel_aspect,
+                // 编码器侧的输入色彩取决于调用方实际推入的帧（builder 尚无
+                // 色彩配置项），保持 UNSPECIFIED：buffer 源不写 color args，
+                // 与旧行为一致。
+                color_space: ffi::AVCOL_SPC_UNSPECIFIED,
+                color_range: ffi::AVCOL_RANGE_UNSPECIFIED,
             }),
             MediaType::AUDIO => FilterParams::Audio(AudioParams {
                 nb_channels: self.nb_channels as i32,
@@ -1155,6 +1181,7 @@ impl EncoderBuilder {
             pending_packets: VecDeque::new(),
             audio_fifo: None,
             next_pts: 0,
+            tail_frame_samples: None,
             input_time_base,
             filter_resampler: None,
             encode_resampler: None,
@@ -1269,11 +1296,15 @@ pub struct Encoder {
     /// `1/sample_rate`，样本位置即时间轴）。用户设置了 pts 的帧照常使用其值，
     /// 但计数器仍跳到其后，保证后续未设置的帧能接续正确的时间轴。
     ///
-    /// 固定帧长音频（aac 等）由 `audio_fifo` 重新切帧：输出帧的 pts 无法取自
+    /// 固定帧长音频由 `audio_fifo` 重新切帧：输出帧的 pts 无法取自
     /// 任何单个输入帧，只能用"已输出累计样本数"。因此首次缓冲时以首帧 pts
     /// （若设置）播种本计数器，此后每切出一帧按 `frame_size` 递增、flush 末帧
     /// 按 `remaining` 递增——与视频/直发路径共用同一个计数器。
     next_pts: i64,
+    /// 末帧的实际样本数（音频）：FIFO 切帧或重采样延迟线排出的**最后一帧**可能
+    /// 不足一个完整帧长，补 duration 时按实际数算，避免轨尾虚高最多一个帧长
+    /// （AAC 约 23ms）。`Some` 后由下一次 duration 补全消费（take 语义）。
+    tail_frame_samples: Option<i64>,
     /// 编码器**输入**时间基：滤镜存在时为滤镜图 buffer 源的时间基（= 建图时的
     /// `effective_time_base()`），否则等于编码器 time_base。滤镜改写输出帧率时
     /// 编码器 time_base 会被改为 `1/滤镜输出fps`，与输入时间基不再相等，因此
@@ -1611,12 +1642,27 @@ impl Encoder {
         }
 
         // 时间基：帧自带有效且与编码器**不同**的时间基时（解码侧容器时间基，如 mp4 的
-        // 1/15360），pts 需先换算过来；无论换算与否，离开时帧都带编码器输入时间基。
+        // 1/15360），pts 与 duration 都要换算过来；无论换算与否，离开时帧都带编码器
+        // 输入时间基。
+        //
+        // duration 必须跟随换算：编码器把 frame.duration **原样**拷进 packet duration
+        // （libx264 的 opaque 路径、encode.c 通用路径都是如此），而 time_base 在下面
+        // 被改写 —— duration 数值不跟着换，就是"旧时间基数值按新时间基解释"：30fps
+        // 的 mp4 源（duration 512 tick @ 1/15360）会被解释成 17s/帧，转码轨时长成倍放大。
         let frame_tb = Rational::from(frame.time_base);
-        let needs_rescale =
-            frame.pts != ffi::AV_NOPTS_VALUE && frame_tb.num() > 0 && frame_tb != input_tb;
-        if needs_rescale {
-            frame.set_pts(frame.pts.rescale(frame_tb, input_tb));
+        if frame_tb.num() > 0 && frame_tb != input_tb {
+            if frame.pts != ffi::AV_NOPTS_VALUE {
+                frame.set_pts(frame.pts.rescale(frame_tb, input_tb));
+            }
+            if frame.duration != ffi::AV_NOPTS_VALUE {
+                let duration = frame.duration;
+                // SAFETY: `frame` 由 `&mut` 独占；写 duration 只改元数据（rsmpeg 的
+                // wrap 类型不暴露该字段的 setter，走 `UnsafeDerefMut::deref_mut`）。
+                unsafe {
+                    frame.deref_mut().duration =
+                        avutil::av_rescale_q(duration, frame_tb.into(), input_tb.into());
+                }
+            }
         }
         frame.set_time_base(input_tb.into());
 
@@ -1628,13 +1674,23 @@ impl Encoder {
         if frame.pts == ffi::AV_NOPTS_VALUE {
             frame.set_pts(self.next_pts);
         }
-        // 输入时间基：视频 `1/fps`（每帧恰一 tick），音频 `1/sample_rate`（样本位置即时间轴）。
+        // 输入时间基：视频 `1/fps`（每帧恰一 tick），音频 `1/sample_rate`。音频步进
+        // 单位是**帧自己的采样率**而不是输入时间基的倒数：本方法先于重采样运行
+        // （见 `send_frame_to_encoder`），变长帧长编码器（frame_size==0 的 pcm_*）
+        // 在采样率转换场景下（48k 输入喂 8k 编码器）`nb_samples` 还是输入侧的样本数
+        // —— 直接把它当 1/8000 的 tick 走，时间轴恒定漂移 48/8 = 6 倍。
         let step = if is_audio {
-            frame.nb_samples.max(1) as i64
+            let sample_spacing = Rational::new(1, frame.sample_rate).unwrap_or(Rational::ZERO);
+            avutil::av_rescale_q(
+                frame.nb_samples.max(1) as i64,
+                sample_spacing.into(),
+                input_tb.into(),
+            )
+            .max(1)
         } else {
             1
         };
-        self.next_pts = frame.pts + step;
+        self.next_pts = frame.pts.saturating_add(step);
     }
 
     /// 编码器要求的目标音频格式（声道布局、采样格式、采样率）。
@@ -1744,16 +1800,19 @@ impl Encoder {
     /// pts（编码器时间基下的样本位置，`assign_pts_sample_rate` 已完成换算/自动编号的
     /// 对齐）播种样本计数器；未设置则保持 0 起步。
     fn ensure_audio_fifo(&mut self, frame: &AVFrame, frame_size: i32) -> &mut AVAudioFifo {
-        if let Some(fifo) = self.audio_fifo.as_mut() {
-            return fifo;
-        }
+        // 借用形状注意：不能把 fifo 借用从提前 `return` 的分支里带出来 ——
+        // `if let Some(fifo) = self.audio_fifo.as_mut() { return fifo; }` 这种写法
+        // 会让稳定版借用检查（NLL 不做路径敏感分析）把借用强行活到函数退出，
+        // 之后任何触碰 `self` 的语句都报 E0502/E0499。这里改成"先建立、后一次性
+        // 取回"（`get_or_insert_with`），全程没有提前返回。建立参数必须先读出来：
+        // 闭包里再经 `self` 读会与 `&mut self.audio_fifo` 冲突。
         let channels = self.ch_layout().nb_channels;
         let sample_fmt = self.sample_fmt() as _;
-        if frame.pts != ffi::AV_NOPTS_VALUE {
+        if self.audio_fifo.is_none() && frame.pts != ffi::AV_NOPTS_VALUE {
             self.next_pts = frame.pts;
         }
         self.audio_fifo
-            .insert(AVAudioFifo::new(sample_fmt, channels, frame_size))
+            .get_or_insert_with(|| AVAudioFifo::new(sample_fmt, channels, frame_size))
     }
 
     /// 从 `audio_fifo` 中取出满帧长样本，拼成帧送编码器，直至剩余不足一帧。
@@ -1806,6 +1865,9 @@ impl Encoder {
         if remaining <= 0 {
             return Ok(());
         }
+        // 末帧的实际样本数交给 duration 补全：不足一帧时按实际数算
+        // （见 [`Self::tail_packet_duration`]），不按满帧长虚高。
+        self.tail_frame_samples = Some(remaining as i64);
         let frame = self.fifo_pop_frame(remaining)?;
         self.check_frame(Some(&frame))?;
         self.send_frame_with_retry(Some(&frame))
@@ -1841,6 +1903,8 @@ impl Encoder {
                 frame.set_pts(self.next_pts);
                 self.next_pts += i64::from(frame.nb_samples);
             }
+            // 重采样延迟线吐出的尾帧同样可能不足一个完整帧长，交给 duration 补全。
+            self.tail_frame_samples = Some(i64::from(frame.nb_samples));
             self.send_frame_ready(frame)?;
         }
         Ok(())
@@ -1849,7 +1913,7 @@ impl Encoder {
     /// 向编码器发送一帧（或 EOF）已就绪的输入；若编码器缓冲已满（EAGAIN），
     /// 先排空已就绪包再重试。
     ///
-    /// 重试次数有上限（[`crate::MAX_DRAIN_ITERATIONS`]）：个别编码器在 EOS 之后
+    /// 重试次数有上限（[`crate::MAX_EAGAIN_RETRIES`]）：个别编码器在 EOS 之后
     /// 会持续返回 EAGAIN 而不再产出包，无上限循环会挂死；达到上限即报错，
     /// 而不是无限等待。
     fn send_frame_with_retry(&mut self, frame: Option<&AVFrame>) -> Result<()> {
@@ -1859,10 +1923,10 @@ impl Encoder {
                 Ok(()) => return Ok(()),
                 Err(rsmpeg::error::RsmpegError::SendFrameAgainError) => {
                     retries += 1;
-                    if retries > crate::MAX_DRAIN_ITERATIONS {
+                    if retries > crate::MAX_EAGAIN_RETRIES {
                         return Err(RsmediaError::msg(format!(
                             "Encoder keeps returning EAGAIN after {} retries (eof: {}); aborting",
-                            crate::MAX_DRAIN_ITERATIONS,
+                            crate::MAX_EAGAIN_RETRIES,
                             frame.is_none()
                         )));
                     }
@@ -2158,6 +2222,31 @@ impl Encoder {
         avutil::av_rescale_q(1, frame_dur_sec.into(), tb.into()).max(1)
     }
 
+    /// 补全编码器 packet 缺失的 duration。
+    ///
+    /// 常规满帧按整帧时长补（见 [`Self::packet_duration`]）；FIFO 切帧或重采样
+    /// 延迟线吐出的**末帧**实际样本数不足一帧时（[`Self::tail_frame_samples`
+    /// ](`Self::tail_frame_samples) 记录），按实际数补——全部按满帧补会让轨尾
+    /// 虚高最多一个帧长（AAC ~23ms）。记录为一次性的（take 语义）：末帧之后
+    /// 恢复整帧口径。
+    fn tail_packet_duration(&mut self) -> i64 {
+        let tail = self.tail_frame_samples.take();
+        let full_frame = self.frame_size();
+        match tail {
+            Some(n)
+                if self.media_type == MediaType::AUDIO
+                    && full_frame > 0
+                    && n < i64::from(full_frame) =>
+            {
+                let tb = self.time_base();
+                let tail_dur_sec =
+                    Rational::new(n as i32, self.sample_rate() as i32).unwrap_or(Rational::ZERO);
+                avutil::av_rescale_q(1, tail_dur_sec.into(), tb.into()).max(1)
+            }
+            _ => self.packet_duration(),
+        }
+    }
+
     /// Internal: pull an encoded packet from the encoder.
     ///
     /// `EAGAIN` ("no packet right now, keep feeding frames") and EOF both
@@ -2290,9 +2379,9 @@ impl Encoder {
                     packet.set_stream_index(index as i32);
                     // 编码器输出的 packet 常不带 duration（libx264 等），若缺失则按
                     // 帧率/采样率补上，否则 MP4 等容器无法推导**最后一帧**的时长，
-                    // 导致末帧被 muxer 丢弃。
+                    // 导致末帧被 muxer 丢弃。FIFO/重采样切出的短末帧按实际数补。
                     if packet.duration <= 0 {
-                        packet.set_duration(self.packet_duration());
+                        packet.set_duration(self.tail_packet_duration());
                     }
                     // 将编码器输出的数据包时间戳，从编码器时间基转换到输出流时间基
                     // encode_ctx_timebase => out_stream_time_base
@@ -2308,11 +2397,11 @@ impl Encoder {
                     if self.is_drained() {
                         tracing::debug!("Encoder drained, try send new frame again.");
                         drained_iterations += 1;
-                        if drained_iterations >= crate::MAX_DRAIN_ITERATIONS {
+                        if drained_iterations >= crate::MAX_EAGAIN_RETRIES {
                             return Err(RsmediaError::msg(format!(
                                 "Encoder keeps returning EAGAIN after EOF for {} iterations; \
                                  flush aborted after {written_packets} packet(s), output is truncated",
-                                crate::MAX_DRAIN_ITERATIONS
+                                crate::MAX_EAGAIN_RETRIES
                             )));
                         }
                         continue;
@@ -2373,11 +2462,165 @@ mod tests {
 
     /// 本构建是否提供默认视频编码器（`EncoderBuilder::VIDEO_CODEC_NAME`）。
     ///
-    /// 环境差异（构建未编入 libx264）应当跳过而不是失败，所以要**先探测可用性**
+    /// 环境差异（构建未编入 libx264）应当跳过而不是失败，所以要**先探测可用性**。
     fn default_video_encoder_available() -> bool {
         let name = std::ffi::CString::new(EncoderBuilder::VIDEO_CODEC_NAME)
             .expect("codec name is a NUL-free literal");
         AVCodec::find_encoder_by_name(&name).is_some()
+    }
+
+    /// 时间戳单位道具：`1/15360`（mp4 视频流的常见时间基）。
+    fn mp4_like_tb() -> Rational {
+        Rational::new(1, 15_360).unwrap()
+    }
+
+    /// 生成一张已填零的 YUV420P 测试帧（不依赖 ndarray/MediaFrame）。
+    fn blank_yuv420p_frame(width: u32, height: u32) -> AVFrame {
+        let mut frame = AVFrame::new();
+        frame.set_width(width as i32);
+        frame.set_height(height as i32);
+        frame.set_format(PixelFormat::YUV420P.into());
+        frame
+            .alloc_buffer()
+            .expect("64x64 YUV420P buffer allocation cannot fail");
+        // SAFETY：缓冲由 `alloc_buffer` 分配、refcount=1 本函数独占；按 YUV420P
+        // 几何在显示范围内填中灰（色度 128 = 中性），行进按对齐后的 linesize。
+        unsafe {
+            let raw = frame.deref_mut();
+            let planes = [
+                (width as usize, height as usize, raw.linesize[0]),
+                ((width / 2) as usize, (height / 2) as usize, raw.linesize[1]),
+                ((width / 2) as usize, (height / 2) as usize, raw.linesize[2]),
+            ];
+            for (i, &(cols, rows, stride)) in planes.iter().enumerate() {
+                let plane = raw.data[i];
+                for row in 0..rows {
+                    let row_ptr = plane.add(row * (stride.max(0) as usize));
+                    std::slice::from_raw_parts_mut(row_ptr, cols).fill(128);
+                }
+            }
+        }
+        frame
+    }
+
+    /// 给帧标时间基（模拟"调用方已按文档把帧时间基设好"的解码产物）。
+    fn tb_frame(frame: &mut AVFrame, tb: Rational) {
+        frame.set_time_base(tb.into());
+    }
+
+    /// E1 回归：帧 duration 必须与 pts 一起按帧自己的时间基换算进编码器时间基。
+    ///
+    /// 解码产物帧的 pts/duration 都在**流时间基**（mp4 常见 1/15360，30fps 每帧
+    /// 恰 512 tick）里；编码器把 `frame.duration` 原样拷进 packet duration、而
+    /// `time_base` 已被改写为 1/30 —— 不换算 duration，就是"旧数值按新时间基
+    /// 解释"，每帧 17s、转码轨时长成倍放大（老 bug 下两处都不换算 pts 之外的量）。
+    #[test]
+    fn test_input_duration_follows_pts_time_base_rewrite() -> Result<()> {
+        if !default_video_encoder_available() {
+            println!("SKIP: default video encoder not available");
+            return Ok(());
+        }
+        let mut encoder = EncoderBuilder::new_video(64, 64).with_fps(30.0).build()?;
+        let mut frame = blank_yuv420p_frame(64, 64);
+        tb_frame(&mut frame, mp4_like_tb());
+        frame.set_pts(512);
+        // SAFETY: 元数据字段写入，rsmpeg 未暴露 duration setter（见 assign_pts）。
+        unsafe {
+            frame.deref_mut().duration = 512;
+        }
+
+        let mut packets = encoder.encode_raw(frame)?;
+        encoder.finish_input()?;
+        while let Some(packet) = encoder.receive_packet()? {
+            packets.push(packet);
+        }
+
+        let summary: Vec<(i64, i64)> = packets.iter().map(|p| (p.pts, p.duration)).collect();
+        let packet = packets
+            .iter()
+            .find(|p| p.pts != ffi::AV_NOPTS_VALUE && p.duration > 0)
+            .unwrap_or_else(|| {
+                panic!("libx264 应产出带 pts/duration 的包；实际 pts/durations = {summary:?}")
+            });
+        // 512 tick @ 1/15360 == 1 tick @ 1/30，pts/duration 同换算后单位自洽。
+        assert_eq!(packet.pts, 1, "pts 应换算到 1/30 时间基");
+        assert_eq!(
+            packet.duration, 1,
+            "duration 应换算到 1/30 时间基(老代码是 512)"
+        );
+        Ok(())
+    }
+
+    /// E2 回归：变长帧长（frame_size==0 的 pcm_*）音频在采样率转换场景下，自动
+    /// pts 的步进单位必须来自**帧自己的采样率**，而不是输入时间基的倒数。
+    ///
+    /// 老代码 `step = nb_samples`：48k 输入喂 8k 编码器时，每帧 1024 个输入样本
+    /// 被当作 1/8000 的 1024 tick（128ms）走，而真实内容只有 21.3ms —— 输出恒定
+    /// 6 倍速漂移。
+    #[test]
+    fn test_audio_next_pts_step_uses_frame_sample_rate() -> Result<()> {
+        let codec_name = "pcm_s16le";
+        let available =
+            AVCodec::find_encoder_by_name(&std::ffi::CString::new(codec_name).unwrap()).is_some();
+        if !available {
+            println!("SKIP: {codec_name} not available in this FFmpeg build");
+            return Ok(());
+        }
+
+        let mut encoder = EncoderBuilder::new_audio(128_000, 2, 8_000, SampleFormat::S16)
+            .with_codec_name(codec_name)
+            .build()?;
+
+        // 输入帧在 48kHz：1024 个样本 = 21.33ms 内容；自动编号交给计数器。
+        let mut packets = Vec::new();
+        for _ in 0..3 {
+            let mut frame = AVFrame::new();
+            frame.set_format(SampleFormat::S16.into());
+            frame.set_sample_rate(48_000);
+            frame.set_nb_samples(1024);
+            frame.set_ch_layout(
+                AVChannelLayout::from_mask(0x3)
+                    .expect("stereo mask is valid")
+                    .into_inner(),
+            );
+            frame
+                .alloc_buffer()
+                .context("audio buffer allocation failed")?;
+            frame.set_pts(ffi::AV_NOPTS_VALUE);
+            packets.extend(encoder.encode_raw(frame)?);
+        }
+        encoder.finish_input()?;
+        while let Some(packet) = encoder.receive_packet()? {
+            packets.push(packet);
+        }
+
+        // 期望步进 = 1024 样本 @ 48kHz 折算到 1/8000 时间基（约 171 tick）；
+        // 老代码的步进恒为输入样本数 1024 tick @ 1/8000（128ms），两者相差 6 倍。
+        let expected_step = avutil::av_rescale_q(
+            1024,
+            Rational::new(1, 48_000).unwrap().into(),
+            Rational::new(1, 8_000).unwrap().into(),
+        )
+        .max(1);
+        assert_ne!(expected_step, 1024, "48k→8k 的换算步进不应等于输入样本数");
+
+        let mut pts: Vec<i64> = packets
+            .iter()
+            .map(|p| p.pts)
+            .filter(|p| *p != ffi::AV_NOPTS_VALUE)
+            .collect();
+        pts.sort_unstable();
+        assert_eq!(
+            *pts.first().expect("pcm 编码器必须出包"),
+            0,
+            "首帧自动 pts 为 0"
+        );
+        let deltas: Vec<i64> = pts.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            deltas.iter().all(|d| *d == expected_step),
+            "pts 步进应恒为 {expected_step}（1024 样本 @48kHz），实际 {deltas:?}"
+        );
+        Ok(())
     }
 
     /// `with_flags`/`with_flags2`/`with_thread_type` 的位集参数落到 `AVCodecContext`
@@ -2541,6 +2784,54 @@ mod tests {
 
         // 正常尺寸不受影响（防止校验过严）。
         assert!(EncoderBuilder::new_video(8, 8).build().is_ok());
+    }
+
+    /// Graph3 编码侧回归：链内 `with_input_format` 冲突必须在 `build()` 就
+    /// loud fail（InvalidConfig），不能像老代码那样 `find_map` 静默取第一条、
+    /// 把其余声明当不存在（解码侧同款校验见 decode.rs 的对应测试）。
+    ///
+    /// 用原生 `mpeg4` 而非默认的 libx264，避免"构建未编入 x264"的环境差异；
+    /// 本测试只验证校验逻辑，不做任何编码。
+    #[test]
+    fn test_conflicting_filter_input_formats_are_rejected_on_encode() -> Result<()> {
+        let filters = vec![
+            crate::filter::video::scale(320, 240, None)?.with_input_format(PixelFormat::YUV420P),
+            crate::filter::video::scale(160, 120, None)?.with_input_format(PixelFormat::RGB24),
+        ];
+        let err = match EncoderBuilder::new_video(64, 64)
+            .with_codec_name("mpeg4")
+            .with_filters(filters)
+            .build()
+        {
+            Ok(_) => panic!("conflicting declarations must fail to build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("conflicting input formats"),
+            "错误信息应当指明冲突：{err:#}"
+        );
+        Ok(())
+    }
+
+    /// Graph3 编码侧回归：跨类型声明（视频滤镜配采样格式）没有可行实现，直接拒绝。
+    #[test]
+    fn test_cross_type_filter_input_format_is_rejected_on_encode() -> Result<()> {
+        let filters = vec![
+            crate::filter::video::scale(320, 240, None)?.with_input_format(SampleFormat::FLTP),
+        ];
+        let err = match EncoderBuilder::new_video(64, 64)
+            .with_codec_name("mpeg4")
+            .with_filters(filters)
+            .build()
+        {
+            Ok(_) => panic!("cross-type declaration must fail to build"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("cross-type"),
+            "错误信息应当指明跨类型：{err:#}"
+        );
+        Ok(())
     }
 
     /// `with_max_bit_rate`/`with_buffer_size` 的非正值不写进 `rc_*` 字段：
@@ -3135,7 +3426,7 @@ mod tests {
                     // 持续不推进说明编码器异常，避免死循环。
                     eagain += 1;
                     assert!(
-                        eagain < crate::MAX_DRAIN_ITERATIONS,
+                        eagain < crate::MAX_EAGAIN_RETRIES,
                         "hardware encoder did not reach EOF after draining"
                     );
                 }

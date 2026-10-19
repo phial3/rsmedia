@@ -106,7 +106,29 @@ pub use stream::MediaType;
 pub use subtitle::SubtitleSegment;
 pub use time::{Rational, Time};
 
-pub(crate) const MAX_DRAIN_ITERATIONS: usize = 1_000;
+/// Upper bound on consecutive "not now" answers before waiting stops.
+///
+/// FFmpeg's send/receive API answers `EAGAIN` both mid-stream (the unit's input
+/// or output queue is full) and while draining (the unit still holds buffered
+/// data). For a while either is legitimate — a B-frame lookahead or a
+/// frame-threaded decoder can answer `EAGAIN` many times — but neither may last
+/// forever, or a damaged stream would turn a public call into a hang. Every
+/// retry path here (decoder, encoder, filter graph, demuxer) gives up with an
+/// error after this many attempts.
+///
+/// This bounds *waiting*, not output: a loop that resets its counter whenever
+/// something is produced may legitimately run longer than this. See
+/// `MAX_DRAIN_OUTPUTS` for the other bound.
+pub(crate) const MAX_EAGAIN_RETRIES: usize = 1_000;
+
+/// Upper bound on how many items a single drain call may hand back.
+///
+/// [`Resampler::flush_frames`] and the subtitle drain keep pulling until the
+/// source reports it has nothing left, so this caps how much buffered data one
+/// call accepts — a source that never empties is a broken one, not a productive
+/// one. It says nothing about waiting: those sources answer at once, which is
+/// why this is kept separate from `MAX_EAGAIN_RETRIES`.
+pub(crate) const MAX_DRAIN_OUTPUTS: usize = 1_000;
 
 /// re-exported under the name `ffmpeg`
 pub use rsmpeg as ffmpeg;

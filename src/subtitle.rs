@@ -380,7 +380,7 @@ mod tests {
         let mut reader = StreamReader::new(&path)?;
         let (index, _) = reader.find_best_stream(crate::MediaType::SUBTITLE)?;
         let (codec_id, stream_tb) = {
-            let stream = reader.input().streams().get(index).unwrap();
+            let stream = reader.stream_at(index)?;
             (stream.codecpar().codec_id, stream.time_base)
         };
         assert_eq!(
@@ -465,13 +465,20 @@ mod tests {
         assert!(content.contains("Hello World"), "content:\n{content}");
         assert!(content.contains("Second subtitle"), "content:\n{content}");
         assert!(content.contains("Third subtitle"), "content:\n{content}");
-        // 序号行（SRT 序号 1..N）
-        for serial in ["1", "2", "3"] {
-            assert!(
-                content.lines().any(|l| l.trim() == serial),
-                "missing SRT serial {serial}, content:\n{content}"
-            );
-        }
+        // 序号行：SRT 序号由 **muxer** 在写包时生成（libavformat/srtenc.c 的
+        // `index`：write_header 归 1、每写出一包 +1）—— 因此这里断言的是
+        // "无重复的完整 1..N 序列"。老断言只查"某个数字存在"，包被重复写出
+        // （序号重复）检测不到；序号也必须按顺序出现。
+        let serials: Vec<&str> = content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        assert_eq!(
+            serials,
+            ["1", "2", "3"],
+            "SRT 序号应为不重复、按序的 1..N 序列，content:\n{content}"
+        );
 
         test_support::remove_test_output(&path);
         Ok(())
@@ -505,7 +512,7 @@ mod tests {
         // Copy codec parameters to output stream (clone to release the borrow
         // on reader before calling copy_subtitle_stream which needs &mut reader).
         let (codecpar, src_tb) = {
-            let src_stream = reader.input().streams().get(in_index).unwrap();
+            let src_stream = reader.stream_at(in_index)?;
             (
                 src_stream.codecpar().clone(),
                 Rational::from(src_stream.time_base),
@@ -561,7 +568,7 @@ mod tests {
         let mut reader = StreamReader::new(&path)?;
         let (index, _) = reader.find_best_stream(crate::MediaType::SUBTITLE)?;
         let (codec_id, stream_tb) = {
-            let stream = reader.input().streams().get(index).unwrap();
+            let stream = reader.stream_at(index)?;
             (stream.codecpar().codec_id, stream.time_base)
         };
         assert_eq!(

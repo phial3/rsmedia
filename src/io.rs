@@ -51,7 +51,7 @@ use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avcodec::{AVCodecParameters, AVPacket};
 use rsmpeg::avformat::{
     AVFormatContextInput, AVFormatContextOutput, AVIOContextContainer, AVIOContextCustom,
-    AVInputFormat, ReadPacketCallback, SeekCallback, WritePacketCallback,
+    AVInputFormat, AVStream, ReadPacketCallback, SeekCallback, WritePacketCallback,
 };
 use rsmpeg::avutil::{AVDictionary, AVMem};
 use rsmpeg::error::RsmpegError;
@@ -123,8 +123,9 @@ pub trait Reader {
     /// Read the next packet. Returns `None` on EOF.
     ///
     /// 成功时返回 `(packet 所属流的 index, packet)`；调用方如需更多流信息
-    /// （time_base、metadata 等），可通过 `self.input().streams().get(index)`
-    /// 直接使用 rsmpeg 的 [`AVStream`](rsmpeg::avformat::AVStream)。
+    /// （time_base、metadata 等），可通过 [`stream_at`](Self::stream_at)
+    /// 按索引取流，或经 `self.input()` 直接使用 rsmpeg 的
+    /// [`AVStream`](rsmpeg::avformat::AVStream)。
     fn read_packet(&mut self) -> Result<Option<(usize, AVPacket)>> {
         match self.input_mut().read_packet() {
             Ok(Some(pkt)) => Ok(Some((pkt.stream_index as usize, pkt))),
@@ -133,11 +134,40 @@ pub trait Reader {
         }
     }
 
+    /// 按容器索引取第 `index` 条流（`AVFormatContextInput::streams()` 的越界
+    /// 安全封装）。
+    ///
+    /// 库内"reader 里按索引取流"的唯一定义点：解码侧多流代理绑定、
+    /// `StreamInfo::from_reader`、subtitle 专用通道一概走这里，越界统一为
+    /// [`RsmediaError::InvalidConfig`]（消息带 `nb_streams`）。
+    ///
+    /// 返回的引用经 `AVStreamRef` 的 deref 呈现为 `&AVStream`，生命周期即
+    /// `&self` 的借用期。
+    fn stream_at(&self, index: usize) -> Result<&AVStream> {
+        self.input()
+            .streams()
+            .get(index)
+            .ok_or_else(|| {
+                RsmediaError::invalid_config(format!(
+                    "stream index {index} not found (nb_streams={})",
+                    self.input().nb_streams
+                ))
+            })
+            .map(|stream| &**stream)
+    }
+
     /// Find the best stream
     ///
     /// # Arguments
     ///
     /// * `media_type` - MediaType maybe Video, Audio, etc.
+    ///
+    /// 返回的 `(索引, codec 名)` 中**名字是参考信息**：它只是"最佳流"默认软解
+    /// decoder 的名字。实际要打开解码器时请以流 `codecpar.codec_id` 的
+    /// [`AVCodec::find_decoder`](rsmpeg::avcodec::AVCodec::find_decoder) 为准
+    /// （Demuxer 逐流构建、subtitle 专用通道都是这一判据），异种 decoder
+    /// hwaccel 变体则由调用方按名另行指定 —— 不要把这里的名字当作解码器
+    /// 判据的权威来源。
     fn find_best_stream(&self, media_type: MediaType) -> Result<(usize, String)> {
         self.input()
             .find_best_stream(media_type as _)?
@@ -433,8 +463,8 @@ macro_rules! impl_reader_builder_setters {
         /// Attach an [`Interrupt`] handle to cancel blocked operations.
         ///
         /// 覆盖范围见 [`Interrupt`]：URL 输入（`StreamReader`）的打开与协议层
-        /// 阻塞读都能被取消；自定义 IO 输入（`BufferReader` / `IoReader`）只有
-        /// 探测循环生效，回调自身的阻塞读不受保护。
+        /// 阻塞读都能被取消；自定义 IO 输入（`BufferReader` / `IoReader`）在
+        /// 打开完成后才安装，覆盖不到打开/探测阶段，回调自身的阻塞读不受保护。
         pub fn with_interrupt(mut self, interrupt: Interrupt) -> Self {
             self.spec.interrupt = Some(interrupt);
             self
@@ -538,8 +568,9 @@ fn build_output_custom(
 ///   等待）均可被取消（原理见 `open_input_with_interrupt`）；
 /// - seek：FFmpeg 的 `avio_seek`/`url_seek` 路径本身不做中断检查，能否被打断
 ///   取决于解复用器内部是否还要读数据（本地文件 seek 无阻塞，不需要中断）；
-/// - 自定义 IO 输入（`BufferReader`/`IoReader` 等）不经过协议层，只有 format
-///   context 层生效（探测循环），用户回调自身的阻塞读不受保护。
+/// - 自定义 IO 输入（`BufferReader`/`IoReader` 等）不经过协议层，中断在打开
+///   完成后才安装：打开/探测阶段覆盖不到，之后仅解复用器自身的中断检查点
+///   生效，用户回调自身的阻塞读不受保护。
 ///
 /// 输出侧对称性：写出方向（[`StreamWriter`] / [`BufferWriter`] / [`IoWriter`]）
 /// 没有对应入口，推流这类阻塞写目前不可取消。
@@ -1032,12 +1063,19 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
         let mut reader = reader;
         let read_packet: ReadPacketCallback = Box::new(move |_opaque, buf: &mut [u8]| {
             loop {
-                match reader.read(buf) {
-                    Ok(0) => return ffi::AVERROR_EOF,
-                    Ok(n) => return n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
+                // IO-F4：回调运行在 FFI 调用栈中，用户的 `Read` 实现 panic 会穿 FFI
+                // 直接 abort 整个进程 —— 与 log 回调（本文件 [`log_callback`] 处的
+                // catch_unwind 边界）同一处理：panic 拦下后按 IO 错误交给 FFmpeg。
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.read(buf))) {
+                    Ok(Ok(0)) => return ffi::AVERROR_EOF,
+                    Ok(Ok(n)) => return n as i32,
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Ok(Err(e)) => {
                         tracing::error!("IoReader read error: {e}");
+                        return AVERROR_EIO;
+                    }
+                    Err(panic) => {
+                        tracing::error!("IoReader user Read panicked: {panic:?}");
                         return AVERROR_EIO;
                     }
                 }
@@ -1171,6 +1209,25 @@ pub trait Writer {
 
     /// Obtain mutable reference to output context.
     fn output_mut(&mut self) -> &mut AVFormatContextOutput;
+
+    /// 按输出容器索引取第 `index` 条流（[`Reader::stream_at`](Reader::stream_at)
+    /// 的写侧对称方法）。
+    ///
+    /// 越界统一为 [`RsmediaError::InvalidConfig`]（消息带 `nb_streams`）。注意
+    /// 输出侧的流是**逐步注册**的（[`add_stream`](Self::add_stream)），该索引
+    /// 语义只在 `write_header` 前稳定。
+    fn stream_at(&self, index: usize) -> Result<&AVStream> {
+        self.output()
+            .streams()
+            .get(index)
+            .ok_or_else(|| {
+                RsmediaError::invalid_config(format!(
+                    "stream index {index} not found (nb_streams={})",
+                    self.output().nb_streams
+                ))
+            })
+            .map(|stream| &**stream)
+    }
 
     /// new stream
     ///
@@ -1764,7 +1821,14 @@ impl BufferWriter {
     /// 会在 trailer 阶段回写 header 的格式（mp4 / mov / wav）拿不到那部分字节，
     /// 完整输出请用 [`into_bytes`](Self::into_bytes)。
     pub fn take_written(&mut self) -> Bytes {
-        let mut st = self.state.lock().expect("mem writer state poisoned");
+        // 毒化容错：state 只暴露 `data`/`delivered` 两个字段，持锁方 panic 的最坏
+        // 后果是这一对字段短暂不一致 —— 字节仍在缓冲里。与其在增量读取处把毒化
+        // 放大成 panic（调用方一个崩溃就传染此后所有取写操作），不如照常取出
+        // 已写入的部分；数据是否完整的判断留给交付方。
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let delta = Bytes::copy_from_slice(&st.data[st.delivered..]);
         st.delivered = st.data.len();
         delta
@@ -1781,7 +1845,11 @@ impl BufferWriter {
         // 先释放 format context（连带 IO 回调释放其持有的 state 引用）
         drop(output);
         match Arc::try_unwrap(state) {
-            Ok(st) => Vec::from(st.into_inner().expect("mem writer state poisoned").data),
+            Ok(st) => Vec::from(
+                st.into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .data,
+            ),
             // 不可达：output 已 drop，回调持有的 Arc 引用随之释放。
             // 用 panic（fail-fast）而非静默返回空 Vec，避免数据无声丢失。
             Err(_) => panic!("BufferWriter: state still referenced after context drop"),
@@ -1863,16 +1931,22 @@ impl<W: std::io::Write + Send + 'static> IoWriterBuilder<W> {
         let inner = Arc::new(Mutex::new(writer));
 
         let write_inner = inner.clone();
-        // 回调在 FFI 调用栈中执行，严禁 panic：锁中毒或写入失败均返回 AVERROR(EIO)。
+        // 回调在 FFI 调用栈中执行，严禁 panic：锁中毒/写入失败返回 AVERROR(EIO)；
+        // 用户 `Write` 实现的 panic 也要拦下（IO-F4，与 log 回调同一 catch_unwind
+        // 边界），否则穿 FFI 就是 abort。
         let write_packet: WritePacketCallback = Box::new(move |_opaque, buf: &[u8]| {
             let mut w = match write_inner.lock() {
                 Ok(guard) => guard,
                 Err(_) => return AVERROR_EIO,
             };
-            match w.write_all(buf) {
-                Ok(()) => buf.len() as i32,
-                Err(e) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.write_all(buf))) {
+                Ok(Ok(())) => buf.len() as i32,
+                Ok(Err(e)) => {
                     tracing::error!("IoWriter write error: {e}");
+                    AVERROR_EIO
+                }
+                Err(panic) => {
+                    tracing::error!("IoWriter user Write panicked: {panic:?}");
                     AVERROR_EIO
                 }
             }

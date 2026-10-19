@@ -169,13 +169,19 @@ impl Rational {
     /// # Ok::<(), rsmedia::RsmediaError>(())
     /// ```
     pub const fn unit(den: i32) -> Self {
-        // One check instead of an `assert!` followed by a `NonZeroI32::new(..).unwrap()`:
-        // the constructor already answers the whole question, and a `let .. else` keeps
-        // the bad `den` a compile error in a `const` context, as the docs promise.
-        let Some(den) = NonZeroI32::new(den) else {
-            panic!("a unit fraction's denominator must be positive");
-        };
-        Self { num: 1, den }
+        // One construction instead of an `assert!` followed by a
+        // `NonZeroI32::new(..).unwrap()`: it keeps a bad `den` a compile error in a
+        // `const` context, as the docs promise.
+        //
+        // Rejecting the negative case alongside zero is what keeps [`Self::den`]
+        // honest: comparisons rely on the denominator being positive, and `1 / -n`
+        // has to be written as `-1 / n` so that the equal value also compares equal.
+        if let Some(den) = NonZeroI32::new(den)
+            && den.get() > 0
+        {
+            return Self { num: 1, den };
+        }
+        panic!("a unit fraction's denominator must be positive");
     }
 
     /// The numerator. May be negative — a time base is not required to be positive.
@@ -538,12 +544,27 @@ impl Time {
     /// # Return value
     ///
     /// Two timestamps that are aligned.
+    ///
+    /// 任一侧时间基为 [`Rational::ZERO`] 时换算不可定义（FFmpeg 的
+    /// `av_rescale_q` 在单位反向的路径上会触碰除零断言；零时间基本身就
+    /// 声明不了单位，见 [`seconds_or_none`](Self::seconds_or_none) 的同一
+    /// 裁决）—— 该侧时间戳按"无时间"处理（`Aligned` 的对应槽位为 `None`，
+    /// [`apply`](Aligned::apply) 产出无时间的 `Time`），不换算。
     pub fn aligned_with(&self, rhs: Time) -> Aligned {
+        // S2：`rhs` 的时间基为 ZERO 时换算不可定义（FFmpeg 的 `av_rescale_q`
+        // 在单位反向的路径上会触碰除零断言；零时间基本身就声明不了单位，
+        // 见 [`seconds_or_none`](Self::seconds_or_none) 的同一裁决）—— 把
+        // rhs 按"无时间"处理（`rhs` 槽位 `None`，[`apply`](Aligned::apply)
+        // 产出无时间的 `Time`）。`lhs` 的数值本就活在自身时间基里，不动。
+        let rhs_time = if rhs.time_base.is_zero() {
+            None
+        } else {
+            rhs.value()
+                .map(|rhs_value| rhs_value.rescale(rhs.time_base, self.time_base))
+        };
         Aligned {
             lhs: self.value(),
-            rhs: rhs
-                .value()
-                .map(|rhs_time| rhs_time.rescale(rhs.time_base, self.time_base)),
+            rhs: rhs_time,
             time_base: self.time_base,
         }
     }
@@ -748,13 +769,24 @@ pub struct Aligned {
 
 impl Aligned {
     /// Add two timestamps together.
+    ///
+    /// 分子的加法用**饱和运算**：两个时间戳的分子是输入容器的原始计数
+    /// （损坏/恶意文件可以给出 `i64::MIN`/`i64::MAX` 附近的任意值），直接
+    /// `+` 在 debug 构建会因溢出 panic、release 构建静默回绕成另一个时间戳。
+    /// 饱和到 `i64` 边界是确定性行为（与 `Time` 比较的"不 panic"立场一致）。
     pub fn add(self) -> Time {
-        self.apply(|lhs, rhs| lhs + rhs)
+        self.apply(|lhs, rhs| lhs.saturating_add(rhs))
     }
 
     /// Subtract the right-hand side timestamp from the left-hand side timestamp.
+    ///
+    /// 同 [`add`](Self::add)：饱和减法，极端输入不 panic、不回绕。
+    ///
+    /// 下界饱和到 `AV_NOPTS_VALUE + 1` 而不是 `i64::MIN`：`i64::MIN` 恰好
+    /// 是 NOPTS 哨兵，落在它上面的结果会被所有访问器当作"无时间"读出 ——
+    /// 两个有效时间做减法不该悄悄变出"没有时间"。
     pub fn subtract(self) -> Time {
-        self.apply(|lhs, rhs| lhs - rhs)
+        self.apply(|lhs, rhs| lhs.saturating_sub(rhs).max(ffi::AV_NOPTS_VALUE + 1))
     }
 
     /// Apply operation `f` on aligned timestamps.
@@ -1209,6 +1241,24 @@ mod tests {
         let a = Time::from_secs(0.8);
         let b = Time::from_secs(0.4);
         assert_eq!(a.aligned_with(b).subtract(), Time::from_secs(0.4));
+    }
+
+    /// `Aligned::add` / `subtract` 的溢出防护：分子直接来自容器时间戳，
+    /// 极端值（损坏文件可给出 i64 边界值）不得 panic（debug）或静默回绕
+    /// （release）——饱和到边界值。注意 `i64::MIN` 是 `AV_NOPTS_VALUE`，
+    /// `Time::new` 会把它规范化为无值，这里用相邻的 `i64::MIN + 1`。
+    #[test]
+    fn test_aligned_arith_saturates_on_extreme_numerators() {
+        let big = Time::new(Some(i64::MAX), rat(1, 1000));
+        let one = Time::new(Some(1), rat(1, 1000));
+        assert_eq!(big.aligned_with(one).add().value(), Some(i64::MAX));
+
+        let tiny = Time::new(Some(i64::MIN + 1), rat(1, 1000));
+        let two = Time::new(Some(2), rat(1, 1000));
+        assert_eq!(
+            tiny.aligned_with(two).subtract().value(),
+            Some(i64::MIN + 1)
+        );
     }
 
     #[test]

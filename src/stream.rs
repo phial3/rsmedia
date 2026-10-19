@@ -11,7 +11,7 @@
 //! [`StreamInfo::find_decoder_name`] / [`find_encoder_name`](StreamInfo::find_encoder_name)
 //! resolve the codec *names* a stream's parameters map to in this FFmpeg build.
 
-use crate::error::{Result, RsmediaError};
+use crate::error::Result;
 use crate::fmt::{FrameFormat, SampleFormat};
 use crate::hwaccel::HWDeviceType;
 use crate::io::{Reader, Writer};
@@ -191,29 +191,11 @@ impl StreamInfo {
     /// * `reader` - Reader to find stream information from.
     /// * `stream_index` - Index of stream in reader.
     pub fn from_reader<R: Reader>(reader: &R, stream_index: usize) -> Result<Self> {
-        let stream =
-            reader
-                .input()
-                .streams()
-                .get(stream_index)
-                .ok_or(RsmediaError::invalid_config(format!(
-                    "reader stream: {stream_index} not found!"
-                )))?;
-
-        Self::from_stream(stream)
+        Self::from_stream(reader.stream_at(stream_index)?)
     }
 
     pub fn from_writer<W: Writer>(writer: &W, stream_index: usize) -> Result<Self> {
-        let stream =
-            writer
-                .output()
-                .streams()
-                .get(stream_index)
-                .ok_or(RsmediaError::invalid_config(format!(
-                    "writer stream: {stream_index} not found!"
-                )))?;
-
-        Self::from_stream(stream)
+        Self::from_stream(writer.stream_at(stream_index)?)
     }
 
     pub fn from_stream(stream: &AVStream) -> Result<Self> {
@@ -693,6 +675,7 @@ unsafe impl Sync for StreamInfo {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RsmediaError;
     use crate::io::StreamReader;
 
     /// DAR = SAR × (W/H)，各退化路径与规约均正确。

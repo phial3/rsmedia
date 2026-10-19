@@ -141,10 +141,12 @@ pub struct Muxer<W: Writer> {
     /// `true` 时把提交进来的时间戳整体平移到 0 起点，见
     /// [`Muxer::set_normalize_timestamps`]。
     normalize_timestamps: bool,
-    /// 归一化基准（微秒，`AV_TIME_BASE`），首个带有效时间戳的提交单元建立。
+    /// 归一化基准（微秒，`AV_TIME_BASE`），由**首个带有效时间戳的提交单元**建立：
+    /// 取该提交单元的 `min(pts, dts)` —— B 帧源首包 dts < pts 是常态，单锚 pts 会
+    /// 把归一化后的首包 dts 弄成负值，恰是本特性要避免的。
     /// 存微秒而**不是**某个流的时间基单位：视频（1/fps）与音频（1/sample_rate）
     /// 减的必须是同一物理时刻，否则会破坏音视频同步。
-    pts_base_us: Option<i64>,
+    ts_base_us: Option<i64>,
     have_written_header: bool,
     have_written_trailer: bool,
 }
@@ -326,7 +328,7 @@ impl<W: Writer> Muxer<W> {
             // 默认不平移：库不悄悄改用户给的时间戳，需要的人显式开启
             // （live 采集的 wallclock/epoch 时间戳等，见 set_normalize_timestamps）。
             normalize_timestamps: false,
-            pts_base_us: None,
+            ts_base_us: None,
             have_written_header: false,
             have_written_trailer: false,
         }
@@ -344,9 +346,15 @@ impl<W: Writer> Muxer<W> {
     /// 开关交错写入（interleaved）。
     ///
     /// **默认开启**，等价于 ffmpeg CLI 的 `av_interleaved_write_frame`：跨流按
-    /// dts 交错排序、缓冲 B 帧导致的乱序，保证首包 dts 非负。编码器输出含
-    /// B 帧时（默认即含，见 [`EncoderBuilder::with_max_b_frames`]）必须使用
-    /// 交错写入，否则 FLV 等容器直接报错。
+    /// dts 交错排序，并缓冲"某条流暂时落后"的包以维持全局顺序。编码器输出含
+    /// B 帧时（默认即含，见 [`EncoderBuilder::with_max_b_frames`]），逐包直写
+    /// 会让 dts 序在流间错乱，FLV 等容器直接报错（`AVERROR(EINVAL)`）。
+    ///
+    /// 注意交错写入**不做负时间戳平移**：首包 dts 是否为负取决于源（remux 的
+    /// 源流、编码器自身的 B 帧延迟），本库不设 `avoid_negative_ts`，也不要指望
+    /// 这个开关"保证首包 dts 非负"——对存不下负时间戳的容器，负 dts 仍会在写
+    /// 包时报错；需要时调用方自己在提交之前把时间戳整体平移（见
+    /// [`Self::set_normalize_timestamps`]）。
     ///
     /// 透传（remux）单流等场景可关闭，回到逐包直写
     /// （`av_write_frame`）的旧行为。
@@ -374,7 +382,11 @@ impl<W: Writer> Muxer<W> {
     ///
     /// 只做整体平移，帧间间隔（真实到达节奏、卡顿造成的 PTS 跳变）完全保留；
     /// 基准跨流共享同一物理时刻（内部按微秒存储、逐流换算回各自时间基），
-    /// 因此音视频同步不受影响。`AV_NOPTS_VALUE`（未设 pts，由编码器自动编号）
+    /// 因此音视频同步不受影响。基准由**提交顺序**决定：首个带有效时间戳的
+    /// 提交单元的 `min(pts, dts)` 落在 0 —— 若先提交一条起点明显晚于其它流的
+    /// （如先字幕后视频），提交流会被整体平移成负值；需要确定性行为时，先提交
+    /// 主 A/V 流或在写入任何数据前保持关闭并自行转好时间戳。
+    /// `AV_NOPTS_VALUE`（未设 pts，由编码器自动编号）
     /// 原样透传，也不参与基准建立。
     ///
     /// 应在写入任何数据**之前**调用；header 写出后才开启时基准只能从下一个提交
@@ -387,30 +399,49 @@ impl<W: Writer> Muxer<W> {
             );
         }
         self.normalize_timestamps = normalize;
-        self.pts_base_us = None;
+        self.ts_base_us = None;
         self
     }
 
-    /// 把一个时间戳平移到归一化基准（`tb` 是该值当前所在的时间基）。
-    ///
-    /// 首个有效时间戳建立基准并把自身恰好平移到 0（避免换算取整后首帧落在 ±1 tick）；
-    /// 后续值减去同一基准。未开启归一化或时间戳为 `AV_NOPTS_VALUE` 时原样返回。
+    /// 归一化单个时间戳（只有 pts 可用的提交单元：编码帧路径）。
     fn normalize_ts(&mut self, ts: i64, tb: Rational) -> i64 {
-        if !self.normalize_timestamps || ts == ffi::AV_NOPTS_VALUE {
-            return ts;
+        self.normalize_ts_pair(ts, ffi::AV_NOPTS_VALUE, tb).0
+    }
+
+    /// 归一化一对 pts/dts（packet 路径）。
+    ///
+    /// 基准锚定**首个带有效时间戳的提交单元**：取它的 `min(pts, dts)` 恰好平移到
+    /// 0（避免换算取整后首帧落在 ±1 tick）。单锚 pts 会出事故：B 帧源的首包
+    /// dts < pts 是常态，归一化后首包 dts 变负——恰是本特性（负 dts 让 FLV 等
+    /// muxer 报错）想避免的。后续值减去同一基准；未开启归一化原样返回，本条
+    /// `pts`/`dts` 全无效的不锚定基准，等下一条。
+    fn normalize_ts_pair(&mut self, pts: i64, dts: i64, tb: Rational) -> (i64, i64) {
+        if !self.normalize_timestamps {
+            return (pts, dts);
         }
-        // FFmpeg 的 `AV_TIME_BASE_Q` 就是 1/1000000，即 [`TIME_BASE`]
-        match self.pts_base_us {
-            Some(base_us) => {
+        let shift = |ts: i64, base_us: i64| -> i64 {
+            if ts == ffi::AV_NOPTS_VALUE {
+                ts
+            } else {
+                // FFmpeg 的 `AV_TIME_BASE_Q` 就是 1/1000000，即 [`TIME_BASE`]
                 ts - rsmpeg::avutil::av_rescale_q(base_us, TIME_BASE.into(), tb.into())
             }
+        };
+        match self.ts_base_us {
+            Some(base_us) => (shift(pts, base_us), shift(dts, base_us)),
             None => {
-                self.pts_base_us = Some(rsmpeg::avutil::av_rescale_q(
-                    ts,
-                    tb.into(),
-                    TIME_BASE.into(),
-                ));
-                0
+                let base = [pts, dts]
+                    .into_iter()
+                    .filter(|ts| *ts != ffi::AV_NOPTS_VALUE)
+                    .min()
+                    .map(|ts| rsmpeg::avutil::av_rescale_q(ts, tb.into(), TIME_BASE.into()));
+                match base {
+                    Some(base_us) => {
+                        self.ts_base_us = Some(base_us);
+                        (shift(pts, base_us), shift(dts, base_us))
+                    }
+                    None => (pts, dts),
+                }
             }
         }
     }
@@ -466,19 +497,25 @@ impl<W: Writer> Muxer<W> {
     /// 输出包再喂给 muxer（对比 [`bsf`](crate::bsf) 模块文档里的手工接线）。
     ///
     /// ```no_run
+    /// use rsmedia::io::StreamReader;
     /// use rsmedia::mux::{Demuxer, Muxer};
-    /// use rsmedia::MediaType;
     ///
     /// # fn main() -> rsmedia::Result<()> {
-    /// let mut demuxer = Demuxer::new("in.mp4")?;
+    /// // remux 走透传模式：包不经过解码器。
+    /// let mut demuxer = Demuxer::new_passthrough(StreamReader::new("in.mp4")?)?;
     /// let mut muxer = Muxer::new("out.ts")?;
     ///
     /// // MP4（avcC）→ TS（Annex B）必须转换，否则 TS 里没有内联的 SPS/PPS。
     /// let info = demuxer.stream_info(0)?;
+    /// let src_index = info.index; // 源容器里的流序号，用于路由
     /// let v_idx = muxer.add_copy_stream_with_bsf(&info, "h264_mp4toannexb")?;
     ///
-    /// while let Some((_, mut pkt)) = demuxer.demux_packet()? {
-    ///     muxer.mux_packet(&mut pkt, v_idx)?;
+    /// // 按**流序号**路由：只把该视频流的包喂给它自己的输出流；
+    /// // 其它流（音频/字幕）的包不要投给 `v_idx`。
+    /// while let Some((stream_index, mut pkt)) = demuxer.demux_packet()? {
+    ///     if stream_index == src_index {
+    ///         muxer.mux_packet(&mut pkt, v_idx)?;
+    ///     }
     /// }
     /// muxer.finish()?;
     /// # Ok(())
@@ -1144,8 +1181,7 @@ impl<W: Writer> Muxer<W> {
         for mut packet in packets {
             // 与 `mux` 一致：归一化在写包前应用（字幕包的 pts/dts 在编码器的
             // 1/1000 时间基里），基准与音视频流共享，不破坏同步。
-            let pts = self.normalize_ts(packet.pts, enc_time_base);
-            let dts = self.normalize_ts(packet.dts, enc_time_base);
+            let (pts, dts) = self.normalize_ts_pair(packet.pts, packet.dts, enc_time_base);
             if pts != packet.pts {
                 packet.set_pts(pts);
             }
@@ -1215,8 +1251,7 @@ impl<W: Writer> Muxer<W> {
     ) -> Result<()> {
         // 与 `mux` 一致：归一化在写包前应用（透传包的 pts/dts 在源流时间基里），
         // 基准与编码流共享同一物理时刻。
-        let pts = self.normalize_ts(packet.pts, src_time_base);
-        let dts = self.normalize_ts(packet.dts, src_time_base);
+        let (pts, dts) = self.normalize_ts_pair(packet.pts, packet.dts, src_time_base);
         if pts != packet.pts {
             packet.set_pts(pts);
         }
@@ -1427,6 +1462,22 @@ pub struct Demuxer<R: Reader> {
     /// an empty `streams` is also a valid decode-mode state (a container with no
     /// decodable stream), and callers must be able to tell the two apart.
     passthrough: bool,
+    /// Set once a step has failed, so the iterators end instead of handing the same
+    /// error out forever.
+    ///
+    /// A failing demux on recoverable-looking input (a truncated file, a network
+    /// reader) fails again identically on every retry, and `Iterator` has no way to
+    /// say "stop": without this, `for result in &mut demuxer` never terminates, and
+    /// `collect()` hangs instead of stopping at the first error. A direct call to
+    /// [`demux`](Self::demux) / [`demux_packet`](Self::demux_packet) is unaffected —
+    /// only the iteration entry points honour the latch.
+    failed: bool,
+    /// **构建期**输入容器的流数（"封存"于 build 时的快照）。
+    ///
+    /// 流集合在构建时定格：`demux()` 只为选中的流建了解码器，之后不会再长。
+    /// 运行期读到 `stream_index >= sealed_nb_streams` 的包说明容器**中途长出了
+    /// 新流**（mpegts 的 live 录制中途新 PID/新节目）—— 这类包走 warn 后丢弃。
+    sealed_nb_streams: usize,
 }
 
 impl Demuxer<StreamReader> {
@@ -1517,7 +1568,9 @@ impl<R: Reader> Demuxer<R> {
                 stream_info.codec_id, stream_info.index
             )));
         };
-        let mut builder = DecoderBuilder::new(media_type).with_codec_name(codec_name.clone());
+        let mut builder = DecoderBuilder::new(media_type)
+            .with_codec_name(codec_name.clone())
+            .with_stream_index(stream_info.index);
         if let Some(cfg) = &device_config {
             builder = builder.with_hardware_device(cfg.clone());
         }
@@ -1536,7 +1589,9 @@ impl<R: Reader> Demuxer<R> {
                 let software_name = stream_info
                     .find_decoder_name(None)
                     .unwrap_or_else(|| codec_name.clone());
-                let mut fallback = DecoderBuilder::new(media_type).with_codec_name(software_name);
+                let mut fallback = DecoderBuilder::new(media_type)
+                    .with_codec_name(software_name)
+                    .with_stream_index(stream_info.index);
                 if let Some(chain) = filters.get(&media_type) {
                     fallback = fallback.with_filters(chain.clone());
                 }
@@ -1555,6 +1610,13 @@ impl<R: Reader> Demuxer<R> {
     ///
     /// `filters` 按媒体类型分组，`device_config` 为可选的硬件加速配置；两者都
     /// 接受「值本身或 `None`」，不需要包 `Some`。
+    ///
+    /// **字幕流被跳过**（与章节轨/附件同一待遇）：字幕解码器只支持
+    /// `avcodec_decode_subtitle2` 通道，与 [`demux`](Self::demux) 驱动的帧
+    /// API 不兼容 —— 为字幕流构建解码器会把问题埋进迭代里（实测把字幕包
+    /// 路由进去，libavcodec 的断言直接 `abort()` 崩进程）。字幕内容走
+    /// [`new_passthrough`](Self::new_passthrough) + `mux_packet` 按字节搬包，
+    /// 或 `Decoder::new_subtitle` + `decode_subtitle_segment` 解成文本段落。
     pub fn new_from_reader(
         reader: R,
         filters: impl Into<Option<Vec<Filter>>>,
@@ -1569,6 +1631,21 @@ impl<R: Reader> Demuxer<R> {
         for stream_idx in 0..nb_streams {
             let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
             let device_type = device_config.as_ref().map(|c| c.device_type);
+            if stream_info.media_type == MediaType::SUBTITLE {
+                // 字幕流跳过：字幕解码器只支持 `avcodec_decode_subtitle2` 通道
+                // （发 AVSubtitle），不支持 send/receive **帧** API ——
+                // `demux()` 驱动帧 API，把字幕包路由进去实测会让 libavcodec
+                // 的断言直接 `abort()` 崩进程（rsmpeg 层无 Err 可捕获）。
+                // 字幕内容走两条既有通道：`Demuxer::new_passthrough` +
+                // `mux_packet`（按字节搬包），或专门的
+                // `Decoder::new_subtitle` + `decode_subtitle_segment`（解成`SubtitleSegment`）
+                tracing::debug!(
+                    "Skipping stream {stream_idx}: subtitle stream (frame-API decode is \
+                     not supported for subtitles; use new_passthrough + mux_packet for \
+                     copy, or Decoder::new_subtitle for SubtitleSegment decoding)"
+                );
+                continue;
+            }
             if stream_info.find_decoder_name(device_type).is_none() {
                 // Streams without a registered decoder (chapter tracks,
                 // attached pictures, binary data, ...) are skipped instead of
@@ -1576,6 +1653,19 @@ impl<R: Reader> Demuxer<R> {
                 tracing::debug!(
                     "Skipping stream {stream_idx}: no decoder for codec_id {:#x}",
                     stream_info.codec_id
+                );
+                continue;
+            }
+            if stream_info.disposition & ffi::AV_DISPOSITION_ATTACHED_PIC as i32 != 0 {
+                // 封面图（mp4 被 `attached_pic` 的 mjpeg/png 流）：解出来是
+                // 一帧裸图片数据，不属于滚动视频内容。老行为把它当普通视频
+                // 流构建解码器 —— 播放/duration 里多出一条内容为封面的"轨"。
+                // 封面处理走 remux（`new_passthrough` + `add_copy_stream`，
+                // 容器级的封面附件原样搬运）或 MediaFrame 直接读图。
+                tracing::debug!(
+                    "Skipping stream {stream_idx}: attached picture (cover art is publish-\
+                     level binary data, not per-frame video; use new_passthrough + \
+                     add_copy_stream to carry it over)"
                 );
                 continue;
             }
@@ -1587,6 +1677,8 @@ impl<R: Reader> Demuxer<R> {
             reader,
             streams,
             passthrough: false,
+            failed: false,
+            sealed_nb_streams: nb_streams,
         })
     }
 
@@ -1624,7 +1716,9 @@ impl<R: Reader> Demuxer<R> {
     /// - 点了名却**不可解码**的流（章节轨、附件、本构建没有解码器的编码）报
     ///   [`RsmediaError::Unsupported`]，而不是像 [`new_from_reader`](Self::new_from_reader)
     ///   那样静默跳过：调用方明确要了这条流，少给一条必须让它知道，而不是让它以为
-    ///   自己拿到的是全部。
+    ///   自己拿到的是全部。字幕流在此处**永远**报 `Unsupported`（帧 API 驱动字幕
+    ///   解码器会崩，见 [`new_from_reader`](Self::new_from_reader) 的说明），即使
+    ///   本构建里有字幕解码器。
     ///
     /// ```no_run
     /// use rsmedia::io::StreamReader;
@@ -1664,6 +1758,17 @@ impl<R: Reader> Demuxer<R> {
                 )));
             }
             let stream_info = StreamInfo::from_reader(&reader, stream_idx)?;
+            if stream_info.media_type == MediaType::SUBTITLE {
+                // 显式点名了字幕流：不能给（frame-API demux() 驱动字幕解码器=
+                // libavcodec abort 崩溃，见 `new_from_reader` 的注释），也不能
+                // 静默跳过（调用方明确要了这条流）。报 `Unsupported` 并指路。
+                return Err(RsmediaError::unsupported(format!(
+                    "stream {stream_idx} is a subtitle stream and cannot be driven by the \
+                     frame-API demux() path: use Demuxer::new_passthrough + Muxer::add_copy_stream \
+                     to copy the track bit-exactly, or Decoder::new_subtitle + \
+                     decode_subtitle_segment to decode it into SubtitleSegments"
+                )));
+            }
             // 不做 `find_decoder_name` 预检后跳过：`build_decoder` 自己就会为"没有
             // 解码器"返回 `Unsupported`（消息里带 codec_id 与流号），正是本方法
             // 想要的策略——显式点名了就要么给流、要么报错。
@@ -1675,6 +1780,8 @@ impl<R: Reader> Demuxer<R> {
             reader,
             streams,
             passthrough: false,
+            failed: false,
+            sealed_nb_streams: nb_streams,
         })
     }
 
@@ -1686,10 +1793,15 @@ impl<R: Reader> Demuxer<R> {
     /// [`Muxer::add_copy_stream`](crate::mux::Muxer::add_copy_stream) 和
     /// [`Muxer::mux_packet`](crate::mux::Muxer::mux_packet) 可原样搬运码流。
     pub fn new_passthrough(reader: R) -> Result<Demuxer<R>> {
+        // 透传模式不筛流（`demux_packet` 交付所有包），封存值只用于保持字段
+        // 语义统一。
+        let sealed_nb_streams = reader.input().nb_streams as usize;
         Ok(Self {
             reader,
             streams: Vec::new(),
             passthrough: true,
+            failed: false,
+            sealed_nb_streams,
         })
     }
 
@@ -1813,6 +1925,32 @@ impl<R: Reader> Demuxer<R> {
         self.passthrough
     }
 
+    /// 冲刷所有解码流，让解码从新位置干净起步。
+    ///
+    /// 调用时机：对底层 reader 完成 **seek** 之后（如
+    /// [`StreamReader::seek_to_timestamp`](crate::io::StreamReader::seek_to_timestamp)）。
+    /// seek 只移动读取位置，解码器与滤镜图里还压着 seek **之前**解出的帧——
+    /// DTS/PTS 还没来得及交给调用方的、滤镜（fps/aresample 等）攒着的都会在
+    /// seek 之后的下一次迭代里旧账新算地冒出来。本方法把它们全部丢弃，并
+    /// 把解码阶段重置回 `Normal`（与 [`Decoder::flush_buffers`](crate::Decoder::flush_buffers)
+    /// 同一语义：上一轮若已 drain 通过 EOF，这里照样允许重新喂包）。
+    ///
+    /// 透传模式没有解码器，本方法是 no-op。
+    pub fn flush(&mut self) -> Result<()> {
+        for demux_stream in &mut self.streams {
+            demux_stream.decoder.flush_buffers().with_context(|| {
+                format!(
+                    "Failed to flush the decoder of stream {}",
+                    demux_stream.stream_index
+                )
+            })?;
+        }
+        if self.passthrough {
+            tracing::debug!("Demuxer::flush() on a passthrough demuxer: nothing to do");
+        }
+        Ok(())
+    }
+
     /// 读取下一个**原始 packet**（不解码）。
     ///
     /// 透传模式（[`new_passthrough`](Self::new_passthrough)）的主迭代入口，
@@ -1846,10 +1984,21 @@ impl<R: Reader> Demuxer<R> {
     /// }
     /// ```
     pub fn packets(&mut self) -> impl Iterator<Item = Result<(usize, AVPacket)>> + '_ {
-        std::iter::from_fn(|| match self.demux_packet() {
-            Ok(Some(item)) => Some(Ok(item)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
+        std::iter::from_fn(|| {
+            // 错误只交付一次后就停止迭代：出错的输入下一次调用会以同样的方式继续
+            // 出错，而迭代器本身无法表达"结束"——不用 latch 记住这一步，`collect()`
+            // 会挂死、`for` 循环永不停歇。直接调 `demux_packet` 不受影响。
+            if self.failed {
+                return None;
+            }
+            match self.demux_packet() {
+                Ok(Some(item)) => Some(Ok(item)),
+                Ok(None) => None,
+                Err(e) => {
+                    self.failed = true;
+                    Some(Err(e))
+                }
+            }
         })
     }
 
@@ -1858,7 +2007,8 @@ impl<R: Reader> Demuxer<R> {
     /// 只覆盖构建时选中的流（[`new`](Self::new) = 全部可解码流，
     /// [`new_single_stream`](Self::new_single_stream) = 单条最佳流，
     /// [`new_with_streams`](Self::new_with_streams) = 点名的那几条），其余流
-    /// 的 packet 被静默丢弃。输入读完后先排空各解码器（含滤镜图）才返回
+    /// 的 packet 被丢弃：构建期存在的流走 `debug`，**运行期中途长出的新流**
+    /// 走 `warn`。输入读完后先排空各解码器（含滤镜图）才返回
     /// `Ok(None)`：提前停止迭代会丢掉解码器里还压着的帧。
     ///
     /// 透传模式（[`new_passthrough`](Self::new_passthrough)）没有解码器，本
@@ -1881,11 +2031,27 @@ impl<R: Reader> Demuxer<R> {
                             .iter_mut()
                             .find(|s| s.stream_index == stream_idx)
                         else {
-                            // Packets of streams with no decoder bound to them:
-                            // chapter tracks and other undecodable streams skipped by
-                            // `new_from_reader`, and streams left out of the selection by
-                            // `new_single_stream` / `new_with_streams`.
-                            tracing::debug!("Dropping packet of stream {stream_idx}: not selected");
+                            // 两类"无解码器绑定"的包在这里被丢弃：
+                            //
+                            // 1. 构建期就存在、只是没被选中的流（章节轨/附件等
+                            //    `new_from_reader` 跳过的流，或 `new_single_stream` /
+                            //    `new_with_streams` 名单之外的流）—— 调用方明确声明的
+                            //    选择，debug 级别足够。
+                            // 2. **构建期不存在**的运行期新生流（live TS 中途新
+                            //    PID/新节目）：只给 debug 等于无声丢数据，升为 warn。
+                            //    流集合在 build 时定格是有意为之：解码中途动态补建
+                            //    解码器会让输出流集合悄悄变化，不在这里"做得更聪明"。
+                            if stream_idx >= self.sealed_nb_streams {
+                                tracing::warn!(
+                                    "Dropping packet of stream {stream_idx}: the stream appeared \
+                                     after this demuxer was built (build-time nb_streams={})",
+                                    self.sealed_nb_streams
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Dropping packet of stream {stream_idx}: not selected"
+                                );
+                            }
                             continue;
                         };
                         if let Some(frame) = demux_stream.decoder.decode_raw_packet(&packet)? {
@@ -1915,7 +2081,7 @@ impl<R: Reader> Demuxer<R> {
                 //    fps/framerate 这类有延迟的）仍可能压着帧，按 `is_flushed`
                 //    跳过会丢掉它们。
                 //
-                // 循环以 `MAX_DRAIN_ITERATIONS` 为上限，与 `Decoder::drain` 一致：
+                // 循环以 `MAX_EAGAIN_RETRIES` 为上限，与 `Decoder::drain` 一致：
                 // 个别编解码器在 EOS 后可能一直回"暂无帧"，没有上限就是挂死。
                 let mut drain_iterations = 0usize;
                 loop {
@@ -1944,10 +2110,10 @@ impl<R: Reader> Demuxer<R> {
                         return Ok(None);
                     }
                     drain_iterations += 1;
-                    if drain_iterations >= crate::MAX_DRAIN_ITERATIONS {
+                    if drain_iterations >= crate::MAX_EAGAIN_RETRIES {
                         tracing::warn!(
                             "Demuxer: decoders produced no frame after {} drain iterations; ending demux()",
-                            crate::MAX_DRAIN_ITERATIONS
+                            crate::MAX_EAGAIN_RETRIES
                         );
                         return Ok(None);
                     }
@@ -1978,10 +2144,18 @@ impl<R: Reader> Iterator for Demuxer<R> {
     type Item = Result<(usize, AVFrame)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // 同 [`packets`](Self::packets)：错误交付一次后结束迭代，
+        // 避免失败的输入把迭代变成永不终止的错误流。
+        if self.failed {
+            return None;
+        }
         match self.demux() {
             Ok(Some(item)) => Some(Ok(item)),
             Ok(None) => None,
-            Err(e) => Some(Err(e)),
+            Err(e) => {
+                self.failed = true;
+                Some(Err(e))
+            }
         }
     }
 }
@@ -3330,6 +3504,235 @@ mod tests {
             EPOCH_TICKS * 40_000,
             "normalize=false 时 FLV 承载不了 epoch 起点"
         );
+        Ok(())
+    }
+
+    /// F3 回归：归一化基准锚定首个提交单元的 `min(pts, dts)`，不是单独的 pts。
+    ///
+    /// B 帧源首包 dts < pts 是常态：老代码锚 pts（30）后，同包 dts 被减成 **-2**
+    /// （负 dts，FLV mo 直接报错）；修后基准取 min=28，首包 dts=0。
+    #[test]
+    fn test_normalize_anchor_uses_min_pts_dts() -> Result<()> {
+        let path = crate::test_support::test_output_path("mux", "test_norm_anchor.mp4");
+        let mut muxer = Muxer::new(&path)?;
+        muxer.set_normalize_timestamps(true);
+        let tb = Rational::new(1, 30).unwrap();
+
+        // 首包：pts=30 tick（1.0s），dts=28 tick（B 帧延迟）。
+        let (pts, dts) = muxer.normalize_ts_pair(30, 28, tb);
+        assert_eq!((pts, dts), (2, 0), "基准锚 min(pts,dts)：首包 dts 不得为负");
+        // 后续包减同一基准，相对间隔保留。
+        let (pts, dts) = muxer.normalize_ts_pair(31, 29, tb);
+        assert_eq!((pts, dts), (3, 1));
+        // 未提交任何有效时间戳（全 NOPTS）不锚定，等下一条。
+        let path2 = crate::test_support::test_output_path("mux", "test_norm_anchor2.mp4");
+        let mut muxer2 = Muxer::new(&path2)?;
+        muxer2.set_normalize_timestamps(true);
+        let (pts, dts) = muxer2.normalize_ts_pair(ffi::AV_NOPTS_VALUE, ffi::AV_NOPTS_VALUE, tb);
+        assert_eq!(
+            (pts, dts),
+            (ffi::AV_NOPTS_VALUE, ffi::AV_NOPTS_VALUE),
+            "全 NOPTS 不锁基准"
+        );
+        drop(muxer2);
+        crate::test_support::remove_test_output(&path2);
+        drop(muxer);
+        crate::test_support::remove_test_output(&path);
+        Ok(())
+    }
+
+    /// D1+E1 端到端回归：解码→编码转码（mp4→mkv）的轨道时长与源一致。
+    ///
+    /// 原缺陷链叠加在"单帧"上看不出来：解码产物帧没有 time_base 标注（编码侧
+    /// 无从换算 duration，mp4 源 30fps 每帧 512 tick @1/15360 被按 1/30 解释成
+    /// 17s/帧）+ flush 时缺 duration 的包按满帧补。修后转码轨时长畸变消失：
+    /// mkv 视频轨的末包终点 ≈ 源视频轨时长（±0.5s 容差；老缺陷形态是虚高
+    /// 数百倍）。
+    #[test]
+    fn test_transcode_track_duration_matches_source() -> Result<()> {
+        let src_path = "assets/mp4.mp4";
+        let out_path = crate::test_support::test_output_path("mux", "test_transcode_duration.mkv");
+        // 源时长（块外断言还要用；no-video-stream 的 Skip 分支直接返回）
+        let src_secs;
+        {
+            // 源参数（时长/尺寸/帧率）
+            let probe = Demuxer::new(src_path)?;
+            let Some(vstream) = probe
+                .streams()
+                .iter()
+                .find(|s| s.media_type == MediaType::VIDEO)
+            else {
+                println!("SKIP: fixture has no video stream");
+                return Ok(());
+            };
+            let v_info = vstream.stream_info.clone();
+            let v_src_index = vstream.stream_index;
+            src_secs = crate::Time::new(Some(v_info.duration), v_info.time_base).as_secs() as f64;
+            let fps = {
+                let r = rsmpeg::avutil::av_q2d(v_info.avg_frame_rate.into());
+                if r <= 0.0 { 25.0 } else { r }
+            };
+            drop(probe);
+
+            // 解码 → 重编码（换容器）
+            let mut demuxer = Demuxer::new(src_path)?;
+            let mut muxer = Muxer::new(&out_path)?;
+            let mut options = crate::AVOptions::new();
+            options.set("preset", "ultrafast");
+            let encoder = EncoderBuilder::new_video(v_info.width, v_info.height)
+                .with_fps(fps as f32)
+                .with_options(options)
+                .build()?;
+            let enc_index = muxer.add_encoder(encoder)?;
+            while let Some((stream, frame)) = demuxer.demux()? {
+                if stream == v_src_index {
+                    muxer.mux(frame, enc_index).context("mux video frame")?;
+                }
+            }
+            muxer.finish()?;
+        }
+
+        // 读回转码产物：视频轨最后一个包的终点（末包 pts + duration）
+        let mut passthrough = Demuxer::new_passthrough(StreamReader::new(&out_path)?)?;
+        let (out_v_index, out_tb) = {
+            let mut found: Option<(usize, Rational)> = None;
+            for (i, s) in passthrough.reader.input().streams().iter().enumerate() {
+                if s.codecpar().codec_type == ffi::AVMEDIA_TYPE_VIDEO {
+                    found = Some((i, s.time_base.into()));
+                    break;
+                }
+            }
+            found.expect("encoded fixture must keep the video stream")
+        };
+        let mut end_us: i64 = 0;
+        for result in passthrough.packets() {
+            let (stream, packet) = result?;
+            if stream != out_v_index {
+                continue;
+            }
+            if packet.pts == ffi::AV_NOPTS_VALUE {
+                continue;
+            }
+            let end_ticks = if packet.duration > 0 {
+                packet.pts + packet.duration
+            } else {
+                packet.pts
+            };
+            let us = rsmpeg::avutil::av_rescale_q(end_ticks, out_tb.into(), ffi::AV_TIME_BASE_Q);
+            end_us = end_us.max(us);
+        }
+        let out_secs = end_us as f64 / 1_000_000.0;
+
+        assert!(
+            (out_secs - src_secs).abs() < 0.5,
+            "转码轨时长应≈源（{src_secs:.3}s），实际 {out_secs:.3}s —— 老缺陷形态是虚高数百倍"
+        );
+        crate::test_support::remove_test_output(&out_path);
+        Ok(())
+    }
+
+    /// F4 回归：`Demuxer::flush()` 把每个解码流带回头看可继续解码的状态，且
+    /// 对解码模式可重复调用是安全操作。
+    #[test]
+    fn test_demuxer_flush_restarts_decoders() -> Result<()> {
+        let mut demuxer = Demuxer::new("assets/mp4.mp4")?;
+        // 先解出几帧，确有缓冲后再冲刷
+        let mut served = 0usize;
+        for _ in 0..3 {
+            if demuxer.demux()?.is_some() {
+                served += 1;
+            }
+        }
+        assert!(served > 0, "fixture 应解出至少一帧");
+
+        demuxer.flush().context("flush after seek")?;
+
+        // 冲刷后迭代应仍可用（从流当前位置继续出帧）。
+        assert!(demuxer.demux()?.is_some(), "flush 后应能继续出帧");
+
+        // 透传模式：flush 是 no-op，不得报错。
+        let mut passthrough = Demuxer::new_passthrough(StreamReader::new("assets/mp4.mp4")?)?;
+        passthrough.flush()?;
+        Ok(())
+    }
+
+    /// E3 回归：FIFO 切出的**短末帧** duration 按实际样本数补，不按满帧长虚高。
+    ///
+    /// 1500 样本 = 1024（满帧）+ 476（尾帧）：全部按满帧补时轨尾虚高 ~12ms
+    /// （AAC 尾帧被补成 1024/44100 ≈ 23ms 而不是 476/44100 ≈ 10.8ms）。
+    #[test]
+    fn test_audio_tail_end_matches_actual_samples() -> Result<()> {
+        let aac_available = {
+            let name = std::ffi::CString::new("aac").unwrap();
+            rsmpeg::avcodec::AVCodec::find_encoder_by_name(&name).is_some()
+        };
+        if !aac_available {
+            println!("SKIP: aac encoder not available in this FFmpeg build");
+            return Ok(());
+        }
+        let path = crate::test_support::test_output_path("mux", "test_audio_tail.mp4");
+        {
+            let mut muxer = Muxer::new(&path)?;
+            let encoder =
+                EncoderBuilder::new_audio(128_000, 2, 44_100, crate::SampleFormat::FLTP).build()?;
+            let index = muxer.add_encoder(encoder)?;
+            for samples in [1024u32, 476u32] {
+                // 两帧都不带 pts：固定帧长音频由 FIFO 按已输出样本数编号。
+                let mut frame = AVFrame::new();
+                frame.set_format(crate::SampleFormat::FLTP.into());
+                frame.set_sample_rate(44_100);
+                frame.set_nb_samples(samples as i32);
+                frame.set_ch_layout(
+                    AVChannelLayout::from_mask(0x3)
+                        .context("stereo mask")?
+                        .into_inner(),
+                );
+                frame.alloc_buffer().context("audio frame buffer")?;
+                // av_frame_get_buffer 不清缓冲：f32 帧填 0（静音）。不填则会拿到
+                // 未初始化内存 —— 并发测试堆重用下出现 NaN/Inf，aac 编码 EINVAL。
+                // SAFETY：缓冲 refcount=1 本函数独占；FLTP 两平面各 nb_samples × f32。
+                unsafe {
+                    let raw = frame.deref_mut();
+                    for plane in raw.data.iter().take(2) {
+                        if plane.is_null() {
+                            break;
+                        }
+                        std::slice::from_raw_parts_mut(
+                            *plane,
+                            samples as usize * std::mem::size_of::<f32>(),
+                        )
+                        .fill(0);
+                    }
+                }
+                frame.set_pts(ffi::AV_NOPTS_VALUE);
+                muxer.mux(frame, index)?;
+            }
+            muxer.finish()?;
+        }
+
+        let reader = StreamReader::new(&path)?;
+        let tb = reader.input().streams()[0].time_base;
+        let mut demuxer = Demuxer::new_passthrough(reader)?;
+        let end_us = demuxer
+            .packets()
+            .filter_map(|item| {
+                item.ok().map(|(_, packet)| {
+                    rsmpeg::avutil::av_rescale_q(
+                        packet.pts + packet.duration,
+                        tb,
+                        ffi::AV_TIME_BASE_Q,
+                    )
+                })
+            })
+            .max()
+            .expect("audio packets exist");
+
+        // 修后：0 + 1024 + 476 = 1500 样本 @ 44100 = 34.0ms；全部按满帧补是 46.4ms。
+        assert!(
+            (20_000..40_000).contains(&end_us),
+            "轨尾 end 应≈34.0ms（1500 样本），实际 {end_us}µs —— 满帧补全是 ~46.4ms"
+        );
+        crate::test_support::remove_test_output(&path);
         Ok(())
     }
 
