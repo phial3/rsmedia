@@ -1168,28 +1168,16 @@ mod tests {
             HWDeviceType::MEDIACODEC,
             HWDeviceType::VULKAN,
         ];
-        types.extend(version_gated_types());
-        types
-    }
-
-    #[cfg(not(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9")))]
-    fn version_gated_types() -> Vec<HWDeviceType> {
-        Vec::new()
-    }
-
-    /// D3D12VA 需要 ffmpeg7+，AMF / OHCODEC 需要 ffmpeg8+。
-    #[cfg(feature = "ffmpeg7")]
-    fn version_gated_types() -> Vec<HWDeviceType> {
-        vec![HWDeviceType::D3D12VA]
-    }
-
-    #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-    fn version_gated_types() -> Vec<HWDeviceType> {
-        vec![
+        // D3D12VA 需要 ffmpeg7+，AMF / OHCODEC 需要 ffmpeg8+。
+        #[cfg(feature = "ffmpeg7")]
+        types.push(HWDeviceType::D3D12VA);
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        types.extend([
             HWDeviceType::D3D12VA,
             HWDeviceType::AMF,
             HWDeviceType::OHCODEC,
-        ]
+        ]);
+        types
     }
 
     /// 自动探测并创建硬件上下文；探不到就返回 `None` 让调用方跳过。

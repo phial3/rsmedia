@@ -2419,24 +2419,6 @@ impl From<AudioParams> for AudioEndpoint {
     }
 }
 
-/// 色彩描述符是否值得写进 buffer 源 args：UNSPECIFIED 没有信息量，RESERVED 是
-/// "FFmpeg 留着不用"的占位（写了只会在协商阶段制造噪声）。
-///
-/// 只有 7.1+ 的 buffer 源接受颜色选项（见 `create_video_source` 的键名矩阵），
-/// 6.1 下没有调用点，连同定义一起 cfg 掉，避免 dead_code 警告。
-#[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
-fn is_known_color_space(space: ffi::AVColorSpace) -> bool {
-    !matches!(space, ffi::AVCOL_SPC_UNSPECIFIED | ffi::AVCOL_SPC_RESERVED)
-}
-
-/// 亮度取值范围已声明的判定：MPEG(TV)/JPEG(PC) 之外都是"未知"。
-///
-/// 与 [`is_known_color_space`] 同理，只在 7.1+ 有调用点。
-#[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
-fn is_known_color_range(range: ffi::AVColorRange) -> bool {
-    matches!(range, ffi::AVCOL_RANGE_MPEG | ffi::AVCOL_RANGE_JPEG)
-}
-
 impl From<VideoParams> for Endpoint {
     fn from(params: VideoParams) -> Self {
         Endpoint::Video(params.into())
@@ -2812,23 +2794,28 @@ impl FilterGraph {
         );
         // 色彩描述符。实测的选项键名矩阵（C 探针，6.1/7.1/8.1/9.0 各一遍）：
         // - 6.1 的 buffer 源**没有**颜色选项：color_space/color_space/range/
-        //   color_range 一律 "Option not found"（构建即 EINVAL）；
+        //   color_range 一律 "Option not found"（构建即 EINVAL）;
         // - 7.1+ 接受但键名是 `colorspace` 与 `range`（不是 buffersrc.h 结构体
         //   字段名里的 color_space/color_range），int 或具名常量皆可——用数值
-        //   （AVCOL_* 枚举值横跨版本稳定，具名表有增改风险）。
+        //   （AVCOL_* 枚举值横跨版本稳定，具名表有增改风险）;
         // 未指定的颜色元数据不写入：0（UNSPEC 侧 0=RESERVED/2=UNSPECIFIED 类）
         // 没有信息量，写了还可能让本可协商的滤镜图误判。
-        //
-        // 整个追加过程连同 `mut` 一起 cfg 掉：6.1 下 `args` 只读，`let mut`
-        // 会挨 unused_mut。
         #[cfg(any(feature = "ffmpeg7", feature = "ffmpeg8", feature = "ffmpeg9"))]
         let args = {
             let mut args = args;
-            if is_known_color_space(endpoint.color_space) {
-                args.push_str(&format!(":colorspace={}", endpoint.color_space as i32));
+            // UNSPECIFIED 没有信息量、RESERVED 是 FFmpeg 留着不用的占位，都不写。
+            if !matches!(
+                endpoint.color_space,
+                ffi::AVCOL_SPC_UNSPECIFIED | ffi::AVCOL_SPC_RESERVED
+            ) {
+                args.push_str(&format!(":colorspace={}", endpoint.color_space));
             }
-            if is_known_color_range(endpoint.color_range) {
-                args.push_str(&format!(":range={}", endpoint.color_range as i32));
+            // 颜色范围只认 MPEG(TV)/JPEG(PC) 两种声明，其余按未指定处理。
+            if matches!(
+                endpoint.color_range,
+                ffi::AVCOL_RANGE_MPEG | ffi::AVCOL_RANGE_JPEG
+            ) {
+                args.push_str(&format!(":range={}", endpoint.color_range));
             }
             args
         };
