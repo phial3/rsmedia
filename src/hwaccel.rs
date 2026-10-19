@@ -1154,7 +1154,24 @@ mod tests {
     /// "rsmedia **认**哪些类型"，是固定的。凡是"必须覆盖每一个建模类型"的测试都用它，
     /// 新增变体时只需在这里补一处。
     fn all_modeled_types() -> Vec<HWDeviceType> {
-        let mut types = vec![
+        // 随 FFmpeg 版本增加的尾部：D3D12VA 需要 ffmpeg7+，AMF / OHCODEC 需要 ffmpeg8+。
+        //
+        // 每个版本各写一条绑定而不是往 Vec 里 push：ffmpeg6 那一格没有任何可加的项，
+        // 用 `let mut` + 条件 push 会让 `mut` 在该版本下未被使用，而 CI 以
+        // `-D warnings` 构建，`unused_mut` 直接把 ffmpeg6 的每个 job 变成编译错误。
+        // 恰好只有一个 ffmpegN 特性被启用，因此下面也恰好只有一条绑定存在。
+        #[cfg(feature = "ffmpeg6")]
+        let newer: &[HWDeviceType] = &[];
+        #[cfg(feature = "ffmpeg7")]
+        let newer: &[HWDeviceType] = &[HWDeviceType::D3D12VA];
+        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
+        let newer: &[HWDeviceType] = &[
+            HWDeviceType::D3D12VA,
+            HWDeviceType::AMF,
+            HWDeviceType::OHCODEC,
+        ];
+
+        let types = vec![
             HWDeviceType::NONE,
             HWDeviceType::VDPAU,
             HWDeviceType::CUDA,
@@ -1168,16 +1185,7 @@ mod tests {
             HWDeviceType::MEDIACODEC,
             HWDeviceType::VULKAN,
         ];
-        // D3D12VA 需要 ffmpeg7+，AMF / OHCODEC 需要 ffmpeg8+。
-        #[cfg(feature = "ffmpeg7")]
-        types.push(HWDeviceType::D3D12VA);
-        #[cfg(any(feature = "ffmpeg8", feature = "ffmpeg9"))]
-        types.extend([
-            HWDeviceType::D3D12VA,
-            HWDeviceType::AMF,
-            HWDeviceType::OHCODEC,
-        ]);
-        types
+        types.into_iter().chain(newer.iter().copied()).collect()
     }
 
     /// 自动探测并创建硬件上下文；探不到就返回 `None` 让调用方跳过。
