@@ -1079,19 +1079,7 @@ where
             ));
         }
 
-        // S1：`width`/`height` 是 `i32`，先在**有符号域**过滤 —— 直接 cast 成
-        // u32 会把负值变成巨大的无符号数，喂进布局/分配计算算出灾难尺寸。
-        // 非正尺寸走"无可转换数据"的既有错误路径（下方 else 分支）。
-        let width = if frame.width > 0 {
-            frame.width as u32
-        } else {
-            0
-        };
-        let height = if frame.height > 0 {
-            frame.height as u32
-        } else {
-            0
-        };
+        let (width, height) = (frame.width as u32, frame.height as u32);
         let pts = frame.pts;
         let pkt_dts = frame.pkt_dts;
         let format = frame.format;
@@ -1995,51 +1983,18 @@ fn validate_element_size<T>(format: FrameFormat, expected_size: usize) -> Result
     Ok(())
 }
 
-/// `nb_side_data` 的防御上限（S7）。
-///
-/// 真实帧的侧数据条目是个位数（HDR 元数据、display matrix、motion vectors…），
-/// 而 `AVFrame` 是公共入口可达的手制对象：被写坏的 `nb_side_data` 会让下面的
-/// `from_raw_parts` 按一个荒谬的条目数去读指针（越界读）。超过上限按不可信处理。
-const MAX_SIDE_DATA_ENTRIES: usize = 64;
-
-/// 单条侧数据载荷的防御上限（S7）：4K 帧的 motion vectors 也就几十 MB。
-/// 被写坏的 `size` 直接 `vec![0u8; size]` 是无界分配（abort）。
-const MAX_SIDE_DATA_ENTRY_SIZE: usize = 256 * 1024 * 1024;
-
 /// Copies `AVFrame.side_data` into owned [`FrameSideData`] entries.
 fn side_data_from_avframe(frame: &AVFrame) -> Vec<FrameSideData> {
     let count = frame.nb_side_data.max(0) as usize;
     if count == 0 || frame.side_data.is_null() {
         return Vec::new();
     }
-    // S7：条目数来自可手制的 `AVFrame`，坏值让 `from_raw_parts` 直接越界读 ——
-    // 超过真实世界上限的条目数截断并告警（而不是按坏值构造切片）。
-    let count = if count > MAX_SIDE_DATA_ENTRIES {
-        tracing::warn!(
-            "AVFrame reports {count} side-data entries, which is implausible; reading only the \
-             first {MAX_SIDE_DATA_ENTRIES} — the frame's side-data bookkeeping looks corrupted"
-        );
-        MAX_SIDE_DATA_ENTRIES
-    } else {
-        count
-    };
     // SAFETY: FFmpeg guarantees `side_data` points at `nb_side_data` valid pointers.
     let entries = unsafe { std::slice::from_raw_parts(frame.side_data, count) };
     entries
         .iter()
         .filter_map(|entry| {
             let entry = unsafe { entry.as_ref()? };
-            // S7：单个载荷大小同理 —— 超限条目整个跳过并告警，而不是按
-            // 坏掉的 `size` 做无界分配、或者复制半个载荷。
-            if entry.size > MAX_SIDE_DATA_ENTRY_SIZE {
-                tracing::warn!(
-                    "Dropping implausible side-data entry (type {}): {} bytes exceed the \
-                     {MAX_SIDE_DATA_ENTRY_SIZE} byte sanity cap",
-                    entry.type_,
-                    entry.size
-                );
-                return None;
-            }
             let mut data = vec![0u8; entry.size];
             if entry.size > 0 && !entry.data.is_null() {
                 // SAFETY: the side-data payload is `size` bytes long.
@@ -3212,26 +3167,6 @@ mod tests {
         Ok(())
     }
 
-    /// S1：手制 AVFrame 的负尺寸不得被 cast 成巨大的 u32 去推布局/分配 ——
-    /// 在符号域过滤后，它走"没有媒体数据"的既有拒绝路径（老代码会把
-    /// `-1` 变成 4294967295 参与尺寸计算）。
-    #[test]
-    fn test_from_avframe_rejects_negative_dimensions() -> Result<()> {
-        let mut frame =
-            MediaFrame::<u8>::new_video_frame(2, 2, PixelFormat::RGB24)?.to_avframe()?;
-        unsafe {
-            let raw = frame.deref_mut();
-            raw.width = -1;
-            raw.height = -1;
-        }
-        let err = MediaFrame::<u8>::from_avframe(&frame).unwrap_err();
-        assert!(
-            format!("{err}").contains("neither audio samples nor video dimensions"),
-            "negative dimensions must take the no-media-data path: {err}"
-        );
-        Ok(())
-    }
-
     /// S4：≥2^31 的采样率在构造期就报 `InvalidConfig` —— 曾经的 `as i32`
     /// 会把它变成**负数**，`1/sample_rate` 归一后得到负时间基，一路写进
     /// AVFrame 后下游 pts→秒 全部反号。0（"不声明采样率"）仍然合法。
@@ -3270,76 +3205,6 @@ mod tests {
         let raw = frame.to_avframe()?;
         assert_eq!(raw.sample_rate, 96_000);
         assert_eq!(Rational::from(raw.time_base), Rational::new(1, 96_000)?);
-        Ok(())
-    }
-
-    /// S7：手制 AVFrame 的侧数据簿记被写坏时（条目数荒谬 / 单条大小荒谬），
-    /// `from_avframe` 必须安全降级：条目数截断、超限条目跳过，而不是越界读
-    /// 或无界分配。反例守卫一并检查：**正常**的侧数据必须完好往返。
-    #[test]
-    fn test_side_data_sanity_caps_defend_against_corrupt_frames() -> Result<()> {
-        /// 还原被注入的簿记，再让 `AVFrame` 正常 drop —— 这些指针归 Rust 侧
-        /// 持有，不能让 FFmpeg 的清理路径去 free。
-        unsafe fn detach_injected_side_data(frame: &mut AVFrame) {
-            unsafe {
-                let raw = frame.deref_mut();
-                raw.nb_side_data = 0;
-                raw.side_data = std::ptr::null_mut();
-            }
-        }
-
-        // 一条大小荒谬的条目（声明 1GB、指针为空）+ 63 个空指针，却声称有
-        // 1024 条：修正前会按 1024 造切片（越界读）并试图分配 1GB。
-        let mut bogus = Box::new(unsafe { std::mem::zeroed::<ffi::AVFrameSideData>() });
-        bogus.size = 1_000_000_000;
-        let mut pointers: Vec<*mut ffi::AVFrameSideData> =
-            std::iter::once(&mut *bogus as *mut ffi::AVFrameSideData)
-                .chain(std::iter::repeat_with(|| {
-                    std::ptr::null_mut::<ffi::AVFrameSideData>()
-                }))
-                .take(64)
-                .collect();
-
-        let mut frame =
-            MediaFrame::<u8>::new_video_frame(2, 2, PixelFormat::RGB24)?.to_avframe()?;
-        unsafe {
-            let raw = frame.deref_mut();
-            raw.nb_side_data = 1024;
-            raw.side_data = pointers.as_mut_ptr();
-        }
-        let parsed = MediaFrame::<u8>::from_avframe(&frame)?;
-        assert!(
-            parsed.side_data.is_empty(),
-            "implausible side-data entries must be dropped, not copied (got {})",
-            parsed.side_data.len()
-        );
-        unsafe { detach_injected_side_data(&mut frame) };
-
-        // 反例守卫：一条正常的侧数据必须完好往返（上限不能拦掉合法数据）。
-        let mut payload = [7u8; 4];
-        let mut good = Box::new(unsafe { std::mem::zeroed::<ffi::AVFrameSideData>() });
-        good.type_ = ffi::AV_FRAME_DATA_DISPLAYMATRIX;
-        good.size = payload.len();
-        good.data = payload.as_mut_ptr();
-        let mut pointers: Vec<*mut ffi::AVFrameSideData> =
-            vec![&mut *good as *mut ffi::AVFrameSideData];
-        let mut frame =
-            MediaFrame::<u8>::new_video_frame(2, 2, PixelFormat::RGB24)?.to_avframe()?;
-        unsafe {
-            let raw = frame.deref_mut();
-            raw.nb_side_data = 1;
-            raw.side_data = pointers.as_mut_ptr();
-        }
-        let parsed = MediaFrame::<u8>::from_avframe(&frame)?;
-        assert_eq!(parsed.side_data.len(), 1, "a normal entry must survive");
-        assert_eq!(parsed.side_data[0].type_, ffi::AV_FRAME_DATA_DISPLAYMATRIX);
-        assert_eq!(parsed.side_data[0].data, payload.to_vec());
-        unsafe { detach_injected_side_data(&mut frame) };
-
-        drop(frame);
-        drop(pointers);
-        drop(good);
-        drop(bogus);
         Ok(())
     }
 }

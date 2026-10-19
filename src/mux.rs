@@ -149,12 +149,6 @@ pub struct Muxer<W: Writer> {
     ts_base_us: Option<i64>,
     have_written_header: bool,
     have_written_trailer: bool,
-    /// header 写出后的 [`Muxer::refresh_stream_info`] 是否失败。
-    ///
-    /// 失败时流信息缓存停留在 **pre-header** 值，不能再当真相源用 ——
-    /// 写包路径见 [`Muxer::write_out_packet`]：退化为逐包实时查询 writer 的
-    /// 输出时间基（F5）。
-    refresh_failed: bool,
 }
 
 /// [`Muxer`] 的全部 FFmpeg 资源与用户数据（见 [`Muxer::resources`] 字段的说明）。
@@ -337,7 +331,6 @@ impl<W: Writer> Muxer<W> {
             ts_base_us: None,
             have_written_header: false,
             have_written_trailer: false,
-            refresh_failed: false,
         }
     }
 
@@ -1007,18 +1000,14 @@ impl<W: Writer> Muxer<W> {
         // 会往无头容器里塞包、`finish` 还会补一个 trailer，错误被彻底掩盖。
         self.have_written_header = true;
         // 刷新失败只告警：header 已经写出，让错误上抛会让调用方以为容器没写成功
-        // 而重试（二次 `write_header` 必然失败）。
-        //
-        // 但缓存不能继续当真相源：mp4/gif 这类 muxer 在 `write_header` 内改
-        // 时间基，拿 pre-header 旧值换算会把全部时间戳（及其派生的时长、末帧
-        // 推导）静默算错。置 `refresh_failed`，写包路径改为**逐包实时**查询
-        // `writer.stream_time_base`（F5）。
+        // 而重试（二次 `write_header` 必然失败）。缓存仍是 header 之前的（旧）
+        // 时间基，包按旧时间基换算——退化为与"未刷新"一致的行为，而不是把已经
+        // 写出的 header 当成没写。
         if let Err(err) = self.refresh_stream_info() {
             tracing::warn!(
                 "Failed to refresh stream info after write_header: {err:#}; \
-                 packet timestamps will use the writer's live stream time bases instead"
+                 packet timestamps keep using the pre-header time bases"
             );
-            self.refresh_failed = true;
         }
         Ok(())
     }
@@ -1059,21 +1048,13 @@ impl<W: Writer> Muxer<W> {
     ///   透传流为源流时间基）；目标时间基取流缓存的 **post-header** 值
     ///   （见 [`Self::refresh_stream_info`]），与 [`Self::finish`] 的 flush 路径
     ///   同源。
-    ///
-    /// 刷新失败（`refresh_failed`）时缓存是 pre-header 值，改用逐包实时查询
-    /// `writer.stream_time_base` 兜底（F5）—— 一次额外的查询换取"不按陈旧
-    /// 时间基静默算错"。
     fn write_out_packet(
         &mut self,
         packet: &mut AVPacket,
         stream_idx: usize,
         tb_from: Rational,
     ) -> Result<()> {
-        let out_time_base = if self.refresh_failed {
-            self.writer.stream_time_base(stream_idx)?
-        } else {
-            self.get_stream(stream_idx)?.stream_info.time_base
-        };
+        let out_time_base = self.get_stream(stream_idx)?.stream_info.time_base;
         packet.set_pos(-1);
         packet.set_stream_index(stream_idx as i32);
         packet.rescale_ts(tb_from.into(), out_time_base.into());
@@ -1369,12 +1350,7 @@ impl<W: Writer> Muxer<W> {
                 continue;
             };
             let out_stream_index = mux_stream.stream_index;
-            // F5：刷新失败时缓存不可信，逐包实时查询（与 `write_out_packet` 同源）。
-            let out_stream_time_base = if self.refresh_failed {
-                self.writer.stream_time_base(out_stream_index)?
-            } else {
-                mux_stream.stream_info.time_base
-            };
+            let out_stream_time_base = mux_stream.stream_info.time_base;
             encoder.flush(
                 &mut self.writer,
                 self.interleaved,
@@ -1500,12 +1476,8 @@ pub struct Demuxer<R: Reader> {
     ///
     /// 流集合在构建时定格：`demux()` 只为选中的流建了解码器，之后不会再长。
     /// 运行期读到 `stream_index >= sealed_nb_streams` 的包说明容器**中途长出了
-    /// 新流**（mpegts 的 live 录制中途新 PID/新节目）—— 这类包单独计数并告警，
-    /// 见 [`late_stream_packets_dropped`](Self::late_stream_packets_dropped)。
+    /// 新流**（mpegts 的 live 录制中途新 PID/新节目）—— 这类包走 warn 后丢弃。
     sealed_nb_streams: usize,
-    /// decode 模式下被丢弃的、**构建期不存在**的流的包数（见
-    /// [`late_stream_packets_dropped`](Self::late_stream_packets_dropped)）。
-    late_stream_packets: u64,
 }
 
 impl Demuxer<StreamReader> {
@@ -1707,7 +1679,6 @@ impl<R: Reader> Demuxer<R> {
             passthrough: false,
             failed: false,
             sealed_nb_streams: nb_streams,
-            late_stream_packets: 0,
         })
     }
 
@@ -1811,7 +1782,6 @@ impl<R: Reader> Demuxer<R> {
             passthrough: false,
             failed: false,
             sealed_nb_streams: nb_streams,
-            late_stream_packets: 0,
         })
     }
 
@@ -1824,7 +1794,7 @@ impl<R: Reader> Demuxer<R> {
     /// [`Muxer::mux_packet`](crate::mux::Muxer::mux_packet) 可原样搬运码流。
     pub fn new_passthrough(reader: R) -> Result<Demuxer<R>> {
         // 透传模式不筛流（`demux_packet` 交付所有包），封存值只用于保持字段
-        // 语义统一（运行期新流会自然被交付，不需要计数）。
+        // 语义统一。
         let sealed_nb_streams = reader.input().nb_streams as usize;
         Ok(Self {
             reader,
@@ -1832,7 +1802,6 @@ impl<R: Reader> Demuxer<R> {
             passthrough: true,
             failed: false,
             sealed_nb_streams,
-            late_stream_packets: 0,
         })
     }
 
@@ -1918,22 +1887,6 @@ impl<R: Reader> Demuxer<R> {
     /// 输入流总数。
     pub fn nb_streams(&self) -> usize {
         self.reader.input().nb_streams as usize
-    }
-
-    /// decode 模式下被丢弃的、**构建期不存在**的流的包数（F6）。
-    ///
-    /// 容器允许读到中途才长出新的流：mpegts 的 live 录制会在中途出现新
-    /// PID / 新节目，`read_packet` 交付的 `stream_index` 因而可能超出构建时
-    /// 的流数。`Demuxer` 的流集合（及其解码器）在 build 时定格，不会为新流
-    /// 动态补建 —— 这类包照旧丢弃，但**不再无声**：第一个包打 `warn!`，
-    /// 累计值从这里取，让"录到的文件少了东西"可被核对。
-    ///
-    /// 构建期就存在、只是未被选中的流（字幕跳过、[`new_single_stream`](Self::new_single_stream) /
-    /// [`new_with_streams`](Self::new_with_streams) 名单之外）不计入 —— 那是
-    /// 调用方自己声明的选择。透传模式不受影响：`demux_packet` 交付所有流的
-    /// 包，不存在丢弃。
-    pub fn late_stream_packets_dropped(&self) -> u64 {
-        self.late_stream_packets
     }
 
     /// 读回**容器级**元数据（`title` / `artist` / `comment` / `encoder` …）。
@@ -2055,8 +2008,7 @@ impl<R: Reader> Demuxer<R> {
     /// [`new_single_stream`](Self::new_single_stream) = 单条最佳流，
     /// [`new_with_streams`](Self::new_with_streams) = 点名的那几条），其余流
     /// 的 packet 被丢弃：构建期存在的流走 `debug`，**运行期中途长出的新流**
-    /// 走 `warn` 并计入 [`late_stream_packets_dropped`](Self::late_stream_packets_dropped)
-    /// （F6）。输入读完后先排空各解码器（含滤镜图）才返回
+    /// 走 `warn`。输入读完后先排空各解码器（含滤镜图）才返回
     /// `Ok(None)`：提前停止迭代会丢掉解码器里还压着的帧。
     ///
     /// 透传模式（[`new_passthrough`](Self::new_passthrough)）没有解码器，本
@@ -2085,20 +2037,15 @@ impl<R: Reader> Demuxer<R> {
                             //    `new_from_reader` 跳过的流，或 `new_single_stream` /
                             //    `new_with_streams` 名单之外的流）—— 调用方明确声明的
                             //    选择，debug 级别足够。
-                            // 2. F6：**构建期不存在**的运行期新生流（live TS 中途
-                            //    新 PID/新节目）。只给 debug 等于无声丢数据，live
-                            //    录制场景的消费端无从察觉 —— 升为 warn 并累积计数，
-                            //    供录制结束时核对（`late_stream_packets_dropped`）。
+                            // 2. **构建期不存在**的运行期新生流（live TS 中途新
+                            //    PID/新节目）：只给 debug 等于无声丢数据，升为 warn。
                             //    流集合在 build 时定格是有意为之：解码中途动态补建
                             //    解码器会让输出流集合悄悄变化，不在这里"做得更聪明"。
                             if stream_idx >= self.sealed_nb_streams {
-                                self.late_stream_packets += 1;
                                 tracing::warn!(
                                     "Dropping packet of stream {stream_idx}: the stream appeared \
-                                     after this demuxer was built (build-time nb_streams={}); {} \
-                                     late-stream packet(s) dropped so far",
-                                    self.sealed_nb_streams,
-                                    self.late_stream_packets
+                                     after this demuxer was built (build-time nb_streams={})",
+                                    self.sealed_nb_streams
                                 );
                             } else {
                                 tracing::debug!(
@@ -3963,230 +3910,5 @@ mod tests {
         assert_send::<Demuxer<StreamReader>>();
         assert_send::<Demuxer<BufferReader>>();
         assert_send::<Demuxer<IoReader>>();
-    }
-
-    /// F5 回归：header 之后的 `refresh_stream_info` 失败时，写包路径必须退化为
-    /// **逐包实时**查询 `writer.stream_time_base`，而不是继续用 pre-header 的
-    /// 陈旧缓存（缓存会把全部时间戳按错误的时间基换算，且无声）。
-    ///
-    /// 触发条件只能由自定义 Writer 构造（真实 Writer 在 header 后不会失败），
-    /// 所以这里手写一个包着 [`crate::io::BufferWriter`] 的 mock：header 写出后
-    /// `stream_at` 的**首次**调用报错（正好落在刷新上）；`stream_time_base`
-    /// 永远返回与 `add_stream` 时不同的 `1/90000` —— 写出的 pts 直接暴露了
-    /// 写包路径读的是哪个时间基。
-    #[test]
-    fn test_refresh_failure_falls_back_to_live_time_base() -> Result<()> {
-        use crate::time::Rescale;
-        use rsmpeg::avformat::{AVFormatContextOutput, AVStream};
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        /// 与任何编码器时间基都不同的标记值，读没读它一目了然。
-        const LIVE_TB: Rational = Rational::unit(90_000);
-
-        struct FlakyRefreshWriter {
-            inner: crate::io::BufferWriter,
-            /// header 后 `stream_at` 只在第一次调用时报错（模拟刷新失败）。
-            refresh_failed_once: AtomicBool,
-            live_tb_reads: AtomicUsize,
-            written_pts: Mutex<Vec<i64>>,
-        }
-
-        impl Writer for FlakyRefreshWriter {
-            fn write_header(&mut self) -> Result<()> {
-                Writer::write_header(&mut self.inner)
-            }
-
-            fn is_header_written(&self) -> bool {
-                Writer::is_header_written(&self.inner)
-            }
-
-            fn write_frame(&mut self, packet: &mut AVPacket) -> Result<()> {
-                self.written_pts.lock().unwrap().push(packet.pts);
-                Ok(())
-            }
-
-            fn write_interleaved(&mut self, packet: &mut AVPacket) -> Result<()> {
-                self.written_pts.lock().unwrap().push(packet.pts);
-                Ok(())
-            }
-
-            fn write_trailer(&mut self) -> Result<()> {
-                Writer::write_trailer(&mut self.inner)
-            }
-
-            fn output(&self) -> &AVFormatContextOutput {
-                Writer::output(&self.inner)
-            }
-
-            fn output_mut(&mut self) -> &mut AVFormatContextOutput {
-                Writer::output_mut(&mut self.inner)
-            }
-
-            fn stream_at(&self, index: usize) -> Result<&AVStream> {
-                // 构建期（header 前）正常委托；header 写出后的首次查询报错 ——
-                // 正好是 `ensure_header_written` 里的 `refresh_stream_info`。
-                if Writer::is_header_written(&self.inner)
-                    && !self.refresh_failed_once.swap(true, Ordering::SeqCst)
-                {
-                    return Err(RsmediaError::invalid_config(
-                        "simulated post-header stream_at failure",
-                    ));
-                }
-                Writer::stream_at(&self.inner, index)
-            }
-
-            fn stream_time_base(&self, _stream_index: usize) -> Result<Rational> {
-                self.live_tb_reads.fetch_add(1, Ordering::SeqCst);
-                Ok(LIVE_TB)
-            }
-        }
-
-        let writer = FlakyRefreshWriter {
-            inner: crate::io::BufferWriter::new("mp4")?,
-            refresh_failed_once: AtomicBool::new(false),
-            live_tb_reads: AtomicUsize::new(0),
-            written_pts: Mutex::new(Vec::new()),
-        };
-        let mut muxer = Muxer::new_from_writer(writer);
-
-        // mpeg4（原生、无 B 帧延迟）让 pts 0/1 立即各出一个包。
-        let encoder = EncoderBuilder::new_video(64, 64)
-            .with_codec_name("mpeg4")
-            .build()?;
-        let enc_time_base = encoder.time_base();
-        let index = muxer.add_encoder(encoder)?;
-        assert!(
-            enc_time_base != LIVE_TB,
-            "the fixture needs two distinct time bases, got {enc_time_base:?}"
-        );
-
-        for frame_index in 0..2i64 {
-            let mut frame = generate_video_frame(64, 64, frame_index);
-            frame.set_pts(frame_index);
-            muxer.mux(frame, index)?;
-        }
-
-        // 前提：刷新确实失败了（否则这条测试什么都没测）。
-        assert!(
-            muxer.writer.refresh_failed_once.load(Ordering::SeqCst),
-            "the mock must have failed exactly during refresh_stream_info"
-        );
-
-        let expected = vec![
-            0i64.rescale(enc_time_base, LIVE_TB),
-            1i64.rescale(enc_time_base, LIVE_TB),
-        ];
-        let written = muxer.writer.written_pts.lock().unwrap().clone();
-        assert_eq!(
-            written, expected,
-            "the packet path must rescale with the writer's live time base, not the stale \
-             pre-header cache"
-        );
-        assert!(
-            muxer.writer.live_tb_reads.load(Ordering::SeqCst) >= 2,
-            "each written packet should query the writer once"
-        );
-        Ok(())
-    }
-
-    /// F6 回归：容器**中途长出**的新流（live TS 场景：新 PID/新节目）在 decode
-    /// 模式被丢弃时必须计数 + warn，而不是无声丢失。
-    ///
-    /// 夹具按 live 录制的真实时间线构造：文件先只有 A 段（1 路视频），此时打开
-    /// `Demuxer` —— 构建期（`find_stream_info`）**无从看到**未来才会出现的流；
-    /// 然后往文件尾部追加 B 段（2 路视频，`start_pid=0x200` 避开 A 的 PID
-    /// 0x100，`tables_version=1` 让 PMT 版本变化被解复用器当成一次更新而不是
-    /// 重复），seek 回文件头开始读。读到拼接点时解复用器中途长出两条新流
-    /// （PID 0x200/0x201），而 `Demuxer` 的流集合在构建时就定格 —— 它们的包走
-    /// "late stream" 路径。
-    ///
-    /// 注意不能把 A、B 先拼好再打开：`mpegts` 的 header 预扫描与
-    /// `find_stream_info` 会读很远（探窗口压到 32 字节也照样能看到拼接点之后
-    /// 的 PMT），构建期就把两条流都收进来，反而测不到"中途长流"。
-    #[test]
-    fn test_late_streams_are_counted() -> Result<()> {
-        use crate::io::Seekable;
-
-        /// 写一段 mpegts：`nb_video` 路 `frames` 帧视频，PID 从 `start_pid` 起。
-        fn write_ts_part(
-            path: &Path,
-            nb_video: usize,
-            frames: i64,
-            tables_version: i64,
-            start_pid: i64,
-        ) -> Result<()> {
-            let mut options = AVOptions::new();
-            if tables_version != 0 {
-                options.set("tables_version", tables_version.to_string());
-            }
-            if start_pid != 0 {
-                options.set("start_pid", start_pid.to_string());
-            }
-            let mut muxer = Muxer::new_with_options(path, options)?;
-            let mut indices = Vec::new();
-            for _ in 0..nb_video {
-                // TS 没有放 extradata 的地方：默认的 global-header 模式会把
-                // mpeg4 的 VOL 头塞进 codecpar，文件里只剩裸 VOP，任何解复用器
-                // 都解不出来。关掉它，让 VOL 随码流写在带内。
-                let encoder = EncoderBuilder::new_video(64, 64)
-                    .with_codec_name("mpeg4")
-                    .with_global_header(false)
-                    .build()?;
-                indices.push(muxer.add_encoder(encoder)?);
-            }
-            for frame_index in 0..frames {
-                for &index in &indices {
-                    let mut frame = generate_video_frame(64, 64, frame_index);
-                    frame.set_pts(frame_index);
-                    muxer.mux(frame, index)?;
-                }
-            }
-            muxer.finish()
-        }
-
-        let combined = crate::test_support::test_output_path("mux", "test_late_stream_joined.ts");
-        let part_b = crate::test_support::test_output_path("mux", "test_late_stream_b.ts");
-        write_ts_part(&combined, 1, 50, 0, 0)?;
-        // 第二段的流用全新 PID（0x200/0x201）：拼接点之后 A 的流干净退场，
-        // 解码器不会跨越拼接点吃到无法对齐的数据。
-        write_ts_part(&part_b, 2, 25, 1, 0x200)?;
-
-        // 构建期文件里只有 A 段：快照必然是 1 条流。
-        let mut demuxer = Demuxer::new(combined.clone())?;
-        assert_eq!(
-            demuxer.streams().len(),
-            1,
-            "the build-time snapshot must only contain the first part's stream"
-        );
-
-        // live 录制继续增长：追加 B 段，再 seek 回文件头（顺带清掉读旧 EOF 时
-        // 记录的 EOF 状态、重置解复用器的解析状态）。
-        {
-            let mut out = std::fs::OpenOptions::new().append(true).open(&combined)?;
-            let mut b = std::fs::File::open(&part_b)?;
-            std::io::copy(&mut b, &mut out).context("append part B")?;
-        }
-        demuxer.reader.seek_to_start()?;
-
-        let mut frames = 0usize;
-        while let Some((stream_index, _frame)) = demuxer.demux()? {
-            assert_eq!(stream_index, 0, "only the sealed stream can yield frames");
-            frames += 1;
-        }
-        assert!(frames > 0, "the first part's video must decode to frames");
-        assert!(
-            demuxer.nb_streams() >= 2,
-            "fixture premise: the container itself must grow a second stream mid-file"
-        );
-        assert!(
-            demuxer.late_stream_packets_dropped() > 0,
-            "packets of the stream that appeared mid-file must be counted, not silently lost"
-        );
-
-        for path in [&part_b, &combined] {
-            crate::test_support::remove_test_output(path);
-        }
-        Ok(())
     }
 }
