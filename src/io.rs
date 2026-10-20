@@ -124,8 +124,7 @@ pub trait Reader {
     ///
     /// 成功时返回 `(packet 所属流的 index, packet)`；调用方如需更多流信息
     /// （time_base、metadata 等），可通过 [`stream_at`](Self::stream_at)
-    /// 按索引取流，或经 `self.input()` 直接使用 rsmpeg 的
-    /// [`AVStream`](rsmpeg::avformat::AVStream)。
+    /// 按索引取流，或经 `self.input()` 直接使用 rsmpeg 的 [`AVStream`]。
     fn read_packet(&mut self) -> Result<Option<(usize, AVPacket)>> {
         match self.input_mut().read_packet() {
             Ok(Some(pkt)) => Ok(Some((pkt.stream_index as usize, pkt))),
@@ -1210,7 +1209,7 @@ pub trait Writer {
     /// Obtain mutable reference to output context.
     fn output_mut(&mut self) -> &mut AVFormatContextOutput;
 
-    /// 按输出容器索引取第 `index` 条流（[`Reader::stream_at`](Reader::stream_at)
+    /// 按输出容器索引取第 `index` 条流（[`Reader::stream_at`]
     /// 的写侧对称方法）。
     ///
     /// 越界统一为 [`RsmediaError::InvalidConfig`]（消息带 `nb_streams`）。注意

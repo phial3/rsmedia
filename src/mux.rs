@@ -1928,7 +1928,7 @@ impl<R: Reader> Demuxer<R> {
     /// 冲刷所有解码流，让解码从新位置干净起步。
     ///
     /// 调用时机：对底层 reader 完成 **seek** 之后（如
-    /// [`StreamReader::seek_to_timestamp`](crate::io::StreamReader::seek_to_timestamp)）。
+    /// [`Seekable::seek_to_timestamp`](crate::io::Seekable::seek_to_timestamp)）。
     /// seek 只移动读取位置，解码器与滤镜图里还压着 seek **之前**解出的帧——
     /// DTS/PTS 还没来得及交给调用方的、滤镜（fps/aresample 等）攒着的都会在
     /// seek 之后的下一次迭代里旧账新算地冒出来。本方法把它们全部丢弃，并

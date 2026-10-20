@@ -547,9 +547,9 @@ impl Time {
     ///
     /// 任一侧时间基为 [`Rational::ZERO`] 时换算不可定义（FFmpeg 的
     /// `av_rescale_q` 在单位反向的路径上会触碰除零断言；零时间基本身就
-    /// 声明不了单位，见 [`seconds_or_none`](Self::seconds_or_none) 的同一
-    /// 裁决）—— 该侧时间戳按"无时间"处理（`Aligned` 的对应槽位为 `None`，
-    /// [`apply`](Aligned::apply) 产出无时间的 `Time`），不换算。
+    /// 声明不了单位，见 `seconds_or_none` 的同一裁决）—— 该侧时间戳按
+    /// "无时间"处理（`Aligned` 的对应槽位为 `None`，`Aligned::apply` 产出
+    /// 无时间的 `Time`），不换算。
     pub fn aligned_with(&self, rhs: Time) -> Aligned {
         // S2：`rhs` 的时间基为 ZERO 时换算不可定义（FFmpeg 的 `av_rescale_q`
         // 在单位反向的路径上会触碰除零断言；零时间基本身就声明不了单位，
