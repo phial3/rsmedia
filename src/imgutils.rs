@@ -1,7 +1,7 @@
 use crate::PixelFormat;
 use crate::error::{Result, RsmediaError};
 
-use rsmpeg::avutil::{AVFrame, AVPixFmtDescriptorRef};
+use rsmpeg::avutil::AVFrame;
 use rsmpeg::ffi;
 
 /// FFmpeg's plane arrays are fixed at 4 entries (`AV_NUM_DATA_POINTERS` is 8, but
@@ -237,79 +237,42 @@ struct PlaneGeom {
     bytes_per_row: usize,
 }
 
-/// 复刻 FFmpeg 的 `av_image_fill_max_pixsteps`：遍历描述符的四个分量槽，
-/// 求每个平面的最大步长（`step`，字节/像素）与取得该步长的**分量下标**。
+/// 某个帧平面的行几何：可见行数与每行字节数。
 ///
-/// 返回的 `max_step_comp` 是后续判据的关键 —— 见 [`plane_geom`]。
-fn max_pixsteps(
-    desc: &AVPixFmtDescriptorRef,
-) -> ([i32; MAX_FFMPEG_PLANES], [usize; MAX_FFMPEG_PLANES]) {
-    let mut max_step = [0i32; MAX_FFMPEG_PLANES];
-    let mut max_step_comp = [0usize; MAX_FFMPEG_PLANES];
-    for (component, comp) in desc.comp.iter().enumerate().take(MAX_FFMPEG_PLANES) {
-        // 描述符是 FFmpeg 的静态数据，但 `plane` 一旦越界就会写坏栈上的数组，
-        // 这里按越界跳过处理，而不是照抄 FFmpeg 的无校验索引。
-        let plane = match usize::try_from(comp.plane) {
-            Ok(plane) if plane < MAX_FFMPEG_PLANES => plane,
-            _ => continue,
-        };
-        if comp.step > max_step[plane] {
-            max_step[plane] = comp.step;
-            max_step_comp[plane] = component;
-        }
-    }
-    (max_step, max_step_comp)
-}
-
-/// 依据像素格式描述符，计算指定平面的行几何（与 FFmpeg 的
-/// `av_image_fill_linesizes` / `av_image_fill_plane_sizes` 逐字对应）。
-///
-/// **横向位移的判据是分量下标，不是平面下标**：`av_image_fill_linesizes` 只在
-/// 「该平面取得最大步长的分量是 1 或 2（色度分量）」时应用 `log2_chroma_w`。
-/// 按平面下标判会漏掉 packed 格式 —— `yuyv422` 的全部分量都在平面 0，而它一步
-/// 跨两个像素（一个色度单元），65 宽要按 33 个单元 × 4 字节 = **132** 字节算，
-/// 按平面下标得到的是 65 × 2 = 130，每行尾部 2 字节因此被丢掉。这也让本函数与
-/// [`PixelFormat::data_layout`](crate::PixelFormat::data_layout) 对同一帧给出一致答案。
-///
-/// 纵向位移按平面下标 1、2（FFmpeg 的 `av_image_fill_plane_sizes` 同理），
-/// 位移一律**向上取整**右移（等价于 `AV_CEIL_RSHIFT`）：65x49 的画面其色度平面是
-/// 33x25，而不是向下取整得到的 32x24 —— 后者会截断一整行/列，并在高度为 1 时算出
-/// 0 行，让后续"最后一行"的偏移计算下溢。**平面 3 不是色度平面**：`YUVA420P` 等带
-/// alpha 的格式把 alpha 放在平面 3，它是全分辨率的；按 `plane_idx > 0` 一律位移会把
-/// alpha 平面算成半尺寸，返回的缓冲区少掉四分之三的 alpha 数据。
-///
-/// 每像素字节数取该平面的最大步长；步长为 0（如调色板格式）时按 1 处理。
+/// 几何只有一份定义：[`PixelFormat::data_layout`](crate::PixelFormat::data_layout)，
+/// 它按 FFmpeg 的像素格式描述符推导（与 `av_image_fill_linesizes` /
+/// `av_image_fill_plane_sizes` 同款规则）。这里经
+/// [`storable_video_layout`](crate::frame::storable_video_layout) 取它，再把"元素"
+/// 折算成字节 —— 本模块**不再**自己复刻一份 `max_pixsteps` + 色度位移：两套实现
+/// 靠人工保持"一致"迟早漂移（旧实现就在 packed 子采样的行尾与 `YUVA` 的 alpha
+/// 平面上各错过一次，见本文件的两条回归测试）。
 fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
     let format = frame_pixel_format(frame)?;
-    let desc = format.descriptor()?;
-
-    // `max_pixsteps` 只填长度 4 的数组；越界的平面索引会读到数组之外。
-    if plane_idx >= MAX_FFMPEG_PLANES {
-        return Err(RsmediaError::invalid_config(format!(
-            "Invalid plane index {plane_idx}: FFmpeg's plane arrays hold at most \
-             {MAX_FFMPEG_PLANES} entries"
-        )));
-    }
-
-    let (max_step, max_step_comp) = max_pixsteps(&desc);
-    let ceil_shift = |value: usize, shift: u32| (value + (1usize << shift) - 1) >> shift;
-    let shift_w = if matches!(max_step_comp[plane_idx], 1 | 2) {
-        desc.log2_chroma_w as u32
-    } else {
-        0
+    let negative = |axis: &str, value: i32| {
+        RsmediaError::invalid_config(format!("frame has a negative {axis}: {value}"))
     };
-    let shift_h = match plane_idx {
-        1 | 2 => desc.log2_chroma_h as u32,
-        _ => 0,
-    };
+    let width = u32::try_from(frame.width).map_err(|_| negative("width", frame.width))?;
+    let height = u32::try_from(frame.height).map_err(|_| negative("height", frame.height))?;
 
-    let bytes_per_pixel = match max_step[plane_idx] {
-        step if step > 0 => step as usize,
-        _ => 1,
-    };
+    let layout = crate::frame::storable_video_layout(format, width, height)?;
+    let (rows, row_elements) = layout.plane_row_extent(plane_idx).ok_or_else(|| {
+        RsmediaError::invalid_config(format!(
+            "plane index {plane_idx} is out of range: {} holds {} plane(s)",
+            format.get_pix_fmt_name(),
+            layout.num_planes()
+        ))
+    })?;
+    // `plane_row_extent` 数的是存储元素（8 位格式 1 字节、9..16 位 2 字节），
+    // 复制/偏移都按字节算，所以在这里乘一次。
+    let element_bytes = format.bytes_per_component().ok_or_else(|| {
+        RsmediaError::unsupported(format!(
+            "pixel format {} has no whole-byte component width",
+            format.get_pix_fmt_name()
+        ))
+    })?;
     Ok(PlaneGeom {
-        rows: ceil_shift(frame.height.max(0) as usize, shift_h),
-        bytes_per_row: ceil_shift(frame.width.max(0) as usize, shift_w) * bytes_per_pixel,
+        rows,
+        bytes_per_row: row_elements * element_bytes,
     })
 }
 

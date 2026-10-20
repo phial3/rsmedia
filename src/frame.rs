@@ -777,9 +777,14 @@ impl<T: ElementType> Default for MediaFrame<T> {
 /// 视频格式的采样平面布局，不可整样本平面化的格式返回 `Err`。
 ///
 /// [`PixelFormat::data_layout`] 对这类格式 panic，而帧的格式可能来自解码器（8 位
-/// 调色板 BMP 解出来就是 `pal8`），不是调用方能保证的事。`new_video` 与
-/// `new_video_frame` 共用这里，两个相邻构造器不会对同一份输入给出不同答案。
-fn storable_video_layout(format: PixelFormat, width: u32, height: u32) -> Result<DataLayout> {
+/// 调色板 BMP 解出来就是 `pal8`），不是调用方能保证的事。`new_video`、
+/// `new_video_frame` 与 [`crate::imgutils`] 的平面访问路径共用这里，同一份输入
+/// 不会在不同入口得到不同答案。
+pub(crate) fn storable_video_layout(
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+) -> Result<DataLayout> {
     // 零尺寸与"不可平面存储"同等地走 `Err`：帧的格式/尺寸随时来自解码器或直接
     // 来自用户，`PixelFormat::data_layout` 的 zero-dimension panic 是给"调用方
     // 已检查"的场合的兜底，这里就是那个"调用方"。
