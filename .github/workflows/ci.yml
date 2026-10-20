@@ -98,12 +98,6 @@ jobs:
           xz-utils \
           pkg-config \
           llvm-dev \
-          libc++1 \
-          libva2 \
-          libva-drm2 \
-          libva-x11-2 \
-          libvdpau1 \
-          libxv1 \
           libclang-dev \
           linux-libc-dev \
           build-essential \
@@ -136,26 +130,19 @@ jobs:
           libfdk-aac-dev \
           libasound2-dev \
           libmp3lame-dev \
-          libmp3lame0 \
           libtwolame-dev \
           libjack-jackd2-dev \
           libopencore-amrnb-dev \
           libopencore-amrwb-dev \
-          libva-dev \
-          libdrm-dev \
           libnuma-dev \
           libvdpau-dev \
           ocl-icd-opencl-dev \
-          libass-dev \
           libxml2-dev \
           libfribidi-dev \
           libfreetype-dev \
           libfontconfig1-dev \
           libssh-dev \
-          libzmq5-dev \
-          libssl-dev \
-          librtmp-dev \
-          libiec61883-dev \
+          libzmq3-dev \
           libgnutls28-dev \
           libsmbclient-dev \
           libtiff-dev \
@@ -165,8 +152,10 @@ jobs:
           zlib1g-dev \
           libsdl2-dev \
           liblzma-dev \
-          libzvbi-dev \
-          librubberband-dev
+          librubberband-dev \
+          libvulkan-dev \
+          libplacebo-dev \
+          libjxl-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@nightly
@@ -264,12 +253,6 @@ jobs:
           xz-utils \
           pkg-config \
           llvm-dev \
-          libc++1 \
-          libva2 \
-          libva-drm2 \
-          libva-x11-2 \
-          libvdpau1 \
-          libxv1 \
           libclang-dev \
           linux-libc-dev \
           build-essential \
@@ -302,26 +285,19 @@ jobs:
           libfdk-aac-dev \
           libasound2-dev \
           libmp3lame-dev \
-          libmp3lame0 \
           libtwolame-dev \
           libjack-jackd2-dev \
           libopencore-amrnb-dev \
           libopencore-amrwb-dev \
-          libva-dev \
-          libdrm-dev \
           libnuma-dev \
           libvdpau-dev \
           ocl-icd-opencl-dev \
-          libass-dev \
           libxml2-dev \
           libfribidi-dev \
           libfreetype-dev \
           libfontconfig1-dev \
           libssh-dev \
-          libzmq5-dev \
-          libssl-dev \
-          librtmp-dev \
-          libiec61883-dev \
+          libzmq3-dev \
           libgnutls28-dev \
           libsmbclient-dev \
           libtiff-dev \
@@ -331,8 +307,10 @@ jobs:
           zlib1g-dev \
           libsdl2-dev \
           liblzma-dev \
-          libzvbi-dev \
-          librubberband-dev
+          librubberband-dev \
+          libvulkan-dev \
+          libplacebo-dev \
+          libjxl-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@nightly
@@ -503,87 +481,79 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            nasm \
-            yasm \
-            curl \
-            wget \
-            unzip \
-            gnupg \
-            clang \
-            cmake \
-            libtool \
-            autoconf \
-            automake \
-            binutils \
-            xz-utils \
-            pkg-config \
-            llvm-dev \
-            libc++1 \
-            libva2 \
-            libva-drm2 \
-            libva-x11-2 \
-            libvdpau1 \
-            libxv1 \
-            libclang-dev \
-            linux-libc-dev \
-            build-essential \
-            ca-certificates \
-            libva-dev \
-            libvpx-dev \
-            libaom-dev \
-            libass-dev \
-            libdrm-dev \
-            libv4l-dev \
-            libx264-dev \
-            libx265-dev \
-            libzimg-dev \
-            libdav1d-dev \
-            libwebp-dev \
-            libbluray-dev \
-            libtheora-dev \
-            libvidstab-dev \
-            libsvtav1enc-dev \
-            libxvidcore-dev \
-            libopenjp2-7-dev \
-            libgsm1-dev \
-            libsoxr-dev \
-            libopus-dev \
-            libpulse-dev \
-            libshine-dev \
-            libspeex-dev \
-            libbs2b-dev \
-            libvorbis-dev \
-            libfdk-aac-dev \
-            libasound2-dev \
-            libmp3lame-dev \
-            libmp3lame0 \
-            libtwolame-dev \
-            libjack-jackd2-dev \
-            libopencore-amrnb-dev \
-            libopencore-amrwb-dev \
-            libnuma-dev \
-            libvdpau-dev \
-            ocl-icd-opencl-dev \
-            libxml2-dev \
-            libfribidi-dev \
-            libfreetype-dev \
-            libfontconfig1-dev \
-            libssh-dev \
-            libzmq5-dev \
-            libssl-dev \
-            librtmp-dev \
-            libiec61883-dev \
-            libgnutls28-dev \
-            libsmbclient-dev \
-            libtiff-dev \
-            libpng-dev \
-            libraw-dev \
-            libjpeg-dev \
-            zlib1g-dev \
-            libsdl2-dev \
-            liblzma-dev \
-            libzvbi-dev \
-            librubberband-dev
+          nasm \
+          yasm \
+          curl \
+          wget \
+          unzip \
+          gnupg \
+          clang \
+          cmake \
+          libtool \
+          autoconf \
+          automake \
+          binutils \
+          xz-utils \
+          pkg-config \
+          llvm-dev \
+          libclang-dev \
+          linux-libc-dev \
+          build-essential \
+          ca-certificates \
+          libva-dev \
+          libvpx-dev \
+          libaom-dev \
+          libass-dev \
+          libdrm-dev \
+          libv4l-dev \
+          libx264-dev \
+          libx265-dev \
+          libzimg-dev \
+          libdav1d-dev \
+          libwebp-dev \
+          libbluray-dev \
+          libtheora-dev \
+          libvidstab-dev \
+          libsvtav1enc-dev \
+          libxvidcore-dev \
+          libopenjp2-7-dev \
+          libgsm1-dev \
+          libsoxr-dev \
+          libopus-dev \
+          libpulse-dev \
+          libshine-dev \
+          libspeex-dev \
+          libbs2b-dev \
+          libvorbis-dev \
+          libfdk-aac-dev \
+          libasound2-dev \
+          libmp3lame-dev \
+          libtwolame-dev \
+          libjack-jackd2-dev \
+          libopencore-amrnb-dev \
+          libopencore-amrwb-dev \
+          libnuma-dev \
+          libvdpau-dev \
+          ocl-icd-opencl-dev \
+          libxml2-dev \
+          libfribidi-dev \
+          libfreetype-dev \
+          libfontconfig1-dev \
+          libssh-dev \
+          libzmq3-dev \
+          libgnutls28-dev \
+          libsmbclient-dev \
+          libtiff-dev \
+          libpng-dev \
+          libraw-dev \
+          libjpeg-dev \
+          zlib1g-dev \
+          libsdl2-dev \
+          liblzma-dev \
+          librubberband-dev \
+          libvulkan-dev \
+          libplacebo-dev \
+          libjxl-dev
 
       - name: Install BtbN FFmpeg
         run: |
