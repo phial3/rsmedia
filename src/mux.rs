@@ -2014,6 +2014,12 @@ impl<R: Reader> Demuxer<R> {
     /// 透传模式（[`new_passthrough`](Self::new_passthrough)）没有解码器，本
     /// 方法返回 `InvalidConfig`，应改用
     /// [`demux_packet`](Self::demux_packet)。
+    ///
+    /// # Errors
+    ///
+    /// 读包失败或某个解码器报错时原样返回；读取已结束、但解码器连着
+    /// `MAX_EAGAIN_RETRIES` 拍都"暂无帧"时返回错误 —— 那是坏输入或坏状态机，
+    /// 不能当作流正常结束（否则调用方会把截断的输出当完整结果）。
     pub fn demux(&mut self) -> Result<Option<(usize, AVFrame)>> {
         if self.is_passthrough() {
             return Err(RsmediaError::invalid_config(
@@ -2081,8 +2087,13 @@ impl<R: Reader> Demuxer<R> {
                 //    fps/framerate 这类有延迟的）仍可能压着帧，按 `is_flushed`
                 //    跳过会丢掉它们。
                 //
-                // 循环以 `MAX_EAGAIN_RETRIES` 为上限，与 `Decoder::drain` 一致：
+                // 循环以 `MAX_EAGAIN_RETRIES` 为上限，与 `decode_stream` 一致：
                 // 个别编解码器在 EOS 后可能一直回"暂无帧"，没有上限就是挂死。
+                //
+                // 撞上限时**报错**，不返回 `Ok(None)`：后者会让 `Iterator::next`
+                // 以为流正常结束，把截断的输出当完整结果交给调用方 —— 这是调用方
+                // 最没法察觉的失败方式，也是本函数与 `decode_stream` 原先唯一分叉
+                // 的地方。
                 let mut drain_iterations = 0usize;
                 loop {
                     let mut pending = false;
@@ -2111,11 +2122,16 @@ impl<R: Reader> Demuxer<R> {
                     }
                     drain_iterations += 1;
                     if drain_iterations >= crate::MAX_EAGAIN_RETRIES {
-                        tracing::warn!(
-                            "Demuxer: decoders produced no frame after {} drain iterations; ending demux()",
+                        tracing::error!(
+                            "Demuxer: decoders produced no frame after {} drain iterations; \
+                             treating the stream as damaged",
                             crate::MAX_EAGAIN_RETRIES
                         );
-                        return Ok(None);
+                        return Err(RsmediaError::msg(format!(
+                            "Demuxer keeps returning EAGAIN after EOF, aborting after {} \
+                             iterations",
+                            crate::MAX_EAGAIN_RETRIES
+                        )));
                     }
                 }
             }

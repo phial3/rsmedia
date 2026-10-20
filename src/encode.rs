@@ -2392,6 +2392,17 @@ impl Encoder {
                         writer.write_frame(&mut packet)?
                     };
                     written_packets += 1;
+                    // 产出也有上限：`drained_iterations` 只在空转时增长，正常产出时
+                    // 归零，单独的它拦不住"每挤出几包就空转一阵"的病态编码器 ——
+                    // 那种情况会一直往 writer 里写。与 `MAX_DRAIN_OUTPUTS` 的语义
+                    // 一致（见 `lib.rs`）：一次排空调用能交出的包数是有限的。
+                    if written_packets >= crate::MAX_DRAIN_OUTPUTS {
+                        return Err(RsmediaError::msg(format!(
+                            "Encoder produced more than {} packets while flushing; aborting, \
+                             output is truncated after {written_packets} packet(s)",
+                            crate::MAX_DRAIN_OUTPUTS
+                        )));
+                    }
                 }
                 Ok(None) => {
                     if self.is_drained() {

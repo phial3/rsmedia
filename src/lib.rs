@@ -113,8 +113,9 @@ pub use time::{Rational, Time};
 /// data). For a while either is legitimate — a B-frame lookahead or a
 /// frame-threaded decoder can answer `EAGAIN` many times — but neither may last
 /// forever, or a damaged stream would turn a public call into a hang. Every
-/// retry path here (decoder, encoder, filter graph, demuxer) gives up with an
-/// error after this many attempts.
+/// retry path here (decoder, encoder, filter graph, demuxer) gives up after this
+/// many consecutive attempts, and gives up **loudly**: the one place that cannot
+/// return an error is a `Drop` impl, which logs instead.
 ///
 /// This bounds *waiting*, not output: a loop that resets its counter whenever
 /// something is produced may legitimately run longer than this. See
@@ -123,11 +124,14 @@ pub(crate) const MAX_EAGAIN_RETRIES: usize = 1_000;
 
 /// Upper bound on how many items a single drain call may hand back.
 ///
-/// [`Resampler::flush_frames`] and the subtitle drain keep pulling until the
-/// source reports it has nothing left, so this caps how much buffered data one
-/// call accepts — a source that never empties is a broken one, not a productive
-/// one. It says nothing about waiting: those sources answer at once, which is
-/// why this is kept separate from `MAX_EAGAIN_RETRIES`.
+/// The counterpart of `MAX_EAGAIN_RETRIES`: a drain that keeps *producing* is
+/// not waiting, so the wait counter never fires, and only this one can stop it.
+/// It covers every drain that pulls until the source reports it has nothing
+/// left — [`Resampler::flush_frames`], the subtitle drain,
+/// [`Encoder::flush`](crate::Encoder::flush) and
+/// [`FilterGraph::drain_output`](crate::FilterGraph::drain_output) — and the
+/// decoder's internal queue pump. A source that never empties is a broken one,
+/// not a productive one.
 pub(crate) const MAX_DRAIN_OUTPUTS: usize = 1_000;
 
 /// re-exported under the name `ffmpeg`

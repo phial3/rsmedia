@@ -1218,6 +1218,10 @@ impl Decoder {
     /// An error once the whole pipeline is finished — decoder at EOF and filter
     /// graph flushed; call [`reset`](Self::reset) before decoding again.
     ///
+    /// Also an error when the input has ended but the decoder keeps answering
+    /// "no frame right now" without ever reporting EOF (a damaged stream): the
+    /// call fails instead of handing back a silently truncated stream.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -1484,8 +1488,13 @@ impl Decoder {
     ///
     /// 只搬运、不归一化：归一化（HW 下载 / 缩放 / 滤镜）严格按交付顺序逐帧做，
     /// 否则滤镜图会看到乱序的输入。
+    ///
+    /// 产出有上限（`MAX_DRAIN_OUTPUTS`）：本函数没有"返回一项给调用方"的出口，
+    /// 只能一次搬完，所以上限在这里自己把关。一个包能解出的帧数是有限的（场编码
+    /// 最多几帧），越过上限说明解码器已经不受控，继续搬只会让队列无限增长 ——
+    /// 报错，不静默撑爆内存。
     fn drain_decoder_frames(&mut self) -> Result<()> {
-        loop {
+        for _ in 0..crate::MAX_DRAIN_OUTPUTS {
             match self.decoder_receive_frame() {
                 Ok(Some(frame)) => self.pending_frames.push_back(frame),
                 // EAGAIN / EOF：此刻再没有可取的帧。
@@ -1493,6 +1502,11 @@ impl Decoder {
                 Err(e) => return Err(e),
             }
         }
+        Err(RsmediaError::msg(format!(
+            "Decoder produced more than {} frames without pausing; aborting instead of growing \
+             the pending queue without bound",
+            crate::MAX_DRAIN_OUTPUTS
+        )))
     }
 
     /// Drain one frame from the decoder.

@@ -3202,6 +3202,17 @@ impl FilterGraph {
                 Ok(Some(frame)) => {
                     drained_iterations = 0;
                     frames.push(frame);
+                    // 与 `MAX_EAGAIN_RETRIES` 是一对：空转计数在有产出时归零，所以
+                    // 停在产出侧的这把闸才拦得住"一直在出帧"的图（`loop` 之类会
+                    // 永远产出的滤镜、或已损坏的图）。见 `lib.rs` 的说明。
+                    if frames.len() >= crate::MAX_DRAIN_OUTPUTS {
+                        return Err(RsmediaError::msg(format!(
+                            "Filter graph produced more than {} buffered frames while flushing; \
+                             aborting, {} already-dequeued frames are discarded",
+                            crate::MAX_DRAIN_OUTPUTS,
+                            frames.len()
+                        )));
+                    }
                 }
                 Ok(None) => {
                     if self.state_at(output).is_flushed() {
