@@ -1016,15 +1016,22 @@ impl Decoder {
     }
 
     /// Width of the decoder's input video frame, in pixels.
+    ///
+    /// `AVCodecContext.width` is `c_int`, but a negative width is not a value the
+    /// codec layer can produce; every other public pixel dimension in this crate
+    /// is `u32` (see [`VideoSpec`]), so this getter
+    /// converts once at the boundary instead of leaking the FFmpeg type.
     #[inline(always)]
-    pub fn width(&self) -> i32 {
-        self.context.width
+    pub fn width(&self) -> u32 {
+        self.context.width as u32
     }
 
     /// Height of the decoder's input video frame, in pixels.
+    ///
+    /// Same reasoning as [`width`](Self::width).
     #[inline(always)]
-    pub fn height(&self) -> i32 {
-        self.context.height
+    pub fn height(&self) -> u32 {
+        self.context.height as u32
     }
 
     /// `AVCodecContext.flags` 位集（`AV_CODEC_FLAG_*`，取值见 [`AVCodecFlag`]）。
@@ -1075,9 +1082,13 @@ impl Decoder {
     }
 
     /// Audio samples per second.
+    ///
+    /// `AVCodecContext.sample_rate` is `c_int`; a non-positive rate is not a
+    /// value a successfully opened audio decoder can report, so the getter
+    /// hands out `u32` to match [`StreamInfo::sample_rate`].
     #[inline]
-    pub fn sample_rate(&self) -> i32 {
-        self.context.sample_rate
+    pub fn sample_rate(&self) -> u32 {
+        self.context.sample_rate as u32
     }
 
     /// The sample format of the frames this decoder **yields**, which is the

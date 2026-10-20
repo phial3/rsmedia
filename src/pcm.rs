@@ -606,7 +606,7 @@ mod tests {
         }
         let channels = u32::try_from(channels)
             .map_err(|_| RsmediaError::invalid_config("decoded channel count out of range"))?;
-        Ok((total_samples, sample_rate as u32, channels))
+        Ok((total_samples, sample_rate, channels))
     }
 
     /// Read the codec id straight from the container's stream parameters.

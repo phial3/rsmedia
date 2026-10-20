@@ -151,7 +151,7 @@ pub struct StreamInfo {
 
     // Audio parameters
     /// Audio sample rate
-    pub sample_rate: i32,
+    pub sample_rate: u32,
     /// Audio Channel layout
     pub channel_layout: AVChannelLayout,
     /// Audio frame size
@@ -337,7 +337,7 @@ impl StreamInfo {
                 0.0
             },
             // Audio
-            sample_rate: codecpar.sample_rate,
+            sample_rate: codecpar.sample_rate as u32,
             channel_layout: codecpar.ch_layout().clone(),
             frame_size: codecpar.frame_size,
             block_align: codecpar.block_align,
