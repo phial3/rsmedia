@@ -16,7 +16,8 @@
 use crate::MediaType;
 use crate::error::{Context, Result, RsmediaError};
 use crate::flags::FlagSet;
-use crate::fmt::{DataLayout, FrameFormat, SampleFormat};
+use crate::fmt::{FrameFormat, SampleFormat};
+use crate::layout::DataLayout;
 use crate::options::Metadata;
 use crate::pixel::PixelFormat;
 use crate::scale::VideoSpec;
@@ -78,17 +79,13 @@ impl ElementType for f64 {}
 /// [`SampleFormat::data_layout`]; [`MediaFrame`] validates against that, so
 /// callers never have to assemble the rules themselves.
 ///
-/// # Invariants
+/// A plane is a row-major `rows x cols` block; an interleaved layout folds its
+/// component axis into the columns, so it is exactly a one-plane frame. Audio
+/// layouts are always one row tall, which keeps the row stride out of every
+/// audio path and lets one copy routine serve every case.
 ///
-/// * A plane is a row-major `rows x cols` block; an interleaved layout folds its
-///   component axis into the columns, so it is exactly a one-plane frame.
-/// * Audio layouts are always one row tall. The row stride therefore never
-///   applies to audio, which is what lets one copy routine serve every case.
-///
-/// # Access
-///
-/// Access is explicit — there is no indexing shorthand, because the two variants
-/// mean different things. Use [`as_packed`](Self::as_packed) /
+/// Access is explicit — no indexing shorthand, because the two variants mean
+/// different things. Use [`as_packed`](Self::as_packed) /
 /// [`as_planes`](Self::as_planes) to pick a variant, and
 /// [`plane`](Self::plane) / [`map_planes`](Self::map_planes) to work with the
 /// plane abstraction both variants share.
@@ -774,35 +771,6 @@ impl<T: ElementType> Default for MediaFrame<T> {
     }
 }
 
-/// 视频格式的采样平面布局，不可整样本平面化的格式返回 `Err`。
-///
-/// [`PixelFormat::data_layout`] 对这类格式 panic，而帧的格式可能来自解码器（8 位
-/// 调色板 BMP 解出来就是 `pal8`），不是调用方能保证的事。`new_video`、
-/// `new_video_frame` 与 [`crate::imgutils`] 的平面访问路径共用这里，同一份输入
-/// 不会在不同入口得到不同答案。
-pub(crate) fn storable_video_layout(
-    format: PixelFormat,
-    width: u32,
-    height: u32,
-) -> Result<DataLayout> {
-    // 零尺寸与"不可平面存储"同等地走 `Err`：帧的格式/尺寸随时来自解码器或直接
-    // 来自用户，`PixelFormat::data_layout` 的 zero-dimension panic 是给"调用方
-    // 已检查"的场合的兜底，这里就是那个"调用方"。
-    if width == 0 || height == 0 {
-        return Err(RsmediaError::invalid_config(format!(
-            "video frame needs a positive size, got {width}x{height}"
-        )));
-    }
-    if !format.is_plane_storable() {
-        return Err(RsmediaError::unsupported(format!(
-            "pixel format {} cannot be stored as sample planes: a bitstream, paletted \
-             or hardware format has no whole-sample layout",
-            format.get_pix_fmt_name()
-        )));
-    }
-    Ok(format.data_layout(width, height))
-}
-
 impl<T> MediaFrame<T>
 where
     T: ElementType,
@@ -822,7 +790,7 @@ where
                 .format
                 .into_pixel()
                 .ok_or_else(|| RsmediaError::invalid_config("Video frame needs a pixel format"))?;
-            storable_video_layout(format, self.width, self.height)
+            format.try_data_layout(self.width, self.height)
         } else {
             if self.nb_samples == 0 || self.nb_channels == 0 {
                 return Err(RsmediaError::invalid_config(format!(
@@ -876,7 +844,7 @@ where
     ///
     /// 只需 `width` / `height` / `format`；时间基的处理见 [`new_video`](Self::new_video)。
     pub fn new_video_frame(width: u32, height: u32, format: PixelFormat) -> Result<Self> {
-        let layout = storable_video_layout(format, width, height)?;
+        let layout = format.try_data_layout(width, height)?;
         Self::new_video(width, height, format, FrameData::zeros(&layout))
     }
 
@@ -952,7 +920,7 @@ where
     fn validated(self) -> Result<Self> {
         // 音频的声道数/采样数必须为正：否则平面布局是空列表、`matches` 会接受，
         // 一个"没有声道"的帧就能一路走到 FFmpeg。视频侧的等价约束（正尺寸）由
-        // `storable_video_layout` 的零尺寸 `Err` 覆盖 —— 不再依赖底层
+        // `PixelFormat::try_data_layout` 的零尺寸 `Err` 覆盖 —— 不依赖底层
         // `PixelFormat::data_layout` 的 panic 兜底。
         if self.media_type == MediaType::AUDIO && (self.nb_channels == 0 || self.nb_samples == 0) {
             return Err(RsmediaError::msg(format!(
@@ -1613,7 +1581,10 @@ where
                 dst_fmt.get_pix_fmt_name()
             )));
         }
-        let dst_layout = dst_fmt.data_layout(self.width, self.height);
+        // 上面的 `is_plane_storable` 是**必要非充分**的（`uyyvyy411` 能通过它），
+        // 所以这里不能用会 panic 的 `data_layout`：目标格式是调用方给的公开枚举值，
+        // 一个合法取值不该让返回 `Result` 的公开方法变成进程终止。
+        let dst_layout = dst_fmt.try_data_layout(self.width, self.height)?;
         // `read_samples::<T>` reads `size_of::<T>()`-wide elements, so a target
         // with a different component width must be rejected here rather than
         // reinterpreted: asking for `YUV420P10LE` out of a `MediaFrame<u8>`
@@ -1919,7 +1890,8 @@ fn yuv420p_extent<T>(data: &FrameData<T>) -> Result<(usize, usize)> {
 /// Checks `data` against the layout `format` requires at `width` x `height`.
 ///
 /// 零尺寸在这里前置拒绝：`check_layout` 的宽高来自调用点的用户数据，不应让
-/// 坏尺寸触达 [`PixelFormat::data_layout`] 的 panic 兜底。
+/// 坏尺寸触达 [`PixelFormat::try_data_layout`] 的分类逻辑（它同样会报
+/// `InvalidConfig`，但消息里没有调用点上下文）。
 fn check_layout<T>(
     data: &FrameData<T>,
     format: PixelFormat,
@@ -1931,7 +1903,7 @@ fn check_layout<T>(
             "video frame needs a positive size, got {width}x{height}"
         )));
     }
-    let layout = format.data_layout(width, height);
+    let layout = format.try_data_layout(width, height)?;
     if data.matches(&layout) {
         Ok(())
     } else {
@@ -2062,12 +2034,40 @@ mod tests {
     use std::error::Error as StdError;
     use std::time::Duration;
 
+    /// 返回 `Result` 的视频帧入口不得因格式算不出布局而 panic。
+    ///
+    /// 帧的格式可以来自解码器，也可以直接来自用户。拿
+    /// [`PixelFormat::is_plane_storable`](crate::pixel::PixelFormat::is_plane_storable)
+    /// 做守卫**并不充分** —— `uyyvyy411` 能通过它，却在布局计算里因为"每像素占
+    /// 分数个元素"被拒，所以这条路径必须走 [`PixelFormat::try_data_layout`]。
+    #[test]
+    fn test_video_frame_rejects_unlayoutable_format_instead_of_panicking() {
+        // 前提：守卫确实不充分，这条测试才有意义。
+        assert!(
+            PixelFormat::UYYVYY411.is_plane_storable(),
+            "the guard must be insufficient for this regression test to mean anything"
+        );
+        assert!(PixelFormat::UYYVYY411.try_data_layout(64, 64).is_err());
+
+        let err = MediaFrame::<u8>::new_video_frame(64, 64, PixelFormat::UYYVYY411)
+            .expect_err("a Result-returning constructor must report, not abort");
+        assert!(
+            matches!(err.root(), RsmediaError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+
+        // `data_layout` 走同一条路径：格式不可布局时也是 Err。
+        let frame = MediaFrame::<u8>::new_video_frame(8, 8, PixelFormat::RGB24)
+            .expect("rgb24 lays out fine");
+        assert!(frame.data_layout().is_ok());
+    }
+
     /// 单行的平面同样要做"能整除"这道校验。
     ///
-    /// `plane_stride` 曾对 `rows <= 1` 直接返回 `linesize / element_size`：当
-    /// `linesize` 不是元素大小的整数倍时得到的是一个**被截断**的 stride，虽然
-    /// 当前两处调用方的循环恰好用不到它（只有一行），但这个函数自身的契约是
-    /// "validated stride"，把截断值交出去就是在埋雷。
+    /// `plane_stride` 对 `rows <= 1` 也必须校验整除：`linesize` 不是元素大小的
+    /// 整数倍时，`linesize / element_size` 是一个**被截断**的 stride。当前两处
+    /// 调用方的循环恰好用不到它（只有一行），但这个函数的契约是 "validated
+    /// stride"，交出截断值就是违约。
     ///
     /// 反过来，"一行放得下吗"对单行平面仍然免检：音频平面（以及高度为一的视频
     /// 平面）从 FFmpeg 那里拿到的 `linesize` 未必衡量行宽——超过内联数组 8 个平面
@@ -2325,7 +2325,7 @@ mod tests {
     }
 
     /// `convert_to` 的文档写的是 "Fails for … `dst` formats with no sample planes"，
-    /// 所以它也必须报错 —— 曾经这里是 panic。
+    /// 所以它必须报错，不能 panic。
     #[test]
     fn convert_to_reports_a_non_storable_target() {
         let frame = MediaFrame::<u8>::new_video_frame(8, 8, PixelFormat::RGB24).unwrap();
@@ -2338,7 +2338,7 @@ mod tests {
 
     /// 元素宽度不符的帧在**构造点**就被拒绝，而不是等到 `to_avframe`。
     ///
-    /// 这条边界原先只在跨 FFI 拷贝时才检查，因此能造出一个永远无法编码的帧。
+    /// 只在跨 FFI 拷贝时才检查的话，会造出一个永远无法编码的帧。
     #[test]
     fn test_element_width_checked_at_construction() {
         // S16 每样本 2 字节，u8 数据即使形状正确也不能构成 S16 帧。
@@ -3172,9 +3172,9 @@ mod tests {
         Ok(())
     }
 
-    /// S4：≥2^31 的采样率在构造期就报 `InvalidConfig` —— 曾经的 `as i32`
-    /// 会把它变成**负数**，`1/sample_rate` 归一后得到负时间基，一路写进
-    /// AVFrame 后下游 pts→秒 全部反号。0（"不声明采样率"）仍然合法。
+    /// ≥2^31 的采样率在构造期就报 `InvalidConfig`：`as i32` 会把它变成**负数**，
+    /// `1/sample_rate` 归一后得到负时间基，写进 AVFrame 后下游 pts→秒 全部反号。
+    /// 0（"不声明采样率"）仍然合法。
     #[test]
     fn test_audio_sample_rate_beyond_i32_is_rejected_at_construction() {
         let err =
@@ -3193,9 +3193,8 @@ mod tests {
         assert!(MediaFrame::<u8>::new_audio_frame(SampleFormat::U8, 1, 16, 0).is_ok());
     }
 
-    /// S4：`sample_rate` 字段是公开的（构造后仍可改写），`to_avframe` 出口
-    /// 必须再拦一次 —— 负时间基绝不能进 AVFrame；合法值照常推导
-    /// `1/sample_rate`。
+    /// `sample_rate` 字段是公开的（构造后仍可改写），`to_avframe` 出口必须再拦
+    /// 一次 —— 负时间基绝不能进 AVFrame；合法值照常推导 `1/sample_rate`。
     #[test]
     fn test_to_avframe_rejects_an_overflowed_public_sample_rate() -> Result<()> {
         let mut frame = MediaFrame::<u8>::new_audio_frame(SampleFormat::U8, 1, 4, 48_000)?;

@@ -1,9 +1,8 @@
-//! What a stream *is*: its media type and its codec parameters.
+//! What a stream *is*: its codec parameters, once detached from any container.
 //!
-//! Two pieces:
-//!
-//! * [`MediaType`] — video / audio / subtitle / … , the classification every
-//!   builder and stream lookup is keyed by.
+//! * [`MediaType`] — video / audio / subtitle / … ,
+//!   the classification every builder and stream lookup is keyed by. It is
+//!   defined in [`crate::mediatype`] and re-exported here for convenience.
 //! * [`StreamInfo`] — a detached snapshot of one stream's parameters
 //!   (codec, format, dimensions, time base, …), the value you read from an
 //!   input to configure an encoder or to duplicate a stream into a muxer.
@@ -21,44 +20,20 @@ use crate::{Metadata, PixelFormat};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecParameters};
 use rsmpeg::avformat::AVStream;
-use rsmpeg::avutil::{self, AVChannelLayout};
+use rsmpeg::avutil::AVChannelLayout;
 use rsmpeg::ffi;
 
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 
-ffi_enum_from!(
-    /// Media type (FFmpeg `AVMEDIA_TYPE_*`): the classification of a stream.
-    ///
-    /// Generated from one `variant => constant` table with a two-way `From`. A value the table
-    /// does not list panics rather than degrading to `UNKNOWN`, so a stream type this crate does
-    /// not model is reported immediately instead of being silently treated as unknown — the
-    /// listed `AVMEDIA_TYPE_UNKNOWN` still converts to `UNKNOWN` as usual.
-    MediaType => ffi::AVMediaType,
-    repr = i32,
-    fallback = panic {
-        UNKNOWN => ffi::AVMEDIA_TYPE_UNKNOWN;
-        VIDEO => ffi::AVMEDIA_TYPE_VIDEO;
-        AUDIO => ffi::AVMEDIA_TYPE_AUDIO;
-        DATA => ffi::AVMEDIA_TYPE_DATA;
-        SUBTITLE => ffi::AVMEDIA_TYPE_SUBTITLE;
-        ATTACHMENT => ffi::AVMEDIA_TYPE_ATTACHMENT;
-    }
-);
-
-impl MediaType {
-    pub fn get_media_name(&self) -> String {
-        // 同 `SampleFormat::get_sample_fmt_name`：FFmpeg 给的名字非 UTF-8 时降级显示。
-        avutil::get_media_type_string(*self as _)
-            .map_or("Unknown".to_string(), strutils::cstr_to_string_lossy)
-    }
-}
-
-impl Display for MediaType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.get_media_name())
-    }
-}
+/// `MediaType` 定义在叶子模块 [`crate::mediatype`]，那里不依赖 crate 内任何其它
+/// 模块。IO 层（[`crate::io::Reader::find_best_stream`]）与编解码层都要用它，
+/// 若由本模块拥有，它们就得反向依赖本模块，而本模块又依赖 IO 的 `Reader` /
+/// `Writer`，两者会成环。
+///
+/// 在这里重导出，使 `rsmedia::stream::MediaType` 与根部的 `rsmedia::MediaType`
+/// 同时可用。
+pub use crate::mediatype::MediaType;
 
 /// A snapshot of one stream's codec parameters, detached from any container.
 ///

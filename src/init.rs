@@ -22,7 +22,7 @@
 
 use crate::error::{Result, RsmediaError};
 use crate::flags::FlagSet;
-use crate::io::init_logging;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use once_cell::sync::OnceCell;
 use rsmpeg::ffi;
@@ -218,6 +218,156 @@ ffi_enum!(
         PRINT_DATETIME => ffi::AV_LOG_PRINT_DATETIME;
     }
 );
+
+////////////////////////////////////////
+// Logging
+////////////////////////////////////////
+
+/// Initialize the logging handler. This will redirect all ffmpeg logging to the Rust `tracing`
+/// crate and any subscribers to it.
+///
+/// `level` 是会被真正执行的过滤门槛：FFmpeg 的 `av_log_set_level` 只作用于它
+/// 自带的默认回调，装上自定义回调后**所有**级别的消息都会送进来，因此本函数
+/// 记下 `level` 并在回调里自行丢弃更啰嗦的消息——包括 [`AVLogLevel::QUIET`]。
+///
+/// `flag` 是 [`AVLogFlag`] 位集，按 [`FlagSet<AVLogFlag>`](crate::FlagSet) 给出（单个标志或 `|` 组合）。
+pub fn init_logging(level: AVLogLevel, flag: impl Into<FlagSet<AVLogFlag>>) {
+    let flag = flag.into();
+    LOG_LEVEL.store(level as i32, Ordering::Relaxed);
+    // SAFETY: all three are process-global setters with no preconditions; `log_callback` is an
+    // `extern "C"` fn whose signature is exactly the one FFmpeg calls it through.
+    unsafe {
+        ffi::av_log_set_callback(Some(log_callback));
+        ffi::av_log_set_level(level as _);
+        ffi::av_log_set_flags(flag.bits() as _);
+    }
+}
+
+/// [`init_logging`] 配置的最大输出级别（FFmpeg 数值语义：越大越啰嗦）。
+///
+/// 默认 `INFO`，与 FFmpeg 自带默认回调的过滤器行为一致。
+static LOG_LEVEL: AtomicI32 = AtomicI32::new(AVLogLevel::INFO as i32);
+
+/// Internal function with C-style callback behavior that receives all log messages from ffmpeg and
+/// handles them with the `tracing` crate, the Rust way.
+///
+/// 这里是 `catch_unwind` 边界：`tracing` 的订阅者可能 panic，而 panic 逸出
+/// `extern "C"` 边界会 abort 整个进程；宁可丢一条日志，也不能拖垮宿主程序。
+///
+/// # Arguments
+///
+/// * `avcl` - Internal struct with log message data.
+/// * `level_no` - Log message level integer.
+/// * `fmt` - Log message format string.
+/// * `vl` - Variable list with format string items.
+unsafe extern "C" fn log_callback(
+    avcl: *mut std::ffi::c_void,
+    level_no: std::ffi::c_int,
+    fmt: *const std::ffi::c_char,
+    #[cfg(all(target_arch = "x86_64", target_family = "unix"))] vl: *mut ffi::__va_list_tag,
+    #[cfg(not(all(target_arch = "x86_64", target_family = "unix")))] vl: ffi::va_list,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: 参数由 FFmpeg 传入，在回调期间保持有效；实现只读取它们。
+        unsafe { log_callback_impl(avcl, level_no, fmt, vl) };
+    }));
+}
+
+/// [`log_callback`] 的实现体，运行在 `catch_unwind` 边界内。
+unsafe fn log_callback_impl(
+    avcl: *mut std::ffi::c_void,
+    level_no: std::ffi::c_int,
+    fmt: *const std::ffi::c_char,
+    #[cfg(all(target_arch = "x86_64", target_family = "unix"))] vl: *mut ffi::__va_list_tag,
+    #[cfg(not(all(target_arch = "x86_64", target_family = "unix")))] vl: ffi::va_list,
+) {
+    // 先按 `init_logging` 的级别过滤（FFmpeg 装了自定义回调后不再自己过滤，
+    // 这一步是 `AVLogLevel::QUIET` 能真正静音的唯一保证）。
+    if level_no > LOG_LEVEL.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let event_would_log = match level_no as u32 {
+        // These are all error states.
+        ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
+            tracing::enabled!(tracing::Level::ERROR)
+        }
+        ffi::AV_LOG_WARNING => tracing::enabled!(tracing::Level::WARN),
+        ffi::AV_LOG_INFO => tracing::enabled!(tracing::Level::INFO),
+        // There is no "verbose" in `log`, so we just put it in the "debug" category.
+        ffi::AV_LOG_VERBOSE | ffi::AV_LOG_DEBUG => tracing::enabled!(tracing::Level::DEBUG),
+        ffi::AV_LOG_TRACE => tracing::enabled!(tracing::Level::TRACE),
+        _ => {
+            return;
+        }
+    };
+
+    if event_would_log {
+        // Allocate some memory for the log line (might be truncated). 1024 bytes is the number used
+        // by ffmpeg itself, so it should be mostly fine.
+        let mut line = [0; 1024];
+        let mut print_prefix: std::ffi::c_int = 1;
+        // Use the ffmpeg default formatting.
+        // SAFETY: FFmpeg passes `avcl`/`fmt`/`vl` per its `av_log` callback contract; `line` is
+        // a live 1024-byte buffer and `print_prefix` a live local, both written by the call and
+        // neither retained.
+        let ret = unsafe {
+            ffi::av_log_format_line2(
+                avcl,
+                level_no,
+                fmt,
+                vl,
+                line.as_mut_ptr(),
+                (line.len()) as std::ffi::c_int,
+                (&mut print_prefix) as *mut std::ffi::c_int,
+            )
+        };
+        // Simply discard the log message if formatting fails.
+        // SAFETY: on success (`ret > 0`) FFmpeg NUL-terminated `line`, so reading it as a C
+        // string is in-bounds.
+        if ret > 0
+            && let Ok(line) = unsafe { std::ffi::CStr::from_ptr(line.as_mut_ptr()) }.to_str()
+        {
+            let line = line.trim();
+            if log_filter_hacks(line) {
+                match level_no as u32 {
+                    // These are all error states.
+                    ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
+                        tracing::error!(target: "rsmedia", "{}", line)
+                    }
+                    ffi::AV_LOG_WARNING => tracing::warn!(target: "rsmedia", "{}", line),
+                    ffi::AV_LOG_INFO => tracing::info!(target: "rsmedia", "{}", line),
+                    // There is no "verbose" in `log`, so we just put it in the "debug" category.
+                    ffi::AV_LOG_VERBOSE | ffi::AV_LOG_DEBUG => {
+                        tracing::debug!(target: "rsmedia", "{}", line)
+                    }
+                    ffi::AV_LOG_TRACE => tracing::trace!(target: "rsmedia", "{}", line),
+                    _ => {}
+                };
+            }
+        } else if ret > 0 {
+            // 格式化成功但不是合法 UTF-8：`tracing` 的 message 只能是 UTF-8 字符串，
+            // 这行字节无法承载。取有损转换会掩盖"日志内容被改写"，因此丢弃并留痕。
+            tracing::debug!(
+                target: "rsmedia",
+                "discarded a non-UTF-8 FFmpeg log line (level {level_no}, {ret} bytes)"
+            );
+        }
+    }
+}
+
+/// Helper function to filter out any lines that we don't want to log because they contaminate.
+/// Currently, it includes the following log line hacks:
+///
+/// * **Pelco H264 encoding issue**. Pelco cameras and encoders have a problem with their SEI NALs
+///   that causes ffmpeg to complain but does not hurt the stream. It does cause continuous error
+///   messages though which we filter out here.
+fn log_filter_hacks(line: &str) -> bool {
+    /* Hack 1 */
+    const HACK_1_PELCO_NEEDLE_1: &str = "SEI type 5 size";
+    const HACK_1_PELCO_NEEDLE_2: &str = "truncated at";
+    !(line.contains(HACK_1_PELCO_NEEDLE_1) && line.contains(HACK_1_PELCO_NEEDLE_2))
+}
 
 #[cfg(test)]
 mod tests {

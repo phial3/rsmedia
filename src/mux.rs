@@ -48,8 +48,9 @@ use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, StreamReader, StreamWriter, Writer};
 use crate::location::Location;
+use crate::mediatype::MediaType;
 use crate::options::{AVOptions, Metadata};
-use crate::stream::{MediaType, StreamInfo};
+use crate::stream::StreamInfo;
 use crate::subtitle::SubtitleSegment;
 use crate::time::Rational;
 use crate::time::TIME_BASE;
@@ -274,13 +275,13 @@ impl Muxer<StreamWriter> {
     ///
     /// 切点落在**关键帧**上：默认只在参考流的关键帧处开新段（`break_non_keyframes=1`
     /// 可放宽）。要精确控制切点，用
-    /// [`MediaFrame::force_key_frame`](crate::MediaFrame::force_key_frame) 在
-    /// 目标位置强制插关键帧，并让
-    /// [`with_gop_size`](crate::EncoderBuilder::with_gop_size) 与段长相称。
+    /// [`MediaFrame::force_key_frame`](crate::MediaFrame::force_key_frame) 在目标位置
+    /// 强制插关键帧，并让 [`with_gop_size`](crate::EncoderBuilder::with_gop_size) 与
+    /// 段长相称。
     ///
-    /// 与 [`Muxer::new`] 的差别只在打开方式：`segment` 是 `AVFMT_NOFILE` 容器，
-    /// 由它自己按模板开/关每个段文件，因此**必须**显式指定格式，模板也不会被
-    /// 当成一个真实文件名创建。
+    /// 与 [`Muxer::new`] 的差别只在打开方式：`segment` 是 `AVFMT_NOFILE` 容器，由它
+    /// 自己按模板开/关每个段文件，因此**必须**显式指定格式，模板也不会被当成一个真实
+    /// 文件名创建。
     ///
     /// ```no_run
     /// use rsmedia::mux::Muxer;

@@ -1,5 +1,5 @@
 use crate::error::{Result, RsmediaError};
-use crate::fmt::DataLayout;
+use crate::layout::DataLayout;
 use crate::strutils;
 
 use rsmpeg::avutil::AVPixFmtDescriptorRef;
@@ -472,7 +472,8 @@ impl PixelFormat {
         })
     }
 
-    /// The data layout this pixel format uses at `width` x `height`.
+    /// The data layout this pixel format uses at `width` x `height`, or `Err`
+    /// when the format has none.
     ///
     /// Derived entirely from FFmpeg's pixel-format descriptor, so this method
     /// knows no format by name and every format FFmpeg describes gets a layout
@@ -487,43 +488,58 @@ impl PixelFormat {
     /// * a **planar** format is one array per plane, each chroma plane carrying
     ///   its own subsampled size, taken from `log2_chroma_w` / `log2_chroma_h`.
     ///
-    /// The same layout type [`crate::fmt::SampleFormat::data_layout`] returns for audio, so
-    /// the two are symmetric: no `Option` to thread through a caller. A format
-    /// that has no whole-sample plane representation —
-    /// a bitstream / palette / hardware format, a zero dimension, or a
-    /// horizontally subsampled packed format whose pixels are not whole elements
-    /// (e.g. `uyyvyy411`: 6 bytes per 4 pixels) — **panics** instead of returning
-    /// a value, because it cannot be expressed and the caller almost always has a
-    /// `width`/`height` or an [`Self::is_plane_storable`] check in hand first.
-    /// [`Self::is_plane_storable`] predicts the first two classes; the third
-    /// cannot be predicted, so only a panic catches it.
-    pub fn data_layout(self, width: u32, height: u32) -> DataLayout {
+    /// The same layout type [`crate::fmt::SampleFormat::data_layout`] returns for
+    /// audio, so the two are symmetric.
+    ///
+    /// This is the **total** form: every shape that cannot be laid out comes
+    /// back as `Err` instead of aborting. Prefer it over [`Self::data_layout`]
+    /// wherever the format or the geometry did not come from a literal the
+    /// caller wrote — a decoded frame's pixel format comes from FFmpeg, and
+    /// [`Self::is_plane_storable`] does **not** cover every rejection here (see
+    /// that method), so guarding with it and then calling `data_layout` is not
+    /// enough.
+    ///
+    /// # Errors
+    ///
+    /// * [`RsmediaError::InvalidConfig`] — `width` or `height` is `0`.
+    /// * [`RsmediaError::Unsupported`] — the format has no whole-element plane
+    ///   representation: a bitstream / palette / hardware format, a descriptor
+    ///   FFmpeg does not model, or a horizontally subsampled packed format whose
+    ///   pixels are not whole elements (`uyyvyy411`: 6 bytes per 4 pixels).
+    pub fn try_data_layout(self, width: u32, height: u32) -> Result<DataLayout> {
+        let name = self.get_pix_fmt_name();
         let width = width as usize;
         let height = height as usize;
         if width == 0 || height == 0 {
-            panic!(
-                "pixel format {self:?} has a zero dimension ({width}x{height}); \
-                 reject zero-sized frames before calling data_layout"
-            );
+            return Err(RsmediaError::invalid_config(format!(
+                "pixel format {name} has a zero dimension ({width}x{height}); a frame must be \
+                 at least 1x1"
+            )));
         }
-        let desc = AVPixFmtDescriptorRef::get(self.into()).unwrap_or_else(|| {
-            panic!(
-                "pixel format {self:?} has no FFmpeg descriptor (e.g. NONE or a hardware pixel format)"
-            )
-        });
+        let desc = AVPixFmtDescriptorRef::get(self.into()).ok_or_else(|| {
+            RsmediaError::unsupported(format!(
+                "pixel format {name} has no FFmpeg descriptor (e.g. NONE or a hardware pixel \
+                 format)"
+            ))
+        })?;
         if has_no_sample_planes(&desc) {
-            panic!(
-                "pixel format {self:?} has no whole-sample planes (bitstream / palette / hardware \
-                 format); check is_plane_storable first"
-            );
+            return Err(RsmediaError::unsupported(format!(
+                "pixel format {name} has no whole-sample planes: a bitstream, paletted or \
+                 hardware format cannot be laid out as sample arrays"
+            )));
         }
 
         let components = desc.nb_components as usize;
         if components == 0 {
-            panic!("pixel format {self:?} describes no components");
+            return Err(RsmediaError::unsupported(format!(
+                "pixel format {name} describes no components"
+            )));
         }
-        let element_bytes = element_bytes(&desc)
-            .unwrap_or_else(|| panic!("pixel format {self:?} has no whole-byte component width"));
+        let element_bytes = element_bytes(&desc).ok_or_else(|| {
+            RsmediaError::unsupported(format!(
+                "pixel format {name} has no whole-byte component width"
+            ))
+        })?;
 
         // FFmpeg models planes 1 and 2 as the chroma planes (`av_image_fill_plane_sizes`
         // does the same) and reports the chroma shifts as 0 for RGB formats, so this
@@ -553,30 +569,30 @@ impl PixelFormat {
             // fractional number of elements per pixel (`uyyvyy411`: 6 elements per 4
             // pixels), which no whole-pixel array can express.
             if !max_step.is_multiple_of(element_bytes * unit_pixels) {
-                panic!(
-                    "pixel format {self:?} stores a fractional number of elements per pixel \
-                     ({max_step} bytes over {} pixels); it cannot be expressed as a whole-element array",
+                return Err(RsmediaError::unsupported(format!(
+                    "pixel format {name} stores a fractional number of elements per pixel \
+                     ({max_step} bytes over {} pixels); it cannot be expressed as a \
+                     whole-element array",
                     element_bytes * unit_pixels
-                );
+                )));
             }
             let elements_per_pixel = max_step / (element_bytes * unit_pixels);
             if elements_per_pixel == 0 {
-                panic!("pixel format {self:?} has zero elements per pixel");
+                return Err(RsmediaError::unsupported(format!(
+                    "pixel format {name} has zero elements per pixel"
+                )));
             }
             // FFmpeg rounds the row up to whole units (`av_image_fill_linesizes`),
             // so an odd width covers the pixels of one more unit: 65 pixels of
             // `yuyv422` occupy 33 units = 66 columns. Using `width` verbatim would
             // drop that last unit, leaving each row's tail out of the round trip.
-            DataLayout::Interleaved {
+            Ok(DataLayout::Interleaved {
                 rows: height,
                 cols: ceil_shift(width, desc.log2_chroma_w as u32) * unit_pixels,
                 components: elements_per_pixel,
-            }
+            })
         } else {
-            let plane_count = self
-                .count_planes()
-                .unwrap_or_else(|_| panic!("pixel format {self:?} reports no plane count"))
-                as usize;
+            let plane_count = self.count_planes()? as usize;
             let mut planes = Vec::with_capacity(plane_count);
             for plane in 0..plane_count {
                 // Elements this plane stores per luma column, e.g. 1 for a planar
@@ -586,18 +602,35 @@ impl PixelFormat {
                     .map(|c| component_bytes(&desc, c))
                     .sum();
                 if plane_bytes == 0 || !plane_bytes.is_multiple_of(element_bytes) {
-                    panic!(
-                        "pixel format {self:?} plane {plane} stores {plane_bytes} bytes, not a \
+                    return Err(RsmediaError::unsupported(format!(
+                        "pixel format {name} plane {plane} stores {plane_bytes} bytes, not a \
                          whole number of {element_bytes}-byte elements"
-                    );
+                    )));
                 }
                 planes.push((
                     ceil_shift(height, h_shift(plane)),
                     ceil_shift(width, w_shift(plane)) * (plane_bytes / element_bytes),
                 ));
             }
-            DataLayout::Planar(planes)
+            Ok(DataLayout::Planar(planes))
         }
+    }
+
+    /// The data layout this pixel format uses at `width` x `height`.
+    ///
+    /// # Panics
+    ///
+    /// Panics exactly where [`Self::try_data_layout`] returns `Err` — see that
+    /// method for the whole list. It is for call sites where the format and the
+    /// geometry are literals the caller wrote, so a wrong combination is a
+    /// programming error worth aborting on. When either comes from FFmpeg or
+    /// from user data, use [`Self::try_data_layout`] and return the `Err`.
+    ///
+    /// Note that [`Self::is_plane_storable`] does **not** predict every panic
+    /// here; `uyyvyy411` passes it and still panics.
+    pub fn data_layout(self, width: u32, height: u32) -> DataLayout {
+        self.try_data_layout(width, height)
+            .unwrap_or_else(|err| panic!("{err}"))
     }
 
     /// Bytes one component of this format occupies in memory.
@@ -777,6 +810,34 @@ mod tests {
         Ok(())
     }
 
+    /// [`PixelFormat::is_plane_storable`] 是**必要非充分**的守卫。
+    ///
+    /// 它只看 BITSTREAM / PAL / HWACCEL 三个标志，而布局计算还有别的拒绝理由
+    /// （每像素占分数个元素、分量宽度不是整字节……）。拿它当充分条件、再去调会
+    /// panic 的 [`PixelFormat::data_layout`]，`uyyvyy411` 这种"能过守卫却算不出
+    /// 布局"的格式就能让**返回 `Result` 的公开路径**终止进程。
+    #[test]
+    fn test_try_data_layout_is_total_and_rejects_more_than_is_plane_storable() {
+        let mut gap = Vec::new();
+        for raw in 0..ffi::AV_PIX_FMT_NB {
+            let Some(fmt) = PixelFormat::from_ffi_checked(raw) else {
+                continue;
+            };
+            // 总函数：任何格式、任何尺寸都不得 panic（这里要的正是"不 panic"）。
+            let _ = fmt.try_data_layout(64, 64);
+            let _ = fmt.try_data_layout(1, 1);
+            let _ = fmt.try_data_layout(0, 0);
+            if fmt.is_plane_storable() && fmt.try_data_layout(64, 64).is_err() {
+                gap.push(fmt);
+            }
+        }
+        assert!(
+            gap.contains(&PixelFormat::UYYVYY411),
+            "uyyvyy411 must stay in the documented gap between is_plane_storable \
+             and a computable layout: {gap:?}"
+        );
+    }
+
     /// `name_of` 是给日志/诊断用的：任何 `AVPixelFormat` 值都能得到可读文本，
     /// **绝不 panic** —— 而 `PixelFormat::from` 对未收录值是 panic。
     #[test]
@@ -924,7 +985,7 @@ mod tests {
 
     /// FFmpeg 调用失败必须保留返回码（`FFmpeg(AVError)`），而"没有可用的候选格式"
     /// 是**能力缺口**（哨兵 `AV_PIX_FMT_NONE`，不是错误码）⇒ 必须报 `Unsupported`。
-    /// 两者以前都落进无类型的 `Other`，调用方无从区分。
+    /// 两者都落进无类型的 `Other` 时，调用方无从区分。
     #[test]
     fn test_pixel_format_errors_are_typed() {
         // `av_get_pix_fmt_loss` 的返回值**不是错误码**（文档：损失标志组合），

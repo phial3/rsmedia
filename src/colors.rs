@@ -688,7 +688,7 @@ pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> [f32; 3] {
 ///
 /// ```
 /// # use rsmedia::colors::{hsv_to_rgb, rgb_to_hsv};
-/// // Exact, not merely close — including the dark colours that used to lose a unit.
+/// // Exact, not merely close — including the darkest colours.
 /// for r in [0u8, 1, 90, 128, 254, 255] {
 ///     let [h, s, v] = rgb_to_hsv(r, 0, 45);
 ///     assert_eq!(hsv_to_rgb(h, s, v), [r, 0, 45]);
@@ -1265,11 +1265,11 @@ mod tests {
         }
     }
 
-    /// The HSV round trip is exact, not ±1. It used to lose a unit on better
-    /// than half of all colours — `colorutils_rs`' `Hsv::to_rgb8` truncates
-    /// where its `Hsl::to_rgb8` rounds — which is why [`hsv_to_rgb`] is
-    /// `palette`'s conversion now. Sweeping every value of one channel at a time
-    /// covers the whole 0..=255 range without an exhaustive 2^24 run.
+    /// The HSV round trip is exact, not ±1. [`hsv_to_rgb`] uses `palette` rather
+    /// than `colorutils_rs` because the latter's `Hsv::to_rgb8` truncates where
+    /// its `Hsl::to_rgb8` rounds, and truncation loses a unit on better than half
+    /// of all colours. Sweeping every value of one channel at a time covers the
+    /// whole 0..=255 range without an exhaustive 2^24 run.
     #[test]
     fn test_round_trip() {
         let mut cases: Vec<[u8; 3]> = vec![

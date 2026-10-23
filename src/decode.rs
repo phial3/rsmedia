@@ -63,13 +63,14 @@ use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::{Reader, StreamReader, StreamReaderBuilder};
 use crate::location::Location;
+use crate::mediatype::MediaType;
 use crate::options::AVOptions;
 use crate::pixel::PixelFormat;
 use crate::resample;
 use crate::resize::Resize;
 use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler, VideoSpec};
 use crate::state::ProcessState;
-use crate::stream::{MediaType, StreamInfo};
+use crate::stream::StreamInfo;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
 use crate::time::{Rational, Rescale, Time};
@@ -391,9 +392,8 @@ impl DecoderBuilder {
 
     /// 指定输入的 demuxer 名（`avformat_open_input` 的 `iformat`）。
     ///
-    /// 默认（不调用本方法）由 libavformat 按 `source` 的内容自行探测容器格式。
-    /// 采集设备（webcam / 麦克风 / 屏幕）没有可探测的头，必须显式声明它。
-    /// 常用取值（`-f` 后的名字，跨平台）：
+    /// 默认由 libavformat 按 `source` 的内容探测容器格式。采集设备（webcam /
+    /// 麦克风 / 屏幕）没有可探测的头，必须显式声明。常用取值（`-f` 后的名字）：
     ///
     /// | 平台 | 视频 | 音频 |
     /// |---|---|---|
@@ -401,66 +401,40 @@ impl DecoderBuilder {
     /// | Windows | `dshow` | `dshow` |
     /// | Linux | `v4l2` | `alsa` / `pulse` |
     ///
-    /// 屏幕录制另有 `x11grab`（X11）/ `gdigrab`（Windows）/ `fbdev`（framebuffer），
-    /// 采集卡有 `decklink` / `vfwcap`。实际可用项取决于该 FFmpeg 构建编译进了哪些
-    /// 设备，用 `ffmpeg -devices` 可列出当前构建支持的（名字不在其中时
-    /// `avformat_open_input` 直接失败）。
+    /// 实际可用项取决于该构建编译进了哪些设备（`ffmpeg -devices` 可列出）；名字不
+    /// 在其中时 `avformat_open_input` 直接失败。
     ///
-    /// 此时 `source` 是**设备的索引对**而非文件名，例如 macOS 上
-    /// `avfoundation` 的 `"0:none"` = 0 号视频设备 + 不采集音频，
-    /// `"0:1"` = 同时采集 0 号视频与 1 号音频（一个设备 URL 出音视频双流，
-    /// 天然同步，省掉跨设备对齐）。
+    /// 此时 `source` 是**设备的索引对**而非文件名：macOS 上 `"0:none"` 是 0 号视频
+    /// 设备且不采集音频，`"0:1"` 同时采集 0 号视频与 1 号音频（一个设备 URL 出音视频
+    /// 双流，天然同步）。
     ///
-    /// 采集端点通常还要用 [`with_input_options`](Self::with_input_options) 补
-    /// `framerate` / `video_size` / `pixel_format` 等**设备私有**参数（这些键由
-    /// demuxer 解释，`avfoundation` / `dshow` / `v4l2` 都认）—— 注意它与
-    /// [`with_options`](Self::with_options) 不是一回事，后者写的是**编解码器**参数
-    /// （`avcodec_open2`），设备端点参数只被 demuxer 认。
+    /// 设备私有参数（`framerate` / `video_size` / `pixel_format`）走
+    /// [`with_input_options`](Self::with_input_options)，它们由 demuxer 解释；
+    /// [`with_options`](Self::with_options) 写的是**编解码器**参数，两者不可互换。
     ///
     /// 仅作用于 [`build`](Self::build)；[`build_from_reader`](Self::build_from_reader)
-    /// 的输入由你自己打开，格式已在那一侧确定，本设置会被忽略。
-    ///
-    /// 名称含 NUL 字节时在构建期报错，而不是 panic。
+    /// 的输入由调用方打开，格式已在那一侧确定，本设置被忽略。名称含 NUL 字节时在
+    /// 构建期报错，而不是 panic。
     ///
     /// # 前置条件：必须先 [`init()`](crate::init())
     ///
-    /// 采集设备的 demuxer 是由 `avdevice_register_all()` 注册进来的，而这一步在
-    /// [`init()`](crate::init()) / [`init_with()`](crate::init_with()) 里、且只在 once-guard
-    /// 内执行一次。**没调用过 `init()` 就构建，会以 `Cannot open input file. (-2)`
-    /// 失败** —— 错误信息完全看不出是缺初始化，很容易误判成 URL 或格式名写错。
+    /// 采集设备的 demuxer 由 `avdevice_register_all()` 注册，这一步只在
+    /// [`init()`](crate::init()) / [`init_with()`](crate::init_with()) 的 once-guard
+    /// 内执行一次。**没调用过 `init()` 就构建会以 `Cannot open input file. (-2)`
+    /// 失败** —— 错误信息看不出是缺初始化，很容易误判成 URL 或格式名写错。普通文件
+    /// 输入不需要这一前置条件（容器 demuxer 是编译期静态注册的）。
     ///
     /// ```no_run
     /// use rsmedia::{DecoderBuilder, MediaType, StreamReaderBuilder};
     ///
     /// # fn main() -> rsmedia::Result<()> {
     /// rsmedia::init()?;                 // 注册 avfoundation / dshow / v4l2 等设备
-    /// let mut reader = StreamReaderBuilder::new("0:none")
+    /// let reader = StreamReaderBuilder::new("0:none")
     ///     .with_format("avfoundation")  // 解码用的 reader，格式与构建期一致
     ///     .build()?;
-    /// let mut decoder = DecoderBuilder::new(MediaType::VIDEO)
-    ///     .with_input_format("avfoundation")
-    ///     .build_from_reader(&reader)?;
-    /// # let _ = decoder.decode_frame(&mut reader);
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// 普通文件输入不需要这一前置条件（容器 demuxer 是编译期静态注册的）。
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use rsmedia::{DecoderBuilder, MediaType, AVOptions};
-    ///
-    /// # fn main() -> rsmedia::Result<()> {
-    /// let mut opts = AVOptions::new();
-    /// opts.set("framerate", "30");
-    /// opts.set("video_size", "1280x720");
-    ///
     /// let _decoder = DecoderBuilder::new(MediaType::VIDEO)
     ///     .with_input_format("avfoundation")
-    ///     .with_input_options(opts)
-    ///     .build("0:none")?;
+    ///     .build_from_reader(&reader)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -2047,7 +2021,10 @@ impl Drop for Decoder {
 /// - `Decoder` 内含 `AVCodecContext` / filter graph，FFmpeg 不保证其线程安全，
 ///   `&Decoder` 跨线程共享（`Sync`）无法成立，故不实现 `Sync`。
 /// - `Send`（move 到另一线程独占使用）是安全的：所有资源随对象移动，
-///   无线程局部句柄。
+///   无线程局部句柄。其中共享的硬件上下文 `HWContext`（crate 内部类型，
+///   不进公开文档故不作链接）以 `Arc` 持有，`Arc<HWContext>: Send` 要求它
+///   同时 `Send + Sync`；这两个约束都由编译器推导（设备上下文在 `Mutex`
+///   里），不在本 `unsafe impl` 的信任范围内。
 unsafe impl Send for Decoder {}
 
 #[cfg(test)]
@@ -2355,7 +2332,7 @@ mod tests {
     ///
     /// ⚠️ "未设置"与"显式 0"在解码侧**不等价**，别再合并成一个断言：不写字段时
     /// 上下文保持 `avcodec_alloc_context3` 给的 `1`；而显式写 `0` 是 FFmpeg 的
-    /// "自动推导"，`avcodec_open2` 会把它改成实际线程数（本机 8 核 ⇒ 9）。
+    /// "自动推导"，`avcodec_open2` 会把它改成实际线程数（随机器核数而变）。
     /// 所以默认值随 FFmpeg 版本/机器变，**不能**锁成具体数字
     #[test]
     fn test_builder_codec_flags_default_and_thread_count() -> Result<()> {

@@ -698,7 +698,7 @@ impl PartialEq for Time {
     /// `Time::from_units(1, 4)` and `Time::new(Some(2), Rational::new(1, 2).unwrap())`
     /// both mean 0.5 s and are therefore equal.
     ///
-    /// Requiring the raw fields to match used to make "the same instant" compare
+    /// Requiring the raw fields to match would make "the same instant" compare
     /// unequal whenever the time bases differed. Two "no value" times are equal
     /// (`None == None`); a "no value" time never equals a valued one. The result
     /// matches [`PartialOrd`]: `a == b` ⟺ `a.partial_cmp(&b) == Some(Equal)`.
@@ -981,10 +981,10 @@ mod tests {
 
     /// `1 / 0` is refused rather than folded into a "no time base" [`Time`].
     ///
-    /// Everything else is now out of reach instead of checked: the denominator is
-    /// [`i32`] — `AVRational`'s own width — so there is no narrowing left for a
-    /// value to wrap in. `from_nth_of_a_second(2^31 + 5)` used to become `1 / 5`
-    /// at the `as i32` cast; it now does not compile.
+    /// Everything else is ruled out by the type rather than checked: the
+    /// denominator is [`i32`] — `AVRational`'s own width — so there is no
+    /// narrowing left for a value to wrap in. `from_nth_of_a_second(2^31 + 5)`
+    /// does not compile.
     #[test]
     fn test_from_nth_of_a_second_rejects_a_zero_denominator() {
         let zero = Time::from_nth_of_a_second(0).unwrap_err();

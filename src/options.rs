@@ -27,21 +27,9 @@
 //! `avio_*`). The two never mix — `preset` handed to a reader is ignored exactly as
 //! `movflags` handed to an encoder is.
 //!
-//! # Finding which key belongs to which layer
-//!
-//! FFmpeg lists each layer's keys through `ffmpeg -h`:
-//!
-//! ```text
-//! ffmpeg -h encoder=libx264      # encoder private options
-//! ffmpeg -h decoder=h264         # decoder private options
-//! ffmpeg -h muxer=flv            # muxer private options
-//! ffmpeg -h demuxer=rtsp         # demuxer private options
-//! ffmpeg -h protocol=tcp         # protocol options
-//! ffmpeg -h bsf=h264_metadata    # bitstream filter options
-//! ```
-//!
-//! A key that does not show up for the layer you are targeting will not take effect
-//! here either.
+//! To see which keys a layer declares, ask FFmpeg: `ffmpeg -h encoder=libx264`,
+//! `-h muxer=flv`, `-h demuxer=rtsp`, `-h protocol=tcp`, `-h bsf=h264_metadata`. A key
+//! that does not show up for the layer you target will not take effect here either.
 //!
 //! # Presets
 //!
@@ -278,10 +266,10 @@ impl AVOptions {
     /// or [`Demuxer::new_with_options`](crate::Demuxer::new_with_options) — never to an
     /// encoder.
     ///
-    /// `timeout` is the **rtsp demuxer** option (`ffmpeg -h demuxer=rtsp`). Its former
-    /// name `stimeout` no longer exists anywhere: FFmpeg 6.1, 7.1, 8.1 and 9.0 all
-    /// reject `-stimeout` with `Unrecognized option` (verified), so a key by that name
-    /// was silently ignored on every build this crate supports.
+    /// `timeout` is the **rtsp demuxer** option (`ffmpeg -h demuxer=rtsp`). The
+    /// similarly named `stimeout` exists on no supported build: FFmpeg 6.1, 7.1,
+    /// 8.1 and 9.0 all reject `-stimeout` with `Unrecognized option` (verified),
+    /// so a key by that name is silently ignored.
     pub fn preset_avformat_rtsp_transport_tcp() -> Self {
         let mut opts = Self::new();
         opts

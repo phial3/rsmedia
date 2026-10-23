@@ -2,18 +2,10 @@
 //!
 //! [`PcmSink`] bridges a realtime interleaved PCM source (a `cpal` capture
 //! callback, a WAV reader, a DSP chain) into rsmedia's audio
-//! [`Encoder`](crate::encode::Encoder) + [`Muxer`] pipeline:
-//!
-//! - interleaved blocks of any size and of `f32` / `i16` / `u8` samples are
-//!   wrapped into packed [`AVFrame`]s, so the caller never aligns chunks to the
-//!   encoder's `frame_size` and never touches `unsafe`;
-//! - a block whose rate, channel layout or sample format differs from the
-//!   encoder's is converted by the encoder itself — see
-//!   [What the encoder already does](#what-the-encoder-already-does);
-//! - the encoder's own FIFO accumulates the encoder's fixed frame size (1024
-//!   samples for AAC) and numbers output packets;
-//! - [`PcmSink::finish`] flushes the encoder and writes the trailer, then hands
-//!   the writer back.
+//! [`Encoder`](crate::encode::Encoder) + [`Muxer`] pipeline. Interleaved blocks
+//! of any size and of `f32` / `i16` / `u8` samples are wrapped into packed
+//! [`AVFrame`]s, so the caller never aligns chunks to the encoder's `frame_size`
+//! and never touches `unsafe`.
 //!
 //! # Example
 //!
@@ -43,102 +35,53 @@
 //!
 //! A complete runnable `cpal` recording example lives in `examples/pcm_recorder.rs`.
 //!
-//! # What the encoder already does
+//! # Division of labour
 //!
-//! [`PcmSink`] deliberately owns **no** resampler and assigns **no** timestamps.
-//! [`Encoder::encode_raw`](crate::encode::Encoder::encode_raw) already:
-//!
-//! - resamples to its own rate / layout / sample format, keeping one persistent
-//!   `SwrContext` so filter delay is not lost between blocks;
-//! - accumulates fixed-size audio frames in an `AVAudioFifo`;
-//! - numbers output packets by samples actually emitted.
-//!
-//! Doing any of that here would be a second implementation of the same policy:
-//! this sink's frames already match the encoder's spec by the time they are
-//! muxed, so the encoder's `resample_if_needed` short-circuits and this type's
-//! numbering would be discarded. Passing frames straight through keeps one owner
-//! per concern, and leaves the encoder's filter graph seeing the source format.
+//! [`PcmSink`] owns no resampler and assigns no timestamps. Blocks whose rate,
+//! channel layout or sample format differ from the encoder's are converted by
+//! [`Encoder::encode_raw`](crate::encode::Encoder::encode_raw), which keeps one
+//! persistent `SwrContext` (so filter delay survives across blocks), accumulates
+//! fixed-size frames in an `AVAudioFifo` and numbers output packets by samples
+//! emitted. Duplicating any of that here would mean two owners for one policy.
 //!
 //! # Reading the bytes back
 //!
-//! `write_*` and [`finish`](PcmSink::finish) return `Result<()>`, never bytes:
-//! output stays in the muxer's writer and is pulled from there. Which pull to
-//! use depends on the container:
-//!
-//! * streaming formats (mpegts, matroska, …): take each segment with
-//!   [`BufferWriter::take_written`](crate::io::BufferWriter::take_written)
-//!   between writes and send it out;
-//! * formats that rewrite their header while writing the trailer (mp4, mov,
-//!   wav): the complete image is only visible through
-//!   [`finish`](PcmSink::finish) → [`into_bytes`](crate::io::BufferWriter::into_bytes),
-//!   because the trailer rewrites bytes already handed out by `take_written`.
-//!
-//! ```no_run
-//! # use rsmedia::error::Result;
-//! # use rsmedia::io::{BufferReader, BufferWriter};
-//! # use rsmedia::mux::Muxer;
-//! # use rsmedia::pcm::{PcmSink, PcmSpec};
-//! # use rsmedia::{Encoder, SampleFormat};
-//! # fn main() -> Result<()> {
-//! let encoder = Encoder::new_audio(2, 44_100, SampleFormat::FLTP)?;
-//! let mut muxer = Muxer::new_from_writer(BufferWriter::new("mpegts")?);
-//! let idx = muxer.add_encoder(encoder)?;
-//! let mut sink = PcmSink::new(muxer, idx, PcmSpec::new(48_000, 2))?;
-//! for _ in 0..10 {
-//!     sink.write_f32(&[0.0f32; 1024])?;
-//!     let _segment = sink.writer_mut().take_written();   // send it out
-//! }
-//! let mut writer = sink.finish()?;
-//! let _tail = writer.take_written();
-//! # Ok(())
-//! # }
-//! ```
+//! `write_*` and [`finish`](PcmSink::finish) return `Result<()>`, never bytes —
+//! output stays in the muxer's writer. For streaming formats (mpegts, matroska)
+//! pull each segment with
+//! [`BufferWriter::take_written`](crate::io::BufferWriter::take_written) between
+//! writes. For formats that rewrite their header when the trailer is written
+//! (mp4, mov, wav) only [`finish`](PcmSink::finish) →
+//! [`into_bytes`](crate::io::BufferWriter::into_bytes) yields a complete image,
+//! because the trailer overwrites bytes `take_written` already handed out.
 //!
 //! # Pauses and the timeline
 //!
-//! There is no external clock: output timing is a running sample count, so a gap
-//! in the input is *closed up* rather than left as silence. To keep a recording
-//! aligned with wall-clock time, **write the silence explicitly** — feed as many
-//! zero samples as the pause lasted:
-//!
-//! ```no_run
-//! # use rsmedia::error::Result;
-//! # use rsmedia::pcm::{PcmSink, PcmSpec};
-//! # fn f(sink: &mut PcmSink<rsmedia::io::StreamWriter>) -> Result<()> {
-//! let paused_samples = 3 * 48_000;                 // 3 s at 48 kHz, 1 channel
-//! sink.write_f32(&vec![0.0f32; paused_samples])?;  // 2 channels -> `* 2`
-//! # Ok(())
-//! # }
-//! ```
+//! There is no external clock: timing is a running sample count, so a gap in the
+//! input is *closed up* rather than left as silence. To stay aligned with
+//! wall-clock time, write the silence explicitly — feed as many zero samples as
+//! the pause lasted.
 //!
 //! # Splitting a long recording
 //!
 //! [`finish`](PcmSink::finish) consumes the sink, so each segment needs a fresh
-//! `Encoder` + `Muxer` + `PcmSink`. Setup is cheap and no samples are lost at the
-//! cut (the tail is drained), but the *resampler state* is not carried across:
-//! since the encoder owns the resampler, a new segment starts from a cold delay
-//! line. For a recording that must stay phase-exact end to end, record one file
-//! and cut it afterwards, or use
-//! [`Muxer::new_segmented`](crate::mux::Muxer::new_segmented).
+//! `Encoder` + `Muxer` + `PcmSink`. Setup is cheap and the tail is drained, but
+//! resampler state is not carried across: a new segment starts from a cold delay
+//! line. For a phase-exact recording use
+//! [`Muxer::new_segmented`](crate::mux::Muxer::new_segmented) instead.
 //!
 //! # Threading
 //!
-//! `PcmSink` is `Send`, so it may be built on one thread and fed from another —
-//! the usual shape is to own it on the audio thread and drive it from a capture
-//! callback there. It is **not** `Sync`: the underlying [`Muxer`] holds an
+//! `PcmSink` is `Send` but not `Sync`: the underlying [`Muxer`] holds an
 //! `AVFormatContext` that must not be touched from two threads at once, so give
-//! each sink its own thread rather than sharing one.
-//!
-//! Note that a capture callback should still hand blocks over a channel instead
-//! of encoding inline: the callback runs on a real-time thread, and encoding
-//! there invites priority inversion and dropouts under load. `Send` makes that
-//! pattern possible; it does not make it advisable. That is what
-//! `examples/pcm_recorder.rs` demonstrates.
+//! each sink its own thread. A capture callback should still hand blocks over a
+//! channel rather than encoding inline — encoding on a real-time thread invites
+//! priority inversion and dropouts.
 
 use crate::error::{Context, Result, RsmediaError};
 use crate::io::Writer;
+use crate::mediatype::MediaType;
 use crate::mux::Muxer;
-use crate::stream::MediaType;
 
 use rsmpeg::UnsafeDerefMut;
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
@@ -313,7 +256,7 @@ impl<W: Writer> PcmSink<W> {
     /// mux frames straight into it. [`Muxer::add_encoder`] refuses to add a
     /// stream once the header has been written, so **register every stream
     /// before the first [`write_*`](Self::write_f32) call** — the first write is
-    /// what commits the header.
+    /// what commits it.
     ///
     /// ```no_run
     /// use rsmedia::mux::Muxer;
@@ -330,7 +273,6 @@ impl<W: Writer> PcmSink<W> {
     ///     EncoderBuilder::new_video(1280, 720).with_pix_fmt(PixelFormat::YUV420P).build()?,
     /// )?;
     ///
-    /// // Audio through the sink (any block size), video straight into the muxer.
     /// sink.write_f32(&[0.0f32; 1024])?;
     /// let frame = rsmedia::MediaFrame::<u8>::new_video_frame(1280, 720, PixelFormat::YUV420P)?
     ///     .to_avframe()?;
@@ -339,14 +281,6 @@ impl<W: Writer> PcmSink<W> {
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// Ordering tip: with a single device URL such as `avfoundation://0:1`
-    /// both streams come from one source and therefore stay in sync by
-    /// construction — far better than combining a camera with a separate
-    /// microphone, whose clocks drift.
-    ///
-    /// Prefer this over adding packets directly whenever the audio side is
-    /// driven by this sink, so the interleaving stays the muxer's job.
     pub fn muxer_mut(&mut self) -> &mut Muxer<W> {
         &mut self.muxer
     }
@@ -530,10 +464,10 @@ impl<W: Writer> PcmSink<W> {
     ///
     /// Both write paths fill a buffer allocated for `sample_format` with
     /// `interleaved.len()` (resp. `nb_samples` per plane) elements of `T`; a
-    /// width mismatch is therefore a **heap out-of-bounds write**. This invariant
-    /// previously rested only on `write_f32`/`write_i16`/`write_u8` pairing each
-    /// `T` with the right format, so a new wrapper pairing them wrongly would
-    /// overrun. Check it explicitly instead.
+    /// width mismatch is therefore a **heap out-of-bounds write**. Relying on
+    /// `write_f32`/`write_i16`/`write_u8` each pairing the right `T` with the
+    /// right format is not enough — a new wrapper could pair them wrongly — so
+    /// the width is checked explicitly.
     fn check_element_width<T: Copy>(sample_format: ffi::AVSampleFormat) -> Result<()> {
         let element_bytes = rsmpeg::avutil::get_bytes_per_sample(sample_format).unwrap_or(0);
         if std::mem::size_of::<T>() != element_bytes {

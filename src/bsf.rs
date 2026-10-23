@@ -230,10 +230,10 @@ impl Bsf {
     /// 一个输入包可能产出零或多个输出包；时间戳由 filter 保持不变。
     /// 通路结束时改用 [`Self::flush_packets`]。
     ///
-    /// **输入包在调用后失效**：`send` 会把 `packet` 交给 filter，FFmpeg 随即
-    /// 复用/清空它作为 receive 的输出 holder（本 crate 靠 `av_packet_ref` 为每个
-    /// 输出另建引用，见私有 `drain`）。因此 `packet` 只能使用一次——重发或
-    /// 在调用后继续读用它都是未定义数据。
+    /// **输入包在调用后失效**：`send` 把 `packet` 交给 filter，FFmpeg 随后
+    /// 将它复用为接收输出的落点，其内容会被覆写。因此 `packet` 只能使用一次
+    /// ——重发或在调用后继续读用它都是未定义数据。返回的输出包是本 crate 另建
+    /// 的引用拷贝，可以安全留存。
     pub fn filter_packet(&mut self, packet: &mut AVPacket) -> Result<Vec<AVPacket>> {
         self.send_packet(packet)?;
         self.drain(packet)

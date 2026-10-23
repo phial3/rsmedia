@@ -239,13 +239,12 @@ struct PlaneGeom {
 
 /// 某个帧平面的行几何：可见行数与每行字节数。
 ///
-/// 几何只有一份定义：[`PixelFormat::data_layout`](crate::PixelFormat::data_layout)，
-/// 它按 FFmpeg 的像素格式描述符推导（与 `av_image_fill_linesizes` /
-/// `av_image_fill_plane_sizes` 同款规则）。这里经
-/// [`storable_video_layout`](crate::frame::storable_video_layout) 取它，再把"元素"
-/// 折算成字节 —— 本模块**不再**自己复刻一份 `max_pixsteps` + 色度位移：两套实现
-/// 靠人工保持"一致"迟早漂移（旧实现就在 packed 子采样的行尾与 `YUVA` 的 alpha
-/// 平面上各错过一次，见本文件的两条回归测试）。
+/// 几何只有一份定义：
+/// [`PixelFormat::try_data_layout`](crate::PixelFormat::try_data_layout)，它按 FFmpeg
+/// 的像素格式描述符推导（与 `av_image_fill_linesizes` / `av_image_fill_plane_sizes`
+/// 同款规则）。这里取它，再把"元素"折算成字节 —— 本模块**不**自己复刻
+/// `max_pixsteps` 与色度位移：两套实现靠人工保持"一致"迟早漂移。packed 子采样的
+/// 行尾与 `YUVA` 的 alpha 平面是两个已知的易错点，本文件各有回归测试。
 fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
     let format = frame_pixel_format(frame)?;
     let negative = |axis: &str, value: i32| {
@@ -254,7 +253,7 @@ fn plane_geom(frame: &AVFrame, plane_idx: usize) -> Result<PlaneGeom> {
     let width = u32::try_from(frame.width).map_err(|_| negative("width", frame.width))?;
     let height = u32::try_from(frame.height).map_err(|_| negative("height", frame.height))?;
 
-    let layout = crate::frame::storable_video_layout(format, width, height)?;
+    let layout = format.try_data_layout(width, height)?;
     let (rows, row_elements) = layout.plane_row_extent(plane_idx).ok_or_else(|| {
         RsmediaError::invalid_config(format!(
             "plane index {plane_idx} is out of range: {} holds {} plane(s)",
@@ -1436,9 +1435,9 @@ mod tests {
     /// 带 alpha 的格式里，平面 3 是 alpha 而不是色度平面，必须保持全分辨率。
     ///
     /// FFmpeg 只对平面 1、2 应用 `log2_chroma_*` 位移（`av_image_fill_plane_sizes`
-    /// 同理，`PixelFormat::data_layout` 也照此建模）。`plane_geom` 旧实现按
-    /// `plane_idx > 0` 一律位移，把 `YUVA420P` 的 alpha 平面算成半宽半高：
-    /// `get_plane_buffer` 于是只返回四分之一的 alpha 数据，每行还按错误的行宽读取。
+    /// 同理，`PixelFormat::data_layout` 也照此建模）。所以 `plane_geom` 不能按
+    /// `plane_idx > 0` 一律位移：那会把 `YUVA420P` 的 alpha 平面算成半宽半高，
+    /// `get_plane_buffer` 只返回四分之一的 alpha 数据，每行还按错误的行宽读取。
     #[test]
     fn test_get_plane_buffer_alpha_plane_is_full_resolution() -> Result<()> {
         let (width, height) = (64usize, 48usize);

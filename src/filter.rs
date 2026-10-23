@@ -32,9 +32,9 @@
 //! See: <https://ffmpeg.org/ffmpeg-filters.html>
 use crate::error::{Context, Result, RsmediaError};
 use crate::fmt::{FrameFormat, SampleFormat};
+use crate::mediatype::MediaType;
 use crate::pixel::PixelFormat;
 use crate::state::ProcessState;
-use crate::stream::MediaType;
 use crate::strutils;
 use crate::time::Rational;
 
@@ -388,11 +388,13 @@ fn escape_backslash(input: &str, specials: &str, all_whitespace: bool) -> Result
 
 /// 第一级：把一个值写进**选项值**位置。
 ///
-/// 两种调用方式：
-/// * 作为 [`escape_filter_value`] 的第一步（未经引号的值）；
-/// * **单独**用于外层已经有 `'` 引号的值（`drawtext` 的 `text='…'` / `fontfile='…'`）：
-///   `av_get_token` 在引号内原样拷贝、不处理反斜杠，所以那种位置只需要一级 —— 恰好
-///   一个 `\` 会被第二遍 unescape 吃掉。这也是唯一"只转一级"合法的场合。
+/// 只作为 [`escape_filter_value`] 与 [`escape_filter_expr`] 的第一步使用 ——
+/// 值一律**不加引号**写进滤镜描述，因此总是需要 [`escape_graph_level`] 补第二级。
+///
+/// 值一律不加引号：`av_get_token` 进入引号模式后原样拷贝到下一个裸 `'`，转义
+/// 出来的 `\'` 里那个 `'` 会提前闭合它。`filename='a\'b'` 与完全不转义的
+/// `filename='a'b'` 解析出来的**都是** `ab` —— 加引号没有收益，却会静默改写值。
+/// 引号同样保护不了 `:`。
 ///
 /// # Errors
 ///
@@ -442,6 +444,19 @@ fn escape_graph_level(input: &str) -> Result<String> {
 /// 本来就是 C 字符串，NUL 无法表示，也没有"丢掉几个字符继续"的余地。
 fn escape_filter_value(input: &str) -> Result<String> {
     escape_graph_level(&escape_option_level(input)?)
+}
+
+/// [`escape_filter_expr`] 的完整形态：保留 `%{...}` 之后补**图级**转义。
+///
+/// 与 [`escape_filter_value`] 的差别只在第一步（`escape_filter_expr` 而不是
+/// `escape_option_level`），第二步完全相同 —— 值一律不加引号写进滤镜描述，
+/// 所以图级那一层不能省。
+///
+/// # Errors
+///
+/// 见 [`escape_backslash`]。
+fn escape_filter_expr_value(input: &str) -> Result<String> {
+    escape_graph_level(&escape_filter_expr(input)?)
 }
 
 /// A filter option that FFmpeg **evaluates**, i.e. one declared `<string>` in
@@ -603,9 +618,8 @@ fn check_closed_set(
 
 /// `amix` 的 `duration`（如何判定流结束）只认三个档位。
 ///
-/// 单独抽出来是因为它有两个入口 —— [`audio::amix`] 与 [`FilterGraphBuilder::amix`]
-/// —— 之前只有后者校验，于是同一个概念在一个入口拼错立刻报错、在另一个入口静默写进
-/// 滤镜串直到建图才炸。
+/// 两个入口 —— [`audio::amix`] 与 [`FilterGraphBuilder::amix`] —— 共用这一处
+/// 校验，任何一个入口写错都当场报错，而不是把非法值写进滤镜串等到建图才炸。
 fn check_amix_duration(duration: &str) -> Result<()> {
     check_closed_set(
         "amix",
@@ -780,13 +794,19 @@ pub mod video {
         /// A NUL byte in any of the values is [`RsmediaError::InvalidConfig`]: a filter
         /// description is a C string and cannot carry one.
         pub fn build(self) -> Result<Filter> {
+            // `text` 与 `fontfile` 都**不加引号**并走完整两级转义：加 `'…'` 看似更
+            // 稳妥，实际会静默改写值 —— `av_get_token` 进入引号模式后原样拷贝到下
+            // 一个裸 `'`，转义出来的 `\'` 里的 `'` 提前闭合了它。FFmpeg 实测
+            // `filename='a\'b'` 与 `filename='a'b'` 打开的**都是** `ab`，只有不加
+            // 引号的两级转义能拿到 `a'b`。引号也保护不了 `:`（同样实测），因此没有
+            // 任何理由留着它。详见 [`escape_option_level`]。
             let text_spec = if self.text_is_expression {
-                escape_filter_expr(&self.text)?
+                escape_filter_expr_value(&self.text)?
             } else {
-                escape_option_level(&self.text)?
+                escape_filter_value(&self.text)?
             };
             let mut spec = format!(
-                "drawtext=text='{}':x={}:y={}:fontsize={}:fontcolor={}",
+                "drawtext=text={}:x={}:y={}:fontsize={}:fontcolor={}",
                 text_spec,
                 self.x,
                 self.y,
@@ -799,7 +819,7 @@ pub mod video {
             let fontfile = self
                 .fontfile
                 .unwrap_or_else(|| "fonts/Arial.ttf".to_string());
-            spec.push_str(&format!(":fontfile='{}'", escape_option_level(&fontfile)?));
+            spec.push_str(&format!(":fontfile={}", escape_filter_value(&fontfile)?));
             if self.box_enabled {
                 spec.push_str(&format!(
                     ":box=1:boxcolor={}:boxborderw={}",
@@ -3485,16 +3505,14 @@ impl std::fmt::Debug for FilterGraph {
 ///    [`add_output_tail`](Self::add_output_tail)（接链尾）声明图输出；
 /// 4. [`build`](Self::build) 校验接线、生成滤镜图描述并协商格式。
 ///
-/// 五个高频形态有现成构造函数，直接返回建好的图：[`overlay`](Self::overlay)、
+/// 五个高频形态有现成构造函数：[`overlay`](Self::overlay)、
 /// [`hstack`](Self::hstack)、[`vstack`](Self::vstack)、[`concat`](Self::concat)、
-/// [`amix`](Self::amix)。需要别的形态时用上面的四步自由组装，
-/// [`Filter::new`] 仍是底层逃生舱。
+/// [`amix`](Self::amix)。
 ///
-/// [`build`](Self::build) 在**触碰 FFmpeg 之前**拒绝这些接线错误（都是
-/// [`RsmediaError::InvalidConfig`]）：标签非法或重名、上游标签不存在（含前向引用）、
-/// 接错媒体类型（视频/音频混接）、多输入滤镜的接线数与 pad 数不符、输出标签数与
-/// 输出 pad 数不符、某个输出没人消费（悬空）或被消费多次。FFmpeg 的 pad 是一对一
-/// 接线：fan-out 必须显式插一个复制节点——[`video::split`] / [`audio::asplit`]，
+/// [`build`](Self::build) 在**触碰 FFmpeg 之前**以 [`RsmediaError::InvalidConfig`]
+/// 拒绝接线错误：标签非法或重名、上游标签不存在、媒体类型混接、接线数与 pad 数不符、
+/// 输出无人消费或被消费多次。FFmpeg 的 pad 是一对一接线，所以 fan-out 必须显式插
+/// 一个复制节点——[`video::split`] / [`audio::asplit`]，
 /// 用 [`FilterNode::with_outputs`] 给每个副本标名后各接一条链路。
 ///
 /// # Examples
@@ -4234,9 +4252,9 @@ mod tests {
 
     /// `Result<Filter>.spec()`，供那些只关心描述字符串的测试使用。
     ///
-    /// 构造器改成返回 [`Result`] 之后（值可能含 NUL，见 [`escape_filter_value`]），
-    /// 这些测试里全是字面量、不可能失败，也就没必要为它们逐个改签名加 `?`：失败即测试
-    /// 本身写错，直接 panic 并把错误打出来更省事。
+    /// 构造器返回 [`Result`]（值可能含 NUL，见 [`escape_filter_value`]），但这些测试
+    /// 里全是字面量、不可能失败，没必要逐个改签名加 `?`：失败即测试本身写错，直接
+    /// panic 把错误打出来更省事。
     trait SpecOf {
         fn spec(self) -> String;
     }
@@ -4310,8 +4328,8 @@ mod tests {
         assert_eq!(audio::anlm_denoise(None, None, None).spec(), "anlmdn");
     }
 
-    /// 批 4：滤镜参数按 `ffmpeg -h filter=<name>` 声明的类型对齐后，**以前写不出来
-    /// 的值现在能写出来**。每条断言都对应一个 FFmpeg 实际接受的域，而不是风格。
+    /// 滤镜参数按 `ffmpeg -h filter=<name>` 声明的类型对齐：每条断言都对应一个
+    /// FFmpeg 实际接受的域，而不是风格。
     #[test]
     fn test_filter_arguments_cover_the_domain_ffmpeg_declares() {
         // `eq` 的 `brightness`/`contrast` 是 `<string>`（FFmpeg 要求值）：表达式
@@ -4355,11 +4373,10 @@ mod tests {
         );
     }
 
-    /// 批 4 的 bug 修复：`afftdn.tr` 是 **布尔**（`track_residual`），不是浮点
-    /// 平滑系数。旧实现把 `Option<f32>` 直接格式化成 `tr=0.5`，FFmpeg 会拒绝整条
-    /// 滤镜链（`Unable to parse "tr" option value "0.5" as boolean`）——也就是说
-    /// 只要传了非整数，`advanced_fft_denoise` 就让 `FilterGraph` 建不起来。
-    /// 这里钉住新的输出形态，避免退回"名字像浮点、选项是布尔"的老样子。
+    /// `afftdn.tr` 是**布尔**（`track_residual`），不是浮点平滑系数：传 `tr=0.5`
+    /// 会让 FFmpeg 拒绝整条滤镜链（`Unable to parse "tr" option value "0.5" as
+    /// boolean`），`advanced_fft_denoise` 于是连图都建不起来。名字像浮点、选项
+    /// 是布尔，这里钉住输出形态。
     #[test]
     fn test_advanced_fft_denoise_emits_a_boolean_for_tr() {
         let spec = audio::advanced_fft_denoise(12, -50, "v", true).spec();
@@ -4501,11 +4518,76 @@ mod tests {
         );
     }
 
-    /// 新的 Rust 实现在**每个输入上**都必须与 `ffi::av_escape` 逐字节一致。
+    /// 用 FFmpeg **自己**用来反转义的 `av_get_token` 把两遍 unescape 跑完：
+    /// 图级 `av_get_token(buf, "[],;")` 拆滤镜，选项级 `av_get_token(buf, ":")`
+    /// 拆选项（`av_opt_get_key_value`）。
     ///
-    /// 生产代码不再调用 `av_escape`（它会把"分配失败"变成一条不存在的可恢复错误，
-    /// 而这正是之前那个 fallback 的来源），但 FFmpeg 才是转义语义的出处，所以这里保留
-    /// 一次差分对照：同一组 `specials` / flags 下两者输出必须相等。`av_escape` 只在本测试里出现。
+    /// 之所以要这个而不是只看转义后的字符串：转义失效时图**照样建得起来**，
+    /// 只是值被悄悄改写了 —— 这正是 P0-1 的形态，只断言"有没有转义"抓不到。
+    fn ffmpeg_unescape_twice(escaped: &str) -> String {
+        fn pass(input: &str, term: &str) -> String {
+            let c_in = CString::new(input).expect("corpus has no interior NUL");
+            let c_term = CString::new(term).expect("terminator sets are crate constants");
+            let mut buf: *const std::os::raw::c_char = c_in.as_ptr();
+            // SAFETY: `buf` points into `c_in`, which outlives the call; `av_get_token`
+            // only advances it. On success it returns an `av_malloc`ed string that is
+            // freed right below (a NULL return means OOM, asserted next).
+            let out = unsafe { ffi::av_get_token(&mut buf, c_term.as_ptr()) };
+            assert!(!out.is_null(), "av_get_token failed on {input:?}");
+            let unescaped = unsafe { CStr::from_ptr(out) }
+                .to_string_lossy()
+                .into_owned();
+            // SAFETY: `out` came from `av_get_token`, which allocates with `av_malloc`.
+            unsafe { ffi::av_free(out as *mut _) };
+            unescaped
+        }
+        pass(&pass(escaped, "[],;"), ":")
+    }
+
+    /// 回归 P0-1：滤镜值必须**原样**穿过 FFmpeg 的两遍 unescape。
+    ///
+    /// 旧写法把值包进 `'…'` 引号，转义因此彻底失效：`av_get_token` 进入引号模式后
+    /// 原样拷贝到下一个裸 `'`，转义出来的 `\'` 里那个 `'` 会提前闭合它。实测
+    /// `filename='a\'b'` 与完全不转义的 `filename='a'b'` 打开的**都是** `ab`，
+    /// 值被静默改写。只有不加引号 + 两级转义能拿到 `a'b`。
+    #[test]
+    fn test_filter_value_survives_ffmpegs_two_unescape_passes() {
+        let corpus = [
+            "a'b",
+            r"a\b",
+            "a:b",
+            "a,b",
+            "a b",
+            "a'b c.txt",
+            "/tmp/a:b/c,d.mp4",
+            "plain",
+            "%{localtime}",
+        ];
+        for value in corpus {
+            let escaped = escape_filter_value(value).unwrap();
+            assert_eq!(
+                ffmpeg_unescape_twice(&escaped),
+                value,
+                "escaped value came back rewritten: {escaped}"
+            );
+        }
+
+        // 反向钉住：同一批值用**旧的引号写法**必然被改写。引号回来的那天这条会红。
+        for value in ["a'b", "a'b c.txt", "it's fine"] {
+            let quoted = format!("'{}'", escape_option_level(value).unwrap());
+            let got = ffmpeg_unescape_twice(&quoted);
+            assert_ne!(
+                got, value,
+                "quoting silently rewrites the value: {quoted} -> {got}"
+            );
+        }
+    }
+
+    /// 本 crate 的转义实现在**每个输入上**都必须与 `ffi::av_escape` 逐字节一致。
+    ///
+    /// 生产代码不调用 `av_escape`（它把"分配失败"变成一条调用方无从处理的可恢复
+    /// 错误），但 FFmpeg 才是转义语义的出处，所以这里保留一次差分对照：同一组
+    /// `specials` / flags 下两者输出必须相等。`av_escape` 只在本测试里出现。
     #[test]
     fn test_rust_escaping_matches_av_escape() {
         fn reference(input: &str, specials: &str, flags: i32) -> String {
@@ -4576,15 +4658,12 @@ mod tests {
         }
     }
 
-    /// 值里的 NUL 不再被静默丢弃，而是在**转义这一层**就报错。
+    /// 值里的 NUL 在**转义这一层**就报错，不会被丢弃。
     ///
     /// `av_escape` 要的是 NUL 结尾的 C 字符串，所以含 NUL 的值根本进不了转义 —— 这也
     /// 正合语义：滤镜描述本身就是 C 字符串，NUL 表示不出来。错误是
-    /// [`RsmediaError::InvalidConfig`]，能一眼看出是 NUL 的问题。
-    ///
-    /// 旧实现把它 `replace('\0', "")` 掉然后照常成功，产出一条少几个字符、却看起来
-    /// 完全正常的滤镜描述 —— 那正是"掩盖问题"。手写 spec 里的 NUL 同样被拒
-    /// （`FilterGraph::build` 把描述变成 C 字符串那一步），两个入口行为一致。
+    /// [`RsmediaError::InvalidConfig`]，能一眼看出是 NUL 的问题。手写 spec 里的
+    /// NUL 同样被拒（`FilterGraph::build` 把描述变成 C 字符串那一步），两个入口一致。
     #[test]
     fn test_nul_in_a_filter_value_is_reported_not_dropped() {
         for err in [
@@ -4694,27 +4773,44 @@ mod tests {
         );
     }
 
+    /// `DrawText` 的 `text` / `fontfile` 一律**不加引号** —— 这是 P0-1 的落点。
+    ///
+    /// 加 `'…'` 看似更稳妥，实际让 `av_get_token` 进入引号模式，转义随即失效、
+    /// 值被静默改写（见 [`test_filter_value_survives_ffmpegs_two_unescape_passes`]）。
     #[test]
     fn test_drawtext_time_text() {
-        // 静态文本正常转义
+        // 静态文本：普通值原样保留，不包引号
         let static_spec = video::DrawText::new("Hello", 10, 20, 24, "white")
             .build()
-            .spec()
-            .to_string();
+            .spec();
         assert!(
-            static_spec.contains("drawtext=text='Hello':x=10:y=20:fontsize=24:fontcolor=white"),
+            static_spec.starts_with(
+                "drawtext=text=Hello:x=10:y=20:fontsize=24:fontcolor=white:fontfile=fonts/Arial.ttf"
+            ),
             "static drawtext spec mismatch: {static_spec}"
         );
+        assert!(
+            !static_spec.contains("text='"),
+            "text must not be quoted: {static_spec}"
+        );
 
-        // 时间表达式不被转义
+        // 含单引号的文本：以**三级**转义出现，两遍 unescape 后才还原成 `'`
+        let quoted_spec = video::DrawText::new("it's", 0, 0, 24, "white")
+            .build()
+            .spec();
+        assert!(
+            quoted_spec.starts_with(r"drawtext=text=it\\\'s:"),
+            "a quote needs three backslashes: {quoted_spec}"
+        );
+
+        // 时间表达式：`%{...}` 不被转义，且同样不加引号
         let time_spec = video::DrawText::new("", 10, 20, 24, "white")
             .time_text("%{localtime}")
             .build()
-            .spec()
-            .to_string();
+            .spec();
         assert!(
-            time_spec.contains("text='%{localtime}'"),
-            "time expression should not be escaped: {time_spec}"
+            time_spec.contains("text=%{localtime}"),
+            "time expression should not be escaped or quoted: {time_spec}"
         );
     }
 
@@ -4891,14 +4987,13 @@ mod tests {
             .build()
             .spec()
             .to_string();
+        // `text` / `fontfile` 不包引号（P0-1）：引号会让 `av_get_token` 进入引号
+        // 模式，转义随即失效、值被静默改写。
         assert!(
-            f.contains("drawtext=text='Hi':x=1:y=2:fontsize=20:fontcolor=white"),
+            f.contains("drawtext=text=Hi:x=1:y=2:fontsize=20:fontcolor=white"),
             "base mismatch: {f}"
         );
-        assert!(
-            f.contains("fontfile='fonts/A.ttf'"),
-            "fontfile missing: {f}"
-        );
+        assert!(f.contains("fontfile=fonts/A.ttf"), "fontfile missing: {f}");
         assert!(
             f.contains("box=1:boxcolor=black@0.5:boxborderw=0"),
             "box missing: {f}"
@@ -5374,8 +5469,8 @@ mod tests {
     /// `Drained` 在**最后一路 EOF 推送成功**的那一刻置位，而不等取帧拿到 `EAGAIN`
     /// —— 判据是"EOF 已送到每一路输入"（`state::ProcessState` 里 `Drained` 的定义）。
     ///
-    /// 旧实现把推进放在 `receive_frame_from` 的 `EAGAIN` 分支里，于是"刚推完 EOF、
-    /// 一次 `EAGAIN` 都还没遇到"的图仍报 `Normal`，与文档里的判据不符。
+    /// 由此推出："刚推完 EOF、一次 `EAGAIN` 都还没遇到"的图必须**已经**是
+    /// `Drained` —— 推进不能挂在 `receive_frame_from` 的 `EAGAIN` 分支上。
     #[test]
     fn test_eof_marks_the_graph_drained_before_any_eagain() -> Result<()> {
         let (w, h) = (8, 4);
@@ -5415,8 +5510,8 @@ mod tests {
 
     /// `init` 这条路径（解码/编码流水线用的单输入线性链）也必须登记输入描述：
     /// 取帧失败时 FFmpeg 只回一句 `EINVAL`，错误信息全靠这份描述定位"声明的
-    /// 格式 vs 实际喂进去的格式"。以前只有 `FilterGraphBuilder::build` 登记它，
-    /// 于是解码/编码路径上的诊断恒为空。
+    /// 格式 vs 实际喂进去的格式"。`FilterGraph::init`（解码/编码路径）与
+    /// `FilterGraphBuilder::build` 都必须登记它，否则那条诊断恒为空。
     #[test]
     fn test_init_records_declared_input_specs() -> Result<()> {
         let (w, h) = (8, 4);
@@ -6024,9 +6119,9 @@ mod tests {
 
     /// 输出索引越界必须是**错误**，不能被折叠成"这一路没有帧率/时间基/尺寸"。
     ///
-    /// 这三个查询原先都用 `.ok()?` 吞掉 `get_sink_context` 的失败，于是
-    /// "调用方写错了索引"和"汇没协商出帧率"在返回类型上完全同形（`None`），
-    /// 前者被静默忽略。改成 `Result` 之后两者必须可区分，这里钉住这一点。
+    /// "调用方写错了索引"与"汇没协商出帧率"必须可区分：前者是
+    /// [`RsmediaError::InvalidConfig`]，后者是 `Ok(None)`。两者都折成 `None`
+    /// 会让写错的索引被静默忽略。
     #[test]
     fn test_output_index_out_of_range_is_an_error_not_a_missing_value() -> Result<()> {
         let mut graph = FilterGraphBuilder::hstack(
@@ -6097,11 +6192,11 @@ mod tests {
 
     /// 闭集滤镜选项：名字与 FFmpeg 的数字写法都收，越界/拼错在**构造期**就拒绝。
     ///
-    /// `yadif`/`bwdif`/`afade`/`amix` 原先**完全不校验**：拼错的名字被原样写进滤镜
-    /// 串，直到建图才变成一句 FFmpeg 的解析错误（"Unable to parse \"mode\" option
-    /// value \"…\""），既没有本 crate 的上下文也定位不到是哪个参数。`amix` 更糟——
-    /// 两个入口一个校验（`FilterGraphBuilder::amix`）一个不校验（`audio::amix`），
-    /// 同一个值在两个入口行为不同。
+    /// `yadif`/`bwdif`/`afade`/`amix` 的封闭取值集在**构造期**校验：拼错的名字若
+    /// 原样写进滤镜串，要到建图才变成一句 FFmpeg 的解析错误（"Unable to parse
+    /// \"mode\" option value \"…\""），既没有本 crate 的上下文也定位不到是哪个
+    /// 参数。`amix` 的两个入口（`FilterGraphBuilder::amix` 与 `audio::amix`）必须
+    /// 对同一个值给出一致的行为。
     ///
     /// 值集按 `ffmpeg -h filter=<name>` 实测：`yadif.mode` 声明 `from 0 to 3` 并给
     /// 四个名字，`bwdif.mode` 是 `0..=1`（**没有** `*_nospatial`），`afade.t` 是
