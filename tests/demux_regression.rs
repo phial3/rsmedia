@@ -246,12 +246,13 @@ fn demux_binds_each_same_type_stream_to_its_own_codecpar() -> anyhow::Result<()>
     // Decode check: whatever frames a stream yields must claim the sample rate
     // of that stream (before the fix, the 8 kHz track decoded into frames
     // claiming 44.1 kHz).
-    let mut per_stream: std::collections::HashMap<usize, (usize, i32)> =
+    let mut per_stream: std::collections::HashMap<usize, (usize, u32)> =
         std::collections::HashMap::new(); // idx → (frame count, sample rate)
     while let Some((idx, frame)) = demuxer.demux()? {
-        let entry = per_stream.entry(idx).or_insert((0, frame.sample_rate));
+        let frame_rate = frame.sample_rate as u32;
+        let entry = per_stream.entry(idx).or_insert((0, frame_rate));
         assert_eq!(
-            entry.1, frame.sample_rate,
+            entry.1, frame_rate,
             "stream {idx}: per-frame sample rate must be constant"
         );
         entry.0 += 1;

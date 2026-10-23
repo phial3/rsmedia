@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
             EncoderBuilder::new_audio(
                 info.bit_rate,
                 info.channel_layout.nb_channels as u32,
-                info.sample_rate as u32,
+                info.sample_rate,
                 info.format.into_sample().unwrap_or(SampleFormat::NONE),
             )
             .build()?

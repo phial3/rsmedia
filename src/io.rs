@@ -39,11 +39,9 @@
 //! warning instead of being silently dropped.
 
 use crate::error::{Context, Result, RsmediaError};
-use crate::flags::FlagSet;
-use crate::init::{AVLogFlag, AVLogLevel};
 use crate::location::Location;
+use crate::mediatype::MediaType;
 use crate::options::AVOptions;
-use crate::stream::MediaType;
 use crate::time::Rational;
 use crate::{strutils, time};
 
@@ -59,8 +57,12 @@ use rsmpeg::ffi;
 
 pub use bytes::{BufMut, Bytes, BytesMut};
 
+/// `init_logging` 现在定义在 [`crate::init`]（日志层与 `init` 同处一层，见那里的
+/// 模块文档）。这里保留重导出，使既有的 `rsmedia::io::init_logging` 路径继续可用。
+pub use crate::init::init_logging;
+
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// `AVERROR(EIO)`：FFmpeg 以负 errno 报错，即 `AVERROR(e) = -e`。
@@ -124,8 +126,7 @@ pub trait Reader {
     ///
     /// 成功时返回 `(packet 所属流的 index, packet)`；调用方如需更多流信息
     /// （time_base、metadata 等），可通过 [`stream_at`](Self::stream_at)
-    /// 按索引取流，或经 `self.input()` 直接使用 rsmpeg 的
-    /// [`AVStream`](rsmpeg::avformat::AVStream)。
+    /// 按索引取流，或经 `self.input()` 直接使用 rsmpeg 的 [`AVStream`]。
     fn read_packet(&mut self) -> Result<Option<(usize, AVPacket)>> {
         match self.input_mut().read_packet() {
             Ok(Some(pkt)) => Ok(Some((pkt.stream_index as usize, pkt))),
@@ -290,53 +291,40 @@ pub trait Seekable: Reader {
     /// Seek to a position in a stream: by **timestamp** by default, or by byte offset /
     /// "frame index" when the matching flag is set.
     ///
-    /// Wraps FFmpeg's `av_seek_frame`. `frame_ts` is interpreted according to `flags`,
-    /// and — this is the part worth reading — **the flags do not all do what their names
-    /// promise**. Measured behaviour on FFmpeg 9:
+    /// Wraps FFmpeg's `av_seek_frame`. `frame_ts` is interpreted according to `flags`, and
+    /// **the flags do not all do what their names promise** (measured on FFmpeg 9):
     ///
-    /// - **No flag, or `AVSeekFlag::ANY` / `AVSeekFlag::BACKWARD`** — timestamp seek, in
-    ///   the stream's time-base units. Works on containers that build an index (MP4/MOV,
-    ///   MPEG-TS, MKV, …); fails on raw Annex-B, which has neither index nor timestamps
-    ///   (next bullet).
-    /// - **`AVSeekFlag::FRAME` is not implemented by FFmpeg.** `avformat.h` documents it
-    ///   as "seeking based on frame number", but no code path in libavformat reads it: a
-    ///   few niche demuxers *reject* it (`mv`, `cine`, `concat`, subtitles, …) and
-    ///   everything else ignores it, so the call falls through to the ordinary timestamp
-    ///   path. On MP4, `seek_to_frame(0, 7, AVSeekFlag::FRAME)` therefore does **not**
-    ///   land on frame 7 and does **not** fail either: it seeks to timestamp 7 and lands
-    ///   on the first keyframe at `ts >= 7` (measured: frame 1 of an all-intra file).
-    ///   Do not use it expecting frame indexes.
-    /// - **`AVSeekFlag::BYTE`** repositions by byte offset — a plain `avio_seek`.
-    ///   Demuxers that index by timestamp and set `AVFMT_NO_BYTE_SEEK` reject it with an
-    ///   error (**MP4/MOV** is one; measured), while raw Annex-B accepts it (pure
-    ///   byte-offset repositioning; measured).
-    /// - **Raw Annex-B (`.h264` / `.hevc`)**: the raw demuxers carry no
-    ///   `read_seek`/`read_seek2` and no `read_timestamp`, and decode every packet with
-    ///   `pts = AV_NOPTS_VALUE`, so nothing ever fills the index and **every** seek by
-    ///   timestamp or by "frame" fails — only `BYTE` works. [`Seekable::seek_to_start`]
-    ///   fails there too.
+    /// - **No flag, `AVSeekFlag::ANY` or `AVSeekFlag::BACKWARD`** — timestamp seek in
+    ///   stream time-base units. Works on containers that build an index (MP4/MOV,
+    ///   MPEG-TS, MKV, …).
+    /// - **`FRAME` is not implemented by FFmpeg.** `avformat.h` documents it as seeking by
+    ///   frame number, but no libavformat code path reads it: a few niche demuxers *reject*
+    ///   it (`mv`, `cine`, `concat`, subtitles, …) and everything else ignores it, so the
+    ///   call falls through to the timestamp path. `seek_to_frame(0, 7, AVSeekFlag::FRAME)`
+    ///   on MP4 lands on the first keyframe at `ts >= 7`, without failing.
+    /// - **`BYTE`** repositions by byte offset (a plain `avio_seek`). Demuxers that index by
+    ///   timestamp and set `AVFMT_NO_BYTE_SEEK` reject it (MP4/MOV does), while raw Annex-B
+    ///   accepts it.
+    /// - **Raw Annex-B (`.h264` / `.hevc`)** carries no seek and no timestamps, so every
+    ///   seek by timestamp or by "frame" fails — only `BYTE` works, and
+    ///   [`Seekable::seek_to_start`] fails too.
     ///
-    /// Support is otherwise source-dependent (network/live inputs may refuse or block),
-    /// so treat the returned `Result` as authoritative — propagate it instead of
-    /// `.unwrap()`-ing it, and prefer [`Seekable::seek_to_timestamp`] for containers.
-    /// Seeking lands on the nearest **keyframe** unless `AVSeekFlag::ANY` is combined,
-    /// which allows landing on a non-keyframe.
+    /// Support is otherwise source-dependent (network/live inputs may refuse or block), so
+    /// treat the returned `Result` as authoritative. Seeking lands on the nearest
+    /// **keyframe** unless `AVSeekFlag::ANY` is combined.
     ///
-    /// A `stream_index` outside the input's streams is rejected here, before FFmpeg
-    /// sees it: `av_seek_frame` dereferences the `AVStream` it is given without
-    /// bounds-checking, so an out-of-range index is undefined behaviour rather than
-    /// an error code.
+    /// A `stream_index` outside the input's streams is rejected here, before FFmpeg sees
+    /// it: `av_seek_frame` dereferences the `AVStream` it is given without bounds-checking,
+    /// so an out-of-range index is undefined behaviour rather than an error code.
     ///
     /// # Arguments
     ///
     /// * `stream_index` - The index of the stream to seek to.
-    /// * `frame_ts` - The target timestamp (stream time-base units), or a byte offset
-    ///   with `AVSeekFlag::BYTE`. "Frame index" only if a demuxer ever honours
-    ///   `AVSeekFlag::FRAME`, which none does today — see above.
-    /// * `flags` - [`AVSeekFlag`] bits: a single flag, or a [`FlagSet`] built with `|`
-    ///   (e.g. `AVSeekFlag::BACKWARD | AVSeekFlag::ANY`), or a mask that is already a bare
-    ///   `i32` — see [`AVSeekFlag`] for how to mix in rsmpeg's `u32` `AVSEEK_FLAG_*`
-    ///   constants.
+    /// * `frame_ts` - The target timestamp (stream time-base units), or a byte offset with
+    ///   `AVSeekFlag::BYTE`.
+    /// * `flags` - [`AVSeekFlag`] bits: a single flag, a [`FlagSet`](crate::FlagSet) built with
+    ///   `|` (e.g. `AVSeekFlag::BACKWARD | AVSeekFlag::ANY`), or a bare `i32` mask — see
+    ///   [`AVSeekFlag`] for how to mix in rsmpeg's `AVSEEK_FLAG_*` constants.
     fn seek_to_frame(
         &mut self,
         stream_index: usize,
@@ -1064,8 +1052,9 @@ impl<'a, R: std::io::Read + Send + 'static> IoReaderBuilder<'a, R> {
         let read_packet: ReadPacketCallback = Box::new(move |_opaque, buf: &mut [u8]| {
             loop {
                 // IO-F4：回调运行在 FFI 调用栈中，用户的 `Read` 实现 panic 会穿 FFI
-                // 直接 abort 整个进程 —— 与 log 回调（本文件 [`log_callback`] 处的
-                // catch_unwind 边界）同一处理：panic 拦下后按 IO 错误交给 FFmpeg。
+                // 直接 abort 整个进程 —— 与 log 回调同一处理（那个
+                // catch_unwind 边界见 [`crate::init::init_logging`] 装的
+                // `log_callback`）：panic 拦下后按 IO 错误交给 FFmpeg。
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.read(buf))) {
                     Ok(Ok(0)) => return ffi::AVERROR_EOF,
                     Ok(Ok(n)) => return n as i32,
@@ -1210,7 +1199,7 @@ pub trait Writer {
     /// Obtain mutable reference to output context.
     fn output_mut(&mut self) -> &mut AVFormatContextOutput;
 
-    /// 按输出容器索引取第 `index` 条流（[`Reader::stream_at`](Reader::stream_at)
+    /// 按输出容器索引取第 `index` 条流（[`Reader::stream_at`]
     /// 的写侧对称方法）。
     ///
     /// 越界统一为 [`RsmediaError::InvalidConfig`]（消息带 `nb_streams`）。注意
@@ -2041,156 +2030,6 @@ impl<W: std::io::Write + Send + 'static> Writer for IoWriter<W> {
 /// the `W: Send` bound covers the wrapped writer, and every callback is `Send`.
 unsafe impl<W: std::io::Write + Send + 'static> Send for IoWriter<W> {}
 
-////////////////////////////////////////
-// Logging
-////////////////////////////////////////
-
-/// Initialize the logging handler. This will redirect all ffmpeg logging to the Rust `tracing`
-/// crate and any subscribers to it.
-///
-/// `level` 也被记下来供回调自行过滤：FFmpeg 的 `av_log_set_level` 只作用于它
-/// 自带的默认回调，安装自定义回调后**所有**级别的消息都会送进回调，因此
-/// [`AVLogLevel::QUIET`] 必须由回调自己实现（见私有 `log_callback`）。
-///
-/// `flag` 是 [`AVLogFlag`] 位集，按 [`FlagSet<AVLogFlag>`](crate::FlagSet) 给出（单个标志或 `|` 组合）。
-pub fn init_logging(level: AVLogLevel, flag: impl Into<FlagSet<AVLogFlag>>) {
-    let flag = flag.into();
-    LOG_LEVEL.store(level as i32, Ordering::Relaxed);
-    // SAFETY: all three are process-global setters with no preconditions; `log_callback` is an
-    // `extern "C"` fn whose signature is exactly the one FFmpeg calls it through.
-    unsafe {
-        ffi::av_log_set_callback(Some(log_callback));
-        ffi::av_log_set_level(level as _);
-        ffi::av_log_set_flags(flag.bits() as _);
-    }
-}
-
-/// [`init_logging`] 配置的最大输出级别（FFmpeg 数值语义：越大越啰嗦）。
-///
-/// 默认 `INFO`，与 FFmpeg 自带默认回调的过滤器行为一致。
-static LOG_LEVEL: AtomicI32 = AtomicI32::new(AVLogLevel::INFO as i32);
-
-/// Internal function with C-style callback behavior that receives all log messages from ffmpeg and
-/// handles them with the `tracing` crate, the Rust way.
-///
-/// 这里是 `catch_unwind` 边界：`tracing` 的订阅者可能 panic，而 panic 逸出
-/// `extern "C"` 边界会 abort 整个进程；宁可丢一条日志，也不能拖垮宿主程序。
-///
-/// # Arguments
-///
-/// * `avcl` - Internal struct with log message data.
-/// * `level_no` - Log message level integer.
-/// * `fmt` - Log message format string.
-/// * `vl` - Variable list with format string items.
-unsafe extern "C" fn log_callback(
-    avcl: *mut std::ffi::c_void,
-    level_no: std::ffi::c_int,
-    fmt: *const std::ffi::c_char,
-    #[cfg(all(target_arch = "x86_64", target_family = "unix"))] vl: *mut ffi::__va_list_tag,
-    #[cfg(not(all(target_arch = "x86_64", target_family = "unix")))] vl: ffi::va_list,
-) {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: 参数由 FFmpeg 传入，在回调期间保持有效；实现只读取它们。
-        unsafe { log_callback_impl(avcl, level_no, fmt, vl) };
-    }));
-}
-
-/// [`log_callback`] 的实现体，运行在 `catch_unwind` 边界内。
-unsafe fn log_callback_impl(
-    avcl: *mut std::ffi::c_void,
-    level_no: std::ffi::c_int,
-    fmt: *const std::ffi::c_char,
-    #[cfg(all(target_arch = "x86_64", target_family = "unix"))] vl: *mut ffi::__va_list_tag,
-    #[cfg(not(all(target_arch = "x86_64", target_family = "unix")))] vl: ffi::va_list,
-) {
-    // 先按 `init_logging` 的级别过滤（FFmpeg 装了自定义回调后不再自己过滤，
-    // 这一步是 `AVLogLevel::QUIET` 能真正静音的唯一保证）。
-    if level_no > LOG_LEVEL.load(Ordering::Relaxed) {
-        return;
-    }
-
-    let event_would_log = match level_no as u32 {
-        // These are all error states.
-        ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
-            tracing::enabled!(tracing::Level::ERROR)
-        }
-        ffi::AV_LOG_WARNING => tracing::enabled!(tracing::Level::WARN),
-        ffi::AV_LOG_INFO => tracing::enabled!(tracing::Level::INFO),
-        // There is no "verbose" in `log`, so we just put it in the "debug" category.
-        ffi::AV_LOG_VERBOSE | ffi::AV_LOG_DEBUG => tracing::enabled!(tracing::Level::DEBUG),
-        ffi::AV_LOG_TRACE => tracing::enabled!(tracing::Level::TRACE),
-        _ => {
-            return;
-        }
-    };
-
-    if event_would_log {
-        // Allocate some memory for the log line (might be truncated). 1024 bytes is the number used
-        // by ffmpeg itself, so it should be mostly fine.
-        let mut line = [0; 1024];
-        let mut print_prefix: std::ffi::c_int = 1;
-        // Use the ffmpeg default formatting.
-        // SAFETY: FFmpeg passes `avcl`/`fmt`/`vl` per its `av_log` callback contract; `line` is
-        // a live 1024-byte buffer and `print_prefix` a live local, both written by the call and
-        // neither retained.
-        let ret = unsafe {
-            ffi::av_log_format_line2(
-                avcl,
-                level_no,
-                fmt,
-                vl,
-                line.as_mut_ptr(),
-                (line.len()) as std::ffi::c_int,
-                (&mut print_prefix) as *mut std::ffi::c_int,
-            )
-        };
-        // Simply discard the log message if formatting fails.
-        // SAFETY: on success (`ret > 0`) FFmpeg NUL-terminated `line`, so reading it as a C
-        // string is in-bounds.
-        if ret > 0
-            && let Ok(line) = unsafe { std::ffi::CStr::from_ptr(line.as_mut_ptr()) }.to_str()
-        {
-            let line = line.trim();
-            if log_filter_hacks(line) {
-                match level_no as u32 {
-                    // These are all error states.
-                    ffi::AV_LOG_PANIC | ffi::AV_LOG_FATAL | ffi::AV_LOG_ERROR => {
-                        tracing::error!(target: "rsmedia", "{}", line)
-                    }
-                    ffi::AV_LOG_WARNING => tracing::warn!(target: "rsmedia", "{}", line),
-                    ffi::AV_LOG_INFO => tracing::info!(target: "rsmedia", "{}", line),
-                    // There is no "verbose" in `log`, so we just put it in the "debug" category.
-                    ffi::AV_LOG_VERBOSE | ffi::AV_LOG_DEBUG => {
-                        tracing::debug!(target: "rsmedia", "{}", line)
-                    }
-                    ffi::AV_LOG_TRACE => tracing::trace!(target: "rsmedia", "{}", line),
-                    _ => {}
-                };
-            }
-        } else if ret > 0 {
-            // 格式化成功但不是合法 UTF-8：`tracing` 的 message 只能是 UTF-8 字符串，
-            // 这行字节无法承载。取有损转换会掩盖"日志内容被改写"，因此丢弃并留痕。
-            tracing::debug!(
-                target: "rsmedia",
-                "discarded a non-UTF-8 FFmpeg log line (level {level_no}, {ret} bytes)"
-            );
-        }
-    }
-}
-
-/// Helper function to filter out any lines that we don't want to log because they contaminate.
-/// Currently, it includes the following log line hacks:
-///
-/// * **Pelco H264 encoding issue**. Pelco cameras and encoders have a problem with their SEI NALs
-///   that causes ffmpeg to complain but does not hurt the stream. It does cause continuous error
-///   messages though which we filter out here.
-fn log_filter_hacks(line: &str) -> bool {
-    /* Hack 1 */
-    const HACK_1_PELCO_NEEDLE_1: &str = "SEI type 5 size";
-    const HACK_1_PELCO_NEEDLE_2: &str = "truncated at";
-    !(line.contains(HACK_1_PELCO_NEEDLE_1) && line.contains(HACK_1_PELCO_NEEDLE_2))
-}
-
 /// Names of the **input** protocols supported by the current FFmpeg build
 /// (`file`, `http`, `rtp`, `tcp`, `udp`, ...).
 ///
@@ -2311,8 +2150,8 @@ mod tests {
 
     /// `deadline` 这个 mutex 被 poison 之后，`triggered()` 仍必须承认**已到期**的超时。
     ///
-    /// 曾经读侧写的是 `.unwrap_or(false)`：一旦该 mutex 被 poison，已到期的 deadline
-    /// 就被读成"没到期" ⇒ abort/超时请求被静默丢弃，FFmpeg 侧拿到 0，阻塞读永远等
+    /// 读侧不能写成 `.unwrap_or(false)`：mutex 被 poison 后，已到期的 deadline 会
+    /// 被读成"没到期" ⇒ abort/超时请求被静默丢弃，FFmpeg 侧拿到 0，阻塞读永远等
     /// 下去且没有任何日志。poison 不是纯理论场景：`set_timeout` 里
     /// `Instant::now() + timeout` 在溢出时会 panic。
     #[test]
@@ -2938,7 +2777,7 @@ mod tests {
     /// BACKWARD seek 无回退余地）上，seek 到任意帧边界必须精确落在该帧。
     ///
     /// 上面的 `test_seek_to_timestamp_advances_the_read_position` 只断言
-    /// "位置移动了"，抓不住落点漂移类回归（曾因此漏检）。
+    /// "位置移动了"，抓不住落点漂移 —— 落点精度必须单独钉住。
     #[test]
     fn test_seek_to_timestamp_lands_exactly_on_all_intra() -> Result<()> {
         const FPS: f64 = 25.0;
@@ -3075,12 +2914,11 @@ mod tests {
     /// 中断句柄：新建时未触发，`abort` 立即触发，零超时也立即触发；
     /// 且**已触发的句柄必须真的拦得下打开与读包**。
     ///
-    /// 曾经的实现只在 `avformat_open_input` 之后把回调写到 format context 上，
-    /// 而 FFmpeg 在打开时会把回调**按值拷贝**进协议层（`ffurl_alloc`），
-    /// `av_read_frame` 自己也不查回调，于是协议层的阻塞读永远看不到它——本测试
-    /// 当时只能断言"装配成功，无法验证中止效果"。现在带 `with_interrupt` 的 URL
-    /// 输入走 `open_input_with_interrupt`（回调先于 open 安装），已触发的句柄会在
-    /// 打开阶段的探测读上直接拿到 AVERROR_EXIT。
+    /// 回调必须**先于** `avformat_open_input` 安装：FFmpeg 在打开时会把回调按值
+    /// 拷贝进协议层（`ffurl_alloc`），`av_read_frame` 自己也不查回调，所以在 open
+    /// 之后才写到 format context 上的回调，协议层的阻塞读永远看不到它。带
+    /// `with_interrupt` 的 URL 输入因此走 `open_input_with_interrupt`，已触发的
+    /// 句柄会在打开阶段的探测读上直接拿到 AVERROR_EXIT。
     #[test]
     fn test_interrupt_abort_and_timeout() -> Result<()> {
         let fresh = Interrupt::new();

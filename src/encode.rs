@@ -44,12 +44,12 @@ use crate::fmt::{FrameFormat, SampleFormat};
 use crate::frame::{ElementType, MediaFrame};
 use crate::hwaccel::{HWContext, HWDeviceConfig};
 use crate::io::Writer;
+use crate::mediatype::MediaType;
 use crate::options::{AVOptions, CRF_CAPABLE_CODECS, Quality, VideoProfile};
 use crate::pixel::PixelFormat;
 use crate::resample;
 use crate::scale::{ScaleAlgorithm, ScaleQuality, Scaler, VideoSpec};
 use crate::state::ProcessState;
-use crate::stream::MediaType;
 use crate::strutils;
 use crate::subtitle::SubtitleSegment;
 use crate::time::{self, Rational, Rescale};
@@ -2392,6 +2392,17 @@ impl Encoder {
                         writer.write_frame(&mut packet)?
                     };
                     written_packets += 1;
+                    // 产出也有上限：`drained_iterations` 只在空转时增长，正常产出时
+                    // 归零，单独的它拦不住"每挤出几包就空转一阵"的病态编码器 ——
+                    // 那种情况会一直往 writer 里写。与 `MAX_DRAIN_OUTPUTS` 的语义
+                    // 一致（见 `lib.rs`）：一次排空调用能交出的包数是有限的。
+                    if written_packets >= crate::MAX_DRAIN_OUTPUTS {
+                        return Err(RsmediaError::msg(format!(
+                            "Encoder produced more than {} packets while flushing; aborting, \
+                             output is truncated after {written_packets} packet(s)",
+                            crate::MAX_DRAIN_OUTPUTS
+                        )));
+                    }
                 }
                 Ok(None) => {
                     if self.is_drained() {
@@ -3690,8 +3701,8 @@ mod tests {
     }
 
     /// 排空失败后**必须能重试**：`Drained`（EOS 已送出、包还没排完）不等于"已经
-    /// flush 过"。回归点：守卫曾经只看"状态不是 `Normal`"，于是第二次 `flush` 直接
-    /// 返回空累积器，而 `Muxer::finish` 随后照样写 trailer ⇒ **截断的流以成功返回**。
+    /// flush 过"。守卫若只看"状态不是 `Normal`"，第二次 `flush` 会直接返回空累积器，
+    /// 而 `Muxer::finish` 随后照样写 trailer ⇒ **截断的流以成功返回**。
     ///
     /// 用可切换失败的 writer 制造"排空循环中途报错"：第一次必然 `Err`；第二次仍必须
     /// `Err`（说明它真的又去排空了，而不是报告成功）；切回正常 writer 后必须把剩下的

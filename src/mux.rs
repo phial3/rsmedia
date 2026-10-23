@@ -48,8 +48,9 @@ use crate::filter::Filter;
 use crate::hwaccel::HWDeviceConfig;
 use crate::io::{Reader, StreamReader, StreamWriter, Writer};
 use crate::location::Location;
+use crate::mediatype::MediaType;
 use crate::options::{AVOptions, Metadata};
-use crate::stream::{MediaType, StreamInfo};
+use crate::stream::StreamInfo;
 use crate::subtitle::SubtitleSegment;
 use crate::time::Rational;
 use crate::time::TIME_BASE;
@@ -274,13 +275,13 @@ impl Muxer<StreamWriter> {
     ///
     /// 切点落在**关键帧**上：默认只在参考流的关键帧处开新段（`break_non_keyframes=1`
     /// 可放宽）。要精确控制切点，用
-    /// [`MediaFrame::force_key_frame`](crate::MediaFrame::force_key_frame) 在
-    /// 目标位置强制插关键帧，并让
-    /// [`with_gop_size`](crate::EncoderBuilder::with_gop_size) 与段长相称。
+    /// [`MediaFrame::force_key_frame`](crate::MediaFrame::force_key_frame) 在目标位置
+    /// 强制插关键帧，并让 [`with_gop_size`](crate::EncoderBuilder::with_gop_size) 与
+    /// 段长相称。
     ///
-    /// 与 [`Muxer::new`] 的差别只在打开方式：`segment` 是 `AVFMT_NOFILE` 容器，
-    /// 由它自己按模板开/关每个段文件，因此**必须**显式指定格式，模板也不会被
-    /// 当成一个真实文件名创建。
+    /// 与 [`Muxer::new`] 的差别只在打开方式：`segment` 是 `AVFMT_NOFILE` 容器，由它
+    /// 自己按模板开/关每个段文件，因此**必须**显式指定格式，模板也不会被当成一个真实
+    /// 文件名创建。
     ///
     /// ```no_run
     /// use rsmedia::mux::Muxer;
@@ -1928,7 +1929,7 @@ impl<R: Reader> Demuxer<R> {
     /// 冲刷所有解码流，让解码从新位置干净起步。
     ///
     /// 调用时机：对底层 reader 完成 **seek** 之后（如
-    /// [`StreamReader::seek_to_timestamp`](crate::io::StreamReader::seek_to_timestamp)）。
+    /// [`Seekable::seek_to_timestamp`](crate::io::Seekable::seek_to_timestamp)）。
     /// seek 只移动读取位置，解码器与滤镜图里还压着 seek **之前**解出的帧——
     /// DTS/PTS 还没来得及交给调用方的、滤镜（fps/aresample 等）攒着的都会在
     /// seek 之后的下一次迭代里旧账新算地冒出来。本方法把它们全部丢弃，并
@@ -2014,6 +2015,12 @@ impl<R: Reader> Demuxer<R> {
     /// 透传模式（[`new_passthrough`](Self::new_passthrough)）没有解码器，本
     /// 方法返回 `InvalidConfig`，应改用
     /// [`demux_packet`](Self::demux_packet)。
+    ///
+    /// # Errors
+    ///
+    /// 读包失败或某个解码器报错时原样返回；读取已结束、但解码器连着
+    /// `MAX_EAGAIN_RETRIES` 拍都"暂无帧"时返回错误 —— 那是坏输入或坏状态机，
+    /// 不能当作流正常结束（否则调用方会把截断的输出当完整结果）。
     pub fn demux(&mut self) -> Result<Option<(usize, AVFrame)>> {
         if self.is_passthrough() {
             return Err(RsmediaError::invalid_config(
@@ -2081,8 +2088,13 @@ impl<R: Reader> Demuxer<R> {
                 //    fps/framerate 这类有延迟的）仍可能压着帧，按 `is_flushed`
                 //    跳过会丢掉它们。
                 //
-                // 循环以 `MAX_EAGAIN_RETRIES` 为上限，与 `Decoder::drain` 一致：
+                // 循环以 `MAX_EAGAIN_RETRIES` 为上限，与 `decode_stream` 一致：
                 // 个别编解码器在 EOS 后可能一直回"暂无帧"，没有上限就是挂死。
+                //
+                // 撞上限时**报错**，不返回 `Ok(None)`：后者会让 `Iterator::next`
+                // 以为流正常结束，把截断的输出当完整结果交给调用方 —— 这是调用方
+                // 最没法察觉的失败方式，也是本函数与 `decode_stream` 原先唯一分叉
+                // 的地方。
                 let mut drain_iterations = 0usize;
                 loop {
                     let mut pending = false;
@@ -2111,11 +2123,16 @@ impl<R: Reader> Demuxer<R> {
                     }
                     drain_iterations += 1;
                     if drain_iterations >= crate::MAX_EAGAIN_RETRIES {
-                        tracing::warn!(
-                            "Demuxer: decoders produced no frame after {} drain iterations; ending demux()",
+                        tracing::error!(
+                            "Demuxer: decoders produced no frame after {} drain iterations; \
+                             treating the stream as damaged",
                             crate::MAX_EAGAIN_RETRIES
                         );
-                        return Ok(None);
+                        return Err(RsmediaError::msg(format!(
+                            "Demuxer keeps returning EAGAIN after EOF, aborting after {} \
+                             iterations",
+                            crate::MAX_EAGAIN_RETRIES
+                        )));
                     }
                 }
             }

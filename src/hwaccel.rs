@@ -11,7 +11,7 @@ use rsmpeg::{UnsafeDerefMut, ffi};
 
 use std::ffi::CString;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Hardware device configuration.
 /// This struct contains all the necessary information to create a hardware device context.
@@ -162,48 +162,24 @@ impl std::fmt::Display for HWDeviceConfig {
 
 /// 该设备类型在 `device_id` 未给出时应当传给 FFmpeg 的 device 字符串。
 ///
-/// # 为什么绝大多数后端返回 `None`（即 `device = NULL`）
+/// 除 DRM 外一律返回 `None`（`device = NULL`），让后端自己选默认设备：这是 FFmpeg
+/// 对每个后端的既定约定，逐一看过后端源码可以确认（VAAPI 自己扫
+/// `/dev/dri/renderD128..135`；VDPAU 走 `XOpenDisplay(NULL)`；CUDA/DXVA2 默认 0 号；
+/// Vulkan/OpenCL 自动选物理设备；VideoToolbox/MediaCodec/AMF 不用 device 串或只当名字
+/// 过滤）。15 个 `hwcontext_*.c` 里没有任何一个因此 `exit()`/`abort()`；实测也一致
+/// （macOS arm64 + Linux aarch64/x86_64 × FFmpeg 6.1/7.1/8.1/9.0 × 全部 15 种类型）：
+/// `NULL` 要么建成设备，要么返回干净的错误码。
 ///
-/// 传 `NULL` 让后端自己选默认设备，是 FFmpeg 对**除 DRM 外**所有后端的既定约定，
-/// 逐一看过后端源码可以确认（FFmpeg 6.1 / 7.1 / 8.1 / 9.0 一致）：
+/// DRM 是唯一例外。`hwcontext_drm.c` 的 `drm_device_create()` 把 device **不加判断**
+/// 交给 `open(device, O_RDWR)`，device 为 `NULL` 时即 `open(NULL, …)`：原生 aarch64 上
+/// 内核返回 `EFAULT`（FFmpeg 干净报错），但 **Rosetta 转译的 x86_64** 上直接 SIGSEGV
+/// （实测退出码 139，最小 C 探针同样复现）。DRM 恰恰是
+/// [`HWDeviceType::platform_preference`] 在 Linux 上的候选之一，所以必须由我们自己补
+/// 一个真实节点。
 ///
-/// | 后端 | `device == NULL` 时的行为 |
-/// |------|--------------------------|
-/// | VAAPI | `if (device) {…} else {…}`：自己扫描 `/dev/dri/renderD128..135` |
-/// | VDPAU | `XOpenDisplay(NULL)`（合法，取 `$DISPLAY`）；失败有 `!priv->dpy` 检查 |
-/// | CUDA | `if (device) device_idx = strtol(…);` → 默认 0 号卡 |
-/// | Vulkan / OpenCL | `if (device && device[0])` → 自动选择物理设备 / 平台 |
-/// | D3D11VA | `if (device) {…} else {…}` → 默认适配器（或按 `vendor_id` 选项）|
-/// | DXVA2 / D3D12VA | `device ? atoi(device) : 0` → 默认适配器 |
-/// | QSV | 用 `child_device_type` 选项派生，device 串不参与主路径 |
-/// | VideoToolbox / MediaCodec / OHCodec | 只用 device 作名字过滤，NULL 即"不过滤" |
-/// | AMF | 完全不用 device 串，走自身枚举 |
-///
-/// 而且**没有任何一个后端**会因此 `exit()`/`abort()`：全部 15 个 `hwcontext_*.c`
-/// 里都没有这类调用。实测也一致（macOS arm64 + Linux aarch64 + Linux x86_64
-/// × FFmpeg 6.1/7.1/8.1/9.0 × 全部 15 种类型）：除 DRM 外 `NULL` 要么建成设备，
-/// 要么返回干净的错误码（未编入该后端时为 `ENOMEM`，无驱动时为其它负值）， 无一崩溃。
-///
-/// # 为什么只有 DRM 例外
-///
-/// `libavutil/hwcontext_drm.c` 的 `drm_device_create()` 是唯一一个把 device
-/// **不加判断**地交给 `open()` 的后端：
-///
-/// ```c
-/// hwctx->fd = open(device, O_RDWR);   /* device 为 NULL 时即 open(NULL, …) */
-/// ```
-///
-/// 这是 FFmpeg 侧的疏漏（6.1 到 9.0 的代码完全相同，未修）。后果依平台而异：
-/// 原生 aarch64 上内核返回 `EFAULT`，FFmpeg 干净地报 `AVERROR(EFAULT)`；
-/// 但在 **Rosetta 转译的 x86_64** 上直接 SIGSEGV —— 实测退出码 139，
-/// 最小 C 探针（只调 libavutil、不经 CLI）同样复现。DRM 恰恰是
-/// [`HWDeviceType::platform_preference`] 在 Linux 上的候选之一，所以它必须由
-/// 我们自己补一个真实节点，不能把这个坑留给 FFmpeg。
-///
-/// 注意这只覆盖 rsmedia 自己的创建路径。若调用方通过 `with_options` 把
-/// `hwaccel` / `hwaccel_device` 之类的 **AVCodecContext 选项**传给 FFmpeg，
-/// 设备将由 FFmpeg 内部创建，那时仍要显式给出
-/// `hwaccel_device=/dev/dri/renderD128`，否则会踩到同一处 `open(NULL)`。
+/// 这只覆盖 rsmedia 自己的创建路径。若调用方通过 `with_options` 把 `hwaccel` /
+/// `hwaccel_device` 之类的 **AVCodecContext 选项**传给 FFmpeg，设备由 FFmpeg 内部创建，
+/// 那时仍要显式给出 `hwaccel_device=/dev/dri/renderD128`。
 fn default_device_string(kind: HWDeviceType) -> Result<Option<CString>> {
     if kind == HWDeviceType::DRM {
         return drm_node_from(Path::new("/dev/dri")).map(Some);
@@ -347,12 +323,29 @@ pub fn release_unused_hw_contexts() -> usize {
 /// or the decoder equivalent; the context itself is the plumbing between those
 /// builders and FFmpeg, never something a user holds.
 ///
-/// 所有方法只做共享访问（`&self`）：底层 `av_hwframe_ctx_alloc` / `av_buffer_ref`
-/// 均为 FFmpeg 保证的线程安全原子操作，因此 [`Send`]/[`Sync`] 实现成立，
-/// 相同配置的多个解码器/编码器可跨线程共享同一 `Arc<HWContext>`。
+/// # Thread safety
+///
+/// [`Send`]/[`Sync`] are **auto-derived**, not hand-written: every field is
+/// either immutable after construction (`config`) or behind a [`Mutex`]
+/// (`device_ctx`). Sharing one `Arc<HWContext>` between the decoders and
+/// encoders of a given config — which [`HWContext::new`]'s cache does — is
+/// therefore checked by the compiler rather than asserted by us.
+///
+/// The hot path needs no lock at all: [`Self::hw_download`] / [`Self::hw_upload`]
+/// / [`Self::map_hw_frame`] work off the caller's own frame and codec context
+/// and only read `config`. Only device-level setup touches `device_ctx`.
+///
+/// Do **not** add `unsafe impl Sync` back. FFmpeg guarantees thread safety for
+/// `AVBufferRef` refcounting (`av_buffer_ref` / `av_hwframe_ctx_alloc`) — that
+/// part really is atomic — but `av_hwframe_ctx_init` runs the device type's
+/// `frames_init` callback, which reaches into device-private state (a CUDA
+/// context's loaded modules, a VAAPI display's surface tables) that FFmpeg does
+/// not promise to be race-free.
 pub(crate) struct HWContext {
     config: HWDeviceConfig,
-    device_ctx: AVHWDeviceContext,
+    /// Behind a [`Mutex`] because device-level setup (`av_hwframe_ctx_init`)
+    /// mutates device-private state; see the type-level note on thread safety.
+    device_ctx: Mutex<AVHWDeviceContext>,
 }
 
 impl HWContext {
@@ -390,7 +383,7 @@ impl HWContext {
 
         let ctx = Arc::new(Self {
             config: config.clone(),
-            device_ctx: hw_device_ctx,
+            device_ctx: Mutex::new(hw_device_ctx),
         });
 
         // 抢占式插入：`entry()` 在同一分片锁内原子地"存在则取用、不存在则插入"。
@@ -422,6 +415,17 @@ impl HWContext {
         prune_hw_ctx_cache(&cached.config);
 
         Ok(cached)
+    }
+
+    /// Take the device lock.
+    ///
+    /// Poisoning means an earlier holder panicked while touching the device, so
+    /// the device may be half-configured; that is reported instead of assumed
+    /// away — every caller here already returns [`Result`].
+    fn lock_device_ctx(&self) -> Result<MutexGuard<'_, AVHWDeviceContext>> {
+        self.device_ctx.lock().map_err(|_| {
+            RsmediaError::msg("Hardware device context lock poisoned by an earlier panic")
+        })
     }
 
     /// Initialize the hardware frames context for a **decoder**.
@@ -469,7 +473,9 @@ impl HWContext {
         }
         // clone 即 av_buffer_ref：codec_ctx 拥有独立引用，析构时正确 unref，
         // 无需 Decoder::Drop 手动置空防 double-free。
-        codec_ctx.set_hw_device_ctx(self.device_ctx.clone());
+        // 取锁只为了读到 `device_ctx`（`av_buffer_ref` 本身是原子的），
+        // 锁在语句末尾即释放，不覆盖上面的 `avcodec_open2` 级写入。
+        codec_ctx.set_hw_device_ctx(self.lock_device_ctx()?.clone());
 
         Ok(())
     }
@@ -503,15 +509,22 @@ impl HWContext {
 
     /// Allocate and initialize an `AVHWFramesContext` bound to this device.
     ///
-    /// 仅共享访问 device_ctx：`hwframe_ctx_alloc` 内部只做 av_buffer_ref（原子），
     /// 每次调用都新建独立的 AVHWFramesContext，由调用方（codec_ctx）独占持有。
+    ///
+    /// 全程持 device 锁：`hwframe_ctx_alloc` 只做原子的 `av_buffer_ref`，但
+    /// 随后的 `init()`（`av_hwframe_ctx_init`）会跑设备类型的 `frames_init`
+    /// 回调，它要动设备私有状态 —— 多个线程同时建 frames context 必须串行。
     pub(crate) fn create_hw_frames_ctx(
         &self,
         width: u32,
         height: u32,
         pool_size: i32,
     ) -> Result<rsmpeg::avutil::AVHWFramesContext> {
-        let mut hw_frames_ctx = self.device_ctx.hwframe_ctx_alloc();
+        // 守卫必须绑到具名变量上：写成 `self.lock_device_ctx()?.hwframe_ctx_alloc()`
+        // 时，临时值的生命周期只到该语句末尾，锁会在 `init()` 之前就释放 —— 于是
+        // 真正需要串行的那一步（`av_hwframe_ctx_init` 跑 `frames_init`）反而没有锁。
+        let device = self.lock_device_ctx()?;
+        let mut hw_frames_ctx = device.hwframe_ctx_alloc();
         hw_frames_ctx.data().format = self.get_format(true);
         hw_frames_ctx.data().sw_format = self.get_format(false);
         hw_frames_ctx.data().width = width as i32;
@@ -793,15 +806,22 @@ impl HWContext {
     }
 }
 
-/// SAFETY:
-/// - `AVHWDeviceContext` 底层是引用计数的 `AVBufferRef`；本类型的所有方法
-///   （`setup_decoder_frames`/`setup_encoder_frames`/`hw_download`/`hw_upload`）
-///   只做共享访问，涉及的
-///   FFI 调用（`av_buffer_ref`/`av_hwframe_ctx_alloc`/`av_hwframe_get_buffer`/
-///   `av_hwframe_transfer_data`）均为 FFmpeg 保证的线程安全操作。
-/// - 硬件设备本身由驱动保证并发使用安全。
-unsafe impl Send for HWContext {}
-unsafe impl Sync for HWContext {}
+// `Send` / `Sync` are intentionally **not** hand-implemented here — see the
+// thread-safety note on [`HWContext`]. `device_ctx` being a `Mutex` and
+// `config` being immutable is what makes both auto-derive, so the compiler —
+// not a SAFETY comment — carries the burden.
+//
+// The assertion below keeps that property from regressing: `Decoder`/`Encoder`
+// hold `Option<Arc<HWContext>>`, and `Arc<T>: Send` requires `T: Send + Sync`.
+// Dropping the `Mutex` would silently make `HWContext` `!Sync` while
+// `unsafe impl Send for Decoder` (a manual impl, so its fields go unchecked)
+// kept compiling — the exact shape of the bug this replaced.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    assert_send::<HWContext>();
+    assert_sync::<HWContext>();
+};
 
 ffi_enum_from!(
     /// Hardware device type (FFmpeg `AV_HWDEVICE_TYPE_*`).
@@ -1614,9 +1634,9 @@ mod tests {
 
     /// `HWContext` 跨线程共享同一 `Arc` 不应触发数据竞争。
     ///
-    /// 回归来源：`setup_decoder_frames` 并发调用曾通过 `UnsafeCell` 做可变访问；
-    /// `HWContext` 的所有方法现在都只做共享访问（`&self`），配合 FFmpeg 保证的
-    /// 原子引用计数，`Send`/`Sync` 才成立。
+    /// `Sync` 由类型自身推导（`config` 不可变 + `device_ctx: Mutex`），不是手写
+    /// `unsafe impl Sync` 的口头保证 —— 见类型级 thread safety 注释。并发建 frames
+    /// context 是唯一会动设备私有状态的路径，必须由那把 `Mutex` 串行化。
     #[test]
     fn test_hw_context_shared_across_threads() {
         let _guard = cache_lock();
@@ -1631,5 +1651,23 @@ mod tests {
         });
         let _ = ctx.get_format(false);
         handle.join().expect("thread should not panic");
+
+        // 建 frames context 是唯一会动设备私有状态的路径（`av_hwframe_ctx_init`
+        // 跑设备类型的 `frames_init`），必须能并发调用 —— 它由 `device_ctx` 的
+        // `Mutex` 串行化，而不是靠一句"FFmpeg 保证线程安全"的口头承诺。
+        let ctx3 = Arc::clone(&ctx);
+        let builder = std::thread::spawn(move || {
+            (0..4)
+                .map(|_| ctx3.create_hw_frames_ctx(64, 64, 2).is_ok())
+                .collect::<Vec<_>>()
+        });
+        let here = (0..4)
+            .map(|_| ctx.create_hw_frames_ctx(64, 64, 2).is_ok())
+            .collect::<Vec<_>>();
+        let there = builder.join().expect("thread should not panic");
+        assert_eq!(
+            here, there,
+            "both threads must see the same outcome: {here:?} vs {there:?}"
+        );
     }
 }

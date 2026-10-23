@@ -494,9 +494,8 @@ impl Resampler {
     /// A negative `swr_convert` result becomes an error, never a count.
     ///
     /// The output buffer is allocated for the **output spec this resampler was
-    /// built with** (see [`Self::new`]) — there is no longer a way to pass a
-    /// mismatched layout/fmt, which previously was a runtime error here and a
-    /// potential heap overrun if it slipped through.
+    /// built with** (see [`Self::new`]): a mismatched layout/fmt has no way in,
+    /// so the buffer always matches what `swr_convert` writes into it.
     pub fn convert(&mut self, src_frame: &AVFrame) -> Result<(AVSamples, i32)> {
         // 输出样本缓冲按**上下文**的输出声道数/采样格式分配：`swr_convert`
         // 始终按上下文（而非调用方传入的形参）写数据。输出规格即 `new` 里归一化后

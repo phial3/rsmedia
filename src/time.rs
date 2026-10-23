@@ -547,9 +547,9 @@ impl Time {
     ///
     /// 任一侧时间基为 [`Rational::ZERO`] 时换算不可定义（FFmpeg 的
     /// `av_rescale_q` 在单位反向的路径上会触碰除零断言；零时间基本身就
-    /// 声明不了单位，见 [`seconds_or_none`](Self::seconds_or_none) 的同一
-    /// 裁决）—— 该侧时间戳按"无时间"处理（`Aligned` 的对应槽位为 `None`，
-    /// [`apply`](Aligned::apply) 产出无时间的 `Time`），不换算。
+    /// 声明不了单位，见 `seconds_or_none` 的同一裁决）—— 该侧时间戳按
+    /// "无时间"处理（`Aligned` 的对应槽位为 `None`，`Aligned::apply` 产出
+    /// 无时间的 `Time`），不换算。
     pub fn aligned_with(&self, rhs: Time) -> Aligned {
         // S2：`rhs` 的时间基为 ZERO 时换算不可定义（FFmpeg 的 `av_rescale_q`
         // 在单位反向的路径上会触碰除零断言；零时间基本身就声明不了单位，
@@ -698,7 +698,7 @@ impl PartialEq for Time {
     /// `Time::from_units(1, 4)` and `Time::new(Some(2), Rational::new(1, 2).unwrap())`
     /// both mean 0.5 s and are therefore equal.
     ///
-    /// Requiring the raw fields to match used to make "the same instant" compare
+    /// Requiring the raw fields to match would make "the same instant" compare
     /// unequal whenever the time bases differed. Two "no value" times are equal
     /// (`None == None`); a "no value" time never equals a valued one. The result
     /// matches [`PartialOrd`]: `a == b` ⟺ `a.partial_cmp(&b) == Some(Equal)`.
@@ -981,10 +981,10 @@ mod tests {
 
     /// `1 / 0` is refused rather than folded into a "no time base" [`Time`].
     ///
-    /// Everything else is now out of reach instead of checked: the denominator is
-    /// [`i32`] — `AVRational`'s own width — so there is no narrowing left for a
-    /// value to wrap in. `from_nth_of_a_second(2^31 + 5)` used to become `1 / 5`
-    /// at the `as i32` cast; it now does not compile.
+    /// Everything else is ruled out by the type rather than checked: the
+    /// denominator is [`i32`] — `AVRational`'s own width — so there is no
+    /// narrowing left for a value to wrap in. `from_nth_of_a_second(2^31 + 5)`
+    /// does not compile.
     #[test]
     fn test_from_nth_of_a_second_rejects_a_zero_denominator() {
         let zero = Time::from_nth_of_a_second(0).unwrap_err();

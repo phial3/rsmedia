@@ -1,8 +1,7 @@
 //! The crate's macros: three FFI wrappers plus one builder generator.
 //!
-//! Three macros cover everything the crate needs from FFmpeg's constants. Pick between them by
-//! asking "can two values be meaningfully combined?", not by which FFmpeg version the constants
-//! come from. Full capability matrix:
+//! Pick among the three FFI macros by asking "can two values be meaningfully combined?",
+//! not by which FFmpeg version the constants come from:
 //!
 //! | capability | `ffi_enum_from!` | `ffi_enum_typed!` | `ffi_enum!` |
 //! |------------|------------------|-------------------|-------------|
@@ -16,74 +15,41 @@
 //! | test one bit in a set | no | no | yes ([`FlagSet::contains`](crate::FlagSet::contains), or `set & Enum::A`) |
 //! | fallback for an unlisted value | panics; every table fails fast (the expression form is still supported but unused) | n/a | n/a |
 //!
-//! The suffixes are the whole naming scheme, and each one names the capability it adds on top of
-//! `ffi_enum!`:
+//! The suffixes name the capability each macro adds on top of `ffi_enum!`: that base case
+//! is an enum over FFmpeg flag constants plus its conversions and bit operators, but
+//! declares no FFI type (its constants may be bare integers on some versions);
+//! `ffi_enum_typed!` adds the named FFI type alias with a compile-time `size_of` check;
+//! `ffi_enum_from!` adds the reverse conversion, which is why it is the ID-table macro —
+//! a combination such as `BACKWARD | ANY` is not any single variant, so there would be
+//! nothing to convert back to.
 //!
-//! - `ffi_enum!` — the base case: an enum over FFmpeg flag constants, its conversions and the bit
-//!   operators. It declares no FFI type, because its constants may be bare integers on some
-//!   FFmpeg versions and a named alias on others.
-//! - `ffi_enum_typed!` — the same, **plus** the named FFI type alias is declared and checked at
-//!   compile time (`size_of::<$ffi>()`). Forward conversion only.
-//! - `ffi_enum_from!` — the same, **plus** the reverse conversion (`From<ffi> for Enum`, and
-//!   `from_ffi_checked`). That is why it is the ID-table macro: a combination such as
-//!   `BACKWARD | ANY` is not any single variant, so there would be nothing to convert back to.
+//! Two tables are IDs yet use `ffi_enum!` — `ScaleAlgorithm` and `AVLogLevel` — because
+//! `ffi_enum_from!` needs a named FFI type alias after `=>` and their constants are bare
+//! integers on older FFmpeg versions. Neither can reject a bad combination at the type
+//! level, so combining their values is a caller error FFmpeg rejects; they carry that
+//! caveat in their own documentation. `ffi_enum_typed!` currently has no user.
 //!
-//! In practice the split is mostly by kind.
-//!
-//! The `ffi_enum!` call sites are bit sets — `AVCodecFlag` / `AVCodecFlag2` / `ThreadType`
-//! (`codec.rs`), `AVFormatFlag` (`fmt.rs`), `AVPixFmtFlag` (`pixel.rs`), `AVSeekFlag`
-//! (`io.rs`), `ErrRecognition` (`decode.rs`), `ScaleQuality` (`scale.rs`), `AVLogFlag`
-//! (`init.rs`) — plus two tables that are really IDs: `ScaleAlgorithm` (`scale.rs`, a
-//! mutually exclusive choice — "only one may be active at a time" per FFmpeg's header —
-//! whose members are `SWS_*` bits) and `AVLogLevel` (`init.rs`, an ordered level, not a
-//! mask). Neither of those two can reject a combination at the type level, so combining
-//! their values is a caller error FFmpeg rejects rather than something the type prevents.
-//!
-//! The `ffi_enum_from!` call sites are IDs: `PixelFormat` (`pixel.rs`), `SampleFormat`
-//! (`fmt.rs`), `MediaType` (`stream.rs`), `HWDeviceType` (`hwaccel.rs`), `SkipFrame`
-//! (`decode.rs`), plus the swscale value sets in `scale.rs`: `SwsDither`, `SwsAlphaBlend`,
-//! `SwsScaler`, `SwsIntent`, `SwsBackend`.
-//!
-//! The two tables above that are IDs yet cannot use `ffi_enum_from!` — `ScaleAlgorithm` and
-//! `AVLogLevel` — are the reason the split is "declared shape" and not "semantics": that macro
-//! needs a named FFI type alias to put after `=>`, and their constants are bare integers on the
-//! older FFmpeg versions. They are declared with `ffi_enum!` and carry the caveat in their own
-//! documentation instead.
-//!
-//! `ffi_enum_typed!` currently has no user — see the note on the macro itself for why the need
-//! for it disappeared.
-//!
-//! The fourth macro, [`impl_codec_builder_setters!`], is not an FFI wrapper: it expands into the
-//! `impl` block that
+//! The fourth macro, [`impl_codec_builder_setters!`], is not an FFI wrapper: it expands
+//! into the `impl` block that
 //! [`EncoderBuilder`](crate::encode::EncoderBuilder) and
-//! [`DecoderBuilder`](crate::decode::DecoderBuilder) share, so a codec option common to both
-//! sides has one definition and one copy of its documentation. It lives here because it is a
-//! macro like the others, and because `#[macro_use] mod macros;` (in `lib.rs`) is what puts every
-//! macro in this file in scope crate-wide — which is why no call site imports any of them.
+//! [`DecoderBuilder`](crate::decode::DecoderBuilder) share, so codec options common to
+//! both sides have one definition and one copy of their documentation.
 //!
-//! Points worth remembering, because they are easy to get wrong:
+//! Points worth remembering:
 //!
-//! - A fieldless enum cannot hold an unnamed discriminant, so the bit-set operators cannot yield
-//!   the enum back: `LOW_DELAY | CLOSED_GOP` is not a variant of anything. They yield
-//!   [`FlagSet<E>`](crate::FlagSet) — the crate's type for "a mask of `Enum`'s bits" — which is also what
-//!   makes `ffi_enum!` unable to ever convert a raw value back into a variant. `BitOr` is
-//!   implemented for both operand orders as well as for a set on either side (`A | B`,
-//!   `A | raw`, `raw | A`, `set | A`, `A | set`), so a chain such as `A | B | C` reads as
-//!   written and stays a `FlagSet` throughout; the read side is
-//!   [`FlagSet::contains`](crate::FlagSet::contains), or
-//!   `set & A` when the common bits are what matter. A mask that cannot be described as a
-//!   combination of named flags goes through
-//!   [`FlagSet::from_bits`](crate::FlagSet::from_bits).
-//! - `ffi_enum!` does not declare an FFI type, but that is a statement about the macro's shape,
-//!   not a restriction on its constants: `SWS_*` is a bare constant on FFmpeg 6/7 and the
-//!   `ffi::SwsFlags` alias on 8+, and one table covers both.
-//! - Every generated enum is `#[non_exhaustive]`. FFmpeg gains and drops these values across
-//!   releases (several tables already carry `#[cfg(feature = ...)]` variants), so a downstream
-//!   `match` must keep a wildcard arm — which is exactly what the attribute now enforces.
-//! - Every generated enum converts **variant to raw** with `Into` (`Into<repr>` for bit sets,
-//!   `Into<ffi>` for IDs), and that is the conversion to reach for by default. `as_raw()` exists
-//!   only on the bit-set macros, where the same value is also needed for bit-level masking; treat
-//!   it as the explicit counterpart of the operators rather than a second generic conversion.
+//! - A fieldless enum cannot hold an unnamed discriminant, so the bit-set operators yield
+//!   [`FlagSet<E>`](crate::FlagSet) rather than a variant — which is also why `ffi_enum!`
+//!   can never convert a raw value back. `BitOr` accepts both operand orders and a set on
+//!   either side (`A | B`, `A | raw`, `raw | A`, `set | A`, `A | set`), so `A | B | C`
+//!   reads as written and stays a `FlagSet`; read it back with
+//!   [`FlagSet::contains`](crate::FlagSet::contains), `set & A`, or
+//!   [`FlagSet::from_bits`](crate::FlagSet::from_bits) for a mask with no named spelling.
+//! - Every generated enum is `#[non_exhaustive]`: FFmpeg gains and drops these values
+//!   across releases (several tables carry `#[cfg(feature = ...)]` variants), so a
+//!   downstream `match` must keep a wildcard arm.
+//! - Reach for `Into` (variant to raw) by default. `as_raw()` exists only on the bit-set
+//!   macros, where the same value is also needed for bit-level masking; treat it as the
+//!   explicit counterpart of the operators, not a second generic conversion.
 //!   A `FlagSet` converts to the same raw `repr` (it is what makes a combination acceptable
 //!   anywhere a single flag is), and [`FlagSet::bits`](crate::FlagSet::bits) is the explicit
 //!   spelling of that read.
@@ -91,92 +57,68 @@
 /// Wraps a mutually exclusive FFI enum: from a single `variant => constant` table it generates
 /// the Rust enum plus the `From` impls in both directions.
 ///
-/// This removes the hand-written "enum + two-way `match`" boilerplate that used to be
-/// duplicated across modules (pixel / fmt / stream / hwaccel). One table is the single source
-/// of truth and expands into:
+/// `#[repr(..)]` comes from the `repr =` argument (`i32`/`u32`, declaring the enum's
+/// signedness); every discriminant is normalised via `$const as $repr`, so `variant as _` equals
+/// the corresponding FFmpeg value. `From<$ffi>` normalises the raw value and matches it against
+/// the constants, handing anything unlisted to the `fallback`; `From<$enum> for $ffi` is
+/// exhaustive over the Rust variants, so a forgotten variant fails to compile. Deprecated
+/// same-value aliases (such as `AV_PIX_FMT_Y400A` ≡ `AV_PIX_FMT_YA8`) need not be listed: they
+/// share the main variant's value and hit its arm automatically.
 ///
-/// - `pub enum`: `#[repr(..)]` comes from the `repr =` argument (`i32`/`u32`, declaring the
-///   enum's signedness); every discriminant is normalised via `$const as $repr`, so
-///   `variant as _` equals the corresponding FFmpeg value.
-/// - `impl From<$ffi> for $enum`: `value as $repr` is normalised, then matched against the
-///   constants. Values not listed take the `fallback`. Deprecated same-value aliases (such as
-///   `AV_PIX_FMT_Y400A` ≡ `AV_PIX_FMT_YA8`) need not be listed: they share the main variant's
-///   value, so they hit its arm automatically.
-/// - `impl From<$enum> for $ffi`: matches the variant back to the constant, normalised via
-///   `$const as $ffi`. Exhaustive over the Rust variants, so a forgotten variant fails to
-///   compile.
-///
-/// # Type normalisation
-///
-/// The type bindgen assigns to an enum constant depends on the C enum's signedness and on the
-/// generation environment (regenerated locally vs. pre-generated per platform): it may be
-/// `c_int`, `c_uint`, a bare `u32`, and so on, and is not guaranteed to match `repr`. The macro
-/// therefore normalises with an explicit `as` at all three seams (discriminant, `From<$ffi>`
-/// match, `From<$enum>` return), which means `repr` only has to declare the signedness implied
-/// by the enum's semantics (`i32` if any value is negative, otherwise `u32`) and does not have
-/// to match the constants' type alias textually. A wrong signedness that makes two
-/// discriminants collide is reported at compile time.
-///
-/// # Panicking fallback
+/// Two fallback forms:
 ///
 /// ```ignore
+/// // Fast failure for a value the table does not model.
 /// ffi_enum_from!(
-///     /// Pixel format definitions in bindings.
-///     #[allow(non_camel_case_types)]
 ///     PixelFormat => ffi::AVPixelFormat,
 ///     repr = i32,
 ///     fallback = panic {
 ///         NONE => ffi::AV_PIX_FMT_NONE;
 ///         YUV420P => ffi::AV_PIX_FMT_YUV420P;
-///         YUYV422 => ffi::AV_PIX_FMT_YUYV422;
 ///     }
 /// );
-/// ```
 ///
-/// # Custom fallback (falls back to `Self::NONE`)
-///
-/// ```ignore
+/// // Degrade to a named variant instead of panicking.
 /// ffi_enum_from!(
-///     /// Pixel format definitions in bindings.
-///     #[allow(non_camel_case_types)]
 ///     PixelFormat => ffi::AVPixelFormat,
 ///     repr = i32,
 ///     fallback = Self::NONE {
 ///         NONE => ffi::AV_PIX_FMT_NONE;
 ///         YUV420P => ffi::AV_PIX_FMT_YUV420P;
-///         YUYV422 => ffi::AV_PIX_FMT_YUYV422;
 ///     }
 /// );
 /// ```
 ///
-/// # Notes
+/// Every table in this crate uses `fallback = panic`: an FFmpeg value the table does not model
+/// is a fast failure, not a silent degradation — mapping it onto some variant would produce a
+/// subtly wrong result that is harder to diagnose than a panic. The expression form remains
+/// supported where degrading is genuinely the right answer, but nothing uses it.
 ///
-/// - Every table in this crate uses `fallback = panic`. An FFmpeg value the table does not model
-///   is a fast failure, not a silent degradation: mapping it onto some variant would produce a
-///   subtly wrong result that is much harder to diagnose than a panic. The `fallback =
-///   <expression>` form remains supported for tables where degrading is genuinely the right
-///   answer, but nothing uses it today.
-/// - A variant's doc comment is forwarded to both the enum variant and the `match` arm. Doc on
-///   a match arm is an `unused_doc_comments` warning, so the macro inserts
-///   `#[allow(unused_doc_comments)]` on every arm.
-/// - When the FFI type is a plain integer alias — `ffi::AVPixelFormat` and `ffi::AVSampleFormat`
-///   are both `c_int` — the generated `From` impls **are** the integer conversions, so
-///   `i32::from(PixelFormat::RGB24)` and `PixelFormat::from(raw_i32)` work without any extra
-///   impl (and a separate `impl From<i32>` would be rejected as a duplicate impl of the same
-///   type). The reverse one runs through the `fallback`, so an unlisted integer panics: reach
-///   for `from_ffi_checked` when the value arrives from FFmpeg.
-/// - `fallback = panic` and `fallback = <expression>` are two **entry** rules that differ only
-///   in the fallback they hand to the internal `@expand` rule, which holds the single copy of
-///   the expansion. Each hands over a **closure** — `|value| panic!(...)`, `|_| <expr>` — that
-///   `@expand` calls with the raw value: macro hygiene would otherwise stop an identifier
-///   written in one rule from resolving to the `value` binding of the `fn from` generated by
-///   another. The expression rule keeps taking a `$fallback:path` rather than `$fb:expr`,
-///   because `fallback = Self::NONE { ... }` would then be parsed as a struct literal instead
-///   of a path followed by the variant list.
+/// # Type normalisation
 ///
-/// `@expand` is an implementation detail: it matches only the two entry rules above and is not
-/// part of the macro's interface.
+/// The type bindgen assigns to an enum constant depends on the C enum's signedness and on the
+/// generation environment: it may be `c_int`, `c_uint`, a bare `u32`, and so on, and is not
+/// guaranteed to match `repr`. The macro therefore normalises with an explicit `as` at all three
+/// seams, so `repr` only has to declare the signedness implied by the enum's semantics (`i32` if
+/// any value is negative, otherwise `u32`). A wrong signedness that makes two discriminants
+/// collide is reported at compile time.
+///
+/// When the FFI type is a plain integer alias — `ffi::AVPixelFormat` and `ffi::AVSampleFormat`
+/// are both `c_int` — the generated `From` impls **are** the integer conversions, so
+/// `i32::from(PixelFormat::RGB24)` and `PixelFormat::from(raw_i32)` work without any extra impl.
+/// The reverse one runs through the `fallback`, so an unlisted integer panics: reach for
+/// `from_ffi_checked` when the value arrives from FFmpeg.
+///
+/// A variant's doc comment is forwarded to the enum variant and to its `match` arm; doc on a
+/// match arm is an `unused_doc_comments` warning, so the macro inserts
+/// `#[allow(unused_doc_comments)]` on every arm.
 macro_rules! ffi_enum_from {
+    // 两个 entry 规则只在交给 `@expand` 的 fallback 上不同；`@expand` 持有唯一一份展开，
+    // 且**不**是宏接口的一部分。各自传入一个 **闭包**（`|value| panic!(...)` / `|_| expr`）
+    // 而不是标识符：宏卫生会让一个规则里写的标识符解析不到另一个规则生成的 `fn from`
+    // 的 `value` 绑定。表达式那条继续收 `$fallback:path` 而非 `$fb:expr`，否则
+    // `fallback = Self::NONE { ... }` 会被当成结构体字面量解析，而不是"路径 + 变体列表"。
+    //
     // panic 版：fallback = panic { 变体列表 }
     (
         $(#[$em:meta])*
@@ -419,34 +361,21 @@ macro_rules! ffi_enum_typed {
 /// - `BitAnd<Self>` for `$repr_ty` (`raw & A`), so a mask that is already raw can be queried
 ///   with a named flag: `flags & AVSeekFlag::BYTE != 0`.
 ///
-/// # Why the operators yield a `FlagSet`, not the enum
-///
-/// A fieldless Rust enum cannot represent an unnamed discriminant, and most useful
-/// combinations (`BACKWARD | ANY`, `GLOBAL_HEADER | NOTIMESTAMPS`) have no variant of their
-/// own. The operators therefore cannot return `$enum`; they return
-/// [`FlagSet`](crate::FlagSet) instead. That keeps the combination **typed**: a
-/// `FlagSet<AVCodecFlag>` cannot be handed to an API expecting `FlagSet<ScaleQuality>` even
-/// though both are 32-bit masks, while `A | B | C` still reads as written because the set
-/// implements `|` against itself and against the enum. Five `|` operand pairs are accepted —
-/// `A | B`, `A | raw`, `raw | A`, `set | A`, `A | set` — so no operand order has to be looked
-/// up. Reading goes through [`FlagSet::contains`](crate::FlagSet::contains) (one bit) or
-/// `set & A` (the common bits).
-///
-/// `raw` means `$repr_ty` — no other integer type is accepted, because a table only
-/// implements the operators for its own `repr` and for itself. An FFI constant whose type
-/// differs from the `repr` therefore needs an explicit cast, which in practice means the
-/// `AVSEEK_FLAG_*` style case: rsmpeg types those constants `u32` while the consumer
-/// (`av_seek_frame`) takes `int`, so the table is declared `repr = i32` and mixing becomes
-/// `AVSeekFlag::FRAME | (ffi::AVSEEK_FLAG_BYTE as i32)`. Tables declared `repr = u32` need no
-/// cast for the same constants.
+/// The `|` operators yield a [`FlagSet`](crate::FlagSet) rather than `$enum` because a
+/// fieldless enum has no variant for a combination, and keeping the set typed stops a
+/// `FlagSet<AVCodecFlag>` from being handed to an API expecting `FlagSet<ScaleQuality>`.
+/// `raw` means `$repr_ty` and nothing else: a table only implements the operators for its own
+/// `repr`, so an FFI constant typed differently needs an explicit cast — in practice the
+/// `AVSEEK_FLAG_*` case, where rsmpeg types the constants `u32` while `av_seek_frame` takes
+/// `int`, hence `repr = i32` and `AVSeekFlag::FRAME | (ffi::AVSEEK_FLAG_BYTE as i32)`.
 ///
 /// # Parameters
 ///
 /// `ffi_enum!(EnumName, ReprType { Variant => ffi::CONSTANT; ... });`
 ///
-/// `ReprType` is `i32` or `u32`. Declare the signedness the FFI call expects, and note that a
-/// flag set whose constants are unsigned but whose consumer wants `i32` (such as
-/// `AVSEEK_FLAG_*`) must be declared `i32` so that `Into<i32>` is generated.
+/// `ReprType` is `i32` or `u32`: declare the signedness the FFI call expects, so a flag set
+/// with unsigned constants but an `i32` consumer must be declared `i32` for `Into<i32>` to be
+/// generated.
 ///
 /// # Example
 ///

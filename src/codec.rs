@@ -1,5 +1,5 @@
 use crate::error::{Result, RsmediaError};
-use crate::stream::MediaType;
+use crate::mediatype::MediaType;
 use crate::strutils;
 use crate::time::Rational;
 
